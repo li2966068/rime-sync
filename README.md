@@ -1,0 +1,2 @@
+# rime-sync
+rime-sync
