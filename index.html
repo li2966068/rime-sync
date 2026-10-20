@@ -12,41 +12,48 @@
         <div class="brand">
           <span class="brand-mark" aria-hidden="true">R</span>
           <div class="brand-text">
-            <h1>Rime 同步</h1>
-            <p>词库与配置 · WebDAV</p>
+            <h1 data-i18n="app.name">Rime 同步</h1>
+            <p data-i18n="app.subtitle">词库与配置 · WebDAV</p>
           </div>
         </div>
         <nav class="tabs" role="tablist" aria-label="页面">
-          <button class="tab is-active" role="tab" data-panel="connection" aria-selected="true">连接</button>
-          <button class="tab" role="tab" data-panel="sync" aria-selected="false">同步</button>
-          <button class="tab" role="tab" data-panel="settings" aria-selected="false">设置</button>
+          <button class="tab is-active" role="tab" data-panel="connection" aria-selected="true" data-i18n="tab.connection">连接</button>
+          <button class="tab" role="tab" data-panel="sync" aria-selected="false" data-i18n="tab.sync">同步</button>
+          <button class="tab" role="tab" data-panel="conflicts" aria-selected="false" data-i18n="tab.conflicts">冲突</button>
+          <button class="tab" role="tab" data-panel="devices" aria-selected="false" data-i18n="tab.devices">设备</button>
+          <button class="tab" role="tab" data-panel="settings" aria-selected="false" data-i18n="tab.settings">设置</button>
         </nav>
         <div class="busy" id="busy" hidden><span class="spinner" aria-hidden="true"></span><span id="busy-text">同步中…</span></div>
       </header>
 
       <main class="content">
-        <section class="panel is-active" id="panel-connection" role="tabpanel" aria-label="连接">
+        <section class="panel is-active" id="panel-connection" role="tabpanel">
           <div class="panel-head">
             <div>
-              <h2>WebDAV 连接</h2>
-              <p class="muted">填写你自己的 WebDAV 服务地址；密码仅保存在本机（配置文件权限 0600）。</p>
+              <h2 data-i18n="conn.title">WebDAV 连接</h2>
+              <p class="muted" data-i18n="conn.desc"></p>
             </div>
+            <span class="pill" id="secret-status"></span>
           </div>
 
           <div class="card">
             <div class="field">
-              <label for="dav-url">服务器地址</label>
-              <input id="dav-url" type="url" spellcheck="false" autocomplete="off"
-                placeholder="https://dav.jianguoyun.com/dav/" />
-              <p class="hint">支持坚果云、Nextcloud、群晖 DSM、自建 WebDAV；这里填服务根地址，不要带远端目录。</p>
+              <label for="preset" data-i18n="conn.preset">服务商</label>
+              <select id="preset"></select>
+              <p class="hint" id="preset-hint" data-i18n="conn.presetHint"></p>
+            </div>
+            <div class="field">
+              <label for="dav-url" data-i18n="conn.url">服务器地址</label>
+              <input id="dav-url" type="url" spellcheck="false" autocomplete="off" data-i18n-placeholder="conn.urlPlaceholder" />
+              <p class="hint" data-i18n="conn.urlHint"></p>
             </div>
             <div class="grid-2">
               <div class="field">
-                <label for="dav-user">用户名</label>
+                <label for="dav-user" data-i18n="conn.user">用户名</label>
                 <input id="dav-user" type="text" spellcheck="false" autocomplete="username" />
               </div>
               <div class="field">
-                <label for="dav-pass">密码 / 应用密码</label>
+                <label for="dav-pass" data-i18n="conn.pass">密码 / 应用密码</label>
                 <div class="input-with-action">
                   <input id="dav-pass" type="password" autocomplete="current-password" />
                   <button class="ghost small" id="toggle-pass" type="button" aria-pressed="false">显示</button>
@@ -54,52 +61,64 @@
               </div>
             </div>
             <div class="field">
-              <label for="dav-dir">远端目录</label>
-              <input id="dav-dir" type="text" spellcheck="false" placeholder="rime-sync" />
-              <p class="hint">应用会在该目录下创建 <code>sync/&lt;设备&gt;/</code> 与 <code>shared/</code>。</p>
+              <label for="dav-dir" data-i18n="conn.dir">远端目录</label>
+              <input id="dav-dir" type="text" spellcheck="false" data-i18n-placeholder="conn.dirPlaceholder" />
+              <p class="hint" data-i18n="conn.dirHint"></p>
             </div>
             <div class="actions">
-              <button class="primary" id="btn-save-conn" type="button">保存配置</button>
-              <button class="secondary" id="btn-test" type="button">测试连接</button>
-              <button class="ghost" id="btn-list-remote" type="button">查看远端</button>
+              <button class="primary" id="btn-save-conn" type="button" data-i18n="conn.save">保存配置</button>
+              <button class="secondary" id="btn-test" type="button" data-i18n="conn.test">测试连接</button>
+              <button class="ghost" id="btn-probe" type="button" data-i18n="conn.probe">写权限探测</button>
+              <button class="ghost" id="btn-list-remote" type="button" data-i18n="conn.remote">查看远端</button>
             </div>
             <div class="status" id="conn-status" hidden></div>
             <div class="remote-list" id="remote-list" hidden></div>
           </div>
         </section>
 
-        <section class="panel" id="panel-sync" role="tabpanel" aria-label="同步">
+        <section class="panel" id="panel-sync" role="tabpanel">
           <div class="panel-head">
             <div>
-              <h2>同步</h2>
-              <p class="muted">搬运只搬文件、不打断输入；合并生效会让 librime 重新部署。</p>
+              <h2 data-i18n="sync.title">同步</h2>
+              <p class="muted" data-i18n="sync.desc"></p>
             </div>
           </div>
 
           <div class="card">
             <div class="field">
-              <label for="rime-dir">当前 Rime 用户目录</label>
+              <label for="rime-dir" data-i18n="sync.rimeDir">当前 Rime 用户目录</label>
               <div class="input-with-action">
-                <input id="rime-dir" type="text" spellcheck="false" placeholder="点击「自动探测」或在设置中手动填写" />
-                <button class="ghost small" id="btn-detect" type="button">自动探测</button>
+                <input id="rime-dir" type="text" spellcheck="false" data-i18n-placeholder="sync.rimeDirPlaceholder" />
+                <button class="ghost small" id="btn-detect" type="button" data-i18n="sync.detect">自动探测</button>
               </div>
-              <p class="hint" id="rime-dir-source">尚未探测</p>
+              <p class="hint" id="rime-dir-source"></p>
             </div>
+
+            <div class="watch-row">
+              <label class="switch">
+                <input type="checkbox" id="watch-toggle" />
+                <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                <span data-i18n="sync.watch">实时同步</span>
+              </label>
+              <span class="watch-state" id="watch-status"></span>
+              <span class="muted" id="watch-last"></span>
+            </div>
+            <p class="hint" data-i18n="sync.watchSub"></p>
 
             <div class="actions big">
               <button class="primary" id="btn-transport" type="button">
-                <span>立即搬运</span><small>不打断输入</small>
+                <span data-i18n="sync.transport">立即搬运</span><small data-i18n="sync.transportSub">不打断输入</small>
               </button>
               <button class="warn" id="btn-apply" type="button">
-                <span>立即合并生效</span><small>会短暂重启输入法</small>
+                <span data-i18n="sync.apply">立即合并生效</span><small data-i18n="sync.applySub">会短暂重启输入法</small>
               </button>
-              <button class="ghost" id="btn-cancel" type="button" disabled>取消</button>
+              <button class="ghost" id="btn-cancel" type="button" disabled data-i18n="sync.cancel">取消</button>
             </div>
           </div>
 
           <div class="card">
             <div class="progress-head">
-              <span id="progress-label">等待同步</span>
+              <span id="progress-label"></span>
               <span class="muted" id="progress-count"></span>
             </div>
             <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
@@ -107,86 +126,300 @@
             </div>
 
             <div class="report" id="report">
-              <div class="report-item"><span class="label">拉取</span><span class="value" id="report-pulled">0</span></div>
-              <div class="report-item"><span class="label">推送</span><span class="value" id="report-pushed">0</span></div>
-              <div class="report-item"><span class="label">合并</span><span class="value" id="report-merged">0</span></div>
-              <div class="report-item"><span class="label">冲突</span><span class="value" id="report-conflicts">0</span></div>
-              <div class="report-item wide"><span class="label">耗时</span><span class="value" id="report-duration">—</span></div>
+              <div class="report-item"><span class="label" data-i18n="sync.pulled">拉取</span><span class="value" id="report-pulled">0</span></div>
+              <div class="report-item"><span class="label" data-i18n="sync.pushed">推送</span><span class="value" id="report-pushed">0</span></div>
+              <div class="report-item"><span class="label" data-i18n="sync.merged">合并</span><span class="value" id="report-merged">0</span></div>
+              <div class="report-item"><span class="label" data-i18n="sync.conflicts">冲突</span><span class="value" id="report-conflicts">0</span></div>
+              <div class="report-item"><span class="label" data-i18n="sync.duration">耗时</span><span class="value" id="report-duration">—</span></div>
+              <div class="report-item wide backup"><span class="label" data-i18n="sync.backup">备份</span><span class="value mono" id="report-backup">—</span></div>
               <div class="report-note" id="report-note" hidden></div>
             </div>
           </div>
 
           <div class="card log-card">
             <div class="log-head">
-              <span>实时日志</span>
+              <span data-i18n="sync.log">实时日志</span>
               <div class="log-actions">
-                <button class="ghost small" id="btn-refresh-log" type="button">刷新</button>
-                <button class="ghost small" id="btn-clear-log" type="button">清空显示</button>
+                <button class="ghost small" id="btn-refresh-log" type="button" data-i18n="common.refresh">刷新</button>
+                <button class="ghost small" id="btn-clear-log" type="button" data-i18n="sync.clearLog">清空显示</button>
               </div>
             </div>
             <pre class="log" id="log" aria-live="polite"></pre>
           </div>
         </section>
 
-        <section class="panel" id="panel-settings" role="tabpanel" aria-label="设置">
+        <section class="panel" id="panel-conflicts" role="tabpanel">
           <div class="panel-head">
             <div>
-              <h2>设置</h2>
-              <p class="muted">更改后点击底部「保存设置」写入本机。</p>
+              <h2 data-i18n="conflicts.title">冲突</h2>
+              <p class="muted" data-i18n="conflicts.desc"></p>
+            </div>
+            <span class="muted" id="conflicts-count"></span>
+          </div>
+
+          <div class="card conflicts-card">
+            <div class="conflict-toolbar">
+              <button class="ghost small" id="btn-conflicts-refresh" type="button" data-i18n="common.refresh">刷新</button>
+              <button class="ghost small" id="btn-conflicts-keep-all" type="button" data-i18n="conflicts.keepAll">全部保留本地</button>
+              <button class="ghost small" id="btn-conflicts-take-all" type="button" data-i18n="conflicts.takeAll">全部采用副本</button>
+            </div>
+            <div class="conflict-layout">
+              <div class="conflict-list" id="conflict-list" role="list"></div>
+              <div class="conflict-detail">
+                <p class="muted" id="conflict-empty" data-i18n="conflicts.select"></p>
+                <div id="conflict-body" hidden>
+                  <div class="conflict-meta" id="conflict-meta"></div>
+                  <div class="diff" id="diff">
+                    <div class="diff-head">
+                      <span data-i18n="conflicts.local">本地现状</span>
+                      <span data-i18n="conflicts.copy">冲突副本</span>
+                    </div>
+                    <div class="diff-body">
+                      <div class="diff-pane" id="diff-left" tabindex="0"></div>
+                      <div class="diff-pane" id="diff-right" tabindex="0"></div>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button class="secondary" id="btn-conflict-local" type="button" data-i18n="conflicts.keepLocal">保留本地</button>
+                    <button class="warn" id="btn-conflict-copy" type="button" data-i18n="conflicts.takeCopy">采用副本</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="panel-devices" role="tabpanel">
+          <div class="panel-head">
+            <div>
+              <h2 data-i18n="devices.title">设备</h2>
+              <p class="muted" data-i18n="devices.desc"></p>
+            </div>
+            <button class="ghost small" id="btn-devices-refresh" type="button" data-i18n="devices.refresh">刷新</button>
+          </div>
+
+          <div class="card">
+            <table class="table" id="device-table">
+              <thead>
+                <tr>
+                  <th data-i18n="devices.id">设备 ID</th>
+                  <th data-i18n="devices.hostname">主机名</th>
+                  <th data-i18n="devices.os">系统</th>
+                  <th data-i18n="devices.heartbeat">最后心跳</th>
+                  <th data-i18n="devices.actions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="device-body"></tbody>
+            </table>
+            <p class="muted empty" id="device-empty" hidden></p>
+          </div>
+        </section>
+
+        <section class="panel" id="panel-settings" role="tabpanel">
+          <div class="panel-head">
+            <div>
+              <h2 data-i18n="settings.title">设置</h2>
+              <p class="muted" data-i18n="settings.desc"></p>
             </div>
           </div>
 
           <div class="card">
             <div class="grid-2">
               <div class="field">
-                <label for="interval">搬运间隔（分钟）</label>
+                <label for="interval" data-i18n="settings.interval">搬运间隔（分钟）</label>
                 <input id="interval" type="number" min="0" max="1440" step="1" />
-                <p class="hint">0 表示关闭定时搬运；定时只执行「搬运」，不打断输入。</p>
+                <p class="hint" data-i18n="settings.intervalHint"></p>
               </div>
               <div class="field">
-                <label for="device-id">设备 ID</label>
+                <label for="device-id" data-i18n="settings.deviceId">设备 ID</label>
                 <div class="input-with-action">
                   <input id="device-id" type="text" readonly />
-                  <button class="ghost small" id="btn-regen-device" type="button">重新生成</button>
+                  <button class="ghost small" id="btn-regen-device" type="button" data-i18n="settings.regen">重新生成</button>
                 </div>
-                <p class="hint">每台设备唯一，修改后会以新目录参与同步。</p>
+                <p class="hint" data-i18n="settings.deviceHint"></p>
               </div>
             </div>
 
             <div class="field">
-              <label>同步范围</label>
+              <label data-i18n="settings.kinds">同步范围</label>
               <div class="checks">
-                <label class="check"><input type="checkbox" id="kind-userdict" /><span>用户词库快照<em>sync/*.userdb.txt</em></span></label>
-                <label class="check"><input type="checkbox" id="kind-yaml" /><span>自定义配置<em>*.custom.yaml</em></span></label>
-                <label class="check"><input type="checkbox" id="kind-dict" /><span>词典源<em>*.dict.yaml / *.txt</em></span></label>
+                <label class="check"><input type="checkbox" id="kind-userdict" /><span><span data-i18n="settings.kindUserdict">用户词库快照</span><em>sync/*.userdb.txt</em></span></label>
+                <label class="check"><input type="checkbox" id="kind-yaml" /><span><span data-i18n="settings.kindYaml">自定义配置</span><em>*.custom.yaml</em></span></label>
+                <label class="check"><input type="checkbox" id="kind-dict" /><span><span data-i18n="settings.kindDict">词典源</span><em>*.dict.yaml / *.txt</em></span></label>
               </div>
-              <p class="hint"><code>*.userdb/</code>、<code>installation.yaml</code> 与引擎产物始终不会同步。</p>
+              <p class="hint" data-i18n="settings.kindsHint"></p>
             </div>
 
             <div class="field">
-              <label for="excludes">排除规则（每行一个 glob）</label>
-              <textarea id="excludes" rows="3" spellcheck="false" placeholder="*.custom.yaml
-build/*"></textarea>
+              <label for="excludes" data-i18n="settings.excludes">排除规则（每行一个 glob）</label>
+              <textarea id="excludes" rows="3" spellcheck="false" data-i18n-placeholder="settings.excludesPlaceholder"></textarea>
             </div>
 
             <label class="check">
               <input type="checkbox" id="stop-fcitx5" />
-              <span>Linux 合并生效时临时停止 fcitx5<em>避免 LevelDB 锁冲突</em></span>
+              <span><span data-i18n="settings.stopFcitx5">Linux 合并生效时临时停止 fcitx5</span><em data-i18n="settings.stopFcitx5Sub">避免 LevelDB 锁冲突</em></span>
             </label>
           </div>
 
+          <div class="card">
+            <div class="card-head">
+              <h3 data-i18n="settings.backups">备份区</h3>
+              <button class="ghost small" id="btn-backup-create" type="button" data-i18n="settings.backupCreate">新建备份</button>
+            </div>
+            <p class="hint" data-i18n="settings.backupsDesc"></p>
+            <div class="backup-list" id="backup-list"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3 data-i18n="settings.diag">诊断包</h3>
+              <button class="ghost small" id="btn-diag" type="button" data-i18n="settings.diagExport">导出诊断包</button>
+            </div>
+            <p class="hint" data-i18n="settings.diagDesc"></p>
+            <div class="diag-result" id="diag-result" hidden>
+              <code id="diag-path"></code>
+              <button class="ghost small" id="btn-diag-copy" type="button">复制路径</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="grid-2">
+              <div class="field">
+                <label for="language" data-i18n="settings.language">语言</label>
+                <select id="language">
+                  <option value="zh">简体中文</option>
+                  <option value="en">English</option>
+                </select>
+                <p class="hint" data-i18n="settings.languageHint"></p>
+              </div>
+              <div class="field">
+                <label data-i18n="settings.update">检查更新</label>
+                <div class="input-with-action">
+                  <span class="muted" id="update-status"></span>
+                  <button class="ghost small" id="btn-update-check" type="button" data-i18n="settings.updateCheck">检查更新</button>
+                </div>
+                <p class="hint" id="update-version"></p>
+              </div>
+            </div>
+            <div class="update-panel" id="update-panel" hidden>
+              <p class="mono" id="update-notes"></p>
+              <button class="warn" id="btn-update-install" type="button" data-i18n="settings.updateInstall">安装更新</button>
+            </div>
+          </div>
+
           <div class="actions sticky-actions">
-            <button class="primary" id="btn-save-settings" type="button">保存设置</button>
+            <button class="primary" id="btn-save-settings" type="button" data-i18n="settings.save">保存设置</button>
             <span class="muted" id="settings-hint"></span>
           </div>
         </section>
       </main>
 
       <footer class="statusbar">
-        <span id="footer-status">就绪</span>
+        <span id="footer-status"></span>
         <span class="muted" id="footer-config"></span>
       </footer>
     </div>
+
+    <div class="modal" id="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <h3 id="modal-title"></h3>
+        <p id="modal-body"></p>
+        <div class="modal-actions">
+          <button class="ghost" id="modal-cancel" type="button" data-i18n="common.cancel">取消</button>
+          <button class="primary danger" id="modal-confirm" type="button" data-i18n="common.confirm">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="wizard" id="wizard" hidden>
+      <div class="wizard-card" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+        <div class="wizard-head">
+          <h2 id="wizard-title" data-i18n="wizard.title">首次运行向导</h2>
+          <span class="muted" id="wizard-step-label"></span>
+        </div>
+        <div class="wizard-progress"><div id="wizard-bar"></div></div>
+
+        <section class="wizard-step is-active" data-wizard-step="1">
+          <h3 data-i18n="wizard.step1Title"></h3>
+          <p class="muted" data-i18n="wizard.step1Body"></p>
+          <div class="field">
+            <label for="wizard-rime" data-i18n="sync.rimeDir"></label>
+            <div class="input-with-action">
+              <input id="wizard-rime" type="text" spellcheck="false" data-i18n-placeholder="wizard.pathPlaceholder" />
+              <button class="ghost small" id="wizard-detect" type="button" data-i18n="wizard.detect">自动探测</button>
+            </div>
+            <p class="hint" id="wizard-rime-status"></p>
+          </div>
+        </section>
+
+        <section class="wizard-step" data-wizard-step="2">
+          <h3 data-i18n="wizard.step2Title"></h3>
+          <p class="muted" data-i18n="wizard.step2Body"></p>
+          <div class="field">
+            <label for="wizard-preset" data-i18n="conn.preset"></label>
+            <select id="wizard-preset"></select>
+            <p class="hint" id="wizard-preset-hint"></p>
+          </div>
+          <div class="field">
+            <label for="wizard-url" data-i18n="conn.url"></label>
+            <input id="wizard-url" type="url" spellcheck="false" autocomplete="off" data-i18n-placeholder="conn.urlPlaceholder" />
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="wizard-user" data-i18n="conn.user"></label>
+              <input id="wizard-user" type="text" spellcheck="false" autocomplete="username" />
+            </div>
+            <div class="field">
+              <label for="wizard-pass" data-i18n="conn.pass"></label>
+              <input id="wizard-pass" type="password" autocomplete="current-password" />
+              <p class="hint" data-i18n="wizard.passwordHint"></p>
+            </div>
+          </div>
+          <div class="field">
+            <label for="wizard-dir" data-i18n="conn.dir"></label>
+            <input id="wizard-dir" type="text" spellcheck="false" data-i18n-placeholder="conn.dirPlaceholder" />
+          </div>
+        </section>
+
+        <section class="wizard-step" data-wizard-step="3">
+          <h3 data-i18n="wizard.step3Title"></h3>
+          <p class="muted" data-i18n="wizard.step3Body"></p>
+          <div class="actions">
+            <button class="secondary" id="wizard-test" type="button" data-i18n="conn.test"></button>
+          </div>
+          <div class="status" id="wizard-status" hidden></div>
+        </section>
+
+        <section class="wizard-step" data-wizard-step="4">
+          <h3 data-i18n="wizard.step4Title"></h3>
+          <p class="muted" data-i18n="wizard.step4Body"></p>
+          <div class="strategy" id="wizard-strategy">
+            <label class="strategy-card">
+              <input type="radio" name="wizard-strategy" value="pull" checked />
+              <span>
+                <strong data-i18n="wizard.pullOnly"></strong>
+                <em data-i18n="wizard.pullOnlyDesc"></em>
+              </span>
+            </label>
+            <label class="strategy-card">
+              <input type="radio" name="wizard-strategy" value="bidirectional" />
+              <span>
+                <strong data-i18n="wizard.twoWay"></strong>
+                <em data-i18n="wizard.twoWayDesc"></em>
+              </span>
+            </label>
+          </div>
+          <div class="wizard-result" id="wizard-result" hidden></div>
+        </section>
+
+        <div class="wizard-actions">
+          <button class="ghost" id="wizard-back" type="button" data-i18n="common.back">上一步</button>
+          <button class="ghost" id="wizard-skip" type="button" hidden data-i18n="wizard.skipTest">跳过测试</button>
+          <button class="primary" id="wizard-next" type="button">下一步</button>
+        </div>
+      </div>
+    </div>
+
     <div class="toast" id="toast" hidden></div>
   </body>
 </html>

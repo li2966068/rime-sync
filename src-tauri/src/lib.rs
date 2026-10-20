@@ -8,28 +8,51 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use rime_sync_core::backup::BackupManager;
 use rime_sync_core::cancel::CancelToken;
 use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::platform;
 use rime_sync_core::rime_dir;
+use rime_sync_core::secret::{self, SecretSelection};
 use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod backup_cmds;
+mod conflict_cmds;
+mod device_cmds;
+mod diagnostics;
+mod preset_cmds;
+mod update_cmds;
+mod watch_cmds;
+
 const LOG_CAPACITY: usize = 1000;
 
-#[derive(Default)]
-struct Inner {
-    cancel: Mutex<Option<CancelToken>>,
-    running: AtomicBool,
-    log: Mutex<Vec<String>>,
+pub(crate) struct Inner {
+    pub(crate) cancel: Mutex<Option<CancelToken>>,
+    pub(crate) running: AtomicBool,
+    pub(crate) log: Mutex<Vec<String>>,
+    pub(crate) secret: Mutex<Option<Arc<SecretSelection>>>,
+    pub(crate) watch: Mutex<Option<watch_cmds::WatchSession>>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            cancel: Mutex::new(None),
+            running: AtomicBool::new(false),
+            log: Mutex::new(Vec::new()),
+            secret: Mutex::new(None),
+            watch: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
-struct AppState(Arc<Inner>);
+pub(crate) struct AppState(pub(crate) Arc<Inner>);
 
-fn push_log(inner: &Inner, message: impl Into<String>) {
+pub(crate) fn push_log(inner: &Inner, message: impl Into<String>) {
     let line = format!(
         "[{}] {}",
         chrono::Local::now().format("%H:%M:%S"),
@@ -44,7 +67,7 @@ fn push_log(inner: &Inner, message: impl Into<String>) {
     }
 }
 
-fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
@@ -54,8 +77,54 @@ fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录：{error}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("创建数据目录 {} 失败：{error}", dir.display()))?;
+    Ok(dir)
+}
+
+pub(crate) fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(state_dir(app)?.join("config.json"))
+}
+
+/// 密码后端：探测一次后缓存（钥匙串探测会写测试条目，不能每个命令都做）。
+fn secret_selection(app: &AppHandle, inner: &Inner) -> Result<Arc<SecretSelection>, String> {
+    if let Ok(guard) = inner.secret.lock() {
+        if let Some(selection) = guard.as_ref() {
+            return Ok(Arc::clone(selection));
+        }
+    }
+    let selection = Arc::new(secret::detect(&data_dir(app)?));
+    push_log(
+        inner,
+        format!("密码存储后端：{}", selection.describe()),
+    );
+    if let Ok(mut guard) = inner.secret.lock() {
+        *guard = Some(Arc::clone(&selection));
+    }
+    Ok(selection)
+}
+
+/// 读取配置并把密码装入内存（config 文件本身不含明文密码）。
+pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
+    let path = config_path(app)?;
+    let selection = secret_selection(app, inner)?;
+    let mut config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    if config.legacy_password {
+        match config.migrate_legacy_password(selection.store.as_ref(), &path) {
+            Ok(true) => push_log(inner, "已把旧配置里的明文密码迁移到密码后端"),
+            Ok(false) => {}
+            Err(error) => push_log(inner, format!("迁移旧密码失败：{error:#}")),
+        }
+    }
+    if let Err(error) = config.load_password(selection.store.as_ref()) {
+        push_log(inner, format!("读取密码失败：{error:#}"));
+    }
+    Ok(config)
 }
 
 fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
@@ -67,9 +136,9 @@ fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
 }
 
 /// 读取配置；device_id 为空时按 PLAN §6 生成并写回。
-fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
+pub(crate) fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
     let path = config_path(app)?;
-    let mut config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    let mut config = load_config(app, inner)?;
     if config.device_id.trim().is_empty() {
         let detected = detect_rime(&config).ok();
         config.device_id = match detected {
@@ -84,6 +153,46 @@ fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
     Ok(config)
 }
 
+pub(crate) fn rime_dir_for(app: &AppHandle, inner: &Inner) -> Result<PathBuf, String> {
+    let config = ensure_config(app, inner)?;
+    Ok(detect_rime(&config)?.path)
+}
+
+pub(crate) fn dav_client(
+    app: &AppHandle,
+    inner: &Inner,
+) -> Result<(Config, DavClient), String> {
+    let config = ensure_config(app, inner)?;
+    if config.webdav.url.trim().is_empty() {
+        return Err("请先填写 WebDAV 地址".to_string());
+    }
+    let client = DavClient::new(
+        &config.webdav.url,
+        &config.webdav.username,
+        &config.webdav.password,
+        &config.webdav.remote_dir,
+    )
+    .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
+    Ok((config, client))
+}
+
+pub(crate) fn backup_manager(
+    app: &AppHandle,
+    inner: &Inner,
+) -> Result<BackupManager, String> {
+    let rime = rime_dir_for(app, inner)?;
+    let root = state_dir(app)?.join("backups");
+    Ok(BackupManager::new(&rime, &root))
+}
+
+pub(crate) fn log_tail(inner: &Inner, limit: usize) -> Vec<String> {
+    let Ok(log) = inner.log.lock() else {
+        return Vec::new();
+    };
+    let start = log.len().saturating_sub(limit);
+    log[start..].to_vec()
+}
+
 fn server_kind(server: Option<&str>, dav: &[String]) -> String {
     let raw = server.unwrap_or("").to_ascii_lowercase();
     if raw.contains("nextcloud") {
@@ -92,6 +201,8 @@ fn server_kind(server: Option<&str>, dav: &[String]) -> String {
         "坚果云".to_string()
     } else if raw.contains("synology") || raw.contains("diskstation") {
         "群晖 DSM".to_string()
+    } else if raw.contains("alist") {
+        "AList".to_string()
     } else if raw.contains("apache") {
         "Apache mod_dav".to_string()
     } else if raw.contains("nginx") {
@@ -148,6 +259,37 @@ fn cmd_set_config(
     config.device_id = config.device_id.trim().to_string();
 
     let path = config_path(&app)?;
+    let selection = secret_selection(&app, &state.0)?;
+    let previous = load_config(&app, &state.0).ok();
+    let typed_password = std::mem::take(&mut config.webdav.password);
+    if typed_password.is_empty() {
+        // 前端只拿得到空的密码字段（Config 序列化时已跳过 password）。
+        // 用户名换了就把旧账号的密码搬到新账号名下，避免用户被迫重新输入。
+        let old_account = previous
+            .as_ref()
+            .map(|old| old.password_account())
+            .unwrap_or_default();
+        let new_account = config.password_account();
+        if !old_account.is_empty() && old_account != new_account {
+            if let Ok(Some(secret)) = selection.store.get(&old_account) {
+                if selection.store.set(&new_account, &secret).is_ok() {
+                    config.password_ref = selection.backend.password_ref();
+                }
+            }
+        }
+        if let Ok(Some(secret)) = selection.store.get(&config.password_account()) {
+            config.webdav.password = secret;
+        }
+    } else {
+        selection
+            .store
+            .set(&config.password_account(), &typed_password)
+            .map_err(|error| format!("保存密码失败：{error:#}"))?;
+        config.password_ref = selection.backend.password_ref();
+        config.webdav.password = typed_password;
+        push_log(&state.0, "密码已写入系统密码后端");
+    }
+
     config
         .save(&path)
         .map_err(|error| format!("写入配置失败：{error:#}"))?;
@@ -260,14 +402,7 @@ struct RemoteList {
 
 #[tauri::command]
 fn cmd_list_remote(app: AppHandle, state: State<'_, AppState>) -> Result<RemoteList, String> {
-    let config = ensure_config(&app, &state.0)?;
-    let client = DavClient::new(
-        &config.webdav.url,
-        &config.webdav.username,
-        &config.webdav.password,
-        &config.webdav.remote_dir,
-    )
-    .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
+    let (_, client) = dav_client(&app, &state.0)?;
 
     let mut devices = Vec::new();
     for entry in client
@@ -321,12 +456,16 @@ fn cmd_list_remote(app: AppHandle, state: State<'_, AppState>) -> Result<RemoteL
 }
 
 #[derive(Clone, Copy)]
-enum SyncMode {
+pub(crate) enum SyncMode {
     Transport,
     Apply,
 }
 
-fn run_sync(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result<Report, String> {
+pub(crate) fn run_sync(
+    app: &AppHandle,
+    inner: &Arc<Inner>,
+    mode: SyncMode,
+) -> Result<Report, String> {
     if inner
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -351,7 +490,7 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
         SyncMode::Apply => "合并生效",
     };
     let path = config_path(app)?;
-    let mut config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    let mut config = load_config(app, inner)?;
 
     let detected = detect_rime(&config)?;
     let rime_path = detected.path;
@@ -375,7 +514,7 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
         *guard = Some(token.clone());
     }
     let sink_app = app.clone();
-    let sink_inner = inner.clone();
+    let sink_inner = Arc::clone(inner);
     let sink = ProgressSink::new(move |progress: &Progress| {
         let _ = sink_app.emit("sync://progress", progress);
         let counts = if progress.total > 0 {
@@ -419,14 +558,23 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
     Ok(report)
 }
 
-#[tauri::command(async)]
-fn cmd_transport(app: AppHandle, state: State<'_, AppState>) -> Result<Report, String> {
-    run_sync(&app, &state.0, SyncMode::Transport)
+// core 的 WebDAV 客户端是 reqwest::blocking，它会自带一个 tokio runtime；
+// 在 async 上下文里 drop 会 panic（"Cannot drop a runtime..."）。
+// 所以阻塞的同步流程一律放到 spawn_blocking 的线程里跑。
+#[tauri::command]
+async fn cmd_transport(app: AppHandle, state: State<'_, AppState>) -> Result<Report, String> {
+    let inner = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || run_sync(&app, &inner, SyncMode::Transport))
+        .await
+        .map_err(|error| format!("同步任务异常结束：{error}"))?
 }
 
-#[tauri::command(async)]
-fn cmd_apply(app: AppHandle, state: State<'_, AppState>) -> Result<Report, String> {
-    run_sync(&app, &state.0, SyncMode::Apply)
+#[tauri::command]
+async fn cmd_apply(app: AppHandle, state: State<'_, AppState>) -> Result<Report, String> {
+    let inner = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || run_sync(&app, &inner, SyncMode::Apply))
+        .await
+        .map_err(|error| format!("同步任务异常结束：{error}"))?
 }
 
 #[tauri::command]
@@ -449,17 +597,121 @@ fn cmd_cancel(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn cmd_get_log(state: State<'_, AppState>, limit: Option<usize>) -> Result<Vec<String>, String> {
     let limit = limit.unwrap_or(200).clamp(1, LOG_CAPACITY);
-    let log = state
-        .0
-        .log
-        .lock()
-        .map_err(|_| "日志缓冲不可用".to_string())?;
-    let start = log.len().saturating_sub(limit);
-    Ok(log[start..].to_vec())
+    Ok(log_tail(&state.0, limit))
+}
+
+#[tauri::command]
+fn cmd_needs_setup(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    let path = config_path(&app)?;
+    if !path.exists() {
+        return Ok(true);
+    }
+    let config = load_config(&app, &state.0)?;
+    Ok(config.webdav.url.trim().is_empty())
+}
+
+#[derive(Serialize)]
+struct SecretStatus {
+    backend: String,
+    has_password: bool,
+    note: Option<String>,
+}
+
+#[tauri::command]
+fn cmd_secret_status(app: AppHandle, state: State<'_, AppState>) -> Result<SecretStatus, String> {
+    let selection = secret_selection(&app, &state.0)?;
+    let config = load_config(&app, &state.0)?;
+    Ok(SecretStatus {
+        backend: selection.backend.as_str().to_string(),
+        has_password: !config.webdav.password.is_empty(),
+        note: selection.note.clone(),
+    })
+}
+
+#[derive(Serialize)]
+struct FirstRunView {
+    report: Report,
+    strategy: String,
+    note: Option<String>,
+}
+
+/// 首次运行向导第 4 步：跑一次传输。
+///
+/// pull = 只拉取：用临时 device_id + 关闭全部 sync_kinds 运行 transport。
+/// 这样引擎会拉取所有远端快照，但不写 shared、也不上传本机快照；
+/// 运行结束后删除临时远端目录（只有 owner.json）。
+#[tauri::command]
+async fn cmd_first_transport(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    strategy: String,
+) -> Result<FirstRunView, String> {
+    let inner = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || first_transport(&app, &inner, &strategy))
+        .await
+        .map_err(|error| format!("首次同步异常结束：{error}"))?
+}
+
+fn first_transport(
+    app: &AppHandle,
+    inner: &Arc<Inner>,
+    strategy: &str,
+) -> Result<FirstRunView, String> {
+    match strategy.trim() {
+        "bidirectional" => {
+            let report = run_sync(app, inner, SyncMode::Transport)?;
+            Ok(FirstRunView {
+                report,
+                strategy: "bidirectional".to_string(),
+                note: None,
+            })
+        }
+        "pull" => {
+            let rime = rime_dir_for(app, inner)?;
+            let state_path = state_dir(app)?;
+            let backups = BackupManager::new(&rime, &state_path.join("backups"));
+            let backup_id = backups
+                .create("pre-first-pull")
+                .map_err(|error| format!("首次拉取前备份失败：{error:#}"))?;
+            // 只在内存里换临时 device_id：不写 config.json，
+            // 这样即使中途失败也不会把用户的设备 ID / 同步范围改坏。
+            let mut config = load_config(app, inner)?;
+            if config.device_id.trim().is_empty() {
+                return Err("设备 ID 尚未生成，无法执行首次拉取".to_string());
+            }
+            let temporary = format!("pull-{}", rime_sync_core::backup::now_secs());
+            config.device_id = temporary.clone();
+            config.sync_kinds.userdict = false;
+            config.sync_kinds.custom_yaml = false;
+            config.sync_kinds.dict_sources = false;
+
+            let trigger = platform::default_trigger(config.stop_fcitx5_during_apply);
+            let mut engine = Engine::new(config, rime, state_path, trigger)
+                .map_err(|error| format!("初始化同步引擎失败：{error:#}"))?;
+            let mut report = engine.transport();
+            report.backup_id = Some(backup_id);
+
+            let (_, client) = dav_client(app, inner)?;
+            let cleanup = client.delete(&format!("sync/{temporary}"));
+            let mut note = "只拉取：本次没有上传本机文件。".to_string();
+            if let Err(error) = cleanup {
+                note.push_str(&format!(
+                    "临时远端目录 sync/{temporary} 清理失败（可手动删除）：{error:#}"
+                ));
+            }
+            Ok(FirstRunView {
+                report,
+                strategy: "pull".to_string(),
+                note: Some(note),
+            })
+        }
+        other => Err(format!("未知的首次同步策略：{other}")),
+    }
 }
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -475,7 +727,26 @@ pub fn run() {
             cmd_transport,
             cmd_apply,
             cmd_cancel,
-            cmd_get_log
+            cmd_get_log,
+            cmd_needs_setup,
+            cmd_secret_status,
+            cmd_first_transport,
+            conflict_cmds::cmd_list_conflicts,
+            conflict_cmds::cmd_resolve_conflict,
+            device_cmds::cmd_list_devices,
+            device_cmds::cmd_revoke_device,
+            backup_cmds::cmd_list_backups,
+            backup_cmds::cmd_create_backup,
+            backup_cmds::cmd_restore_backup,
+            preset_cmds::cmd_list_presets,
+            preset_cmds::cmd_apply_preset,
+            preset_cmds::cmd_probe_write,
+            diagnostics::cmd_export_diagnostics,
+            watch_cmds::cmd_watch_start,
+            watch_cmds::cmd_watch_stop,
+            watch_cmds::cmd_watch_status,
+            update_cmds::cmd_check_update,
+            update_cmds::cmd_install_update
         ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {
