@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+# src-tauri / src / packaging / scripts 由其他代理负责；它们未就绪时不参与构建。
+exclude = ["src-tauri", "src", "packaging", "scripts", ".github"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+quick-xml = "0.38"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

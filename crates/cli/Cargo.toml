@@ -1,0 +1,18 @@
+[package]
+name = "rime-sync-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rime-sync-cli"
+path = "src/main.rs"
+
+[dependencies]
+rime-sync-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
