@@ -7,6 +7,7 @@ import {
   type Config,
   type ConflictEntry,
   type DeviceInfo,
+  type NetworkStatus,
   type PresetInfo,
   type Progress,
   type Report,
@@ -43,6 +44,7 @@ const el = {
   probe: byId<HTMLButtonElement>("btn-probe"),
   listRemote: byId<HTMLButtonElement>("btn-list-remote"),
   connStatus: byId<HTMLDivElement>("conn-status"),
+  networkStatus: byId<HTMLParagraphElement>("network-status"),
   remoteList: byId<HTMLDivElement>("remote-list"),
   secretStatus: byId<HTMLSpanElement>("secret-status"),
 
@@ -345,7 +347,8 @@ function connectionDraft(): Config {
       url: el.url.value.trim(),
       username: el.user.value,
       password: el.pass.value,
-      remote_dir: el.dir.value.trim() || "rime-sync",
+      // 留空 = 服务器根（SPEC-3 §A4）。
+      remote_dir: el.dir.value.trim(),
     },
   };
 }
@@ -511,6 +514,7 @@ async function run(mode: "transport" | "apply", automatic = false): Promise<void
     lastRun = Date.now();
     setBusy(false);
     el.progress.classList.remove("is-running");
+    void refreshNetwork();
   }
 }
 
@@ -557,10 +561,17 @@ async function testConnection(notify = true): Promise<WriteProbe | null> {
       t("conn.latency", { ms: result.latency_ms }),
       t("conn.server", { name: result.server_type }),
       t("conn.dav", { value: result.dav_class || t("conn.davNone") }),
-      result.remote_dir_exists ? t("conn.dirExists") : t("conn.dirMissing"),
+      result.remote_dir_missing
+        ? t("conn.dirWillCreate")
+        : result.remote_dir_exists
+          ? t("conn.dirExists")
+          : t("conn.dirMissing"),
     ];
     if (result.message) {
       lines.push(result.message);
+    }
+    if (result.hint) {
+      lines.push(result.hint);
     }
     const probe = await api.probeWrite();
     lines.push(
@@ -670,6 +681,37 @@ async function refreshSecretStatus(): Promise<void> {
     el.secretStatus.className = "pill" + (status.has_password ? " ok" : "");
   } catch {
     el.secretStatus.textContent = "";
+  }
+}
+
+/* ---------- 网络状态（SPEC-3 §C10） ---------- */
+
+function formatRetry(seconds: number): string {
+  if (seconds <= 0) {
+    return t("network.retryDue");
+  }
+  if (seconds < 60) {
+    return t("network.retrySoon");
+  }
+  const minutes = Math.ceil(seconds / 60);
+  return t("network.retryIn", { minutes });
+}
+
+async function refreshNetwork(): Promise<void> {
+  try {
+    const status: NetworkStatus = await api.networkStatus();
+    const lines = [t("network.label", { state: status.message })];
+    if (status.state === "metered") {
+      lines.push(t("network.meteredNote"));
+    }
+    if (typeof status.next_retry_in_secs === "number") {
+      lines.push(formatRetry(status.next_retry_in_secs));
+    }
+    el.networkStatus.textContent = lines.join(" · ");
+    el.networkStatus.className =
+      "hint network-" + status.state + (status.state === "online" ? "" : " warn");
+  } catch {
+    el.networkStatus.textContent = "";
   }
 }
 
@@ -1319,7 +1361,7 @@ function wizardDraft(): Config {
       url: el.wizardUrl.value.trim(),
       username: el.wizardUser.value.trim(),
       password: el.wizardPass.value,
-      remote_dir: el.wizardDir.value.trim() || "rime-sync",
+      remote_dir: el.wizardDir.value.trim(),
     },
   };
 }
@@ -1789,6 +1831,7 @@ async function init(): Promise<void> {
     await subscribe();
     await loadLog();
     await refreshSecretStatus();
+    await refreshNetwork();
     await loadWatchStatus();
     await loadBackups();
     localLog("界面已就绪");

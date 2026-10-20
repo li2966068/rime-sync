@@ -8,6 +8,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::watch;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -49,12 +50,13 @@ fn status_of(inner: &Inner) -> WatchStatus {
 }
 
 #[tauri::command]
-pub fn cmd_watch_start(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<WatchStatus, String> {
+pub fn cmd_watch_start(app: AppHandle, state: State<'_, AppState>) -> Result<WatchStatus, String> {
     {
-        let guard = state.0.watch.lock().map_err(|_| "监听状态不可用".to_string())?;
+        let guard = state
+            .0
+            .watch
+            .lock()
+            .map_err(|_| "监听状态不可用".to_string())?;
         if let Some(session) = guard.as_ref() {
             if session.running.load(Ordering::SeqCst) {
                 return Ok(status_of(&state.0));
@@ -124,6 +126,11 @@ pub fn cmd_watch_start(
 fn run_watched_transport(app: &AppHandle, inner: &Arc<Inner>) {
     if inner.running.load(Ordering::SeqCst) {
         push_log(inner, "已有同步任务在运行，跳过本次自动搬运");
+        return;
+    }
+    // SPEC-3 §B7：离线/计量网络下跳过自动搬运；手动同步不受影响。
+    if let Some(reason) = NetworkPolicy::system().scheduled_block_reason(false) {
+        push_log(inner, reason);
         return;
     }
     if let Err(error) = run_sync(app, inner, SyncMode::Transport) {

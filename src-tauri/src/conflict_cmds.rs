@@ -134,7 +134,7 @@ pub fn cmd_list_conflicts(
             modified_at: modified_at(&path),
         });
     }
-    out.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.modified_at));
     Ok(out)
 }
 

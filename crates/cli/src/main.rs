@@ -7,9 +7,11 @@ use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::index::FileIndex;
 use rime_sync_core::lock;
+use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::plan;
 use rime_sync_core::platform;
 use rime_sync_core::presets::Preset;
+use rime_sync_core::retry::RetryState;
 use rime_sync_core::rime_dir;
 use rime_sync_core::secret;
 use rime_sync_core::watch;
@@ -17,7 +19,7 @@ use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -36,7 +38,10 @@ struct Cli {
     dav_user: Option<String>,
     #[arg(long = "dav-pass", global = true, value_name = "PASS")]
     dav_pass: Option<String>,
-    /// 服务商预设：alist / jianguoyun / nextcloud / synology / custom（会归一化 dav-url）
+    /// 远端目录；传空串 = 服务器根（默认读 config.json）
+    #[arg(long = "dav-dir", global = true, value_name = "DIR")]
+    dav_dir: Option<String>,
+    /// 服务商预设：openlist / alist / jianguoyun / nextcloud / synology / custom（会归一化 dav-url）
     #[arg(long, global = true, value_name = "PRESET")]
     preset: Option<String>,
     #[arg(long, global = true)]
@@ -87,13 +92,17 @@ struct DetectReport {
 #[derive(Serialize)]
 struct ConnReport {
     ok: bool,
-    latency_ms: u128,
+    latency_ms: u64,
     server: String,
     dav_class: String,
     status: u16,
     dav: Vec<String>,
     preset: Option<String>,
     hint: Option<String>,
+    base_url: String,
+    remote_dir: String,
+    remote_dir_missing: bool,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -111,6 +120,11 @@ struct StatusReport {
     remote_error: Option<String>,
     secret_backend: String,
     password_stored: bool,
+    network_state: String,
+    network_message: String,
+    network_available: bool,
+    network_metered: bool,
+    next_retry_at: Option<u64>,
     lock_held: bool,
     lock_stale: bool,
     lock_holder: Option<String>,
@@ -176,6 +190,7 @@ fn run(cli: Cli) -> Result<()> {
         cli.dav_url.as_deref(),
         cli.dav_user.as_deref(),
         cli.dav_pass.as_deref(),
+        cli.dav_dir.as_deref(),
     );
     if let Some(raw) = cli.preset.as_deref() {
         match Preset::from_id(raw) {
@@ -230,51 +245,44 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::TestConn => {
             let dav = dav_client(&config)?;
-            let started = Instant::now();
-            let probe = dav.probe()?;
-            let latency_ms = started.elapsed().as_millis();
-            let ok = probe.status != 401 && probe.status != 403 && probe.status < 500;
-            let dav_class = if probe.status == 207
-                || probe.status < 300
-                || probe.dav.iter().any(|value| value.contains('1'))
-            {
-                "webdav"
-            } else if probe.status == 404 {
-                "missing-dir"
-            } else {
-                "unknown"
-            };
-            let mut headers = rime_sync_core::presets::Headers::new();
-            if let Some(server) = probe.server.as_deref() {
-                headers.insert("server", server);
-            }
-            if let Some(path) = dav_base_path(&config) {
-                headers = headers.with_path(&path);
-            }
-            let preset = Preset::detect(&headers);
-            let hint = preset.map(|value| value.hint().to_string());
+            let check = dav.check_connection()?;
             let report = ConnReport {
-                ok,
-                latency_ms,
-                server: dav.base_url().to_string(),
-                dav_class: dav_class.to_string(),
-                status: probe.status,
-                dav: probe.dav,
-                preset: preset.map(|value| value.id().to_string()),
-                hint,
+                ok: check.ok,
+                latency_ms: check.latency_ms,
+                server: check.base_url.clone(),
+                dav_class: check.dav_class,
+                status: check.status,
+                dav: check.dav,
+                preset: check.preset,
+                hint: check.hint,
+                base_url: check.base_url,
+                remote_dir: check.remote_dir.clone(),
+                remote_dir_missing: check.remote_dir_missing,
+                message: check.message,
             };
             if cli.json {
                 print_json(&report)
             } else {
                 println!(
-                    "ok={} status={} latency={}ms server={} dav_class={} preset={}",
+                    "ok={} status={} latency={}ms server={} dav_class={} preset={} remote_dir_missing={}",
                     report.ok,
                     report.status,
                     report.latency_ms,
                     report.server,
                     report.dav_class,
-                    report.preset.as_deref().unwrap_or("-")
+                    report.preset.as_deref().unwrap_or("-"),
+                    report.remote_dir_missing
                 );
+                println!(
+                    "remote_dir={} base={}",
+                    if report.remote_dir.is_empty() {
+                        "(server root)"
+                    } else {
+                        report.remote_dir.as_str()
+                    },
+                    report.base_url
+                );
+                println!("message={}", report.message);
                 if let Some(hint) = report.hint {
                     println!("{hint}");
                 }
@@ -320,6 +328,9 @@ fn run(cli: Cli) -> Result<()> {
                 Err(error) => remote_error = Some(format!("{error:#}")),
             }
             let lock_status = lock::inspect(&state_dir(&config_path).join("sync.lock"));
+            let network = NetworkPolicy::system();
+            let retry =
+                RetryState::load(&state_dir(&config_path).join("retry.json")).unwrap_or_default();
             let report = StatusReport {
                 config_path: config_path.display().to_string(),
                 rime_dir: detection.display().to_string(),
@@ -334,6 +345,11 @@ fn run(cli: Cli) -> Result<()> {
                 remote_error,
                 secret_backend: secrets.describe(),
                 password_stored: config.password_ref != config::PasswordRef::None,
+                network_state: network.state().as_str().to_string(),
+                network_message: network.state().message().to_string(),
+                network_available: network.available(),
+                network_metered: network.is_metered(),
+                next_retry_at: retry.next_retry_at,
                 lock_held: lock_status.held,
                 lock_stale: lock_status.stale,
                 lock_holder: lock_status
@@ -359,6 +375,17 @@ fn run(cli: Cli) -> Result<()> {
                     "secret_backend={} password_stored={}",
                     report.secret_backend, report.password_stored
                 );
+                println!(
+                    "network={} available={} metered={} next_retry_at={}",
+                    report.network_state,
+                    report.network_available,
+                    report.network_metered,
+                    report
+                        .next_retry_at
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
+                println!("network_message={}", report.network_message);
                 println!(
                     "lock_held={} lock_stale={} holder={}",
                     report.lock_held,
@@ -551,6 +578,11 @@ fn run(cli: Cli) -> Result<()> {
                         );
                     }));
                 }
+                // SPEC-3 §B7：定时/自动搬运在离线或计量网络下跳过，手动同步不受影响。
+                if let Some(reason) = NetworkPolicy::system().scheduled_block_reason(false) {
+                    eprintln!("watch: {reason}");
+                    continue;
+                }
                 let report = engine.transport();
                 if cli.json {
                     let _ = print_json(&report);
@@ -592,20 +624,6 @@ fn dav_client(config: &Config) -> Result<DavClient> {
     )
 }
 
-fn dav_base_path(config: &Config) -> Option<String> {
-    let url = config.webdav.url.trim().trim_end_matches('/');
-    let rest = url.split_once("://").map(|(_, rest)| rest)?;
-    let path = match rest.find('/') {
-        Some(index) => &rest[index..],
-        None => "",
-    };
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
-    }
-}
-
 fn resolve_rime_dir(explicit: Option<&Path>, config: &Config) -> Result<PathBuf> {
     let configured = config.rime_dir.clone().map(PathBuf::from);
     let detection = rime_dir::detect(explicit.or(configured.as_deref()))?;
@@ -638,6 +656,9 @@ fn print_report(report: &Report) {
         report.duration_ms,
         report.backup_id.as_deref().unwrap_or("-")
     );
+    if let Some(next) = report.next_retry_at {
+        eprintln!("next_retry_at: {next}");
+    }
     if let Some(error) = &report.error {
         eprintln!("error: {error}");
     }

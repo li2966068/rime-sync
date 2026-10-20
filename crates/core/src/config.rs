@@ -189,6 +189,9 @@ impl Config {
         if let Some(v) = non_empty(env::var("RIME_SYNC_RIME_DIR").ok()) {
             self.rime_dir = Some(v);
         }
+        if let Ok(v) = env::var("RIME_SYNC_DAV_DIR") {
+            self.webdav.remote_dir = v.trim().to_string();
+        }
     }
 
     pub fn apply_overrides(
@@ -196,6 +199,7 @@ impl Config {
         url: Option<&str>,
         username: Option<&str>,
         password: Option<&str>,
+        remote_dir: Option<&str>,
     ) {
         if let Some(v) = non_empty(url.map(str::to_string)) {
             self.webdav.url = v;
@@ -205,6 +209,10 @@ impl Config {
         }
         if let Some(v) = password {
             self.webdav.password = v.to_string();
+        }
+        // SPEC-3 §A4：允许显式传空串 = 服务器根，所以这里不做 non_empty 过滤。
+        if let Some(v) = remote_dir {
+            self.webdav.remote_dir = v.trim().to_string();
         }
     }
 

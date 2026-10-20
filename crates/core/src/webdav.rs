@@ -44,6 +44,24 @@ pub struct Probe {
     pub server: Option<String>,
 }
 
+/// SPEC-3 §A3：连接语义——只有连不上/认证失败才 ok=false；
+/// 远端目录不存在是正常状态（首次同步自动创建）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionCheck {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub status: u16,
+    pub server: Option<String>,
+    pub dav: Vec<String>,
+    pub dav_class: String,
+    pub preset: Option<String>,
+    pub base_url: String,
+    pub remote_dir: String,
+    pub remote_dir_missing: bool,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DavClient {
     http: Client,
@@ -51,6 +69,8 @@ pub struct DavClient {
     base: String,
     base_path: String,
     remote_components: Vec<String>,
+    /// 原始 remote_dir（空 = 服务器根）。
+    remote_dir: String,
     username: String,
     password: String,
 }
@@ -89,6 +109,7 @@ impl DavClient {
             base,
             base_path,
             remote_components,
+            remote_dir: remote.to_string(),
             username: username.to_string(),
             password: password.to_string(),
         })
@@ -96,6 +117,137 @@ impl DavClient {
 
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+
+    /// 服务器根地址（去掉 remote_dir，用于检查站点是否存在）。
+    pub fn root_url(&self) -> &str {
+        &self.root
+    }
+
+    pub fn base_path(&self) -> &str {
+        &self.base_path
+    }
+
+    /// 尽力而为：GET 站点根页面取 <title>（OpenList 登录页即可识别服务商）。
+    /// 失败一律返回 None，绝不能因为它让连接测试失败。
+    pub fn site_title(&self) -> Option<String> {
+        let response = self
+            .http
+            .get(origin_of(&self.root))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let html = response.text().ok()?;
+        presets::html_title(&html)
+    }
+
+    /// SPEC-3 §A3：连接测试的完整语义。
+    pub fn check_connection(&self) -> Result<ConnectionCheck> {
+        let started = std::time::Instant::now();
+        let probe = self.probe()?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let mut headers = presets::Headers::new();
+        if let Some(server) = probe.server.as_deref() {
+            headers.insert("server", server);
+        }
+        headers = headers.with_path(&self.base_path);
+        if let Some(title) = self.site_title() {
+            headers = headers.with_title(&title);
+        }
+        let preset = Preset::detect(&headers);
+        let dav_class = if !probe.dav.is_empty() {
+            probe.dav.join(", ")
+        } else if probe.status == 207 {
+            "webdav".to_string()
+        } else {
+            "unknown".to_string()
+        };
+
+        let remote_dir = self.remote_dir.clone();
+        let mut remote_dir_missing = false;
+        let (ok, message) = match probe.status {
+            401 | 403 => (
+                false,
+                format!(
+                    "认证失败（HTTP {}）：请检查用户名与密码/应用密码",
+                    probe.status
+                ),
+            ),
+            404 if remote_dir.is_empty() => (
+                false,
+                "服务器连通，但地址中的 WebDAV 根路径不存在（HTTP 404）：请确认地址是否应带 /dav"
+                    .to_string(),
+            ),
+            404 => match self.root_probe_status() {
+                Some(root_status) if root_status != 404 && root_status < 500 => {
+                    remote_dir_missing = true;
+                    (
+                        true,
+                        "服务器连通，远端目录将在首次同步时自动创建".to_string(),
+                    )
+                }
+                Some(root_status) => (
+                    false,
+                    format!("服务器根路径也不可用（HTTP {root_status}）：请检查 WebDAV 地址与端口"),
+                ),
+                None => (
+                    false,
+                    "服务器连通，但无法确认远端目录：请检查地址中的路径是否正确".to_string(),
+                ),
+            },
+            405 => (
+                false,
+                "服务器不接受该地址的 WebDAV 请求（HTTP 405）：请检查 WebDAV 根路径（OpenList/AList 通常是 /dav）"
+                    .to_string(),
+            ),
+            status if (200..300).contains(&status) => {
+                (true, "连接成功，认证与 WebDAV 协议可用".to_string())
+            }
+            status if status >= 500 => (
+                false,
+                format!("服务端错误（HTTP {status}）：请查看 WebDAV 服务端日志或稍后重试"),
+            ),
+            status => (false, format!("连接失败（HTTP {status}）")),
+        };
+        let hint = match (&preset, ok) {
+            (Some(preset), _) => Some(preset.hint().to_string()),
+            (None, false) => Some(write_failure_hint(probe.status, "PROPFIND", None)),
+            (None, true) => None,
+        };
+        Ok(ConnectionCheck {
+            ok,
+            latency_ms,
+            status: probe.status,
+            server: probe.server,
+            dav: probe.dav,
+            dav_class,
+            preset: preset.map(|value| value.id().to_string()),
+            base_url: self.base.clone(),
+            remote_dir,
+            remote_dir_missing,
+            message,
+            hint,
+        })
+    }
+
+    /// 服务器根（scheme://authority/）的 PROPFIND 深度 0 状态码。
+    fn root_probe_status(&self) -> Option<u16> {
+        let url = origin_of(&self.root);
+        let response = self
+            .send(
+                Method::from_bytes(b"PROPFIND").ok()?,
+                &url,
+                Some(PROPFIND_BODY.as_bytes()),
+                &[
+                    ("Depth", "0".to_string()),
+                    ("Content-Type", "application/xml; charset=utf-8".to_string()),
+                ],
+            )
+            .ok()?;
+        Some(response.status().as_u16())
     }
 
     pub fn url_for(&self, rel: &str) -> Result<String> {
@@ -184,8 +336,18 @@ impl DavClient {
         Ok(entries)
     }
 
+    /// PROPFIND 目标：服务器根带尾斜杠；remote_dir 不带（OpenList 对
+    /// 隐藏目录 + 尾斜杠会返回 404，去掉斜杠才是可靠的 207）。
+    fn probe_url(&self) -> String {
+        if self.remote_components.is_empty() {
+            format!("{}/", self.base)
+        } else {
+            self.base.clone()
+        }
+    }
+
     pub fn probe(&self) -> Result<Probe> {
-        let url = self.url_for("")?;
+        let url = self.probe_url();
         let response = self.send(
             Method::from_bytes(b"PROPFIND")?,
             &url,
@@ -387,6 +549,20 @@ pub fn entry_unchanged(entry: &RemoteEntry, meta: &FileMeta) -> bool {
     }
 }
 
+/// scheme://authority/（站点根，含尾斜杠）。
+pub fn origin_of(url: &str) -> String {
+    match url.find("://") {
+        Some(index) => {
+            let rest = &url[index + 3..];
+            match rest.find('/') {
+                Some(slash) => format!("{}/", &url[..index + 3 + slash]),
+                None => format!("{}/", url.trim_end_matches('/')),
+            }
+        }
+        None => format!("{}/", url.trim_end_matches('/')),
+    }
+}
+
 fn extract_path(url: &str) -> String {
     match url.find("://") {
         Some(index) => {
@@ -558,7 +734,8 @@ pub struct WriteProbe {
 }
 
 impl DavClient {
-    /// 真正走一遍写路径；失败时把 HTTP 状态翻译成中文可执行建议。
+    /// 真正走一遍写路径：先 ensure_base，再 MKCOL → PUT(1 字节) → DELETE。
+    /// 无论成败都会清理临时目录（SPEC-3 §A2：探测结束不得留残留）。
     pub fn check_write(&self) -> Result<WriteProbe> {
         let nonce = format!(
             "{}-{}",
@@ -576,11 +753,52 @@ impl DavClient {
             headers = headers.with_path(&self.base_path);
         }
 
+        // 0) remote_dir 本身可能还不存在：父目录不存在时 MKCOL 只会返回 409。
+        if let Err(error) = self.ensure_base() {
+            let base = if self.remote_dir.is_empty() {
+                "(服务器根)".to_string()
+            } else {
+                self.remote_dir.clone()
+            };
+            steps.push(ProbeStep {
+                step: "ENSURE".to_string(),
+                ok: false,
+                status: 0,
+                detail: format!("ensure base {base}: {error:#}"),
+            });
+            return Ok(finish_probe(
+                steps,
+                headers,
+                None,
+                Some(format!(
+                    "无法创建远端目录 {base}：{error:#}。请确认地址路径正确且账号有写权限。"
+                )),
+            ));
+        }
+
+        let outcome = self.probe_body(&dir, &object, &mut steps, &mut headers);
+        // 即使中途出错也要删除临时目录；DELETE 404 视为已清理。
+        if steps.iter().any(|step| step.step == "MKCOL" && step.ok) {
+            self.cleanup_dir(&dir, &mut steps);
+        }
+        outcome?;
+        let preset = Preset::detect(&headers);
+        let hint = probe_hint(&steps, preset);
+        Ok(finish_probe(steps, headers, preset, hint))
+    }
+
+    fn probe_body(
+        &self,
+        dir: &str,
+        object: &str,
+        steps: &mut Vec<ProbeStep>,
+        headers: &mut presets::Headers,
+    ) -> Result<()> {
         // 1) MKCOL 临时目录。
-        let url = self.url_for(&dir)?;
+        let url = self.url_for(dir)?;
         let response = self.send(Method::from_bytes(b"MKCOL")?, &url, None, &[])?;
         let status = response.status().as_u16();
-        absorb_headers(&response, &mut headers);
+        absorb_headers(&response, headers);
         let created = matches!(status, 200 | 201 | 204 | 405);
         steps.push(ProbeStep {
             step: "MKCOL".to_string(),
@@ -588,16 +806,12 @@ impl DavClient {
             status,
             detail: format!("create {dir}"),
         });
-        let preset = Preset::detect(&headers);
-        // RFC 4918：MKCOL 对已存在集合也返回 405，无法区分“已存在”与“不允许”。
-        let mkcol_ambiguous = status == 405;
         if !created {
-            let hint = Some(write_failure_hint(status, "MKCOL", preset));
-            return Ok(finish_probe(steps, headers, preset, hint));
+            return Ok(());
         }
 
         // 2) PUT 1 字节对象。
-        let url = self.url_for(&object)?;
+        let url = self.url_for(object)?;
         let response = self.send(
             Method::PUT,
             &url,
@@ -605,7 +819,7 @@ impl DavClient {
             &[("Content-Type", "application/octet-stream".to_string())],
         )?;
         let status = response.status().as_u16();
-        absorb_headers(&response, &mut headers);
+        absorb_headers(&response, headers);
         let written = matches!(status, 200 | 201 | 204);
         steps.push(ProbeStep {
             step: "PUT".to_string(),
@@ -614,42 +828,39 @@ impl DavClient {
             detail: format!("upload 1 byte to {object}"),
         });
         if !written {
-            let hint = Some(if mkcol_ambiguous {
-                read_only_hint(status, preset)
-            } else {
-                write_failure_hint(status, "PUT", preset)
-            });
-            let _ = self.delete(&dir);
-            return Ok(finish_probe(steps, headers, preset, hint));
+            return Ok(());
         }
 
-        // 3) DELETE 对象 + 4) 清理临时目录。
-        let url = self.url_for(&object)?;
+        // 3) 删除对象；目录由外层统一清理。
+        let url = self.url_for(object)?;
         let response = self.send(Method::DELETE, &url, None, &[])?;
         let status = response.status().as_u16();
-        let removed = matches!(status, 200 | 202 | 204 | 404);
         steps.push(ProbeStep {
             step: "DELETE".to_string(),
-            ok: removed,
+            ok: matches!(status, 200 | 202 | 204 | 404),
             status,
             detail: format!("remove {object}"),
         });
-        let url = self.url_for(&dir)?;
-        let response = self.send(Method::DELETE, &url, None, &[])?;
-        let status = response.status().as_u16();
-        let cleaned = matches!(status, 200 | 202 | 204 | 404);
+        Ok(())
+    }
+
+    fn cleanup_dir(&self, dir: &str, steps: &mut Vec<ProbeStep>) {
+        let Ok(url) = self.url_for(dir) else {
+            return;
+        };
+        let (ok, status) = match self.send(Method::DELETE, &url, None, &[]) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                (matches!(status, 200 | 202 | 204 | 404), status)
+            }
+            Err(_) => (false, 0),
+        };
         steps.push(ProbeStep {
             step: "CLEANUP".to_string(),
-            ok: cleaned,
+            ok,
             status,
             detail: format!("remove {dir}"),
         });
-        let hint = if removed && cleaned {
-            None
-        } else {
-            Some(write_failure_hint(status, "DELETE", preset))
-        };
-        Ok(finish_probe(steps, headers, preset, hint))
     }
 }
 
@@ -678,6 +889,26 @@ fn finish_probe(
         preset: preset.map(|value| value.id().to_string()),
         hint,
     }
+}
+
+/// 第一个失败步骤 → 中文建议（ENSURE 失败在外层单独处理）。
+fn probe_hint(steps: &[ProbeStep], preset: Option<Preset>) -> Option<String> {
+    let failed = steps.iter().find(|step| !step.ok)?;
+    if failed.step == "CLEANUP" {
+        return Some(format!(
+            "探测目录清理失败（HTTP {}）：请在服务端手动删除 .rime-sync-probe-* 残留目录。",
+            failed.status
+        ));
+    }
+    // RFC 4918：MKCOL 对已存在集合返回 405，随后 PUT 失败才说明只读。
+    let mkcol_ambiguous = steps
+        .iter()
+        .any(|step| step.step == "MKCOL" && step.status == 405);
+    Some(if mkcol_ambiguous && failed.step == "PUT" {
+        read_only_hint(failed.status, preset)
+    } else {
+        write_failure_hint(failed.status, &failed.step, preset)
+    })
 }
 
 /// MKCOL 返回 405 后再失败：最可能是只读挂载或权限不足。
@@ -820,6 +1051,36 @@ mod tests {
         assert!(entry_unchanged(&entry_without_etag, &meta_without_etag));
         entry_without_etag.last_modified = Some("Tue, 02 Jan 2024 00:00:00 GMT".into());
         assert!(!entry_unchanged(&entry_without_etag, &meta_without_etag));
+    }
+
+    /// SPEC-3 §A4：remote_dir 为空 = 服务器根，URL 不得多出斜杠段。
+    #[test]
+    fn empty_remote_dir_targets_server_root() {
+        let client = DavClient::new("http://192.168.111.1:5244/dav", "u", "p", "").expect("client");
+        assert_eq!(client.base_url(), "http://192.168.111.1:5244/dav");
+        assert_eq!(
+            client.url_for("").expect("base url"),
+            "http://192.168.111.1:5244/dav/"
+        );
+        assert_eq!(
+            client.url_for("shared/manifest.json").expect("url"),
+            "http://192.168.111.1:5244/dav/shared/manifest.json"
+        );
+        // 空 remote_dir 不需要创建任何目录层级。
+        assert!(client.ensure_base().is_ok());
+        // 根目录下的 href 依然能相对化成 sync/<dev>/x。
+        let relative = client.relative("/dav/sync/devA/x.userdb.txt").expect("rel");
+        assert_eq!(relative, "sync/devA/x.userdb.txt");
+        assert!(client.relative("/other/x").is_err());
+    }
+
+    #[test]
+    fn origin_of_strips_path_and_keeps_authority() {
+        assert_eq!(
+            origin_of("http://192.168.111.1:5244/dav"),
+            "http://192.168.111.1:5244/"
+        );
+        assert_eq!(origin_of("https://host"), "https://host/");
     }
 
     #[test]

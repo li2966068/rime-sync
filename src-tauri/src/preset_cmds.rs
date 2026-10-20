@@ -52,7 +52,8 @@ pub fn cmd_list_presets() -> Vec<PresetView> {
 
 #[tauri::command]
 pub fn cmd_apply_preset(preset_id: String, raw_url: String) -> Result<PresetApply, String> {
-    let preset = Preset::from_id(&preset_id).ok_or_else(|| format!("未知的服务商预设：{preset_id}"))?;
+    let preset =
+        Preset::from_id(&preset_id).ok_or_else(|| format!("未知的服务商预设：{preset_id}"))?;
     Ok(PresetApply {
         normalized_url: preset.normalize(&raw_url),
         hint: preset.hint().to_string(),
@@ -64,19 +65,8 @@ pub fn cmd_probe_write(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<WriteProbeView, String> {
-    let (config, client) = dav_client(&app, &state.0)?;
-    if let Err(error) = client.ensure_base() {
-        return Ok(WriteProbeView {
-            ok: false,
-            step: "MKCOL".to_string(),
-            http_status: 0,
-            hint: Some(format!(
-                "无法创建远端目录 {}：{error:#}。请检查地址路径与账号写权限。",
-                config.webdav.remote_dir
-            )),
-            steps: Vec::new(),
-        });
-    }
+    let (_config, client) = dav_client(&app, &state.0)?;
+    // DavClient::check_write 内部已 ensure_base 并保证清理临时目录。
     let probe = client
         .check_write()
         .map_err(|error| format!("写权限探测失败：{error:#}"))?;

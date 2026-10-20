@@ -55,8 +55,22 @@ export interface ProbeResult {
   dav_class: string;
   server_type: string;
   status: number;
+  remote_dir: string;
   remote_dir_exists: boolean;
+  remote_dir_missing: boolean;
+  preset: string | null;
   message: string;
+  hint: string | null;
+}
+
+export interface NetworkStatus {
+  state: "online" | "metered" | "offline";
+  message: string;
+  available: boolean;
+  metered: boolean;
+  failures: number;
+  next_retry_at: number | null;
+  next_retry_in_secs: number | null;
 }
 
 export interface RemoteDevice {
@@ -193,6 +207,7 @@ export const api = {
   setConfig: (config: Config) => invoke<Config>("cmd_set_config", { config }),
   detectRimeDir: () => invoke<Detection>("cmd_detect_rime_dir"),
   testConnection: () => invoke<ProbeResult>("cmd_test_connection"),
+  networkStatus: () => invoke<NetworkStatus>("cmd_network_status"),
   listRemote: () => invoke<RemoteList>("cmd_list_remote"),
   transport: () => invoke<Report>("cmd_transport"),
   apply: () => invoke<Report>("cmd_apply"),

@@ -1,10 +1,13 @@
-//! 服务商预设：默认路径、URL 归一化、按响应头/路径识别服务商。
+//! 服务商预设：默认路径、URL 归一化、按响应头/页面标题识别服务商。
 
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Preset {
+    /// OpenList 是 AList 的开源分支，默认端口与路径完全一致。
+    OpenList,
+    /// AList：保留为 legacy 别名，行为与 OpenList 一致。
     Alist,
     Jianguoyun,
     Nextcloud,
@@ -13,8 +16,9 @@ pub enum Preset {
 }
 
 impl Preset {
-    pub fn all() -> [Preset; 5] {
+    pub fn all() -> [Preset; 6] {
         [
+            Preset::OpenList,
             Preset::Alist,
             Preset::Jianguoyun,
             Preset::Nextcloud,
@@ -25,6 +29,7 @@ impl Preset {
 
     pub fn id(&self) -> &'static str {
         match self {
+            Preset::OpenList => "openlist",
             Preset::Alist => "alist",
             Preset::Jianguoyun => "jianguoyun",
             Preset::Nextcloud => "nextcloud",
@@ -40,7 +45,8 @@ impl Preset {
 
     pub fn label(&self) -> &'static str {
         match self {
-            Preset::Alist => "AList",
+            Preset::OpenList => "OpenList",
+            Preset::Alist => "AList (legacy)",
             Preset::Jianguoyun => "坚果云",
             Preset::Nextcloud => "Nextcloud",
             Preset::Synology => "群晖 Synology",
@@ -51,15 +57,24 @@ impl Preset {
     /// WebDAV 根路径（SPEC-2 §2.6）。
     pub fn default_path(&self) -> &'static str {
         match self {
-            Preset::Alist => "/dav",
-            Preset::Jianguoyun => "/dav",
+            Preset::OpenList | Preset::Alist | Preset::Jianguoyun => "/dav",
             Preset::Nextcloud => "/remote.php/dav/",
             Preset::Synology => "/webdav",
             Preset::Custom => "",
         }
     }
 
-    /// 补全 scheme / 去掉尾斜杠 / AList 补默认端口 5244 / 补默认路径。
+    /// SPEC-3 §A1：OpenList/AList 未写明端口时补 5244。
+    pub fn default_port(&self) -> Option<u16> {
+        match self {
+            Preset::OpenList | Preset::Alist => Some(5244),
+            _ => None,
+        }
+    }
+
+    /// 补全 scheme / 去掉尾斜杠 / OpenList 补默认端口 5244 / 补默认路径。
+    ///
+    /// 已带路径时不重复追加（/dav 不会变成 /dav/dav）。
     pub fn normalize(&self, raw: &str) -> String {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -80,8 +95,10 @@ impl Preset {
             return String::new();
         }
         let mut authority = authority.to_string();
-        if *self == Preset::Alist && !authority_has_port(&authority) {
-            authority.push_str(":5244");
+        if let Some(port) = self.default_port() {
+            if !authority_has_port(&authority) {
+                authority.push_str(&format!(":{port}"));
+            }
         }
         let mut path = path.trim_end_matches('/').to_string();
         if path.is_empty() {
@@ -90,10 +107,15 @@ impl Preset {
         format!("{scheme}://{authority}{path}")
     }
 
-    /// 识别依据（SPEC-2 §2.6）：Server 头含 alist，或 /dav + Basic 认证。
+    /// 识别依据（SPEC-3 §A1）：页面标题或 Server 头含 openlist/alist，
+    /// 或 /dav + Basic 认证（AList 系的老特征）。
     pub fn detect(headers: &Headers) -> Option<Preset> {
         let server = headers.get("server").unwrap_or("").to_ascii_lowercase();
-        if server.contains("alist") {
+        let title = headers.title().unwrap_or("").to_ascii_lowercase();
+        if server.contains("openlist") || title.contains("openlist") {
+            return Some(Preset::OpenList);
+        }
+        if server.contains("alist") || title.contains("alist") {
             return Some(Preset::Alist);
         }
         let path = headers.path().unwrap_or("").to_ascii_lowercase();
@@ -120,8 +142,11 @@ impl Preset {
     /// 给 CLI/诊断用的可读中文建议。
     pub fn hint(&self) -> &'static str {
         match self {
+            Preset::OpenList => {
+                "OpenList（AList 分支）：地址形如 http://主机:5244/dav，需在后台为账号开启 Webdav Read 与 Webdav Manage，并允许上传/删除/重命名/移动"
+            }
             Preset::Alist => {
-                "AList：地址形如 http://主机:5244/dav，需在后台为账号勾选 Webdav Read 与 Webdav Manage 权限"
+                "AList（legacy）：地址形如 http://主机:5244/dav，需在后台为账号勾选 Webdav Read 与 Webdav Manage 权限"
             }
             Preset::Jianguoyun => "坚果云：地址形如 https://dav.jianguoyun.com/dav，使用应用密码而非登录密码",
             Preset::Nextcloud => "Nextcloud：地址形如 https://主机/remote.php/dav",
@@ -160,11 +185,26 @@ fn default_scheme(raw: &str) -> &'static str {
     }
 }
 
+/// 从 HTML 里取 <title>（OpenList 登录页即可判定服务商）。
+pub fn html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let open_end = lower[start..].find('>')? + start + 1;
+    let close = lower[open_end..].find("</title>")? + open_end;
+    let title = html[open_end..close].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
 /// 轻量响应头集合（不引 http crate，便于单测与序列化）。
 #[derive(Debug, Clone, Default)]
 pub struct Headers {
     entries: Vec<(String, String)>,
     path: Option<String>,
+    title: Option<String>,
 }
 
 impl Headers {
@@ -187,6 +227,11 @@ impl Headers {
         self
     }
 
+    pub fn with_title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
         self.entries
@@ -200,8 +245,12 @@ impl Headers {
         self.path.as_deref()
     }
 
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.path.is_none()
+        self.entries.is_empty() && self.path.is_none() && self.title.is_none()
     }
 }
 
@@ -211,6 +260,8 @@ mod tests {
 
     #[test]
     fn default_paths_match_spec() {
+        assert_eq!(Preset::OpenList.default_path(), "/dav");
+        assert_eq!(Preset::OpenList.default_port(), Some(5244));
         assert_eq!(Preset::Alist.default_path(), "/dav");
         assert_eq!(Preset::Jianguoyun.default_path(), "/dav");
         assert_eq!(Preset::Nextcloud.default_path(), "/remote.php/dav/");
@@ -219,22 +270,48 @@ mod tests {
     }
 
     #[test]
-    fn normalize_completes_scheme_and_alist_port() {
+    fn normalize_completes_scheme_and_default_port() {
         assert_eq!(
-            Preset::Alist.normalize("192.168.1.10"),
+            Preset::OpenList.normalize("192.168.1.10"),
             "http://192.168.1.10:5244/dav"
         );
         assert_eq!(
-            Preset::Alist.normalize("http://192.168.1.10:5244/dav/"),
+            Preset::OpenList.normalize("http://192.168.1.10:5244/dav/"),
             "http://192.168.1.10:5244/dav"
         );
         assert_eq!(
-            Preset::Alist.normalize("https://dav.example.com"),
+            Preset::OpenList.normalize("https://dav.example.com"),
             "https://dav.example.com:5244/dav"
         );
         assert_eq!(
-            Preset::Alist.normalize("http://[::1]"),
+            Preset::OpenList.normalize("http://[::1]"),
             "http://[::1]:5244/dav"
+        );
+    }
+
+    /// SPEC-3 验收 6：5 种典型输入。
+    #[test]
+    fn normalize_real_world_inputs() {
+        assert_eq!(
+            Preset::OpenList.normalize("192.168.111.1:5244"),
+            "http://192.168.111.1:5244/dav"
+        );
+        assert_eq!(
+            Preset::OpenList.normalize("192.168.111.1:5244/"),
+            "http://192.168.111.1:5244/dav"
+        );
+        assert_eq!(
+            Preset::OpenList.normalize("http://192.168.111.1:5244"),
+            "http://192.168.111.1:5244/dav"
+        );
+        // 未写端口时补 5244（与 AList legacy 行为一致）；已写端口/路径不重复追加。
+        assert_eq!(
+            Preset::OpenList.normalize("https://pan.example.com/dav/"),
+            "https://pan.example.com:5244/dav"
+        );
+        assert_eq!(
+            Preset::OpenList.normalize("http://pan.example.com:5244/dav/sub"),
+            "http://pan.example.com:5244/dav/sub"
         );
     }
 
@@ -256,9 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_openlist_by_title() {
+        let headers = Headers::new().with_title("OpenList");
+        assert_eq!(Preset::detect(&headers), Some(Preset::OpenList));
+        assert!(Preset::OpenList.hint().contains("Webdav Manage"));
+    }
+
+    #[test]
     fn detect_alist_by_server_header() {
         let headers = Headers::new().with("Server", "AList/3.28.0");
         assert_eq!(Preset::detect(&headers), Some(Preset::Alist));
+        let openlist = Headers::new().with("Server", "OpenList/4.0.0");
+        assert_eq!(Preset::detect(&openlist), Some(Preset::OpenList));
     }
 
     #[test]
@@ -292,11 +378,21 @@ mod tests {
     }
 
     #[test]
+    fn html_title_extracts_openlist() {
+        assert_eq!(
+            html_title("<html><head><title>OpenList</title></head></html>").as_deref(),
+            Some("OpenList")
+        );
+        assert_eq!(html_title("<html>no title</html>"), None);
+    }
+
+    #[test]
     fn preset_ids_roundtrip() {
         for preset in Preset::all() {
             assert_eq!(Preset::from_id(preset.id()), Some(preset));
         }
         assert_eq!(Preset::from_id("ALIST"), Some(Preset::Alist));
+        assert_eq!(Preset::from_id("OPENLIST"), Some(Preset::OpenList));
         assert_eq!(Preset::from_id("unknown"), None);
     }
 }

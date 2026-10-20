@@ -17,6 +17,7 @@ use crate::lock::{self, LockGuard};
 use crate::merge3::{merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult};
 use crate::plan;
 use crate::platform::RimeTrigger;
+use crate::retry::RetryState;
 use crate::rime_dir;
 use crate::webdav::{DavClient, PutOutcome};
 
@@ -33,6 +34,9 @@ pub struct Report {
     /// apply 前生成的备份 id（apply 失败时也可能已有备份）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_id: Option<String>,
+    /// 失败退避：下一次允许尝试的时间（Unix 秒），成功后为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +84,8 @@ pub struct Engine {
     base_dir: PathBuf,
     dav: DavClient,
     index: FileIndex,
+    retry: RetryState,
+    retry_path: PathBuf,
     trigger: Box<dyn RimeTrigger>,
     progress: Option<ProgressSink>,
     cancel: Option<CancelToken>,
@@ -104,6 +110,8 @@ impl Engine {
         )?;
         let index_path = state_dir.join("index.json");
         let index = FileIndex::load(&index_path)?;
+        let retry_path = state_dir.join("retry.json");
+        let retry = RetryState::load(&retry_path).unwrap_or_default();
         let sync_dir = rime_dir::sync_dir(&rime_dir);
         Ok(Self {
             config,
@@ -115,6 +123,8 @@ impl Engine {
             base_dir: state_dir.join("base"),
             dav,
             index,
+            retry,
+            retry_path,
             trigger,
             progress: None,
             cancel: None,
@@ -193,6 +203,7 @@ impl Engine {
         }
         dedupe(&mut report.conflicts);
         dedupe(&mut report.skipped);
+        self.record_retry(&mut report);
         report.duration_ms = started.elapsed().as_millis() as u64;
         self.emit(
             "done",
@@ -285,6 +296,7 @@ impl Engine {
         }
         dedupe(&mut report.conflicts);
         dedupe(&mut report.skipped);
+        self.record_retry(&mut report);
         report.duration_ms = started.elapsed().as_millis() as u64;
         self.emit(
             "done",
@@ -293,6 +305,24 @@ impl Engine {
             format!("apply ok={} duration={}ms", report.ok, report.duration_ms),
         );
         report
+    }
+
+    /// 连续失败退避：1→2→4→8→16→30 分钟，成功即复位（SPEC-3 §B8）。
+    fn record_retry(&mut self, report: &mut Report) {
+        if report.ok {
+            if self.retry.failures > 0 {
+                self.retry.record_success();
+                let _ = self.retry.save(&self.retry_path);
+            }
+            report.next_retry_at = None;
+            return;
+        }
+        report.next_retry_at = Some(self.retry.record_failure(now_secs()));
+        let _ = self.retry.save(&self.retry_path);
+    }
+
+    pub fn retry_state(&self) -> &RetryState {
+        &self.retry
     }
 
     fn emit(&self, phase: &str, current: usize, total: usize, message: impl Into<String>) {
@@ -917,6 +947,7 @@ mod tests {
             ok: true,
             error: None,
             backup_id: Some("20240101-000000".into()),
+            next_retry_at: Some(1_700_000_000),
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);

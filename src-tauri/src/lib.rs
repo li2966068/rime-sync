@@ -6,13 +6,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use rime_sync_core::backup::BackupManager;
 use rime_sync_core::cancel::CancelToken;
 use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
+use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::platform;
+use rime_sync_core::retry::RetryState;
 use rime_sync_core::rime_dir;
 use rime_sync_core::secret::{self, SecretSelection};
 use rime_sync_core::webdav::DavClient;
@@ -99,10 +100,7 @@ fn secret_selection(app: &AppHandle, inner: &Inner) -> Result<Arc<SecretSelectio
         }
     }
     let selection = Arc::new(secret::detect(&data_dir(app)?));
-    push_log(
-        inner,
-        format!("密码存储后端：{}", selection.describe()),
-    );
+    push_log(inner, format!("密码存储后端：{}", selection.describe()));
     if let Ok(mut guard) = inner.secret.lock() {
         *guard = Some(Arc::clone(&selection));
     }
@@ -131,7 +129,9 @@ fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
     rime_dir::detect(config.rime_dir.as_deref().map(Path::new))
         .or_else(|_| rime_dir::detect(None))
         .map_err(|error| {
-            format!("未能定位 Rime 用户目录：{error:#}。请在「同步」页点击自动探测或手动填写目录路径。")
+            format!(
+                "未能定位 Rime 用户目录：{error:#}。请在「同步」页点击自动探测或手动填写目录路径。"
+            )
         })
 }
 
@@ -158,10 +158,7 @@ pub(crate) fn rime_dir_for(app: &AppHandle, inner: &Inner) -> Result<PathBuf, St
     Ok(detect_rime(&config)?.path)
 }
 
-pub(crate) fn dav_client(
-    app: &AppHandle,
-    inner: &Inner,
-) -> Result<(Config, DavClient), String> {
+pub(crate) fn dav_client(app: &AppHandle, inner: &Inner) -> Result<(Config, DavClient), String> {
     let config = ensure_config(app, inner)?;
     if config.webdav.url.trim().is_empty() {
         return Err("请先填写 WebDAV 地址".to_string());
@@ -176,10 +173,7 @@ pub(crate) fn dav_client(
     Ok((config, client))
 }
 
-pub(crate) fn backup_manager(
-    app: &AppHandle,
-    inner: &Inner,
-) -> Result<BackupManager, String> {
+pub(crate) fn backup_manager(app: &AppHandle, inner: &Inner) -> Result<BackupManager, String> {
     let rime = rime_dir_for(app, inner)?;
     let root = state_dir(app)?.join("backups");
     Ok(BackupManager::new(&rime, &root))
@@ -201,6 +195,8 @@ fn server_kind(server: Option<&str>, dav: &[String]) -> String {
         "坚果云".to_string()
     } else if raw.contains("synology") || raw.contains("diskstation") {
         "群晖 DSM".to_string()
+    } else if raw.contains("openlist") {
+        "OpenList".to_string()
     } else if raw.contains("alist") {
         "AList".to_string()
     } else if raw.contains("apache") {
@@ -231,15 +227,13 @@ fn cmd_set_config(
 ) -> Result<Config, String> {
     config.webdav.url = config.webdav.url.trim().to_string();
     config.webdav.username = config.webdav.username.trim().to_string();
+    // 远端目录留空 = 服务器根（SPEC-3 §A4），不再回填默认值。
     config.webdav.remote_dir = config
         .webdav
         .remote_dir
         .trim()
         .trim_matches('/')
         .to_string();
-    if config.webdav.remote_dir.is_empty() {
-        config.webdav.remote_dir = "rime-sync".to_string();
-    }
     config.rime_dir = config
         .rime_dir
         .map(|dir| dir.trim().to_string())
@@ -326,8 +320,12 @@ struct ConnectionTest {
     dav_class: String,
     server_type: String,
     status: u16,
+    remote_dir: String,
     remote_dir_exists: bool,
+    remote_dir_missing: bool,
+    preset: Option<String>,
     message: String,
+    hint: Option<String>,
 }
 
 #[tauri::command]
@@ -339,46 +337,70 @@ fn cmd_test_connection(
     if config.webdav.url.trim().is_empty() {
         return Err("请先填写 WebDAV 地址".to_string());
     }
-    let root = DavClient::new(
-        &config.webdav.url,
-        &config.webdav.username,
-        &config.webdav.password,
-        "",
-    )
-    .map_err(|error| format!("WebDAV 地址无效：{error:#}"))?;
-    let started = Instant::now();
-    let probe = root
-        .probe()
-        .map_err(|error| format!("连接失败：{error:#}"))?;
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let dav_class = probe.dav.join(", ");
-    let server_type = server_kind(probe.server.as_deref(), &probe.dav);
-    let base = DavClient::new(
+    let client = DavClient::new(
         &config.webdav.url,
         &config.webdav.username,
         &config.webdav.password,
         &config.webdav.remote_dir,
     )
-    .map_err(|error| format!("远端目录无效：{error:#}"))?;
-    let remote_dir_exists = !base
-        .propfind("", 0)
-        .map_err(|error| format!("远端目录不可访问：{error:#}"))?
-        .is_empty();
-    let ok = (200..300).contains(&probe.status);
-    let message = if ok {
-        "认证与 WebDAV 协议可用".to_string()
-    } else {
-        format!("服务器返回 HTTP {}", probe.status)
+    .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
+    // SPEC-3 §A3：远端目录不存在是正常状态，只有连不上/认证失败才 ok=false。
+    let check = client
+        .check_connection()
+        .map_err(|error| format!("连接失败：{error:#}"))?;
+    let server_type = match check.preset.as_deref() {
+        Some("openlist") => "OpenList".to_string(),
+        Some("alist") => "AList".to_string(),
+        Some("nextcloud") => "Nextcloud".to_string(),
+        Some("jianguoyun") => "坚果云".to_string(),
+        Some("synology") => "群晖 DSM".to_string(),
+        _ => server_kind(check.server.as_deref(), &check.dav),
     };
     Ok(ConnectionTest {
-        ok,
-        latency_ms,
-        server: probe.server,
-        dav_class,
+        ok: check.ok,
+        latency_ms: check.latency_ms,
+        server: check.server,
+        dav_class: check.dav_class,
         server_type,
-        status: probe.status,
-        remote_dir_exists,
-        message,
+        status: check.status,
+        remote_dir_exists: check.ok && !check.remote_dir_missing,
+        remote_dir_missing: check.remote_dir_missing,
+        remote_dir: check.remote_dir,
+        preset: check.preset,
+        message: check.message,
+        hint: check.hint,
+    })
+}
+
+#[derive(Serialize)]
+struct NetworkStatus {
+    state: String,
+    message: String,
+    available: bool,
+    metered: bool,
+    failures: u32,
+    next_retry_at: Option<u64>,
+    next_retry_in_secs: Option<u64>,
+}
+
+/// SPEC-3 §B/C10：UI 展示网络状态与下次重试时间。
+#[tauri::command]
+fn cmd_network_status(app: AppHandle) -> Result<NetworkStatus, String> {
+    let policy = NetworkPolicy::system();
+    let state = policy.state();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let retry = RetryState::load(&state_dir(&app)?.join("retry.json")).unwrap_or_default();
+    Ok(NetworkStatus {
+        state: state.as_str().to_string(),
+        message: state.message().to_string(),
+        available: policy.available(),
+        metered: policy.is_metered(),
+        failures: retry.failures,
+        next_retry_at: retry.next_retry_at,
+        next_retry_in_secs: retry.next_retry_at.map(|next| next.saturating_sub(now)),
     })
 }
 
@@ -723,6 +745,7 @@ pub fn run() {
             cmd_set_config,
             cmd_detect_rime_dir,
             cmd_test_connection,
+            cmd_network_status,
             cmd_list_remote,
             cmd_transport,
             cmd_apply,
