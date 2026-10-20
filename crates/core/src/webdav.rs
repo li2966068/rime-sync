@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::index::FileMeta;
 use crate::plan;
+use crate::presets::{self, Preset};
 
 const MAX_RETRIES: usize = 3;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -134,8 +135,7 @@ impl DavClient {
                     return Ok(response);
                 }
                 Err(error) => {
-                    let retryable =
-                        error.is_timeout() || error.is_connect() || error.is_request();
+                    let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                     if retryable && attempt < MAX_RETRIES {
                         last_error = error.to_string();
                         sleep(backoff(attempt));
@@ -159,10 +159,7 @@ impl DavClient {
             Some(PROPFIND_BODY.as_bytes()),
             &[
                 ("Depth", depth.to_string()),
-                (
-                    "Content-Type",
-                    "application/xml; charset=utf-8".to_string(),
-                ),
+                ("Content-Type", "application/xml; charset=utf-8".to_string()),
             ],
         )?;
         let status = response.status();
@@ -195,10 +192,7 @@ impl DavClient {
             Some(PROPFIND_BODY.as_bytes()),
             &[
                 ("Depth", "0".to_string()),
-                (
-                    "Content-Type",
-                    "application/xml; charset=utf-8".to_string(),
-                ),
+                ("Content-Type", "application/xml; charset=utf-8".to_string()),
             ],
         )?;
         let status = response.status().as_u16();
@@ -253,10 +247,7 @@ impl DavClient {
 
     pub fn put(&self, rel: &str, bytes: &[u8], if_match: Option<&str>) -> Result<PutOutcome> {
         let url = self.url_for(rel)?;
-        let mut headers = vec![(
-            "Content-Type",
-            "application/octet-stream".to_string(),
-        )];
+        let mut headers = vec![("Content-Type", "application/octet-stream".to_string())];
         if let Some(etag) = if_match {
             headers.push(("If-Match", etag.to_string()));
         }
@@ -516,15 +507,9 @@ fn parse_multistatus(xml: &str) -> Result<Vec<RemoteEntry>> {
                             match name.as_str() {
                                 "href" => entry.href = value,
                                 "getcontentlength" => entry.size = value.parse::<u64>().ok(),
-                                "getetag" => {
-                                    if !value.is_empty() {
-                                        entry.etag = Some(value)
-                                    }
-                                }
-                                "getlastmodified" => {
-                                    if !value.is_empty() {
-                                        entry.last_modified = Some(value)
-                                    }
+                                "getetag" if !value.is_empty() => entry.etag = Some(value),
+                                "getlastmodified" if !value.is_empty() => {
+                                    entry.last_modified = Some(value)
                                 }
                                 _ => {}
                             }
@@ -551,10 +536,198 @@ fn parse_multistatus(xml: &str) -> Result<Vec<RemoteEntry>> {
 
 fn local_name(qname: &[u8]) -> String {
     let text = String::from_utf8_lossy(qname);
-    text.rsplit(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    text.rsplit(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeStep {
+    pub step: String,
+    pub ok: bool,
+    pub status: u16,
+    pub detail: String,
+}
+
+/// 写权限探测结果：MKCOL → PUT(1 字节) → DELETE 清理。
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteProbe {
+    pub ok: bool,
+    pub steps: Vec<ProbeStep>,
+    pub server: Option<String>,
+    pub preset: Option<String>,
+    pub hint: Option<String>,
+}
+
+impl DavClient {
+    /// 真正走一遍写路径；失败时把 HTTP 状态翻译成中文可执行建议。
+    pub fn check_write(&self) -> Result<WriteProbe> {
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = format!(".rime-sync-probe-{nonce}");
+        let object = format!("{dir}/probe.bin");
+        let mut steps: Vec<ProbeStep> = Vec::new();
+        let mut headers = presets::Headers::new();
+        if !self.base_path.is_empty() {
+            headers = headers.with_path(&self.base_path);
+        }
+
+        // 1) MKCOL 临时目录。
+        let url = self.url_for(&dir)?;
+        let response = self.send(Method::from_bytes(b"MKCOL")?, &url, None, &[])?;
+        let status = response.status().as_u16();
+        absorb_headers(&response, &mut headers);
+        let created = matches!(status, 200 | 201 | 204 | 405);
+        steps.push(ProbeStep {
+            step: "MKCOL".to_string(),
+            ok: created,
+            status,
+            detail: format!("create {dir}"),
+        });
+        let preset = Preset::detect(&headers);
+        // RFC 4918：MKCOL 对已存在集合也返回 405，无法区分“已存在”与“不允许”。
+        let mkcol_ambiguous = status == 405;
+        if !created {
+            let hint = Some(write_failure_hint(status, "MKCOL", preset));
+            return Ok(finish_probe(steps, headers, preset, hint));
+        }
+
+        // 2) PUT 1 字节对象。
+        let url = self.url_for(&object)?;
+        let response = self.send(
+            Method::PUT,
+            &url,
+            Some(b"x"),
+            &[("Content-Type", "application/octet-stream".to_string())],
+        )?;
+        let status = response.status().as_u16();
+        absorb_headers(&response, &mut headers);
+        let written = matches!(status, 200 | 201 | 204);
+        steps.push(ProbeStep {
+            step: "PUT".to_string(),
+            ok: written,
+            status,
+            detail: format!("upload 1 byte to {object}"),
+        });
+        if !written {
+            let hint = Some(if mkcol_ambiguous {
+                read_only_hint(status, preset)
+            } else {
+                write_failure_hint(status, "PUT", preset)
+            });
+            let _ = self.delete(&dir);
+            return Ok(finish_probe(steps, headers, preset, hint));
+        }
+
+        // 3) DELETE 对象 + 4) 清理临时目录。
+        let url = self.url_for(&object)?;
+        let response = self.send(Method::DELETE, &url, None, &[])?;
+        let status = response.status().as_u16();
+        let removed = matches!(status, 200 | 202 | 204 | 404);
+        steps.push(ProbeStep {
+            step: "DELETE".to_string(),
+            ok: removed,
+            status,
+            detail: format!("remove {object}"),
+        });
+        let url = self.url_for(&dir)?;
+        let response = self.send(Method::DELETE, &url, None, &[])?;
+        let status = response.status().as_u16();
+        let cleaned = matches!(status, 200 | 202 | 204 | 404);
+        steps.push(ProbeStep {
+            step: "CLEANUP".to_string(),
+            ok: cleaned,
+            status,
+            detail: format!("remove {dir}"),
+        });
+        let hint = if removed && cleaned {
+            None
+        } else {
+            Some(write_failure_hint(status, "DELETE", preset))
+        };
+        Ok(finish_probe(steps, headers, preset, hint))
+    }
+}
+
+fn absorb_headers(response: &Response, headers: &mut presets::Headers) {
+    for name in ["server", "www-authenticate"] {
+        if let Some(value) = response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+        {
+            headers.insert(name, value);
+        }
+    }
+}
+
+fn finish_probe(
+    steps: Vec<ProbeStep>,
+    headers: presets::Headers,
+    preset: Option<Preset>,
+    hint: Option<String>,
+) -> WriteProbe {
+    WriteProbe {
+        ok: steps.iter().all(|step| step.ok),
+        steps,
+        server: headers.get("server").map(str::to_string),
+        preset: preset.map(|value| value.id().to_string()),
+        hint,
+    }
+}
+
+/// MKCOL 返回 405 后再失败：最可能是只读挂载或权限不足。
+pub fn read_only_hint(status: u16, preset: Option<Preset>) -> String {
+    let mut text = format!(
+        "服务端不允许创建目录或写入(HTTP {status}，PUT)：可能是只读挂载（rclone --read-only / 只读网盘）或账号缺少写权限。"
+    );
+    match preset {
+        Some(Preset::Alist) => text.push_str(
+            "AList 请在后台为账号勾选 Webdav Read 与 Webdav Manage，并确认挂载存储允许上传与删除。",
+        ),
+        _ => text.push_str("请检查账号对该目录的写权限，并确认服务端不是只读模式。"),
+    }
+    text
+}
+
+/// HTTP 状态 → 中文可执行建议（SPEC-2 §2.6）。
+pub fn write_failure_hint(status: u16, step: &str, preset: Option<Preset>) -> String {
+    match status {
+        401 => "认证失败(401)：用户名或密码错误。AList 请用 AList 账号密码，坚果云请用「应用密码」。"
+            .to_string(),
+        403 => match preset {
+            Some(Preset::Alist) => {
+                "AList 拒绝写入(403)：请到 AList 后台「用户」为该账号勾选 Webdav Read 与 Webdav Manage 权限，并确认挂载存储本身允许上传与删除。"
+                    .to_string()
+            }
+            Some(other) => format!(
+                "{} 拒绝写入(403，{step})：请检查账号的 WebDAV 读写权限与目录归属。",
+                other.label()
+            ),
+            None => format!(
+                "服务端拒绝写入(403，{step})：请检查账号是否有该目录的写权限（只读挂载无法同步）。"
+            ),
+        },
+        404 => format!(
+            "路径不存在(404，{step})：请确认 WebDAV 地址、端口与远端目录是否正确。"
+        ),
+        405 => format!(
+            "服务端不接受该操作(405，{step})：可能禁用了 MKCOL/PUT/DELETE，请检查 WebDAV 服务器配置。"
+        ),
+        409 => format!(
+            "父目录不存在(409，{step})：请先在服务端创建远端目录，或让其可自动创建。"
+        ),
+        423 => format!("资源被锁定(423，{step})：稍后重试或解除服务端锁。"),
+        507 => "空间不足(507)：清理远端空间后重试。".to_string(),
+        code if code >= 500 => format!(
+            "服务端错误({code}，{step})：请查看 WebDAV 服务端日志，或稍后重试。"
+        ),
+        code => format!("写入探测失败(HTTP {code}，{step})：请检查地址、账号与目录权限。"),
+    }
 }
 
 #[cfg(test)]
@@ -656,5 +829,56 @@ mod tests {
             client.url_for("a b/c.yaml").expect("url"),
             "http://x/dav/my%20sync/a%20b/c.yaml"
         );
+    }
+}
+#[cfg(test)]
+mod write_probe_tests {
+    use super::*;
+
+    #[test]
+    fn alist_403_hint_mentions_permissions() {
+        let hint = write_failure_hint(403, "MKCOL", Some(Preset::Alist));
+        assert!(hint.contains("Webdav Read"));
+        assert!(hint.contains("Webdav Manage"));
+    }
+
+    #[test]
+    fn auth_and_space_hints_are_actionable() {
+        assert!(write_failure_hint(401, "PUT", None).contains("用户名或密码"));
+        assert!(write_failure_hint(507, "PUT", None).contains("空间不足"));
+        assert!(write_failure_hint(404, "MKCOL", None).contains("远端目录"));
+        assert!(write_failure_hint(405, "PUT", None).contains("MKCOL"));
+        assert!(write_failure_hint(503, "PUT", None).contains("服务端"));
+    }
+
+    #[test]
+    fn read_only_hint_is_chinese_and_actionable() {
+        let hint = read_only_hint(405, None);
+        assert!(hint.contains("只读"));
+        assert!(hint
+            .chars()
+            .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
+        let alist = read_only_hint(409, Some(Preset::Alist));
+        assert!(alist.contains("Webdav Manage"));
+    }
+
+    #[test]
+    fn probe_result_shape_serializes() {
+        let probe = WriteProbe {
+            ok: false,
+            steps: vec![ProbeStep {
+                step: "MKCOL".into(),
+                ok: false,
+                status: 403,
+                detail: "create".into(),
+            }],
+            server: Some("AList".into()),
+            preset: Some("alist".into()),
+            hint: Some(write_failure_hint(403, "MKCOL", Some(Preset::Alist))),
+        };
+        let json = serde_json::to_value(&probe).expect("json");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["steps"][0]["status"], 403);
+        assert_eq!(json["preset"], "alist");
     }
 }

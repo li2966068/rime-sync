@@ -12,3 +12,6 @@ sha2.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
+serde_yaml.workspace = true
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+notify = "8"

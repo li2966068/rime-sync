@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rime 同步 · 配置
+Name[zh_CN]=Rime 同步 · 配置
+Comment=配置 rime-sync 的 WebDAV 地址与远端目录
+Exec=rime-sync-config
+Icon=network-workgroup
+Terminal=false
+Categories=Settings;Utility;
+Keywords=Rime;WebDAV;Sync;

@@ -14,8 +14,9 @@
 ### Windows 10/11
 1. 下载 `rime-sync_<版本>_x64-setup.exe`，双击。
 2. 若出现"Windows 已保护你的电脑"：点"更多信息 → 仍要运行"（安装包未做代码签名）。
-3. 安装过程如需联网下载 WebView2，请保持网络畅通（Win11 一般已自带）。
-4. 从开始菜单启动 "rime-sync"。
+3. 安装过程如需联网下载 WebView2，请保持网络畅通（安装包已内嵌 WebView2 引导器，无需预装）。
+4. 从开始菜单启动「Rime 同步」（若装了 Weasel，程序组里也会有一份快捷方式）。
+5. 不想安装时用便携版 `rime-sync_<版本>_x64-portable.zip`：解压即用，不写注册表。
 
 ### Linux
 deb 系（Ubuntu/Debian，推荐）：
@@ -103,7 +104,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND \
 ### 3.3 关于密码的三条硬建议
 
 1. **永远用应用专用密码**，不要用主账号密码：应用密码可单独吊销，泄露损失可控。
-2. 密码在本机以明文存在 `config.json`（权限 0600，仅本人可读）。共享电脑上不要保存密码。
+2. 密码优先存**系统钥匙串**（service = `rime-sync`，account = WebDAV 用户名）；没有 Secret Service
+   的 headless 环境会回落到 0600 文件，并在界面标明当前后端。共享电脑上仍然不要保存密码。
 3. 服务端若支持，给这个应用密码限定**只读写一个目录**（坚果云/Nextcloud 均可按目录授权）。
 
 ### 3.4 本地自测（不想动真服务时）
@@ -116,6 +118,41 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND \
 curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND -u u:p http://127.0.0.1:18080/
 # 应用里 URL 填 http://127.0.0.1:18080/  账号 u  密码 p
 ```
+
+### 3.5 AList
+
+AList 把每个存储挂载成一个路径，WebDAV 入口固定是 `/dav`：
+
+| 字段 | 填法 | 示例 |
+|---|---|---|
+| URL | `http://<主机>:5244/dav` | `http://192.168.1.10:5244/dav` |
+| 用户名 / 密码 | AList 账号（不是存储本身的账号） | `admin` / 你的密码 |
+| 远端目录 | **挂载路径前缀 + 工作目录** | 挂载点叫 `aliyun` → `aliyun/rime-sync` |
+
+AList 后台 → 用户 → 编辑，权限按下表勾选（这是 403 的头号原因）：
+
+| 权限项 | 必须 | 用在哪里 |
+|---|---|---|
+| Webdav Read | ✅ | PROPFIND 列目录、GET 下载快照 |
+| Webdav Manage | ✅ | MKCOL 建目录、PUT 上传、DELETE 清理 |
+| 存储「写入」 | ✅ | 上传 `shared/files/*` 与 `owner.json` |
+| 存储「删除」 | ✅ | 删除写权限探测对象、清理过期文件 |
+| 存储「重命名/移动」 | 建议 | manifest 的原子替换 |
+| 离线下载 / 索引 | ❌ | 与本工具无关 |
+
+先验证再填进应用：
+
+```bash
+# 只读探测：207/200 说明地址与账号正确
+curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND -H 'Depth: 0' \
+  -u 'admin:密码' 'http://192.168.1.10:5244/dav/'
+
+# 写探测（会建目录、写 1 字节再删；失败时看状态码）
+curl -s -o /dev/null -w '%{http_code}\n' -X MKCOL \
+  -u 'admin:密码' 'http://192.168.1.10:5244/dav/aliyun/rime-sync-probe'
+```
+
+应用内也有写权限探测（CLI：`rime-sync-cli probe`），失败时会把状态码翻译成可执行建议。
 
 ---
 
@@ -209,7 +246,18 @@ code --diff default.custom.yaml default.custom.yaml.conflict-laptop-20261020T130
 | 误同步了 `installation.yaml` | 立刻删除远端该文件；它含设备私有 id，互相覆盖会导致快照目录错乱 |
 | 磁盘满/权限拒绝 | 检查用户目录可写；`config.json` 需 0600 |
 
-### 6.4 收集日志
+### 6.4 AList 权限排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 测试连接就 403 | 账号没勾 **Webdav Read**；或存储本身只读 | AList 后台 → 用户 → 编辑，勾上 Webdav Read |
+| 能列目录但一上传就 403/405 | 缺 **Webdav Manage** | 勾上 Webdav Manage，保存后重新登录 WebDAV |
+| 报 404 / 目录不存在 | URL 少了 `/dav`；远端目录少了挂载前缀 | URL 用 `http://主机:5244/dav`；远端目录填 `<挂载点>/rime-sync` |
+| 上传成功但文件是 0 字节 | 存储配额满或后端网盘限流 | 看 AList 日志；换存储或扩容 |
+| 中文文件名乱码 | 后端存储编码问题（多见于 S3/WebDAV 后端） | 先在 AList 网页上传同名文件复现；与本工具无关 |
+| 一会儿能写一会儿 403 | AList 重启后 WebDAV 会话失效 | 重新保存一次配置触发重新认证 |
+
+### 6.5 收集日志
 
 界面"日志"面板 → 复制；或直接看配置目录下的 `log` 文件
 （Windows：`%APPDATA%\rime-sync\`，Linux：`~/.config/rime-sync/`）。
@@ -222,7 +270,7 @@ code --diff default.custom.yaml default.custom.yaml.conflict-laptop-20261020T130
 
 - 只上传白名单文件（`*.custom.yaml`、`*.schema.yaml`、`*.dict.yaml`、词表 `*.txt`、`*.userdb.txt`），
   引擎产物（`build/`、`*.bin`）与 LevelDB 目录永不上传。
-- 密码只存本机 `config.json`（0600），不上传、不写日志。
+- 密码优先存系统钥匙串；回落时写 0600 文件。不上传、不写日志。
 - 路径穿越防护：远端返回的路径若含 `..` 或绝对路径会被拒绝。
 
 ## 8. 卸载

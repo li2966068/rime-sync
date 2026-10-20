@@ -1,0 +1,9 @@
+[Addon]
+Name=Rime Sync
+Comment=Launch the rime-sync WebDAV configuration page
+Category=Module
+Version=@PROJECT_VERSION@
+Library=rimesync
+Type=SharedLibrary
+OnDemand=True
+Configurable=False

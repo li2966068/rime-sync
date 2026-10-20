@@ -9,10 +9,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::backup::BackupManager;
 use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::index::{sha256_hex, FileIndex, FileMeta};
-use crate::merge3::{merge3_digests, MergeResult};
+use crate::lock::{self, LockGuard};
+use crate::merge3::{merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult};
 use crate::plan;
 use crate::platform::RimeTrigger;
 use crate::rime_dir;
@@ -28,6 +30,9 @@ pub struct Report {
     pub duration_ms: u64,
     pub ok: bool,
     pub error: Option<String>,
+    /// apply 前生成的备份 id（apply 失败时也可能已有备份）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +75,9 @@ pub struct Engine {
     rime_dir: PathBuf,
     sync_dir: PathBuf,
     index_path: PathBuf,
+    lock_path: PathBuf,
+    backup_root: PathBuf,
+    base_dir: PathBuf,
     dav: DavClient,
     index: FileIndex,
     trigger: Box<dyn RimeTrigger>,
@@ -102,12 +110,21 @@ impl Engine {
             rime_dir,
             sync_dir,
             index_path,
+            lock_path: state_dir.join("sync.lock"),
+            backup_root: state_dir.join("backups"),
+            base_dir: state_dir.join("base"),
             dav,
             index,
             trigger,
             progress: None,
             cancel: None,
         })
+    }
+
+    /// 覆盖备份根目录（默认 <state_dir>/backups）。
+    pub fn with_backup_root(mut self, root: PathBuf) -> Self {
+        self.backup_root = root;
+        self
     }
 
     pub fn with_progress(mut self, sink: ProgressSink) -> Self {
@@ -135,8 +152,28 @@ impl Engine {
         &self.rime_dir
     }
 
-    /// 只搬文件：pull → merge → push。
+    /// 只搬文件：pull → merge → push（持锁执行）。
     pub fn transport(&mut self) -> Report {
+        match self.lock() {
+            Ok(_guard) => self.transport_inner(),
+            Err(error) => self.locked_report(error),
+        }
+    }
+
+    fn lock(&self) -> Result<LockGuard> {
+        lock::acquire(&self.lock_path)
+    }
+
+    fn locked_report(&self, error: anyhow::Error) -> Report {
+        self.emit("done", 0, 0, "aborted: another sync holds the lock");
+        Report {
+            ok: false,
+            error: Some(format!("{error:#}")),
+            ..Report::default()
+        }
+    }
+
+    fn transport_inner(&mut self) -> Report {
         let started = Instant::now();
         let mut report = Report {
             ok: true,
@@ -172,9 +209,36 @@ impl Engine {
     }
 
     /// 合并 + 部署 + 再 push（librime 会产出新快照）。
+    ///
+    /// 顺序：拿锁 → 备份（失败即中止）→ transport → 停输入法 → sync → deploy → 再 transport。
     pub fn apply(&mut self) -> Report {
         let started = Instant::now();
-        let mut report = self.transport();
+        let _guard = match self.lock() {
+            Ok(guard) => guard,
+            Err(error) => return self.locked_report(error),
+        };
+        let backups = BackupManager::new(&self.rime_dir, &self.backup_root);
+        let backup_id = match backups.create("pre-apply") {
+            Ok(id) => id,
+            Err(error) => {
+                // 备份失败 → 中止 apply，一个字都不写（宁可不合并）。
+                self.emit("done", 0, 0, "apply aborted: backup failed");
+                tracing::error!("apply aborted, backup failed: {error:#}");
+                return Report {
+                    ok: false,
+                    error: Some(format!(
+                        "backup failed, apply aborted before any write: {error:#}"
+                    )),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    ..Report::default()
+                };
+            }
+        };
+        if let Err(error) = backups.prune(crate::backup::DEFAULT_KEEP) {
+            tracing::warn!("prune backups: {error:#}");
+        }
+        let mut report = self.transport_inner();
+        report.backup_id = Some(backup_id);
         if !report.ok {
             report.duration_ms = started.elapsed().as_millis() as u64;
             return report;
@@ -270,7 +334,8 @@ impl Engine {
             "heartbeat_ts": now,
         });
         let bytes = serde_json::to_vec_pretty(&owner)?;
-        self.dav.put(&format!("{remote_sync}/owner.json"), &bytes, None)?;
+        self.dav
+            .put(&format!("{remote_sync}/owner.json"), &bytes, None)?;
         Ok(())
     }
 
@@ -312,9 +377,7 @@ impl Engine {
                     continue;
                 }
                 if let Err(error) = plan::assert_remote_snapshot_path(&entry.path) {
-                    report
-                        .skipped
-                        .push(format!("{}: {error:#}", entry.path));
+                    report.skipped.push(format!("{}: {error:#}", entry.path));
                     continue;
                 }
                 let local = match safe_join(&self.rime_dir, &entry.path) {
@@ -384,7 +447,9 @@ impl Engine {
             match self.dav.put(&rel, &bytes, None)? {
                 PutOutcome::Written => {}
                 PutOutcome::PreconditionFailed => {
-                    report.conflicts.push(format!("{rel}: remote changed during upload"));
+                    report
+                        .conflicts
+                        .push(format!("{rel}: remote changed during upload"));
                     continue;
                 }
             }
@@ -407,8 +472,9 @@ impl Engine {
     fn sync_shared(&mut self, report: &mut Report) -> Result<()> {
         let manifest_bytes = self.dav.get("shared/manifest.json")?;
         let mut manifest = match &manifest_bytes {
-            Some(bytes) => serde_json::from_slice::<FileIndex>(bytes)
-                .context("parse shared/manifest.json")?,
+            Some(bytes) => {
+                serde_json::from_slice::<FileIndex>(bytes).context("parse shared/manifest.json")?
+            }
             None => FileIndex::default(),
         };
         if manifest.version == 0 {
@@ -464,6 +530,7 @@ impl Engine {
 
             match decision {
                 MergeResult::Unchanged => {
+                    self.remember_base(local_hash.as_deref(), local_bytes.as_deref());
                     match remote_meta {
                         Some(meta) => {
                             self.index.files.insert(rel.clone(), meta);
@@ -476,15 +543,14 @@ impl Engine {
                     }
                 }
                 MergeResult::TakeLocal => {
-                    let bytes = local_bytes
-                        .ok_or_else(|| anyhow!("local file disappeared: {rel}"))?;
-                    let if_match = remote_meta
-                        .as_ref()
-                        .and_then(|meta| meta.etag.as_deref());
+                    let bytes =
+                        local_bytes.ok_or_else(|| anyhow!("local file disappeared: {rel}"))?;
+                    let if_match = remote_meta.as_ref().and_then(|meta| meta.etag.as_deref());
                     let remote_path = format!("shared/files/{rel}");
                     match self.dav.put(&remote_path, &bytes, if_match)? {
                         PutOutcome::Written => {
                             let meta = FileMeta::local(&bytes);
+                            self.remember_base(Some(&meta.sha256), Some(&bytes));
                             manifest.files.insert(rel.clone(), meta.clone());
                             self.index.files.insert(rel.clone(), meta);
                             report.pushed += 1;
@@ -498,8 +564,8 @@ impl Engine {
                     }
                 }
                 MergeResult::TakeRemote => {
-                    let meta = remote_meta
-                        .ok_or_else(|| anyhow!("missing remote metadata for {rel}"))?;
+                    let meta =
+                        remote_meta.ok_or_else(|| anyhow!("missing remote metadata for {rel}"))?;
                     let remote_path = format!("shared/files/{rel}");
                     let Some(bytes) = self.dav.get(&remote_path)? else {
                         report
@@ -508,17 +574,31 @@ impl Engine {
                         continue;
                     };
                     if sha256_hex(&bytes) != meta.sha256 {
-                        report.conflicts.push(format!(
-                            "{rel}: remote hash does not match manifest"
-                        ));
+                        report
+                            .conflicts
+                            .push(format!("{rel}: remote hash does not match manifest"));
                         continue;
                     }
                     write_file(&self.rime_dir, rel, &bytes)?;
+                    self.remember_base(Some(&meta.sha256), Some(&bytes));
                     self.index.files.insert(rel.clone(), meta);
                     report.pulled += 1;
                     report.merged += 1;
                 }
                 MergeResult::Conflict => {
+                    // *.custom.yaml 先试段落级合并；任何不适配都静默回落文件级冲突。
+                    if rel.ends_with(".custom.yaml")
+                        && self.merge_custom_yaml(
+                            rel,
+                            local_bytes.as_deref(),
+                            remote_meta.as_ref(),
+                            base.as_ref(),
+                            &mut manifest,
+                            report,
+                        )?
+                    {
+                        continue;
+                    }
                     if let Some(bytes) = &local_bytes {
                         if !self.has_conflict_copy(rel)? {
                             let conflict_rel = conflict_path(rel, &self.config.device_id)?;
@@ -529,8 +609,7 @@ impl Engine {
                 }
                 MergeResult::DeleteLocal => {
                     if local_path.exists() {
-                        fs::remove_file(&local_path)
-                            .with_context(|| format!("remove {rel}"))?;
+                        fs::remove_file(&local_path).with_context(|| format!("remove {rel}"))?;
                     }
                     self.index.files.remove(rel);
                     manifest.files.remove(rel);
@@ -558,6 +637,105 @@ impl Engine {
         Ok(())
     }
 
+    /// *.custom.yaml 段落级合并：成功返回 true（调用方继续下一项），不适配返回 false。
+    fn merge_custom_yaml(
+        &mut self,
+        rel: &str,
+        local: Option<&[u8]>,
+        remote_meta: Option<&FileMeta>,
+        base: Option<&FileMeta>,
+        manifest: &mut FileIndex,
+        report: &mut Report,
+    ) -> Result<bool> {
+        let (Some(local_bytes), Some(meta)) = (local, remote_meta) else {
+            return Ok(false);
+        };
+        let remote_path = format!("shared/files/{rel}");
+        let Some(remote_bytes) = self.dav.get(&remote_path)? else {
+            return Ok(false);
+        };
+        if sha256_hex(&remote_bytes) != meta.sha256 {
+            return Ok(false);
+        }
+        let base_bytes = self.load_base(base.map(|item| item.sha256.as_str()));
+        let outcome = merge_yaml_patch(base_bytes.as_deref(), local_bytes, Some(&remote_bytes))?;
+        let (bytes, conflicts) = match outcome {
+            MergeOutcome::Patch { bytes, conflicts } => (bytes, conflicts),
+            MergeOutcome::Fallback { reason } => {
+                tracing::debug!("patch merge not applicable for {rel}: {reason}");
+                return Ok(false);
+            }
+        };
+        let hash = sha256_hex(&bytes);
+        if hash != sha256_hex(local_bytes) {
+            write_file(&self.rime_dir, rel, &bytes)?;
+        }
+        if hash != meta.sha256 {
+            match self.dav.put(&remote_path, &bytes, meta.etag.as_deref())? {
+                PutOutcome::Written => {
+                    let new_meta = FileMeta::local(&bytes);
+                    self.remember_base(Some(&hash), Some(&bytes));
+                    manifest.files.insert(rel.to_string(), new_meta.clone());
+                    self.index.files.insert(rel.to_string(), new_meta);
+                    report.pushed += 1;
+                }
+                PutOutcome::PreconditionFailed => {
+                    report
+                        .conflicts
+                        .push(format!("{rel}: remote changed during upload"));
+                    return Ok(true);
+                }
+            }
+        }
+        report.merged += 1;
+        if conflicts.is_empty() {
+            tracing::debug!("patch merge resolved {rel}");
+        } else {
+            report
+                .conflicts
+                .push(format!("{rel}: {}", conflicts.join(", ")));
+            if !self.has_conflict_copy(rel)? {
+                let conflict_rel = conflict_path(rel, &self.config.device_id)?;
+                write_file(&self.rime_dir, &conflict_rel, local_bytes)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// 基线内容缓存（内容寻址，只用于 *.custom.yaml 的段落级合并）。
+    fn remember_base(&self, hash: Option<&str>, bytes: Option<&[u8]>) {
+        let (Some(hash), Some(bytes)) = (hash, bytes) else {
+            return;
+        };
+        if !is_hex_sha256(hash) {
+            return;
+        }
+        let path = self.base_dir.join(hash);
+        if path.is_file() {
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&self.base_dir) {
+            tracing::debug!("create base cache {}: {error}", self.base_dir.display());
+            return;
+        }
+        if let Err(error) = fs::write(&path, bytes) {
+            tracing::debug!("write base cache {hash}: {error}");
+        }
+    }
+
+    fn load_base(&self, hash: Option<&str>) -> Option<Vec<u8>> {
+        let hash = hash?;
+        if !is_hex_sha256(hash) {
+            return None;
+        }
+        let bytes = fs::read(self.base_dir.join(hash)).ok()?;
+        if sha256_hex(&bytes) == hash {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
     /// 同一冲突在用户处理前不应每轮都生成新副本。
     fn has_conflict_copy(&self, rel: &str) -> Result<bool> {
         let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -569,9 +747,7 @@ impl Engine {
         let entries = match fs::read_dir(&parent) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {}", parent.display()))
-            }
+            Err(error) => return Err(error).with_context(|| format!("read {}", parent.display())),
         };
         for entry in entries {
             let entry = entry?;
@@ -632,6 +808,10 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn is_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn dedupe(items: &mut Vec<String>) {
@@ -736,9 +916,11 @@ mod tests {
             duration_ms: 9,
             ok: true,
             error: None,
+            backup_id: Some("20240101-000000".into()),
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);
         assert_eq!(json["conflicts"][0], "a");
+        assert_eq!(json["backup_id"], "20240101-000000");
     }
 }

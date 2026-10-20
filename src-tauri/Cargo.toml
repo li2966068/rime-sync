@@ -1,6 +1,6 @@
 [package]
 name = "rime-sync-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rime 词库与配置 WebDAV 同步（桌面壳）"
 edition = "2021"
 rust-version = "1.77"
@@ -15,6 +15,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# 自动更新：与 tauri 2.12.4 对齐（插件 2.14.0 的 tauri 依赖为 ^2.12）。
+# 前端调用前需在 <src-tauri>/capabilities 中补 "updater:default" 权限（由 UI 模块负责）。
+tauri-plugin-updater = "2.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

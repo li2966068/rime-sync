@@ -75,8 +75,7 @@ impl FileIndex {
         }
         let text = serde_json::to_string_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, format!("{text}\n"))
-            .with_context(|| format!("write {}", tmp.display()))?;
+        fs::write(&tmp, format!("{text}\n")).with_context(|| format!("write {}", tmp.display()))?;
         fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
         Ok(())
     }
@@ -120,10 +119,9 @@ mod tests {
         index
             .files
             .insert("a.custom.yaml".into(), FileMeta::local(b"x"));
-        index.snapshots.insert(
-            "sync/dev/a.userdb.txt".into(),
-            FileMeta::local(b"y"),
-        );
+        index
+            .snapshots
+            .insert("sync/dev/a.userdb.txt".into(), FileMeta::local(b"y"));
         index.save(&path).expect("save");
         let loaded = FileIndex::load(&path).expect("load");
         assert_eq!(loaded.files["a.custom.yaml"].sha256, sha256_hex(b"x"));

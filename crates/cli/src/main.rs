@@ -2,17 +2,22 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};
 use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::index::FileIndex;
+use rime_sync_core::lock;
 use rime_sync_core::plan;
 use rime_sync_core::platform;
+use rime_sync_core::presets::Preset;
 use rime_sync_core::rime_dir;
+use rime_sync_core::secret;
+use rime_sync_core::watch;
 use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +36,9 @@ struct Cli {
     dav_user: Option<String>,
     #[arg(long = "dav-pass", global = true, value_name = "PASS")]
     dav_pass: Option<String>,
+    /// 服务商预设：alist / jianguoyun / nextcloud / synology / custom（会归一化 dav-url）
+    #[arg(long, global = true, value_name = "PRESET")]
+    preset: Option<String>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -50,6 +58,24 @@ enum Command {
     Transport,
     /// 合并 + 部署 + push
     Apply,
+    /// 立即生成一份备份
+    Backup {
+        /// 备份原因，写入 manifest
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
+    /// 列出已有备份
+    Backups,
+    /// 回滚到指定备份（写回前自动建 pre-restore 备份）
+    Rollback { id: String },
+    /// 前台监听 Rime 目录，变更后自动 transport
+    Watch {
+        /// 去抖秒数
+        #[arg(long, default_value_t = 3)]
+        debounce_secs: u64,
+    },
+    /// 写权限探测（MKCOL → PUT → DELETE）
+    Probe,
 }
 
 #[derive(Serialize)]
@@ -66,6 +92,8 @@ struct ConnReport {
     dav_class: String,
     status: u16,
     dav: Vec<String>,
+    preset: Option<String>,
+    hint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,12 +109,49 @@ struct StatusReport {
     remote_devices: Vec<String>,
     remote_shared: Option<usize>,
     remote_error: Option<String>,
+    secret_backend: String,
+    password_stored: bool,
+    lock_held: bool,
+    lock_stale: bool,
+    lock_holder: Option<String>,
 }
+
+#[derive(Serialize)]
+struct BackupReport {
+    ok: bool,
+    id: String,
+    path: String,
+    reason: String,
+    pruned: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RollbackReport {
+    ok: bool,
+    backup_id: String,
+    pre_restore_id: Option<String>,
+    restored: usize,
+}
+
+/// probe 失败时已经打印了结构化结果，main 不再重复输出一行错误。
+#[derive(Debug)]
+struct ProbeFailed;
+
+impl std::fmt::Display for ProbeFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("write probe failed")
+    }
+}
+
+impl std::error::Error for ProbeFailed {}
 
 fn main() {
     let cli = Cli::parse();
     let wants_json = cli.json;
     if let Err(error) = run(cli) {
+        if error.downcast_ref::<ProbeFailed>().is_some() {
+            std::process::exit(1);
+        }
         if wants_json {
             println!(
                 "{}",
@@ -104,14 +169,46 @@ fn run(cli: Cli) -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
-    let mut loaded = Config::load(&config_path)?;
-    let mut config = loaded.clone();
+    let mut stored = Config::load(&config_path)?;
+    let mut config = stored.clone();
     config.apply_env();
     config.apply_overrides(
         cli.dav_url.as_deref(),
         cli.dav_user.as_deref(),
         cli.dav_pass.as_deref(),
     );
+    if let Some(raw) = cli.preset.as_deref() {
+        match Preset::from_id(raw) {
+            Some(preset) => {
+                if !config.webdav.url.trim().is_empty() {
+                    config.webdav.url = preset.normalize(&config.webdav.url);
+                }
+            }
+            None => eprintln!("warning: unknown preset {raw}, ignored"),
+        }
+    }
+
+    let app_data = state_dir(&config_path);
+    let secrets = secret::detect(&app_data);
+    if config.legacy_password {
+        match config.migrate_legacy_password(secrets.store.as_ref(), &config_path) {
+            Ok(true) => {
+                stored.legacy_password = false;
+                stored.password_ref = config.password_ref;
+                if !cli.json {
+                    eprintln!(
+                        "已把 config.json 中的明文密码迁移到 {} 后端并删除该字段",
+                        secrets.backend.as_str()
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("warning: 明文密码迁移失败: {error:#}"),
+        }
+    }
+    if let Err(error) = config.load_password(secrets.store.as_ref()) {
+        eprintln!("warning: 读取已保存密码失败: {error:#}");
+    }
 
     match cli.command {
         Command::Detect => {
@@ -132,12 +229,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::TestConn => {
-            let dav = DavClient::new(
-                &config.webdav.url,
-                &config.webdav.username,
-                &config.webdav.password,
-                &config.webdav.remote_dir,
-            )?;
+            let dav = dav_client(&config)?;
             let started = Instant::now();
             let probe = dav.probe()?;
             let latency_ms = started.elapsed().as_millis();
@@ -152,6 +244,15 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 "unknown"
             };
+            let mut headers = rime_sync_core::presets::Headers::new();
+            if let Some(server) = probe.server.as_deref() {
+                headers.insert("server", server);
+            }
+            if let Some(path) = dav_base_path(&config) {
+                headers = headers.with_path(&path);
+            }
+            let preset = Preset::detect(&headers);
+            let hint = preset.map(|value| value.hint().to_string());
             let report = ConnReport {
                 ok,
                 latency_ms,
@@ -159,22 +260,31 @@ fn run(cli: Cli) -> Result<()> {
                 dav_class: dav_class.to_string(),
                 status: probe.status,
                 dav: probe.dav,
+                preset: preset.map(|value| value.id().to_string()),
+                hint,
             };
             if cli.json {
                 print_json(&report)
             } else {
                 println!(
-                    "ok={} status={} latency={}ms server={} dav_class={}",
-                    report.ok, report.status, report.latency_ms, report.server, report.dav_class
+                    "ok={} status={} latency={}ms server={} dav_class={} preset={}",
+                    report.ok,
+                    report.status,
+                    report.latency_ms,
+                    report.server,
+                    report.dav_class,
+                    report.preset.as_deref().unwrap_or("-")
                 );
+                if let Some(hint) = report.hint {
+                    println!("{hint}");
+                }
                 Ok(())
             }
         }
         Command::Status => {
             let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
             let device_id = if config.device_id.trim().is_empty() {
-                rime_dir::installation_id(&detection)
-                    .unwrap_or_else(|| "(unset)".to_string())
+                rime_dir::installation_id(&detection).unwrap_or_else(|| "(unset)".to_string())
             } else {
                 config.device_id.clone()
             };
@@ -183,12 +293,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut remote_devices = Vec::new();
             let mut remote_shared = None;
             let mut remote_error = None;
-            match DavClient::new(
-                &config.webdav.url,
-                &config.webdav.username,
-                &config.webdav.password,
-                &config.webdav.remote_dir,
-            ) {
+            match dav_client(&config) {
                 Ok(dav) => {
                     match dav.propfind("sync", 1) {
                         Ok(entries) => {
@@ -202,7 +307,8 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     match dav.propfind("shared/files", 1) {
                         Ok(entries) => {
-                            remote_shared = Some(entries.iter().filter(|entry| !entry.is_dir).count())
+                            remote_shared =
+                                Some(entries.iter().filter(|entry| !entry.is_dir).count())
                         }
                         Err(error) => {
                             if remote_error.is_none() {
@@ -213,6 +319,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 Err(error) => remote_error = Some(format!("{error:#}")),
             }
+            let lock_status = lock::inspect(&state_dir(&config_path).join("sync.lock"));
             let report = StatusReport {
                 config_path: config_path.display().to_string(),
                 rime_dir: detection.display().to_string(),
@@ -225,6 +332,13 @@ fn run(cli: Cli) -> Result<()> {
                 remote_devices,
                 remote_shared,
                 remote_error,
+                secret_backend: secrets.describe(),
+                password_stored: config.password_ref != config::PasswordRef::None,
+                lock_held: lock_status.held,
+                lock_stale: lock_status.stale,
+                lock_holder: lock_status
+                    .info
+                    .map(|info| format!("pid={} host={}", info.pid, info.hostname)),
             };
             if cli.json {
                 print_json(&report)
@@ -232,43 +346,135 @@ fn run(cli: Cli) -> Result<()> {
                 println!("config={}", report.config_path);
                 println!("rime_dir={}", report.rime_dir);
                 println!("device_id={}", report.device_id);
-                println!(
-                    "remote={} dir={}",
-                    report.dav_url, report.remote_dir
-                );
+                println!("remote={} dir={}", report.dav_url, report.remote_dir);
                 println!(
                     "local_shared={} local_snapshots={} index_files={}",
                     report.local_shared, report.local_snapshots, report.index_files
                 );
-                println!("remote_devices={:?} remote_shared={:?}", report.remote_devices, report.remote_shared);
+                println!(
+                    "remote_devices={:?} remote_shared={:?}",
+                    report.remote_devices, report.remote_shared
+                );
+                println!(
+                    "secret_backend={} password_stored={}",
+                    report.secret_backend, report.password_stored
+                );
+                println!(
+                    "lock_held={} lock_stale={} holder={}",
+                    report.lock_held,
+                    report.lock_stale,
+                    report.lock_holder.as_deref().unwrap_or("-")
+                );
                 if let Some(error) = report.remote_error {
                     eprintln!("remote_error: {error}");
                 }
                 Ok(())
             }
         }
-        Command::Transport | Command::Apply => {
+        Command::Backup { reason } => {
             let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
-            let device_was_empty = config.device_id.trim().is_empty();
-            if device_was_empty {
-                config.resolve_device_id(&detection);
+            let manager = BackupManager::new(&detection, &app_data.join("backups"));
+            let id = manager.create(&reason)?;
+            let pruned = manager.prune(DEFAULT_KEEP).unwrap_or_default();
+            let report = BackupReport {
+                ok: true,
+                path: manager.root().join(&id).display().to_string(),
+                id,
+                reason,
+                pruned,
+            };
+            if cli.json {
+                print_json(&report)
+            } else {
+                println!(
+                    "backup={} path={} reason={} pruned={}",
+                    report.id,
+                    report.path,
+                    report.reason,
+                    report.pruned.len()
+                );
+                Ok(())
             }
-            let rime_str = detection.display().to_string();
-            let rime_dir_was_empty = loaded.rime_dir.is_none();
-            if device_was_empty || rime_dir_was_empty {
-                loaded.device_id = config.device_id.clone();
-                loaded.rime_dir = Some(rime_str);
-                loaded.save(&config_path)?;
+        }
+        Command::Backups => {
+            let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let manager = BackupManager::new(&detection, &app_data.join("backups"));
+            let infos = manager.list()?;
+            if cli.json {
+                print_json(&infos)
+            } else if infos.is_empty() {
+                println!("no backups in {}", manager.root().display());
+                Ok(())
+            } else {
+                for info in &infos {
+                    println!(
+                        "{}  files={} bytes={} reason={}",
+                        info.id, info.file_count, info.total_bytes, info.reason
+                    );
+                }
+                Ok(())
             }
-
+        }
+        Command::Rollback { id } => {
+            let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let manager = BackupManager::new(&detection, &app_data.join("backups"));
+            let restored = manager.restore(&id)?;
+            let report = RollbackReport {
+                ok: true,
+                backup_id: restored.backup_id,
+                pre_restore_id: restored.pre_restore_id,
+                restored: restored.restored,
+            };
+            if cli.json {
+                print_json(&report)
+            } else {
+                println!(
+                    "rollback={} restored={} pre_restore={}",
+                    report.backup_id,
+                    report.restored,
+                    report.pre_restore_id.as_deref().unwrap_or("-")
+                );
+                Ok(())
+            }
+        }
+        Command::Probe => {
+            let dav = dav_client(&config)?;
+            let probe = dav.check_write()?;
+            if cli.json {
+                print_json(&probe)?;
+            } else {
+                println!(
+                    "ok={} preset={} server={}",
+                    probe.ok,
+                    probe.preset.as_deref().unwrap_or("-"),
+                    probe.server.as_deref().unwrap_or("-")
+                );
+                for step in &probe.steps {
+                    println!(
+                        "  {:<8} status={} ok={} {}",
+                        step.step, step.status, step.ok, step.detail
+                    );
+                }
+                if let Some(hint) = &probe.hint {
+                    println!("hint: {hint}");
+                }
+            }
+            if probe.ok {
+                Ok(())
+            } else {
+                Err(anyhow::Error::new(ProbeFailed))
+            }
+        }
+        Command::Transport | Command::Apply => {
+            let detection = prepare_sync(
+                &mut config,
+                &mut stored,
+                &config_path,
+                cli.rime_dir.as_deref(),
+            )?;
             let apply_mode = matches!(cli.command, Command::Apply);
             let trigger = platform::default_trigger(config.stop_fcitx5_during_apply);
-            let mut engine = Engine::new(
-                config,
-                detection,
-                state_dir(&config_path),
-                trigger,
-            )?;
+            let mut engine = Engine::new(config, detection, state_dir(&config_path), trigger)?;
             if !cli.json {
                 engine = engine.with_progress(ProgressSink::new(|progress: &Progress| {
                     eprintln!(
@@ -289,6 +495,114 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
+        Command::Watch { debounce_secs } => {
+            let detection = prepare_sync(
+                &mut config,
+                &mut stored,
+                &config_path,
+                cli.rime_dir.as_deref(),
+            )?;
+            let debounce = Duration::from_secs(debounce_secs.max(1));
+            let handle = watch::start(&detection, debounce)?;
+            if !cli.json {
+                eprintln!(
+                    "watching {} (debounce {}s), Ctrl-C 退出",
+                    detection.display(),
+                    debounce.as_secs()
+                );
+            }
+            loop {
+                let event = match handle.rx.recv() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        eprintln!("watch channel closed: {error}");
+                        return Ok(());
+                    }
+                };
+                if cli.json {
+                    let _ = print_json(&event);
+                    eprintln!("watch: transport triggered");
+                } else {
+                    eprintln!(
+                        "watch: transport triggered ({})",
+                        watch::event_summary(&event)
+                    );
+                }
+                // 写盘期间静音，避免引擎自己的写入再触发一轮。
+                handle.mute(Duration::from_secs(15));
+                let trigger = platform::default_trigger(config.stop_fcitx5_during_apply);
+                let mut engine = match Engine::new(
+                    config.clone(),
+                    detection.clone(),
+                    state_dir(&config_path),
+                    trigger,
+                ) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        eprintln!("watch: engine init failed: {error:#}");
+                        continue;
+                    }
+                };
+                if !cli.json {
+                    engine = engine.with_progress(ProgressSink::new(|progress: &Progress| {
+                        eprintln!(
+                            "[{}] {}/{} {}",
+                            progress.phase, progress.current, progress.total, progress.message
+                        );
+                    }));
+                }
+                let report = engine.transport();
+                if cli.json {
+                    let _ = print_json(&report);
+                } else {
+                    print_report(&report);
+                }
+            }
+        }
+    }
+}
+
+/// 解析 rime 目录、补齐 device_id / rime_dir 并写回（不写密码）。
+fn prepare_sync(
+    config: &mut Config,
+    stored: &mut Config,
+    config_path: &Path,
+    explicit: Option<&Path>,
+) -> Result<PathBuf> {
+    let detection = resolve_rime_dir(explicit, config)?;
+    let device_was_empty = config.device_id.trim().is_empty();
+    if device_was_empty {
+        config.resolve_device_id(&detection);
+    }
+    let rime_was_empty = stored.rime_dir.is_none();
+    if device_was_empty || rime_was_empty {
+        stored.device_id = config.device_id.clone();
+        stored.rime_dir = Some(detection.display().to_string());
+        stored.save(config_path)?;
+    }
+    Ok(detection)
+}
+
+fn dav_client(config: &Config) -> Result<DavClient> {
+    DavClient::new(
+        &config.webdav.url,
+        &config.webdav.username,
+        &config.webdav.password,
+        &config.webdav.remote_dir,
+    )
+}
+
+fn dav_base_path(config: &Config) -> Option<String> {
+    let url = config.webdav.url.trim().trim_end_matches('/');
+    let rest = url.split_once("://").map(|(_, rest)| rest)?;
+    let path = match rest.find('/') {
+        Some(index) => &rest[index..],
+        None => "",
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
     }
 }
 
@@ -314,14 +628,15 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 fn print_report(report: &Report) {
     println!(
-        "ok={} pulled={} pushed={} merged={} conflicts={} skipped={} duration={}ms",
+        "ok={} pulled={} pushed={} merged={} conflicts={} skipped={} duration={}ms backup={}",
         report.ok,
         report.pulled,
         report.pushed,
         report.merged,
         report.conflicts.len(),
         report.skipped.len(),
-        report.duration_ms
+        report.duration_ms,
+        report.backup_id.as_deref().unwrap_or("-")
     );
     if let Some(error) = &report.error {
         eprintln!("error: {error}");
@@ -381,9 +696,7 @@ fn count_local(root: &Path) -> Result<(usize, usize)> {
                         snapshots += files
                             .flatten()
                             .filter(|file| {
-                                file.file_name()
-                                    .to_string_lossy()
-                                    .ends_with(".userdb.txt")
+                                file.file_name().to_string_lossy().ends_with(".userdb.txt")
                             })
                             .count();
                     }

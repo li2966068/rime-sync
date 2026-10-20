@@ -9,12 +9,25 @@ use std::path::{Path, PathBuf};
 use crate::index::sha256_hex;
 use crate::plan::Category;
 use crate::rime_dir;
+use crate::secret::SecretStore;
+
+/// 密码存放位置。None = 尚未设置（或旧配置还没迁移）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PasswordRef {
+    Keyring,
+    File,
+    #[default]
+    None,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebDavConfig {
     pub url: String,
     pub username: String,
+    /// 只在内存里：绝不序列化（SPEC-2 §2.2 不允许明文密码落盘）。
+    #[serde(default, skip_serializing)]
     pub password: String,
     pub remote_dir: String,
 }
@@ -52,24 +65,31 @@ impl Default for SyncKinds {
 #[serde(default)]
 pub struct Config {
     pub webdav: WebDavConfig,
+    /// 密码保存在钥匙串还是 0600 文件里。
+    pub password_ref: PasswordRef,
     pub rime_dir: Option<String>,
     pub device_id: String,
     pub transport_interval_minutes: u32,
     pub sync_kinds: SyncKinds,
     pub exclude_globs: Vec<String>,
     pub stop_fcitx5_during_apply: bool,
+    /// 旧版配置里读到明文 password：迁移后清掉。
+    #[serde(skip)]
+    pub legacy_password: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             webdav: WebDavConfig::default(),
+            password_ref: PasswordRef::None,
             rime_dir: None,
             device_id: String::new(),
             transport_interval_minutes: 10,
             sync_kinds: SyncKinds::default(),
             exclude_globs: Vec::new(),
             stop_fcitx5_during_apply: true,
+            legacy_password: false,
         }
     }
 }
@@ -77,11 +97,58 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .with_context(|| format!("parse config {}", path.display())),
+            Ok(text) => {
+                let mut config: Self = serde_json::from_str(&text)
+                    .with_context(|| format!("parse config {}", path.display()))?;
+                config.legacy_password = has_plaintext_password(&text);
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("read config {}", path.display())),
         }
+    }
+
+    /// 钥匙串/文件后端的 key：WebDAV 用户名。
+    pub fn password_account(&self) -> String {
+        self.webdav.username.trim().to_string()
+    }
+
+    /// 内存里的密码优先（--dav-pass / 环境变量），其次从后端读。
+    pub fn load_password(&mut self, store: &dyn SecretStore) -> Result<Option<String>> {
+        if !self.webdav.password.is_empty() {
+            return Ok(Some(self.webdav.password.clone()));
+        }
+        if self.password_ref == PasswordRef::None {
+            return Ok(None);
+        }
+        match store.get(&self.password_account())? {
+            Some(password) => {
+                self.webdav.password = password.clone();
+                Ok(Some(password))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 旧配置的明文 password → 后端，然后重写不含 password 的 JSON。
+    pub fn migrate_legacy_password(
+        &mut self,
+        store: &dyn SecretStore,
+        path: &Path,
+    ) -> Result<bool> {
+        if !self.legacy_password {
+            return Ok(false);
+        }
+        let password = self.webdav.password.clone();
+        self.legacy_password = false;
+        if !password.is_empty() {
+            store
+                .set(&self.password_account(), &password)
+                .with_context(|| "store webdav password in secret backend")?;
+            self.password_ref = store.backend().password_ref();
+        }
+        self.save(path)?;
+        Ok(true)
     }
 
     /// 含密码，落盘必须是 0600。
@@ -98,8 +165,7 @@ impl Config {
             .and_then(|n| n.to_str())
             .unwrap_or("config.json");
         let tmp = path.with_file_name(format!(".{name}.tmp"));
-        fs::write(&tmp, format!("{text}\n"))
-            .with_context(|| format!("write {}", tmp.display()))?;
+        fs::write(&tmp, format!("{text}\n")).with_context(|| format!("write {}", tmp.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -114,10 +180,10 @@ impl Config {
         if let Some(v) = non_empty(env::var("RIME_SYNC_DAV_URL").ok()) {
             self.webdav.url = v;
         }
-        if let Some(v) = env::var("RIME_SYNC_DAV_USER").ok() {
+        if let Ok(v) = env::var("RIME_SYNC_DAV_USER") {
             self.webdav.username = v;
         }
-        if let Some(v) = env::var("RIME_SYNC_DAV_PASS").ok() {
+        if let Ok(v) = env::var("RIME_SYNC_DAV_PASS") {
             self.webdav.password = v;
         }
         if let Some(v) = non_empty(env::var("RIME_SYNC_RIME_DIR").ok()) {
@@ -183,6 +249,19 @@ impl Config {
         self.device_id = id.clone();
         id
     }
+}
+
+/// 旧配置里 webdav.password 是非空字符串 → 需要迁移进钥匙串。
+fn has_plaintext_password(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    value
+        .get("webdav")
+        .and_then(|webdav| webdav.get("password"))
+        .and_then(|password| password.as_str())
+        .map(|password| !password.is_empty())
+        .unwrap_or(false)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -256,10 +335,15 @@ mod tests {
         let mut config = Config::default();
         config.webdav.url = "http://127.0.0.1:18080".into();
         config.webdav.password = "secret".into();
+        config.password_ref = PasswordRef::File;
         config.save(&path).expect("save");
         let loaded = Config::load(&path).expect("load");
         assert_eq!(loaded.webdav.url, "http://127.0.0.1:18080");
-        assert_eq!(loaded.webdav.password, "secret");
+        assert_eq!(loaded.password_ref, PasswordRef::File);
+        // SPEC-2 §2.2：明文密码不再落盘，只在内存里。
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("\"password\""), "{raw}");
+        assert_eq!(config.webdav.password, "secret");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -287,5 +371,67 @@ mod tests {
         let id = generate_device_id();
         assert!(!id.contains('/'));
         assert!(id.len() > 7);
+    }
+
+    #[test]
+    fn legacy_plaintext_password_is_migrated_and_removed() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-mig-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"webdav":{"url":"http://127.0.0.1:1","username":"alice","password":"legacy"}}"#,
+        )
+        .expect("write");
+        let store = crate::secret::FileStore::new(&dir.join("secrets.json"));
+        let mut config = Config::load(&path).expect("load");
+        assert!(config.legacy_password);
+        assert_eq!(config.webdav.password, "legacy");
+        assert!(config
+            .migrate_legacy_password(&store, &path)
+            .expect("migrate"));
+        assert_eq!(config.password_ref, PasswordRef::File);
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("legacy"), "{raw}");
+        assert!(!raw.contains("\"password\""));
+        let reloaded = Config::load(&path).expect("reload");
+        assert!(!reloaded.legacy_password);
+        assert_eq!(reloaded.webdav.password, "");
+        assert_eq!(store.get("alice").expect("get"), Some("legacy".to_string()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_password_prefers_memory_then_backend() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-pw-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let store = crate::secret::FileStore::new(&dir.join("secrets.json"));
+        store.set("alice", "stored").expect("set");
+        let mut config = Config::default();
+        config.webdav.username = "alice".into();
+        config.password_ref = PasswordRef::File;
+        assert_eq!(
+            config.load_password(&store).expect("load"),
+            Some("stored".into())
+        );
+        config.webdav.password = "override".into();
+        assert_eq!(
+            config.load_password(&store).expect("load"),
+            Some("override".into())
+        );
+        config.password_ref = PasswordRef::None;
+        config.webdav.password.clear();
+        assert_eq!(config.load_password(&store).expect("load"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plaintext_detection_only_looks_at_webdav_password() {
+        assert!(has_plaintext_password(r#"{"webdav":{"password":"x"}}"#));
+        assert!(!has_plaintext_password(
+            r#"{"webdav":{"password_ref":"file"}}"#
+        ));
+        assert!(!has_plaintext_password(r#"{"webdav":{"password":""}}"#));
+        assert!(!has_plaintext_password("not json"));
     }
 }

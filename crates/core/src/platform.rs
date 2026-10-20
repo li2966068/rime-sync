@@ -86,9 +86,7 @@ impl LinuxTrigger {
 impl RimeTrigger for LinuxTrigger {
     fn sync_userdb(&self, rime_dir: &Path) -> Result<()> {
         self.require(&self.dict_manager)?;
-        let rime_dir = rime_dir
-            .to_str()
-            .context("rime_dir is not valid UTF-8")?;
+        let rime_dir = rime_dir.to_str().context("rime_dir is not valid UTF-8")?;
         run(
             &self.dict_manager,
             &["--sync"],
@@ -99,9 +97,7 @@ impl RimeTrigger for LinuxTrigger {
 
     fn deploy(&self, rime_dir: &Path) -> Result<()> {
         self.require(&self.deployer)?;
-        let rime_dir = rime_dir
-            .to_str()
-            .context("rime_dir is not valid UTF-8")?;
+        let rime_dir = rime_dir.to_str().context("rime_dir is not valid UTF-8")?;
         let shared = self
             .shared_data_dir
             .to_str()
@@ -172,9 +168,9 @@ impl WeaselTrigger {
     fn exe(&self) -> Result<&Path> {
         match self.deployer.as_deref() {
             Some(path) => Ok(path),
-            None => bail!(
-                "WeaselDeployer.exe not found; install Weasel or keep transport-only mode"
-            ),
+            None => {
+                bail!("WeaselDeployer.exe not found; install Weasel or keep transport-only mode")
+            }
         }
     }
 
@@ -291,11 +287,7 @@ impl FakeTrigger {
         if let Ok(mut guard) = self.calls.lock() {
             guard.push(step.to_string());
         }
-        let fail = self
-            .fail_on
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let fail = self.fail_on.lock().ok().and_then(|guard| guard.clone());
         if fail.as_deref() == Some(step) {
             bail!("fake trigger failure at {step}");
         }

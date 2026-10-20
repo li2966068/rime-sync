@@ -66,7 +66,7 @@ pub fn classify(relative_path: &str) -> Classification {
         reason,
     };
 
-    if components.iter().any(|c| *c == ".rime-sync") {
+    if components.contains(&".rime-sync") {
         return make(Category::Private, "app state directory");
     }
     if components.iter().any(|c| c.ends_with(".userdb")) || name.ends_with(".userdb") {
@@ -75,7 +75,7 @@ pub fn classify(relative_path: &str) -> Classification {
     if name == "installation.yaml" {
         return make(Category::Private, "per-device private metadata");
     }
-    if components.iter().any(|c| *c == "build") {
+    if components.contains(&"build") {
         return make(Category::EngineArtifact, "build output");
     }
     if name.ends_with(".bin") || name.ends_with(".gram") {
@@ -173,7 +173,9 @@ pub fn assert_remote_shared_path(full_remote_path: &str) -> Result<String> {
     validate_rel_path(full_remote_path)?;
     let inner = full_remote_path
         .strip_prefix("shared/files/")
-        .ok_or_else(|| anyhow::anyhow!("shared path must start with shared/files/: {full_remote_path}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("shared path must start with shared/files/: {full_remote_path}")
+        })?;
     assert_shared_allowed(inner)?;
     Ok(inner.to_string())
 }
@@ -183,8 +185,14 @@ pub fn assert_remote_snapshot_path(full_remote_path: &str) -> Result<()> {
     validate_rel_path(full_remote_path)?;
     assert_no_userdb_dir(full_remote_path)?;
     let parts: Vec<&str> = full_remote_path.split('/').collect();
-    ensure!(parts.len() == 3, "unexpected snapshot path: {full_remote_path}");
-    ensure!(parts[0] == "sync", "snapshot must live under sync/: {full_remote_path}");
+    ensure!(
+        parts.len() == 3,
+        "unexpected snapshot path: {full_remote_path}"
+    );
+    ensure!(
+        parts[0] == "sync",
+        "snapshot must live under sync/: {full_remote_path}"
+    );
     ensure!(
         is_single_segment(parts[1]),
         "invalid device id in remote path: {full_remote_path}"
@@ -264,19 +272,31 @@ mod tests {
             Category::CustomYaml
         );
         assert_eq!(classify("user.yaml").category, Category::CustomYaml);
-        assert_eq!(classify("rime_ice.schema.yaml").category, Category::CustomYaml);
+        assert_eq!(
+            classify("rime_ice.schema.yaml").category,
+            Category::CustomYaml
+        );
         assert_eq!(classify("words.dict.yaml").category, Category::DictSource);
         assert_eq!(classify("words.txt").category, Category::DictSource);
-        assert_eq!(classify("build/main.bin").category, Category::EngineArtifact);
-        assert_eq!(classify("main.prism.bin").category, Category::EngineArtifact);
-        assert_eq!(classify("main.table.bin").category, Category::EngineArtifact);
         assert_eq!(
-            classify("main.userdb/CURRENT").category,
-            Category::LevelDb
+            classify("build/main.bin").category,
+            Category::EngineArtifact
         );
+        assert_eq!(
+            classify("main.prism.bin").category,
+            Category::EngineArtifact
+        );
+        assert_eq!(
+            classify("main.table.bin").category,
+            Category::EngineArtifact
+        );
+        assert_eq!(classify("main.userdb/CURRENT").category, Category::LevelDb);
         assert_eq!(classify("installation.yaml").category, Category::Private);
         assert_eq!(classify("sync/devA/owner.json").category, Category::Private);
-        assert_eq!(classify(".rime-sync/index.json").category, Category::Private);
+        assert_eq!(
+            classify(".rime-sync/index.json").category,
+            Category::Private
+        );
         assert_eq!(classify("README.md").category, Category::Unknown);
     }
 
