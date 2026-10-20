@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::index::{sha256_hex, FileIndex, FileMeta};
 use crate::merge3::{merge3_digests, MergeResult};
@@ -73,6 +74,7 @@ pub struct Engine {
     index: FileIndex,
     trigger: Box<dyn RimeTrigger>,
     progress: Option<ProgressSink>,
+    cancel: Option<CancelToken>,
 }
 
 impl Engine {
@@ -104,12 +106,25 @@ impl Engine {
             index,
             trigger,
             progress: None,
+            cancel: None,
         })
     }
 
     pub fn with_progress(mut self, sink: ProgressSink) -> Self {
         self.progress = Some(sink);
         self
+    }
+
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    fn cancelled(&self) -> Result<()> {
+        if let Some(token) = &self.cancel {
+            token.check()?;
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &Config {
@@ -229,6 +244,7 @@ impl Engine {
             bail!("device_id must be a single path segment: {device}");
         }
         let remote_sync = format!("sync/{device}");
+        self.cancelled()?;
 
         self.emit("pull", 0, 0, "ensure remote layout");
         self.dav.ensure_base()?;
@@ -269,6 +285,7 @@ impl Engine {
         }
         let total = dirs.len();
         for (index, dir) in dirs.iter().enumerate() {
+            self.cancelled()?;
             self.emit("pull", index, total, format!("scan {dir}"));
             let Some(name) = dir.rsplit('/').next() else {
                 continue;
@@ -333,6 +350,7 @@ impl Engine {
         collect_files(&local_root, 0, &mut files)?;
         let total = files.len();
         for (index, path) in files.iter().enumerate() {
+            self.cancelled()?;
             let Ok(relative) = path.strip_prefix(&self.rime_dir) else {
                 continue;
             };
@@ -416,6 +434,7 @@ impl Engine {
 
         let total = keys.len();
         for (index, rel) in keys.iter().enumerate() {
+            self.cancelled()?;
             plan::validate_rel_path(rel).with_context(|| format!("unsafe path: {rel}"))?;
             let class = plan::classify(rel);
             if !class.category.is_shared() || !self.config.wants(class.category) {

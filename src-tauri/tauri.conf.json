@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rime-sync",
+  "version": "0.1.0",
+  "identifier": "com.rimesync.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Rime 同步",
+        "width": 900,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "Rime 词库与配置的 WebDAV 双向同步",
+    "longDescription": "把 Rime 的用户词库快照、custom.yaml 与词典源通过用户自有的 WebDAV 在 Windows 与 Linux 之间双向同步；支持只搬运不打断输入，以及手动合并生效。",
+    "linux": {
+      "deb": {
+        "section": "utils"
+      }
+    }
+  }
+}

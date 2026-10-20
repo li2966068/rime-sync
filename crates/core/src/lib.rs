@@ -1,5 +1,6 @@
 //! rime-sync-core: Rime WebDAV 同步引擎（无 GUI 依赖）。
 
+pub mod cancel;
 pub mod config;
 pub mod engine;
 pub mod index;
@@ -9,5 +10,6 @@ pub mod platform;
 pub mod rime_dir;
 pub mod webdav;
 
+pub use cancel::CancelToken;
 pub use engine::{Engine, Progress, ProgressSink, Report};
 pub use platform::RimeTrigger;
