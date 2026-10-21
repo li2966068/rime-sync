@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::backup::BackupManager;
 use crate::cancel::CancelToken;
 use crate::config::Config;
+use crate::history::{self, HistoryEntry};
 use crate::index::{sha256_hex, FileIndex, FileMeta};
 use crate::lock::{self, LockGuard};
 use crate::merge3::{merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult};
@@ -37,6 +38,25 @@ pub struct Report {
     /// 失败退避：下一次允许尝试的时间（Unix 秒），成功后为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<u64>,
+    /// 首次接入保护（SPEC-4 §A1）：本次是首次接入。
+    #[serde(default)]
+    pub first_sync: bool,
+    /// 本次运行模式：normal / pull-only。首次接入按策略可能只拉不推。
+    #[serde(default)]
+    pub mode: String,
+    /// *.userdb.txt 词条级冲突统计；统计失败时整体降级为 null（不影响主流程）。
+    #[serde(default)]
+    pub conflict_details: Option<Vec<ConflictDetail>>,
+}
+
+/// 单份 userdb 快照的词条差异统计（只统计，不自动合并）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictDetail {
+    pub path: String,
+    pub only_local: usize,
+    pub only_remote: usize,
+    pub both_changed: usize,
+    pub sample: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +104,9 @@ pub struct Engine {
     base_dir: PathBuf,
     dav: DavClient,
     index: FileIndex,
+    /// Engine::new 时本地是否已有 index.json（首次接入判定的第一半）。
+    index_existed: bool,
+    history_path: PathBuf,
     retry: RetryState,
     retry_path: PathBuf,
     trigger: Box<dyn RimeTrigger>,
@@ -109,6 +132,7 @@ impl Engine {
             &config.webdav.remote_dir,
         )?;
         let index_path = state_dir.join("index.json");
+        let index_existed = index_path.is_file();
         let index = FileIndex::load(&index_path)?;
         let retry_path = state_dir.join("retry.json");
         let retry = RetryState::load(&retry_path).unwrap_or_default();
@@ -123,6 +147,8 @@ impl Engine {
             base_dir: state_dir.join("base"),
             dav,
             index,
+            index_existed,
+            history_path: state_dir.join("history.jsonl"),
             retry,
             retry_path,
             trigger,
@@ -163,11 +189,15 @@ impl Engine {
     }
 
     /// 只搬文件：pull → merge → push（持锁执行）。
+    ///
+    /// 首次接入（本地无 index 且远端已有数据）按 first_sync_policy 只拉不推。
     pub fn transport(&mut self) -> Report {
-        match self.lock() {
+        let report = match self.lock() {
             Ok(_guard) => self.transport_inner(),
             Err(error) => self.locked_report(error),
-        }
+        };
+        self.record_history("transport", &report);
+        report
     }
 
     fn lock(&self) -> Result<LockGuard> {
@@ -187,6 +217,8 @@ impl Engine {
         let started = Instant::now();
         let mut report = Report {
             ok: true,
+            mode: "normal".to_string(),
+            conflict_details: Some(Vec::new()),
             ..Report::default()
         };
         self.emit("start", 0, 0, "transport");
@@ -195,10 +227,13 @@ impl Engine {
             report.error = Some(format!("{error:#}"));
             tracing::error!("transport failed: {error:#}");
         }
-        if let Err(error) = self.index.save(&self.index_path) {
-            report.ok = false;
-            if report.error.is_none() {
-                report.error = Some(format!("save index: {error:#}"));
+        match self.index.save(&self.index_path) {
+            Ok(()) => self.index_existed = true,
+            Err(error) => {
+                report.ok = false;
+                if report.error.is_none() {
+                    report.error = Some(format!("save index: {error:#}"));
+                }
             }
         }
         dedupe(&mut report.conflicts);
@@ -223,6 +258,12 @@ impl Engine {
     ///
     /// 顺序：拿锁 → 备份（失败即中止）→ transport → 停输入法 → sync → deploy → 再 transport。
     pub fn apply(&mut self) -> Report {
+        let report = self.apply_inner();
+        self.record_history("apply", &report);
+        report
+    }
+
+    fn apply_inner(&mut self) -> Report {
         let started = Instant::now();
         let _guard = match self.lock() {
             Ok(guard) => guard,
@@ -340,6 +381,34 @@ impl Engine {
         let remote_sync = format!("sync/{device}");
         self.cancelled()?;
 
+        report.first_sync = self.detect_first_sync(&device)?;
+        if self.config.first_sync_policy.pull_only() {
+            // 只读策略：policy != normal 时永远只拉不推（与是否首轮无关）。
+            // 不 ensure_base / ensure_dir、不写 owner.json、不写 shared、不上传任何文件。
+            report.mode = self.config.first_sync_policy.id().to_string();
+            if report.first_sync {
+                tracing::info!(
+                    "first sync detected; policy={} -> read-only (pull only)",
+                    self.config.first_sync_policy.id()
+                );
+                self.emit("pull", 0, 0, "first sync: pull only");
+            } else {
+                tracing::debug!(
+                    "policy={} -> read-only (pull only)",
+                    self.config.first_sync_policy.id()
+                );
+            }
+            self.pull_snapshots(report)?;
+            self.sync_shared(report, true)?;
+            return Ok(());
+        }
+        if report.first_sync {
+            tracing::warn!(
+                "first sync detected but policy={} allows bidirectional sync",
+                self.config.first_sync_policy.id()
+            );
+        }
+
         self.emit("pull", 0, 0, "ensure remote layout");
         self.dav.ensure_base()?;
         self.dav.ensure_dir("sync")?;
@@ -349,9 +418,67 @@ impl Engine {
         self.write_owner(&remote_sync)?;
 
         self.pull_snapshots(report)?;
-        self.sync_shared(report)?;
+        self.sync_shared(report, false)?;
         self.push_snapshots(report)?;
         Ok(())
+    }
+
+    /// SPEC-4 §A1：首次接入 = 本地无 index.json 且远端已有别的设备目录或 shared 数据。
+    ///
+    /// 只读探测：这里不创建任何远端目录/文件。
+    fn detect_first_sync(&self, device: &str) -> Result<bool> {
+        if self.index_existed {
+            return Ok(false);
+        }
+        self.cancelled()?;
+        let entries = self.dav.propfind("sync", 1)?;
+        let mut other_devices = 0usize;
+        for entry in entries {
+            if !entry.is_dir || !entry.path.starts_with("sync/") {
+                continue;
+            }
+            let name = entry.path.rsplit('/').next().unwrap_or_default();
+            if name.is_empty() || name == device || name.starts_with('.') {
+                continue;
+            }
+            other_devices += 1;
+        }
+        let mut shared_files = 0usize;
+        if other_devices == 0 {
+            let files = self.dav.propfind("shared/files", 1)?;
+            shared_files = files.iter().filter(|entry| !entry.is_dir).count();
+            if shared_files == 0 {
+                if let Some(bytes) = self.dav.get("shared/manifest.json")? {
+                    shared_files = serde_json::from_slice::<FileIndex>(&bytes)
+                        .map(|manifest| manifest.files.len())
+                        .unwrap_or(0);
+                }
+            }
+        }
+        Ok(first_sync_needed(
+            self.index_existed,
+            other_devices,
+            shared_files,
+        ))
+    }
+
+    /// 追加一条同步历史（失败只 warn，不影响同步结果）。
+    fn record_history(&self, mode: &str, report: &Report) {
+        let entry = HistoryEntry {
+            ts: now_secs(),
+            mode: mode.to_string(),
+            ok: report.ok,
+            pulled: report.pulled,
+            pushed: report.pushed,
+            merged: report.merged,
+            conflicts: report.conflicts.len(),
+            duration_ms: report.duration_ms,
+            backup_id: report.backup_id.clone(),
+            error: report.error.clone(),
+        };
+        if let Err(error) = history::append(&self.history_path, &entry) {
+            tracing::warn!("append history {}: {error:#}", self.history_path.display());
+        }
     }
 
     fn write_owner(&self, remote_sync: &str) -> Result<()> {
@@ -420,17 +547,45 @@ impl Engine {
                 let Some(bytes) = self.dav.get(&entry.path)? else {
                     continue;
                 };
-                if fs::read(&local)
-                    .map(|current| current == bytes)
-                    .unwrap_or(false)
-                {
-                    continue;
+                if let Ok(current) = fs::read(&local) {
+                    if current == bytes {
+                        continue;
+                    }
+                    if entry.path.ends_with(".userdb.txt") {
+                        self.note_userdb_conflict(&entry.path, &current, &bytes, report);
+                    }
                 }
                 write_bytes(&local, &bytes)?;
                 report.pulled += 1;
             }
         }
         Ok(())
+    }
+
+    /// SPEC-4 §A5：只统计两侧 *.userdb.txt 的词条差异，绝不自动合并。
+    fn note_userdb_conflict(&self, path: &str, local: &[u8], remote: &[u8], report: &mut Report) {
+        if report.conflict_details.is_none() {
+            return;
+        }
+        match crate::userdb::diff_stats(local, remote) {
+            Some(stats) => {
+                let details = report.conflict_details.get_or_insert_with(Vec::new);
+                if !details.iter().any(|item| item.path == path) {
+                    details.push(ConflictDetail {
+                        path: path.to_string(),
+                        only_local: stats.only_local,
+                        only_remote: stats.only_remote,
+                        both_changed: stats.both_changed,
+                        sample: stats.sample,
+                    });
+                }
+            }
+            None => {
+                // 统计失败 → 降级为 null，主流程继续。
+                tracing::debug!("userdb stats unavailable for {path}; conflict_details=null");
+                report.conflict_details = None;
+            }
+        }
     }
 
     fn push_snapshots(&mut self, report: &mut Report) -> Result<()> {
@@ -499,7 +654,8 @@ impl Engine {
         Ok(())
     }
 
-    fn sync_shared(&mut self, report: &mut Report) -> Result<()> {
+    /// read_only=true 时只做远端 -> 本地方向的合并，绝不 PUT / MKCOL / DELETE。
+    fn sync_shared(&mut self, report: &mut Report, read_only: bool) -> Result<()> {
         let manifest_bytes = self.dav.get("shared/manifest.json")?;
         let mut manifest = match &manifest_bytes {
             Some(bytes) => {
@@ -573,6 +729,12 @@ impl Engine {
                     }
                 }
                 MergeResult::TakeLocal => {
+                    if read_only {
+                        report
+                            .skipped
+                            .push(format!("{rel}: read-only policy, local change not pushed"));
+                        continue;
+                    }
                     let bytes =
                         local_bytes.ok_or_else(|| anyhow!("local file disappeared: {rel}"))?;
                     let if_match = remote_meta.as_ref().and_then(|meta| meta.etag.as_deref());
@@ -617,7 +779,8 @@ impl Engine {
                 }
                 MergeResult::Conflict => {
                     // *.custom.yaml 先试段落级合并；任何不适配都静默回落文件级冲突。
-                    if rel.ends_with(".custom.yaml")
+                    if !read_only
+                        && rel.ends_with(".custom.yaml")
                         && self.merge_custom_yaml(
                             rel,
                             local_bytes.as_deref(),
@@ -646,6 +809,12 @@ impl Engine {
                     report.merged += 1;
                 }
                 MergeResult::LocalDeleted => {
+                    if read_only {
+                        report.skipped.push(format!(
+                            "{rel}: read-only policy, remote deletion not propagated"
+                        ));
+                        continue;
+                    }
                     self.dav.delete(&format!("shared/files/{rel}"))?;
                     manifest.files.remove(rel);
                     self.index.files.remove(rel);
@@ -660,9 +829,11 @@ impl Engine {
             }
         }
 
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        if manifest_bytes.as_deref() != Some(bytes.as_slice()) {
-            self.dav.put("shared/manifest.json", &bytes, None)?;
+        if !read_only {
+            let bytes = serde_json::to_vec_pretty(&manifest)?;
+            if manifest_bytes.as_deref() != Some(bytes.as_slice()) {
+                self.dav.put("shared/manifest.json", &bytes, None)?;
+            }
         }
         Ok(())
     }
@@ -840,6 +1011,11 @@ impl Engine {
     }
 }
 
+/// SPEC-4 §A1 判定核心：本地无基线，且远端已有别的设备目录或 shared 文件。
+pub fn first_sync_needed(index_existed: bool, other_devices: usize, shared_files: usize) -> bool {
+    !index_existed && (other_devices > 0 || shared_files > 0)
+}
+
 fn is_hex_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -948,10 +1124,45 @@ mod tests {
             error: None,
             backup_id: Some("20240101-000000".into()),
             next_retry_at: Some(1_700_000_000),
+            first_sync: true,
+            mode: "pull-only".into(),
+            conflict_details: Some(vec![ConflictDetail {
+                path: "sync/devB/main.userdb.txt".into(),
+                only_local: 1,
+                only_remote: 2,
+                both_changed: 3,
+                sample: vec!["-a".into()],
+            }]),
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);
         assert_eq!(json["conflicts"][0], "a");
         assert_eq!(json["backup_id"], "20240101-000000");
+        assert_eq!(json["first_sync"], true);
+        assert_eq!(json["mode"], "pull-only");
+        assert_eq!(json["conflict_details"][0]["both_changed"], 3);
+    }
+
+    #[test]
+    fn first_sync_needs_missing_index_and_remote_data() {
+        // (本地有 index, 其他设备目录数, shared 文件数) → 是否首次接入
+        assert!(first_sync_needed(false, 1, 0), "no index + other device");
+        assert!(first_sync_needed(false, 0, 3), "no index + shared files");
+        assert!(
+            !first_sync_needed(false, 0, 0),
+            "no index but empty remote is a fresh start, not first sync"
+        );
+        assert!(
+            !first_sync_needed(true, 1, 5),
+            "existing index means not first sync"
+        );
+    }
+
+    #[test]
+    fn pull_only_policy_covers_preview_and_pull_only() {
+        use crate::config::FirstSyncPolicy;
+        assert!(FirstSyncPolicy::Preview.pull_only());
+        assert!(FirstSyncPolicy::PullOnly.pull_only());
+        assert!(!FirstSyncPolicy::Normal.pull_only());
     }
 }

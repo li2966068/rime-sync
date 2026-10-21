@@ -156,6 +156,13 @@ export const en: Record<keyof Dict, string> = {
   "sync.startedTransport": "Transfer started",
   "sync.startedApply": "Merge & apply started",
   "sync.lastBackup": "Latest backup {id}",
+  "sync.modePullOnly": "Pull-only this run · mode={mode} · pushed={pushed} (nothing uploaded or overwritten)",
+
+  "firstSync.title": "Read-only protection",
+  "firstSync.body": "Read-only protection is active: this device only pulls from the remote and never uploads or overwrites it. Switch to two-way sync once you have confirmed the remote content is correct.",
+  "firstSync.switch": "Switch to two-way sync (normal)",
+  "firstSync.switched": "Switched to two-way sync (normal)",
+  "firstSync.switchFail": "Could not switch: {error}",
 
   "conflicts.title": "Conflicts",
   "conflicts.desc": "When a file changed on both sides, a .conflict-* copy is created. Choose which side to keep.",

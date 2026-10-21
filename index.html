@@ -26,6 +26,15 @@
         <div class="busy" id="busy" hidden><span class="spinner" aria-hidden="true"></span><span id="busy-text">同步中…</span></div>
       </header>
 
+      <div class="first-sync-banner" id="first-sync-banner" role="status" hidden>
+        <div class="first-sync-copy">
+          <strong data-i18n="firstSync.title">只读保护中</strong>
+          <p data-i18n="firstSync.body"></p>
+          <p class="first-sync-error" id="first-sync-error" hidden></p>
+        </div>
+        <button class="primary" id="btn-first-sync-normal" type="button" data-i18n="firstSync.switch"></button>
+      </div>
+
       <main class="content">
         <section class="panel is-active" id="panel-connection" role="tabpanel">
           <div class="panel-head">
@@ -133,6 +142,7 @@
               <div class="report-item"><span class="label" data-i18n="sync.conflicts">冲突</span><span class="value" id="report-conflicts">0</span></div>
               <div class="report-item"><span class="label" data-i18n="sync.duration">耗时</span><span class="value" id="report-duration">—</span></div>
               <div class="report-item wide backup"><span class="label" data-i18n="sync.backup">备份</span><span class="value mono" id="report-backup">—</span></div>
+              <div class="report-mode" id="report-mode" hidden></div>
               <div class="report-note" id="report-note" hidden></div>
             </div>
           </div>

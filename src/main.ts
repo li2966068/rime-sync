@@ -69,7 +69,12 @@ const el = {
   reportConflicts: byId<HTMLSpanElement>("report-conflicts"),
   reportDuration: byId<HTMLSpanElement>("report-duration"),
   reportBackup: byId<HTMLSpanElement>("report-backup"),
+  reportMode: byId<HTMLDivElement>("report-mode"),
   reportNote: byId<HTMLDivElement>("report-note"),
+
+  firstSyncBanner: byId<HTMLDivElement>("first-sync-banner"),
+  firstSyncError: byId<HTMLParagraphElement>("first-sync-error"),
+  firstSyncSwitch: byId<HTMLButtonElement>("btn-first-sync-normal"),
 
   log: byId<HTMLPreElement>("log"),
   refreshLog: byId<HTMLButtonElement>("btn-refresh-log"),
@@ -330,6 +335,43 @@ function renderConfig(next: Config): void {
   el.excludes.value = next.exclude_globs.join("\n");
   el.stopFcitx5.checked = next.stop_fcitx5_during_apply;
   el.footerConfig.textContent = next.device_id ? t("footer.device", { id: next.device_id }) : "";
+  renderFirstSyncBanner();
+}
+
+/* ---------- 首同步保护（SPEC-4 §A1） ---------- */
+
+function renderFirstSyncBanner(): void {
+  // 字段缺失时按后端默认值 preview 处理（宁可按只读展示，也不静默放开上传）。
+  const policy = config?.first_sync_policy ?? "preview";
+  const visible = config !== null && policy !== "normal";
+  el.firstSyncBanner.hidden = !visible;
+  el.firstSyncSwitch.disabled = !visible || busy;
+  if (!visible) {
+    el.firstSyncError.hidden = true;
+    el.firstSyncError.textContent = "";
+  }
+}
+
+async function switchToTwoWay(): Promise<void> {
+  if (!config || busy) {
+    return;
+  }
+  // 只改 first_sync_policy；其余字段（含 schema_version / password_ref）原样写回。
+  const draft: Config = { ...config, first_sync_policy: "normal" };
+  el.firstSyncSwitch.disabled = true;
+  try {
+    const saved = await api.setConfig(draft);
+    renderConfig(saved);
+    toast(t("firstSync.switched"));
+    localLog(t("firstSync.switched"));
+  } catch (error) {
+    const text = errorText(error);
+    el.firstSyncError.textContent = t("firstSync.switchFail", { error: text });
+    el.firstSyncError.hidden = false;
+    toast(t("firstSync.switchFail", { error: text }));
+    localLog(t("firstSync.switchFail", { error: text }));
+    el.firstSyncSwitch.disabled = false;
+  }
 }
 
 function requireConfig(): Config {
@@ -427,6 +469,13 @@ function renderReport(report: Report): void {
   el.reportDuration.textContent = report.duration_ms + " ms";
   el.reportBackup.textContent = report.backup_id ?? t("sync.none");
 
+  const mode = report.mode ?? "";
+  const pullOnly = mode === "preview" || mode === "pull-only";
+  el.reportMode.hidden = !pullOnly;
+  el.reportMode.textContent = pullOnly
+    ? t("sync.modePullOnly", { mode, pushed: report.pushed })
+    : "";
+
   const notes: string[] = [];
   if (report.error) {
     notes.push(t("sync.reportError", { error: report.error }));
@@ -469,6 +518,7 @@ function setBusy(value: boolean, label = t("busy.default")): void {
   el.probe.disabled = value;
   el.conflictsKeepAll.disabled = value;
   el.conflictsTakeAll.disabled = value;
+  el.firstSyncSwitch.disabled = value || !config || config.first_sync_policy === "normal";
 }
 
 async function run(mode: "transport" | "apply", automatic = false): Promise<void> {
@@ -1537,6 +1587,9 @@ function bindEvents(): void {
   el.watchToggle.addEventListener("change", () => {
     void toggleWatch(el.watchToggle.checked);
   });
+  el.firstSyncSwitch.addEventListener("click", () => {
+    void switchToTwoWay();
+  });
   el.transport.addEventListener("click", () => {
     void run("transport");
   });
@@ -1751,6 +1804,7 @@ function refreshLanguageDependent(): void {
   el.rimeDirSource.textContent = config?.rime_dir ? t("sync.saved") : t("sync.notDetected");
   el.progressLabel.textContent = t("sync.progressWaiting");
   el.conflictsCount.textContent = t("conflicts.count", { count: conflicts.length });
+  renderFirstSyncBanner();
   renderWatch();
   renderConflictList();
   renderDevices();

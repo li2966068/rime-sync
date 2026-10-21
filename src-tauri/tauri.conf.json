@@ -31,7 +31,7 @@
       "endpoints": [
         "https://REPLACE-ME.example.com/rime-sync/{{target}}/{{arch}}/{{current_version}}"
       ],
-      "pubkey": "REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExRkRGNEUzRkUzQTBGMjcKUldRbkR6cis0L1Q5b2NPVmIzd2h1TWswT2NlVlcrbGdGRlRvODJuNWZMc0F6TStGMWd4NkQrOWQK",
       "windows": {
         "installMode": "passive"
       }

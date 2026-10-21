@@ -27,6 +27,9 @@ packaging/out/
 *.pem
 *.key
 
+# 更新签名私钥（SPEC-4 §B1：只存本地与 GitHub Secrets，绝不入库）
+.secrets/
+
 # 系统噪音
 *.log
 .DS_Store

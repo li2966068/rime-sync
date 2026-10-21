@@ -5,8 +5,10 @@ use clap::{Parser, Subcommand};
 use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};
 use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
+use rime_sync_core::history;
 use rime_sync_core::index::FileIndex;
 use rime_sync_core::lock;
+use rime_sync_core::log;
 use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::plan;
 use rime_sync_core::platform;
@@ -81,6 +83,12 @@ enum Command {
     },
     /// 写权限探测（MKCOL → PUT → DELETE）
     Probe,
+    /// 查看同步历史（history.jsonl，最多 500 条）
+    History {
+        /// 只显示最近 N 条
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -183,6 +191,7 @@ fn run(cli: Cli) -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
+    init_logging(&config_path);
     let mut stored = Config::load(&config_path)?;
     let mut config = stored.clone();
     config.apply_env();
@@ -205,20 +214,23 @@ fn run(cli: Cli) -> Result<()> {
 
     let app_data = state_dir(&config_path);
     let secrets = secret::detect(&app_data);
-    if config.legacy_password {
-        match config.migrate_legacy_password(secrets.store.as_ref(), &config_path) {
-            Ok(true) => {
+    if config.legacy_password || config.schema_version < config::CONFIG_SCHEMA_VERSION {
+        match config.migrate(secrets.store.as_ref(), &config_path) {
+            Ok(report) if report.changed => {
                 stored.legacy_password = false;
                 stored.password_ref = config.password_ref;
+                stored.schema_version = config.schema_version;
                 if !cli.json {
                     eprintln!(
-                        "已把 config.json 中的明文密码迁移到 {} 后端并删除该字段",
+                        "config schema v{} -> v{} 迁移完成（密码后端 {}）",
+                        report.from,
+                        report.to,
                         secrets.backend.as_str()
                     );
                 }
             }
-            Ok(false) => {}
-            Err(error) => eprintln!("warning: 明文密码迁移失败: {error:#}"),
+            Ok(_) => {}
+            Err(error) => eprintln!("warning: 配置迁移失败（原文件保留）: {error:#}"),
         }
     }
     if let Err(error) = config.load_password(secrets.store.as_ref()) {
@@ -492,6 +504,29 @@ fn run(cli: Cli) -> Result<()> {
                 Err(anyhow::Error::new(ProbeFailed))
             }
         }
+        Command::History { limit } => {
+            let entries = history::read(&state_dir(&config_path).join("history.jsonl"), limit)?;
+            if cli.json {
+                print_json(&entries)
+            } else {
+                for entry in &entries {
+                    println!(
+                        "ts={} mode={} ok={} pulled={} pushed={} merged={} conflicts={} duration={}ms backup={} error={}",
+                        entry.ts,
+                        entry.mode,
+                        entry.ok,
+                        entry.pulled,
+                        entry.pushed,
+                        entry.merged,
+                        entry.conflicts,
+                        entry.duration_ms,
+                        entry.backup_id.as_deref().unwrap_or("-"),
+                        entry.error.as_deref().unwrap_or("-")
+                    );
+                }
+                Ok(())
+            }
+        }
         Command::Transport | Command::Apply => {
             let detection = prepare_sync(
                 &mut config,
@@ -644,10 +679,30 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn init_logging(config_path: &Path) {
+    let path = state_dir(config_path).join("log.txt");
+    let log = std::sync::Arc::new(log::RotatingLog::new(
+        path,
+        log::DEFAULT_MAX_BYTES,
+        log::DEFAULT_KEEP,
+    ));
+    let writer = log::LogWriter::new(log);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // 日志初始化失败（例如同进程重复调用）不影响命令本身。
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(move || writer.clone())
+        .try_init();
+}
+
 fn print_report(report: &Report) {
     println!(
-        "ok={} pulled={} pushed={} merged={} conflicts={} skipped={} duration={}ms backup={}",
+        "ok={} mode={} first_sync={} pulled={} pushed={} merged={} conflicts={} skipped={} duration={}ms backup={}",
         report.ok,
+        if report.mode.is_empty() { "-" } else { report.mode.as_str() },
+        report.first_sync,
         report.pulled,
         report.pushed,
         report.merged,
@@ -656,6 +711,14 @@ fn print_report(report: &Report) {
         report.duration_ms,
         report.backup_id.as_deref().unwrap_or("-")
     );
+    if let Some(details) = &report.conflict_details {
+        for detail in details {
+            eprintln!(
+                "conflict-detail: {} only_local={} only_remote={} both_changed={}",
+                detail.path, detail.only_local, detail.only_remote, detail.both_changed
+            );
+        }
+    }
     if let Some(next) = report.next_retry_at {
         eprintln!("next_retry_at: {next}");
     }

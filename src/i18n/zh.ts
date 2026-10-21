@@ -153,6 +153,13 @@ export const zh = {
   "sync.startedTransport": "开始搬运",
   "sync.startedApply": "开始合并生效",
   "sync.lastBackup": "最近一次备份 {id}",
+  "sync.modePullOnly": "本次只拉不推 · mode={mode} · pushed={pushed}（未上传/覆盖远端）",
+
+  "firstSync.title": "只读保护中",
+  "firstSync.body": "当前处于只读保护：只从远端拉取，不会上传/覆盖远端；确认远端内容无误后再切换为双向同步。",
+  "firstSync.switch": "切换为双向同步（normal）",
+  "firstSync.switched": "已切换为双向同步（normal）",
+  "firstSync.switchFail": "切换失败：{error}",
 
   "conflicts.title": "冲突",
   "conflicts.desc": "文件在两端同时改动时会生成 .conflict-* 副本；逐条选择保留哪一侧。",

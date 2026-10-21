@@ -13,14 +13,19 @@ export interface SyncKinds {
   dict_sources: boolean;
 }
 
+export type FirstSyncPolicy = "preview" | "pull-only" | "normal";
+
 export interface Config {
   webdav: WebDavConfig;
+  password_ref: "keyring" | "file" | "none";
   rime_dir: string | null;
   device_id: string;
   transport_interval_minutes: number;
   sync_kinds: SyncKinds;
   exclude_globs: string[];
   stop_fcitx5_during_apply: boolean;
+  schema_version: number;
+  first_sync_policy: FirstSyncPolicy;
 }
 
 export interface Report {
@@ -33,6 +38,15 @@ export interface Report {
   ok: boolean;
   error: string | null;
   backup_id?: string | null;
+  first_sync?: boolean;
+  mode?: string;
+  conflict_details?: {
+    path: string;
+    only_local: number;
+    only_remote: number;
+    both_changed: number;
+    sample: string[];
+  }[];
 }
 
 export interface Progress {

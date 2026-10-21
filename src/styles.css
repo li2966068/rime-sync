@@ -245,6 +245,30 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 .status.ok { background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 35%, transparent); color: var(--ok); }
 .status.err { background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 35%, transparent); color: var(--danger); }
 
+/* ---------- first-sync protection banner (SPEC-4 §A1) ---------- */
+.first-sync-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 12px 20px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12px;
+}
+.first-sync-copy { min-width: 0; }
+.first-sync-copy strong { display: block; font-size: 13px; }
+.first-sync-copy p { margin: 3px 0 0; line-height: 1.5; }
+.first-sync-error { font-weight: 600; word-break: break-all; }
+.first-sync-banner button { flex: 0 0 auto; }
+@media (max-width: 620px) {
+  .first-sync-banner { flex-direction: column; align-items: stretch; }
+}
+
 .remote-list {
   margin-top: 12px;
   border: 1px solid var(--border);
@@ -283,6 +307,7 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 .report-item .value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .report-item.wide { grid-column: span 1; }
 .report-note { grid-column: 1 / -1; margin-top: 2px; font-size: 11px; color: var(--danger); white-space: pre-wrap; word-break: break-all; }
+.report-mode { grid-column: 1 / -1; margin-top: 2px; font-size: 11px; color: var(--warn); white-space: pre-wrap; }
 
 /* ---------- log ---------- */
 .log-card { padding: 0; overflow: hidden; }

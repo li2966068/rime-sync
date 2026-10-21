@@ -11,6 +11,43 @@ use crate::plan::Category;
 use crate::rime_dir;
 use crate::secret::SecretStore;
 
+/// config.json 当前 schema 版本（SPEC-4 §A4）。
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+/// 首次接入策略：preview=只拉不推并提示；pull-only=只拉不推；normal=双向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirstSyncPolicy {
+    #[default]
+    Preview,
+    PullOnly,
+    Normal,
+}
+
+impl FirstSyncPolicy {
+    pub fn id(&self) -> &'static str {
+        match self {
+            FirstSyncPolicy::Preview => "preview",
+            FirstSyncPolicy::PullOnly => "pull-only",
+            FirstSyncPolicy::Normal => "normal",
+        }
+    }
+
+    /// preview / pull-only 在首次接入时都只拉不推。
+    pub fn pull_only(&self) -> bool {
+        !matches!(self, FirstSyncPolicy::Normal)
+    }
+}
+
+/// 一次 schema 迁移的结果（幂等：已是最新时 changed=false）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationReport {
+    pub from: u32,
+    pub to: u32,
+    pub changed: bool,
+    pub password_migrated: bool,
+}
+
 /// 密码存放位置。None = 尚未设置（或旧配置还没迁移）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,9 +110,16 @@ pub struct Config {
     pub sync_kinds: SyncKinds,
     pub exclude_globs: Vec<String>,
     pub stop_fcitx5_during_apply: bool,
+    /// 配置 schema 版本（写入文件；缺失按 v1 处理）。
+    pub schema_version: u32,
+    /// 首次接入策略，默认 preview（只拉不推）。
+    pub first_sync_policy: FirstSyncPolicy,
     /// 旧版配置里读到明文 password：迁移后清掉。
     #[serde(skip)]
     pub legacy_password: bool,
+    /// 从原始 JSON 探测到的文件版本（不落盘）。
+    #[serde(skip)]
+    pub schema_detected: u32,
 }
 
 impl Default for Config {
@@ -89,7 +133,10 @@ impl Default for Config {
             sync_kinds: SyncKinds::default(),
             exclude_globs: Vec::new(),
             stop_fcitx5_during_apply: true,
+            schema_version: CONFIG_SCHEMA_VERSION,
+            first_sync_policy: FirstSyncPolicy::default(),
             legacy_password: false,
+            schema_detected: CONFIG_SCHEMA_VERSION,
         }
     }
 }
@@ -101,6 +148,8 @@ impl Config {
                 let mut config: Self = serde_json::from_str(&text)
                     .with_context(|| format!("parse config {}", path.display()))?;
                 config.legacy_password = has_plaintext_password(&text);
+                config.schema_detected = detected_schema_version(&text);
+                config.schema_version = config.schema_detected;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -149,6 +198,59 @@ impl Config {
         }
         self.save(path)?;
         Ok(true)
+    }
+
+    /// SPEC-4 §A4：v1（无 schema_version / 明文密码）→ v2。
+    ///
+    /// 幂等：已是最新版本且无明文密码时不写盘。迁移失败时原文件保持不变，
+    /// 错误信息里明确说明这一点（绝不静默丢配置）。
+    pub fn migrate(&mut self, store: &dyn SecretStore, path: &Path) -> Result<MigrationReport> {
+        let from = self.schema_version;
+        if from > CONFIG_SCHEMA_VERSION {
+            bail!(
+                "config schema_version {from} is newer than supported {CONFIG_SCHEMA_VERSION}; original file kept: {}",
+                path.display()
+            );
+        }
+        let mut report = MigrationReport {
+            from,
+            to: CONFIG_SCHEMA_VERSION,
+            changed: false,
+            password_migrated: false,
+        };
+        if self.legacy_password {
+            let password = self.webdav.password.clone();
+            if !password.is_empty() {
+                store
+                    .set(&self.password_account(), &password)
+                    .with_context(|| {
+                        format!(
+                            "migrate {} to schema v{CONFIG_SCHEMA_VERSION}: store password in {} failed; original config kept",
+                            path.display(),
+                            store.backend().as_str()
+                        )
+                    })?;
+                self.password_ref = store.backend().password_ref();
+                report.password_migrated = true;
+            }
+            report.changed = true;
+        }
+        if from < CONFIG_SCHEMA_VERSION {
+            self.schema_version = CONFIG_SCHEMA_VERSION;
+            report.changed = true;
+        }
+        if !report.changed {
+            return Ok(report);
+        }
+        self.save(path).with_context(|| {
+            format!(
+                "write migrated config {} (schema v{from} -> v{CONFIG_SCHEMA_VERSION}); original config kept",
+                path.display()
+            )
+        })?;
+        self.legacy_password = false;
+        self.schema_detected = CONFIG_SCHEMA_VERSION;
+        Ok(report)
     }
 
     /// 含密码，落盘必须是 0600。
@@ -272,6 +374,19 @@ fn has_plaintext_password(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 原始 JSON 里的 schema_version；缺失 = v1。
+fn detected_schema_version(text: &str) -> u32 {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("schema_version")
+                .and_then(|version| version.as_u64())
+        })
+        .map(|version| version as u32)
+        .unwrap_or(1)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
 }
@@ -333,7 +448,102 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::SecretBackend;
     use std::io::Write;
+
+    struct FailingStore;
+
+    impl SecretStore for FailingStore {
+        fn backend(&self) -> SecretBackend {
+            SecretBackend::File
+        }
+
+        fn get(&self, _account: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn set(&self, _account: &str, _secret: &str) -> Result<()> {
+            bail!("secret backend is locked")
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn v1_config_migrates_to_v2_idempotently() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-schema-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"webdav":{"url":"http://127.0.0.1:1","username":"alice","password":"legacy"}}"#,
+        )
+        .expect("write");
+        let store = crate::secret::FileStore::new(&dir.join("secrets.json"));
+        let mut config = Config::load(&path).expect("load");
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.first_sync_policy, FirstSyncPolicy::Preview);
+
+        let report = config.migrate(&store, &path).expect("migrate");
+        assert_eq!(report.from, 1);
+        assert_eq!(report.to, CONFIG_SCHEMA_VERSION);
+        assert!(report.changed);
+        assert!(report.password_migrated);
+        let migrated = fs::read_to_string(&path).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&migrated).expect("json");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["first_sync_policy"], "preview");
+        assert!(value["webdav"].get("password").is_none());
+        assert!(!migrated.contains("legacy"));
+
+        let mut reloaded = Config::load(&path).expect("reload");
+        assert_eq!(reloaded.schema_version, 2);
+        let again = reloaded.migrate(&store, &path).expect("migrate twice");
+        assert!(!again.changed);
+        assert!(!again.password_migrated);
+        assert_eq!(fs::read_to_string(&path).expect("read again"), migrated);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_failure_keeps_original_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rime-sync-schema-fail-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        let original =
+            r#"{"webdav":{"url":"http://127.0.0.1:1","username":"alice","password":"legacy"}}"#;
+        fs::write(&path, original).expect("write");
+        let mut config = Config::load(&path).expect("load");
+        let error = config.migrate(&FailingStore, &path).expect_err("must fail");
+        assert!(format!("{error:#}").contains("original config kept"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_without_writing() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-schema-new-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        let original = r#"{"schema_version":9,"webdav":{"url":"http://127.0.0.1:1"}}"#;
+        fs::write(&path, original).expect("write");
+        let store = crate::secret::FileStore::new(&dir.join("secrets.json"));
+        let mut config = Config::load(&path).expect("load");
+        assert_eq!(config.schema_version, 9);
+        assert!(config.migrate(&store, &path).is_err());
+        assert_eq!(fs::read_to_string(&path).expect("read"), original);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_schema_version_is_v1() {
+        assert_eq!(detected_schema_version(r#"{"a":1}"#), 1);
+        assert_eq!(detected_schema_version(r#"{"schema_version":2}"#), 2);
+        assert_eq!(detected_schema_version("not json"), 1);
+    }
 
     #[test]
     fn save_sets_0600_and_roundtrips() {

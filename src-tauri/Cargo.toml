@@ -14,10 +14,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon：v2 的托盘在 tauri 本体里，feature 为 tray-icon（Linux 依赖 libayatana-appindicator3）。
+# image-png：托盘图标从 PNG 解码（icons/32x32.png）。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # 自动更新：与 tauri 2.12.4 对齐（插件 2.14.0 的 tauri 依赖为 ^2.12）。
 # 前端调用前需在 <src-tauri>/capabilities 中补 "updater:default" 权限（由 UI 模块负责）。
 tauri-plugin-updater = "2.14"
+# 开机自启：2.7.0 的 tauri 依赖为 ^2.12，与 tauri 2.12.4 对齐（2.6.0 亦可，2.5.x 只要求 ^2.8.2）。
+tauri-plugin-autostart = "2.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -25,7 +29,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rime-sync-core = { path = "../crates/core" }
 
 [profile.release]
+# SPEC-4 §B4：瘦身。strip 去掉符号表，thin LTO 兼顾体积与构建时长，
+# opt-level="s" 优先体积；codegen-units=1 让 LTO 发挥最大效果。
+strip = true
+lto = "thin"
 codegen-units = 1
+opt-level = "s"
 panic = "abort"
 
 [workspace]

@@ -20,11 +20,14 @@ use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod autostart_cmds;
 mod backup_cmds;
 mod conflict_cmds;
 mod device_cmds;
 mod diagnostics;
+mod platform_prefs;
 mod preset_cmds;
+mod tray;
 mod update_cmds;
 mod watch_cmds;
 
@@ -734,11 +737,47 @@ fn first_transport(
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 开机自启（SPEC-4 §B3）：带 --minimized 自启时静默进托盘。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .manage(AppState::default())
         .setup(|app| {
+            let handle = app.handle().clone();
             let state = app.state::<AppState>();
             push_log(&state.0, "Rime 同步已启动");
+            // 托盘在 headless / 缺 appindicator 时会创建失败：只降级记日志，不 panic。
+            match tray::setup(&handle) {
+                Ok(()) => push_log(&state.0, "托盘已就绪（关闭窗口默认隐藏到托盘）"),
+                Err(error) => push_log(
+                    &state.0,
+                    format!("托盘不可用，关闭窗口将直接退出：{error}"),
+                ),
+            }
+            if std::env::args().any(|arg| arg == "--minimized") && tray::ready() {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.hide();
+                    push_log(&state.0, "以 --minimized 启动：已隐藏到托盘");
+                }
+            }
             Ok(())
+        })
+        // SPEC-4 §B2：关闭窗口默认隐藏到托盘；托盘不可用或 close_to_tray=false 时放行退出。
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            if window.label() != "main" {
+                return;
+            }
+            let app = window.app_handle();
+            let state = app.state::<AppState>();
+            if platform_prefs::should_hide_on_close(app, &state.0) {
+                api.prevent_close();
+                let _ = window.hide();
+                push_log(&state.0, "窗口已隐藏到托盘（托盘菜单「退出」才真正退出）");
+            }
         })
         .invoke_handler(tauri::generate_handler![
             cmd_get_config,
@@ -769,7 +808,12 @@ pub fn run() {
             watch_cmds::cmd_watch_stop,
             watch_cmds::cmd_watch_status,
             update_cmds::cmd_check_update,
-            update_cmds::cmd_install_update
+            update_cmds::cmd_install_update,
+            tray::cmd_tray_status,
+            autostart_cmds::cmd_get_autostart,
+            autostart_cmds::cmd_set_autostart,
+            platform_prefs::cmd_get_close_to_tray,
+            platform_prefs::cmd_set_close_to_tray
         ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {
