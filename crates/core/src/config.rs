@@ -37,6 +37,16 @@ impl FirstSyncPolicy {
     pub fn pull_only(&self) -> bool {
         !matches!(self, FirstSyncPolicy::Normal)
     }
+
+    /// 解析配置/环境里的取值；未知取值返回 None（调用方保持原值）。
+    pub fn from_id(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "preview" => Some(Self::Preview),
+            "pull-only" | "pull_only" => Some(Self::PullOnly),
+            "normal" => Some(Self::Normal),
+            _ => None,
+        }
+    }
 }
 
 /// 一次 schema 迁移的结果（幂等：已是最新时 changed=false）。
@@ -294,6 +304,11 @@ impl Config {
         if let Ok(v) = env::var("RIME_SYNC_DAV_DIR") {
             self.webdav.remote_dir = v.trim().to_string();
         }
+        if let Some(v) = non_empty(env::var("RIME_SYNC_FIRST_SYNC_POLICY").ok()) {
+            if let Some(policy) = FirstSyncPolicy::from_id(&v) {
+                self.first_sync_policy = policy;
+            }
+        }
     }
 
     pub fn apply_overrides(
@@ -536,6 +551,23 @@ mod tests {
         assert!(config.migrate(&store, &path).is_err());
         assert_eq!(fs::read_to_string(&path).expect("read"), original);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_sync_policy_from_id_roundtrips() {
+        assert_eq!(
+            FirstSyncPolicy::from_id("preview"),
+            Some(FirstSyncPolicy::Preview)
+        );
+        assert_eq!(
+            FirstSyncPolicy::from_id(" Pull-Only "),
+            Some(FirstSyncPolicy::PullOnly)
+        );
+        assert_eq!(
+            FirstSyncPolicy::from_id("normal"),
+            Some(FirstSyncPolicy::Normal)
+        );
+        assert_eq!(FirstSyncPolicy::from_id("bogus"), None);
     }
 
     #[test]

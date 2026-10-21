@@ -98,6 +98,8 @@ export RIME_SYNC_DAV_URL="http://$DAV_ADDR/"
 export RIME_SYNC_DAV_USER="$DAV_USER"
 export RIME_SYNC_DAV_PASS="$DAV_PASS"
 export RIME_SYNC_RIME_DIR="$RIME"
+# SPEC-4 §A1：默认 preview 是只读的；e2e 要验证双向搬运，显式切 normal。
+export RIME_SYNC_FIRST_SYNC_POLICY="normal"
 
 remote_paths() {
   (cd "$REMOTE" && find . -type f | sort)
