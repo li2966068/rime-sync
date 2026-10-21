@@ -2,6 +2,28 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.3.0 — 2026-10-21
+
+本轮聚焦「首次接入安全 + 可运维性 + 桌面常驻」：
+
+1. **首同步保护（默认安全，粘性）**：本地无 `index.json` 且远端已有别的设备或 `shared/` 数据时判定首次接入；
+   `first_sync_policy` 默认 `preview`，只要不是 `normal`，每一轮 transport 都只拉不推——不建远端目录、
+   不写 `owner.json`、不碰 `shared/`、不上传任何文件，同时照常拉取设备快照与 shared 文件。
+   只有用户在界面点「切换为双向同步」才写入 `normal`。
+2. **同步历史**：每次 transport/apply 追加 `history.jsonl`（ts/mode/ok/pulled/pushed/merged/conflicts/duration_ms/backup_id/error），
+   上限 500 条；新增 `history --limit N --json`。
+3. **日志轮转**：`log.txt` 单文件 5 MB，保留 3 份；轮转失败不影响同步。
+4. **配置 schema v2**：新增 `schema_version` 与 `first_sync_policy`；v1（无版本号/明文密码）自动迁移到钥匙串，迁移幂等，
+   遇到更高版本保留原文件并报错，不静默丢配置。
+5. **词条级冲突统计**：对 `*.userdb.txt` 冲突解析两侧行，上报 `only_local` / `only_remote` / `both_changed` 与样本，
+   只统计不自动合并；统计失败降级为 null 且不阻断同步。
+6. **更新签名闭环**：`tauri.conf.json` 写入 minisign 公钥、updater 指向 GitHub Releases `latest.json`；
+   私钥存 `.secrets/`（已 gitignore），`docs/RELEASE-SIGNING.md` 说明 GitHub Secrets 配置与轮换。
+7. **托盘常驻 + 开机自启**：托盘菜单「打开主窗口 / 立即搬运 / 立即合并生效 / 查看冲突 / 退出」；关窗默认隐藏到托盘；
+   接入 autostart 插件（Linux 写 `~/.config/autostart`，Windows 写注册表）。
+8. **发布瘦身**：release profile 打开 `strip` / `lto=thin` / `codegen-units=1` / `opt-level=s`。
+9. **测试**：119 个测试通过（109 单元 + first_sync + 5 read_only + spec2_flow），fmt/clippy 干净；
+   前端补 zh/en 文案与只读提示。
 ## v0.2.0 — 2026-10-20
 
 本轮的 14 项改进：

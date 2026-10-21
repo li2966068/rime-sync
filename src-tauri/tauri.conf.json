@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rime-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.rimesync.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -29,9 +29,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://REPLACE-ME.example.com/rime-sync/{{target}}/{{arch}}/{{current_version}}"
+        "https://github.com/li2966068/rime-sync/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExRkRGNEUzRkUzQTBGMjcKUldRbkR6cis0L1Q5b2NPVmIzd2h1TWswT2NlVlcrbGdGRlRvODJuNWZMc0F6TStGMWd4NkQrOWQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMyQUY0NDg1NzBFODVBMUYKUldRZld1aHdoVVN2TWx6VE90cTF3dmJLdU9iZ2NwKzZlUWhLbXlVMDdrQUR5VUFTaCtQdVBMVFgK",
       "windows": {
         "installMode": "passive"
       }
