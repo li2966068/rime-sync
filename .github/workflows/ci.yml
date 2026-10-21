@@ -34,6 +34,11 @@ jobs:
       - name: rust cache
         uses: swatinem/rust-cache@v2
 
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -75,7 +80,7 @@ jobs:
       - name: install rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y rclone curl
+          sudo apt-get install -y rclone curl pkg-config libdbus-1-dev
 
       - name: setup rust
         uses: dtolnay/rust-toolchain@stable
