@@ -1,27 +1,26 @@
-# vendor/ — 离线依赖 .deb（不入库）
+# vendor/ — 按发行版分目录的离线依赖闭包（不入库）
 
-这个目录由 `../fetch-vendor-debs.sh` 生成，打包时被
-`src-tauri/tauri.conf.json` 的 `bundle.linux.deb.files` 原样映射到
-`/usr/share/rime-sync/vendor/`，安装期的 postinst 在没有网络时用
-`dpkg -i` 装它们。
+由 `scripts/ime/fetch-vendor-deps.sh` 生成，按发行版分目录：
 
-    packaging/linux/fetch-vendor-debs.sh              # 默认 ubuntu:22.04
-    APT_MIRROR=http://mirrors.aliyun.com/ubuntu \
-      packaging/linux/fetch-vendor-debs.sh            # 墙内换源（必须 http）
+```
+vendor/ubuntu-22.04/{*.deb,VENDOR-INFO,SHA256SUMS,DEPS.txt}
+vendor/ubuntu-24.04/...
+vendor/debian-12/...
+vendor/debian-13/...
+```
 
-生成物（都被 .gitignore 忽略，不进仓库）：
+每个目录是该发行版上 `rime-inputmethod` + `rime-sync` 两个 deb 的运行期依赖闭包
+（apt 解析、`--no-install-recommends`）。故意排除：
 
-| 文件 | 说明 |
+| 包 | 原因 |
 | --- | --- |
-| `*.deb` | fcitx5 / fcitx5-rime / librime-data 及其完整依赖闭包（22.04 为 82 个包，约 28 MB） |
-| `VENDOR-INFO` | 发行版、VERSION_ID、生成时间、包版本清单；安装期与 /etc/os-release 比对 |
-| `SHA256SUMS` | 安装期 `sha256sum -c` 校验 |
+| librime1 / librime1t64 | rime-inputmethod 自带 librime，同名 so 会冲突 |
+| librime-data | rime-inputmethod 自带 /usr/share/rime-data |
+| fcitx5-rime | rime-inputmethod Provides/Conflicts 它 |
 
-注意：
+`fcitx5`（守护进程）**包含**在闭包里：没有它 addon 无处加载，离线安装就不算
+可用的输入法。若目标机已确定装有 fcitx5，可用 `ROOT_PKGS=""` 重新抓取以缩小体积。
 
-- 仓库里只保留本 README，所以没跑过 fetch 的机器也能 `tauri build`（deb 里只有
-  README，postinst 会发现没有 .deb 并打印手工安装指引，安装不会失败）。
-- 发布流水线必须在打包前先跑一次 fetch 脚本，否则打出来的 deb 不具备离线能力。
-- 只抓过 ubuntu:22.04。Ubuntu 24.04 / Debian 的包名与版本不同（如 librime1t64），
-  需要另跑一次 fetch 并替换 vendor 内容；多发行版并存要改成按目录分
-  （当前 VENDOR-INFO 只描述一套）。
+这些 .deb 由构建流程生成、随离线安装包分发，不提交进仓库（见
+`packaging/linux/.gitignore`）。旧的单层 `vendor/*.deb`（ubuntu 22.04 的
+fcitx5-rime 闭包）会与新的 rime-inputmethod 冲突，已废弃。

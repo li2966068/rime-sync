@@ -30,14 +30,50 @@ env:
   NODE_VERSION: "22"
 
 jobs:
+# 触发：推送 v* tag，或手动指定一个 tag。
+# 产物：
+#   linux   → deb + AppImage（+ 更新包 .AppImage.tar.gz 与 .sig）
+#             + 四发行版离线安装器（self-extracting .run：IME deb + 依赖闭包）
+#   windows → NSIS 安装包 + 便携版 zip（+ 更新包 .sig）
   linux:
-    name: linux · deb + AppImage
+    name: linux · deb + AppImage + 四发行版离线安装器
     runs-on: ubuntu-22.04
+    timeout-minutes: 210
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      # 预算：四套 docker 构建镜像（每套 1.5-2.5 GiB）+ 四份 vendor 闭包（~700 MiB）
+      # + 四份 .run（~600 MiB）。runner 默认只剩 ~14 GiB，先删掉本次构建用不到的预装 SDK。
+      - name: free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: preflight · docker + disk headroom
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null 2>&1 || {
+            echo "::error::runner 缺少 docker：scripts/ime/build-linux.sh 与 scripts/ime/fetch-vendor-deps.sh 都在容器里运行"
+            exit 1
+          }
+          docker info >/dev/null 2>&1 || {
+            echo "::error::docker daemon 不可用，四发行版构建无法进行"
+            exit 1
+          }
+          avail=$(df -Pk / | awk "NR==2 {print \$4}")
+          avail_gib=$(( avail / 1024 / 1024 ))
+          echo "docker: $(docker --version)"
+          echo "可用磁盘: ${avail_gib} GiB"
+          if [ "$avail_gib" -lt 12 ]; then
+            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 12 GiB）：四套 IME 镜像 + vendor 闭包装不下"
+            exit 1
+          fi
 
       - name: install linux system dependencies
         run: |
@@ -70,51 +106,149 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: fetch offline input-method deps (vendor .deb)
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          # ubuntu-22.04 runner 自带 docker；脚本在容器内解析 fcitx5-rime 依赖闭包。
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "::error::runner 缺少 docker，packaging/linux/fetch-vendor-debs.sh 无法解析依赖闭包"
-            exit 1
-          fi
-          bash packaging/linux/fetch-vendor-debs.sh || {
-            echo "::error::抓取 vendor .deb 失败（需要联网 + docker）。deb 将缺少离线输入法依赖，中止发布。"
-            exit 1
-          }
-          count=$(find packaging/linux/vendor -maxdepth 1 -name '*.deb' | wc -l)
-          echo "vendor .deb 数量: $count"
-          du -sh packaging/linux/vendor
-          if [ "$count" -eq 0 ]; then
-            echo "::error::packaging/linux/vendor 仍没有 .deb，tauri deb.files 会打进一个空目录"
-            exit 1
-          fi
-
-      - name: build bundles
+      # 顺序是硬约束：tauri deb 的 bundle.linux.deb.files 把 packaging/linux/vendor/ 整个
+      # 拷进 /usr/share/rime-sync/vendor/。必须先于 vendor 闭包抓取构建，否则 deb 会吞下
+      # 四份发行版闭包（~700 MiB）且互相冲突。ci.yml 有对应的顺序守卫。
+      - name: build bundles (deb + AppImage)
+        timeout-minutes: 45
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles deb,appimage
 
-      - name: assert deb ships vendor payload (> 20 MiB)
+      # fetch-vendor-deps.sh / build-offline-installer.sh 的默认输入
+      - name: stage rime-sync deb for offline bundles
         run: |
+          set -euo pipefail
           shopt -s nullglob
           debs=(src-tauri/target/release/bundle/deb/*.deb)
-          if [ ${#debs[@]} -eq 0 ]; then
-            echo "::error::没有生成 .deb 产物"
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::期望恰好 1 个 rime-sync deb，实际 ${#debs[@]} 个"
+            printf '  %s\n' "${debs[@]}"
             exit 1
           fi
+          mkdir -p packaging/out
+          cp -f "${debs[0]}" packaging/out/
+          deb=$(basename "${debs[0]}")
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          case "$deb" in
+            "rime-sync_${ver}_"*) : ;;
+            *) echo "::error::deb 名 $deb 与 tauri.conf.json 版本 $ver 不一致"; exit 1 ;;
+          esac
+          echo "offline bundle 输入: packaging/out/$deb ($(( $(stat -c %s "packaging/out/$deb") / 1024 / 1024 )) MiB)"
+
+      - name: build input-method debs for 4 distros (docker)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          rc=0
+          ALL=1 bash scripts/ime/build-linux.sh || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::scripts/ime/build-linux.sh ALL=1 失败（exit $rc）；缺失的发行版："
+            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+              compgen -G "build/deb/$d/rime-inputmethod_*.deb" >/dev/null || \
+                echo "::error file=scripts/ime/build-linux.sh::$d 的 rime-inputmethod deb 未生成"
+            done
+            exit "$rc"
+          fi
+          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+            f=$(ls -1t build/deb/"$d"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
+            [ -n "$f" ] || { echo "::error::$d: 缺少 rime-inputmethod deb"; exit 1; }
+            echo "$d: $(basename "$f") ($(( $(stat -c %s "$f") / 1024 / 1024 )) MiB)"
+          done
+          du -sh build/deb
+
+      # 四套 builder 镜像此时只占地方：清掉给 vendor 闭包和四份目录 bundle 腾空间。
+      # if: always() —— 构建失败时也清，避免 runner 磁盘爆掉掩盖真正的错误。
+      - name: free disk after IME build
+        if: always()
+        run: |
+          set -uo pipefail
+          rm -rf build/ime-staging || true
+          docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
+
+      - name: fetch offline vendor dependency closure (4 distros)
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          rc=0
+          bash scripts/ime/fetch-vendor-deps.sh || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::scripts/ime/fetch-vendor-deps.sh 失败（exit $rc）"
+            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+              n=$(find "packaging/linux/vendor/$d" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l)
+              echo "::error::$d: vendor .deb = $n"
+            done
+            exit "$rc"
+          fi
           status=0
-          for f in "${debs[@]}"; do
+          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+            dir=packaging/linux/vendor/$d
+            if [ ! -d "$dir" ]; then
+              echo "::error::$d: 缺少 vendor 目录 $dir"
+              status=1
+              continue
+            fi
+            n=$(find "$dir" -maxdepth 1 -name "*.deb" | wc -l)
+            mib=$(du -sm "$dir" | cut -f1)
+            echo "$d: $n debs, ${mib} MiB"
+            if [ "$n" -lt 100 ]; then
+              echo "::error::$d: vendor 闭包只有 $n 个 .deb（< 100），apt 下载很可能不完整"
+              status=1
+            fi
+            [ -f "$dir/VENDOR-INFO" ] || { echo "::error::$d: 缺少 VENDOR-INFO"; status=1; }
+            [ -f "$dir/SHA256SUMS" ] || { echo "::error::$d: 缺少 SHA256SUMS"; status=1; }
+          done
+          du -sh packaging/linux/vendor
+          df -h /
+          exit $status
+
+      - name: free disk before assembling .run
+        run: |
+          set -uo pipefail
+          docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
+
+      - name: assemble offline installers (.run × 4)
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          bash packaging/linux/build-offline-installer.sh || {
+            echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
+            exit 1
+          }
+
+      - name: assert offline installers (> 100 MiB each, one per distro)
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          status=0
+          for pair in ubuntu-22.04:jammy ubuntu-24.04:noble debian-12:bookworm debian-13:trixie; do
+            d=${pair%%:*}
+            suite=${pair##*:}
+            f=packaging/linux/out/rime-sync-installer_${ver}~${suite}.run
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少 $d 的离线安装器 $f"
+              status=1
+              continue
+            fi
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::没有可执行位（build-offline-installer.sh 的 chmod 0755 未生效）"
+              status=1
+            fi
             size=$(stat -c %s "$f")
             mib=$(( size / 1024 / 1024 ))
             echo "$f: ${mib} MiB"
-            if [ "$size" -lt $(( 20 * 1024 * 1024 )) ]; then
-              echo "::error file=$f::deb 仅 ${mib} MiB（< 20 MiB），packaging/linux/vendor/*.deb 很可能没被打进包"
+            if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
+              echo "::error file=$f::${d} 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
               status=1
             fi
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              echo "- $d ($suite): rime-sync-installer_${ver}~${suite}.run — ${mib} MiB" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
+          ls -lh packaging/linux/out/*.run || true
           exit $status
 
       - name: upload linux artifacts
@@ -127,10 +261,14 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
             src-tauri/target/release/bundle/appimage/*.sig
+            packaging/linux/out/*.run
+            build/deb/**/*.deb
 
   windows:
     name: windows · nsis + portable zip
     runs-on: windows-latest
+    env:
+      RIMESYNC_WEASEL_MODE: ${{ vars.RIMESYNC_WEASEL_MODE || 'build' }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -157,31 +295,108 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: fetch weasel installer (vendor payload)
+      - name: cache weasel build deps (boost 1.84.0)
+        if: env.RIMESYNC_WEASEL_MODE != 'fetch'
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/weasel/deps/boost_1_84_0/boost
+            third_party/weasel/deps/boost_1_84_0/stage
+          key: ${{ runner.os }}-weasel-boost-1.84.0-${{ hashFiles('scripts/ime/build-weasel.ps1', 'third_party/weasel/weasel.sln') }}
+          restore-keys: |
+            ${{ runner.os }}-weasel-boost-1.84.0-
+
+      # 从 vendored 源码（third_party/weasel = rime/weasel 0.17.4）编译 Weasel 安装包。
+      # 依赖：VS2022/v143 + boost 1.84.0（脚本自建/缓存）+ librime 预编译包（get-rime.ps1）
+      #       + NSIS 3.08（脚本自动安装）。脚本内部会做产物断言。
+      # 失败不直接红：下一步用上游官方安装包兜底，保证发布不中断（见 packaging/windows/README.md）。
+      - name: build weasel installer from vendored source
+        id: weasel_selfbuild
+        if: env.RIMESYNC_WEASEL_MODE != 'fetch'
+        continue-on-error: true
+        timeout-minutes: 90
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -LibrimeTag 1.13.1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::build-weasel.ps1 失败（exit $LASTEXITCODE）；下一步回退上游安装包"
+            exit $LASTEXITCODE
+          }
+          $exe = Get-Item -LiteralPath 'packaging/windows/vendor/weasel-0.17.4.0-installer.exe'
+          Write-Host ("self-built weasel: {0:N1} MiB" -f ($exe.Length / 1MB))
+
+      # 离线兜底：fetch-weasel.ps1 仍然保留，下载并校验上游官方安装包（大小 + SHA-256）。
+      # 触发条件：显式 RIMESYNC_WEASEL_MODE=fetch，或上一步自编译失败。
+      - name: fetch upstream weasel installer (fallback / offline mode)
+        if: env.RIMESYNC_WEASEL_MODE == 'fetch' || steps.weasel_selfbuild.outcome == 'failure'
         timeout-minutes: 15
         shell: pwsh
         run: |
+          if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'failure') {
+            Write-Host '::warning::自编译 Weasel 失败，回退到上游官方安装包（packaging/windows/fetch-weasel.ps1）'
+          } else {
+            Write-Host '::notice::RIMESYNC_WEASEL_MODE=fetch：直接使用上游官方安装包'
+          }
           if (-not (Test-Path -LiteralPath 'packaging/windows/fetch-weasel.ps1')) {
-            Write-Host '::error::缺少 packaging/windows/fetch-weasel.ps1，NSIS 无法内置 weasel 安装包'
+            Write-Host '::error::缺少 packaging/windows/fetch-weasel.ps1（兜底路径不可用）'
             exit 1
           }
           pwsh -NoProfile -File packaging/windows/fetch-weasel.ps1
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::packaging/windows/fetch-weasel.ps1 失败（exit $LASTEXITCODE），NSIS 将缺少 weasel 安装包"
-            exit 1
+            Write-Host "::error::fetch-weasel.ps1 失败（exit $LASTEXITCODE）"
+            exit $LASTEXITCODE
           }
-          $exe = Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*.exe' -ErrorAction SilentlyContinue
+
+      - name: verify weasel vendor payload
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
           if (-not $exe) {
-            Write-Host '::error::packaging/windows/vendor 下没有 weasel-*.exe，resources 会打进空目录'
+            Write-Host '::error::packaging/windows/vendor 下没有 weasel-*.exe，NSIS 安装包里不会有输入法'
             exit 1
           }
-          $exe | ForEach-Object { Write-Host ("vendor: {0} {1:N1} MiB" -f $_.Name, ($_.Length / 1MB)) }
+          $mib = [math]::Round($exe.Length / 1MB, 1)
+          Write-Host "vendor: $($exe.Name) $mib MiB"
+          if ($exe.Length -lt 10MB) {
+            Write-Host "::error::weasel 安装包只有 $mib MiB（< 10 MiB），疑似下载/构建不完整"
+            exit 1
+          }
+          $source = 'upstream official installer (fetch-weasel.ps1 fallback)'
+          if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'success') {
+            $source = 'self-built from third_party/weasel @ 0.17.4'
+          }
+          Write-Host "weasel source: $source"
+          if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Weasel 安装器：{0}（{1} MiB，来源：{2}）" -f $exe.Name, $mib, $source)
+          }
 
       - name: build nsis
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
+
+      # 验收断言：最终 setup.exe ≥ 15 MiB（内嵌的 Weasel 安装器约 12 MiB，未被 LZMA 压没）。
+      - name: assert nsis setup embeds weasel
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $setup) {
+            Write-Host '::error::没找到 NSIS 安装包（src-tauri/target/release/bundle/nsis/*-setup.exe）'
+            exit 1
+          }
+          $mib = [math]::Round($setup.Length / 1MB, 1)
+          Write-Host "NSIS setup: $($setup.Name) $mib MiB"
+          if ($setup.Length -lt 15MB) {
+            Write-Host "::error::NSIS 安装包只有 $mib MiB（< 15 MiB）：内置 Weasel 很可能没打进去。"
+            Write-Host "检查 packaging/windows/vendor/weasel-*.exe 是否存在，以及 makensis 日志里"
+            Write-Host "是否有 'NSIS_HOOK_PREINSTALL' 相关告警（packaging/nsis-hooks.nsh 的 !warning）。"
+            exit 1
+          }
 
       - name: build portable zip
         shell: pwsh

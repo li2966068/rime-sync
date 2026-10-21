@@ -1,0 +1,212 @@
+name: offline-verify
+
+# 手动回归：把四发行版离线安装器真装一遍（--network none 容器内安装 + 断言）。
+# 不进 tag 触发的发布路径：单次约 90-120 分钟，只用于发版前/改动安装器后的人工验收。
+# 产物证据：build/evidence/<distro>/{test-image.log,offline-install.log,sizes.txt} + SIZES.txt。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要验证的 ref（分支 / tag / SHA）"
+        required: false
+        default: master
+        type: string
+      distros:
+        description: "只验证部分发行版（空格分隔，例如 ubuntu-22.04 debian-12）；留空=全部四套"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: offline-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "22"
+
+jobs:
+  verify-offline:
+    name: offline install · verify-offline.sh
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: preflight · docker + disk headroom
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null 2>&1 || {
+            echo "::error::runner 缺少 docker：verify-offline.sh 在容器里安装并断言"
+            exit 1
+          }
+          docker info >/dev/null 2>&1 || {
+            echo "::error::docker daemon 不可用"
+            exit 1
+          }
+          avail=$(df -Pk / | awk "NR==2 {print \$4}")
+          avail_gib=$(( avail / 1024 / 1024 ))
+          echo "可用磁盘: ${avail_gib} GiB"
+          if [ "$avail_gib" -lt 12 ]; then
+            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 12 GiB）：四套构建镜像 + 四套测试镜像装不下"
+            exit 1
+          fi
+
+      - name: install linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            file
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 只出 deb（回归只关心离线安装器），且必须先于 fetch-vendor-deps.sh：
+      # 否则 deb 会把 packaging/linux/vendor/ 整个吞进 /usr/share/rime-sync/vendor/。
+      - name: build rime-sync deb
+        timeout-minutes: 45
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles deb
+
+      - name: stage rime-sync deb for offline bundles
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::期望恰好 1 个 rime-sync deb，实际 ${#debs[@]} 个"
+            exit 1
+          fi
+          mkdir -p packaging/out
+          cp -f "${debs[0]}" packaging/out/
+          echo "offline bundle 输入: packaging/out/$(basename "${debs[0]}")"
+
+      - name: build input-method debs for 4 distros (docker)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          rc=0
+          ALL=1 bash scripts/ime/build-linux.sh || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::scripts/ime/build-linux.sh ALL=1 失败（exit $rc）"
+            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+              compgen -G "build/deb/$d/rime-inputmethod_*.deb" >/dev/null || \
+                echo "::error file=scripts/ime/build-linux.sh::$d 的 rime-inputmethod deb 未生成"
+            done
+            exit "$rc"
+          fi
+          du -sh build/deb
+
+      - name: free disk after IME build
+        if: always()
+        run: |
+          set -uo pipefail
+          rm -rf build/ime-staging || true
+          docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
+
+      - name: fetch offline vendor dependency closure (4 distros)
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          bash scripts/ime/fetch-vendor-deps.sh || {
+            echo "::error::scripts/ime/fetch-vendor-deps.sh 失败（见上方日志）"
+            exit 1
+          }
+          status=0
+          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+            dir=packaging/linux/vendor/$d
+            n=$(find "$dir" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l)
+            echo "$d: $n debs"
+            [ "$n" -ge 100 ] || { echo "::error::$d: vendor 闭包只有 $n 个 .deb（< 100）"; status=1; }
+          done
+          exit $status
+
+      - name: free disk before assembling .run
+        run: |
+          set -uo pipefail
+          docker system prune -af --volumes >/dev/null 2>&1 || true
+          df -h /
+
+      - name: assemble offline installers (.run × 4)
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          bash packaging/linux/build-offline-installer.sh || {
+            echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
+            exit 1
+          }
+
+      # 真正的验收：四发行版各建一个测试镜像，在 --network none 容器里跑 .run 安装 + 断言。
+      - name: verify offline install (--network none)
+        timeout-minutes: 90
+        env:
+          DISTROS: ${{ inputs.distros }}
+        run: |
+          set -euo pipefail
+          read -r -a wanted <<< "$DISTROS"
+          echo "verifying: ${wanted[*]:-all four distros}"
+          bash packaging/linux/verify-offline.sh "${wanted[@]}" || {
+            echo "::error::packaging/linux/verify-offline.sh 失败：离线安装断言未通过（证据见 build/evidence）"
+            exit 1
+          }
+
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-evidence
+          if-no-files-found: warn
+          path: |
+            build/evidence/**
+
+      - name: summary
+        if: always()
+        run: |
+          if [ -f build/evidence/SIZES.txt ]; then
+            {
+              echo "## 离线安装回归（$(date -u +%Y-%m-%dT%H:%M:%SZ)）"
+              echo
+              echo "```"
+              cat build/evidence/SIZES.txt
+              echo "```"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

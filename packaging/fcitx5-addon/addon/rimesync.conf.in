@@ -1,9 +1,11 @@
 [Addon]
 Name=Rime Sync
-Comment=Launch the rime-sync WebDAV configuration page
+Name[zh_CN]=Rime 同步
+Comment=Configure WebDAV sync for rime-sync
+Comment[zh_CN]=配置 rime-sync 的 WebDAV 同步（地址 / 用户名 / 密码 / 远端目录 / 设备名）
 Category=Module
 Version=@PROJECT_VERSION@
 Library=rimesync
 Type=SharedLibrary
 OnDemand=True
-Configurable=False
+Configurable=True

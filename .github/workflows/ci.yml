@@ -101,25 +101,82 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      # 只做静态校验：脚本会下载几十 MB 的 vendor 资源，不在 CI 里真跑。
-      - name: scripts exist and release.yml still references them
+      # 只做静态校验：脚本会下载几十 MB 的 vendor 资源 / 跑 docker 构建，不在 CI 里真跑。
+      - name: packaging scripts exist
         run: |
           set -euo pipefail
           missing=0
-          for f in packaging/linux/fetch-vendor-debs.sh packaging/windows/fetch-weasel.ps1; do
-            [ -f "$f" ] || { echo "::error::缺少 $f（发布产物需要它抓取 vendor 资源）"; missing=1; }
+          for f in \
+            scripts/ime/build-linux.sh \
+            scripts/ime/container-build.sh \
+            scripts/ime/package-ime-deb.sh \
+            scripts/ime/fetch-vendor-deps.sh \
+            scripts/ime/build-fcitx5-addon.sh \
+            scripts/ime/Dockerfile \
+            packaging/linux/build-offline-installer.sh \
+            packaging/linux/prepare-sync-deb.sh \
+            packaging/linux/verify-offline.sh \
+            packaging/linux/install.sh \
+            packaging/linux/install-vendor-deps.sh \
+            packaging/linux/fetch-vendor-debs.sh \
+            packaging/linux/postinst \
+            packaging/linux/prerm \
+            packaging/linux/postrm \
+            packaging/linux/test/Dockerfile \
+            packaging/linux/test/verify-in-container.sh \
+            packaging/windows/fetch-weasel.ps1; do
+            [ -f "$f" ] || { echo "::error::缺少 $f"; missing=1; }
           done
           [ "$missing" -eq 0 ] || exit 1
-          # 改名或删步时这里立刻红，避免 vendor 静默缺席发布产物
-          for f in packaging/linux/fetch-vendor-debs.sh packaging/windows/fetch-weasel.ps1; do
-            grep -qF "$f" .github/workflows/release.yml || {
-              echo "::error::release.yml 未引用 $f，发布产物将缺少 vendor 资源"
-              exit 1
-            }
-          done
 
-      - name: bash -n packaging/linux/fetch-vendor-debs.sh
-        run: bash -n packaging/linux/fetch-vendor-debs.sh
+      - name: bash -n every packaging shell script
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find scripts/ime packaging/linux -maxdepth 2 -type f -name '*.sh' | sort)
+          printf '%s\n' "${files[@]}"
+          for f in "${files[@]}"; do bash -n "$f"; done
+          echo "bash -n OK: ${#files[@]} 个脚本"
+
+      # 改名 / 删步 / 换顺序时这里立刻红：离线安装器静默缺席比构建失败更难查。
+      - name: release.yml + offline-verify.yml still wire the offline pipeline
+        run: |
+          set -euo pipefail
+          for wf in .github/workflows/release.yml .github/workflows/offline-verify.yml; do
+            for f in scripts/ime/build-linux.sh scripts/ime/fetch-vendor-deps.sh packaging/linux/build-offline-installer.sh; do
+              grep -qF "$f" "$wf" || { echo "::error::$wf 未引用 $f"; exit 1; }
+            done
+          done
+          grep -qF packaging/linux/verify-offline.sh .github/workflows/offline-verify.yml || {
+            echo "::error::offline-verify.yml 未调用 packaging/linux/verify-offline.sh"
+            exit 1
+          }
+
+      # 顺序守卫：tauri deb 的 bundle.linux.deb.files 会把 packaging/linux/vendor/ 整个拷进
+      # /usr/share/rime-sync/vendor/，必须先 build deb 再填 per-distro vendor，否则 deb 会
+      # 吞下四份发行版闭包（~700 MiB）。
+      - name: ordering guard · tauri build before per-distro vendor fill
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          bundle=$(grep -nE '^[[:space:]]*run: pnpm tauri build' "$wf" | head -n 1 | cut -d: -f1 || true)
+          vendor=$(grep -nE '^[[:space:]]*bash scripts/ime/fetch-vendor-deps\.sh' "$wf" | head -n 1 | cut -d: -f1 || true)
+          if [ -z "$bundle" ] || [ -z "$vendor" ]; then
+            echo "::error::$wf 缺少 pnpm tauri build 或 fetch-vendor-deps 步骤"
+            exit 1
+          fi
+          if [ "$bundle" -ge "$vendor" ]; then
+            echo "::error::$wf 顺序反了：tauri build（第 $bundle 行）必须先于 fetch-vendor-deps（第 $vendor 行）"
+            exit 1
+          fi
+          echo "ordering OK: tauri build @$bundle < vendor fill @$vendor"
+
+      - name: legacy flat vendor fetch stays out of release.yml
+        run: |
+          set -euo pipefail
+          if grep -qE '^ *bash packaging/linux/fetch-vendor-debs.sh' .github/workflows/release.yml; then
+            echo "::error::release.yml 又跑回了旧的扁平 vendor 抓取（packaging/linux/fetch-vendor-debs.sh）：与四发行版 vendor/<distro>/ 布局冲突"
+            exit 1
+          fi
 
       - name: parse packaging/windows/fetch-weasel.ps1
         run: |

@@ -3,10 +3,12 @@
 #include <QDialog>
 #include <QString>
 
+class QCheckBox;
 class QLabel;
 class QLineEdit;
 
-// 读写 ~/.config/rime-sync/config.json 的 webdav 段，与 rime-sync 主程序共享。
+// 独立配置页（没有 fcitx5-configtool 时的退路）：与 addon 共用 rimesyncstore，
+// 写同一份 ~/.config/rime-sync/config.json。
 class RimeSyncConfigDialog : public QDialog {
     Q_OBJECT
 
@@ -27,5 +29,7 @@ private:
     QLineEdit *userEdit_ = nullptr;
     QLineEdit *passEdit_ = nullptr;
     QLineEdit *remoteDirEdit_ = nullptr;
+    QLineEdit *deviceIdEdit_ = nullptr;
+    QCheckBox *stopFcitx5Check_ = nullptr;
     QLabel *statusLabel_ = nullptr;
 };

@@ -1,3 +1,6 @@
-# 离线依赖 .deb 由 fetch-vendor-debs.sh 生成，体积大，不入库
+# 离线依赖 .deb 由 scripts/ime/fetch-vendor-deps.sh 按发行版生成，体积大，不入库
 vendor/*
 !vendor/README.md
+
+# 离线安装包与自解压 .run（build-offline-installer.sh 的产物）
+out/

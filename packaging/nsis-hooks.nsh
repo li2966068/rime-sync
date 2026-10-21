@@ -3,12 +3,30 @@
 ; Tauri 在 installer.nsi / uninstaller.nsi 里以 !ifmacrodef 方式插入这些宏，
 ; 因此本文件只定义宏与私有函数，不覆盖 Tauri 自己的安装逻辑。
 ;
+; 安装顺序（验收点）：输入法 → 同步程序
+;   Tauri 模板的 Install 段顺序是：
+;       SetOutPath $INSTDIR
+;       !insertmacro NSIS_HOOK_PREINSTALL      <-- 本文件的 PREINSTALL
+;       File "${MAINBINARYSRCPATH}"             <-- 这里才开始拷我们的程序
+;       File ... resources ...                 <-- resources 也是这之后才落地
+;       !insertmacro NSIS_HOOK_POSTINSTALL
+;   所以：
+;     1) PREINSTALL 阶段不能读 $INSTDIR\resources（文件还没解压出来）。
+;     2) 要真正做到“先装输入法”，安装包必须在构建期用 NSIS 自己的 File 指令内嵌，
+;        运行时先解到 $PLUGINSDIR 再 ExecWait —— 见下面的 RIMESYNC_WEASEL_EXE。
+;     3) 内嵌源路径用 ${__FILEDIR__}（= 本文件所在目录 packaging/）。Tauri 会把
+;        installerHooks 路径 canonicalize 成绝对路径再 !include，因此这里得到的是
+;        <repo>\packaging\windows\vendor\weasel-<ver>-installer.exe。
+;
+; 验收证据：除了 DetailPrint，安装过程还会把带时间戳的顺序日志追加到
+;   $INSTDIR\install-ime-order.log
+; （静默安装看不到 DetailPrint，这个文件是唯一可复核的证据；卸载时删除）
+;
 ; 前提（见 tauri.conf.json 的 bundle.windows.nsis）：
 ;   installMode = perMachine  → 安装器以管理员运行，$SMPROGRAMS / $INSTDIR 都是
 ;   「所有用户」上下文（Tauri 的 SetContext 宏已 SetShellVarContext all）。
-;   内嵌的小狼毫官方安装包由 bundle.resources 装到 $INSTDIR\resources\。
 ;
-; 安装结束**不启动** rime-sync：Tauri 模板在完成页有「运行」复选框，
+; 安装结束不启动 rime-sync：Tauri 模板在完成页有「运行」复选框，
 ; 这里把它的默认状态改成不勾选（MUI_FINISHPAGE_RUN_NOTCHECKED），
 ; 用户想用只能自己从开始菜单点开。
 ;
@@ -20,9 +38,52 @@
 !define RIMESYNC_SETUP_NAME "同步设置"
 !define RIMESYNC_WEASEL_INSTALLER "weasel-0.17.4.0-installer.exe"
 !define RIMESYNC_WEASEL_DIRVER "0.17.4"
+!define RIMESYNC_ORDER_LOG "$INSTDIR\install-ime-order.log"
+
+; 构建期由 scripts/ime/build-weasel.ps1 放到 packaging/windows/vendor/。
+; 不存在时不直接报错：允许“离线兜底/根本没编译”的构建继续，只给编译告警，
+; 运行时再退回旧的 resources 布局（旧布局在 PREINSTALL 阶段通常拿不到文件）。
+!define RIMESYNC_WEASEL_EXE "${__FILEDIR__}\windows\vendor\${RIMESYNC_WEASEL_INSTALLER}"
+
+!if /FileExists "${RIMESYNC_WEASEL_EXE}"
+  !define RIMESYNC_WEASEL_EMBEDDED
+!else
+  !warning "rime-sync: vendored weasel installer not found, IME will not be installed (run scripts/ime/build-weasel.ps1)"
+!endif
 
 ; 完成页「运行 rime-sync」复选框默认不勾选（不自动启动主程序）
 !define MUI_FINISHPAGE_RUN_NOTCHECKED
+
+; ---------------------------------------------------------------------------
+; 时间戳：$R2 = "YYYY-MM-DD HH:MM:SS"（本地时间）
+; 占用 $1..$9（都是函数内 scratch），$0 / $R0..$R9 不受影响。
+; ---------------------------------------------------------------------------
+Function RimeSyncStamp
+  System::Call '*(&i2,&i2,&i2,&i2,&i2,&i2,&i2,&i2) p .r1'
+  System::Call 'kernel32::GetLocalTime(p r1)'
+  System::Call '*$1(&i2.r2,&i2.r3,&i2.r4,&i2.r5,&i2.r6,&i2.r7,&i2.r8,&i2.r9)'
+  System::Free $1
+  IntFmt $2 "%.4u" $2
+  IntFmt $3 "%.2u" $3
+  IntFmt $5 "%.2u" $5
+  IntFmt $6 "%.2u" $6
+  IntFmt $7 "%.2u" $7
+  IntFmt $8 "%.2u" $8
+  StrCpy $R2 "$2-$3-$5 $6:$7:$8"
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 顺序日志：入参 $R3 = 单行文本（保持 ASCII，避免代码页问题）
+; 追加到 $INSTDIR\install-ime-order.log
+; ---------------------------------------------------------------------------
+Function RimeSyncLog
+  ClearErrors
+  FileOpen $R4 "${RIMESYNC_ORDER_LOG}" a
+  IfErrors rimesync_log_done
+  FileWrite $R4 "$R3$\r$\n"
+  FileClose $R4
+  rimesync_log_done:
+FunctionEnd
 
 ; ---------------------------------------------------------------------------
 ; 探测：$R8 = 小狼毫安装根目录（含 WeaselServer.exe），未安装则空字符串
@@ -93,43 +154,79 @@ Function RimeSyncFindWeaselGroup
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; 静默安装内嵌的小狼毫：<installer> /S
-; 已安装则跳过（避免把用户现有小狼毫重装/降级）；失败只写 DetailPrint，不阻断主安装。
+; PREINSTALL：先装小狼毫（在 Tauri 拷主程序与 resources 之前）
+; 已安装则跳过（避免把用户现有小狼毫重装/降级）；失败只写日志，不阻断主安装。
 ; ---------------------------------------------------------------------------
-Function RimeSyncInstallWeasel
+Function RimeSyncInstallWeaselPre
   Call RimeSyncFindWeaselRoot
-  StrCmp $R8 "" rimesync_wi_install
+  StrCmp $R8 "" rimesync_pre_install
     DetailPrint "[rime-sync] 已检测到小狼毫（$R8），跳过内嵌安装包"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL skip existing weasel=$R8"
+    Call RimeSyncLog
     Return
 
-  rimesync_wi_install:
-  IfFileExists "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}" rimesync_wi_found_res
-  IfFileExists "$INSTDIR\${RIMESYNC_WEASEL_INSTALLER}" rimesync_wi_found_root
-    DetailPrint "[rime-sync] 警告：未找到内嵌的小狼毫安装包（$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}），跳过输入法安装"
+  rimesync_pre_install:
+  StrCpy $R0 ""
+  !ifdef RIMESYNC_WEASEL_EMBEDDED
+    ; $PLUGINSDIR 在安装器退出时由 NSIS 删除；这里只在还没初始化时初始化
+    StrCmp $PLUGINSDIR "" 0 rimesync_pre_have_plugins
+      InitPluginsDir
+    rimesync_pre_have_plugins:
+    SetOutPath "$PLUGINSDIR\rime-sync-weasel"
+    File "/oname=${RIMESYNC_WEASEL_INSTALLER}" "${RIMESYNC_WEASEL_EXE}"
+    StrCpy $R0 "$PLUGINSDIR\rime-sync-weasel\${RIMESYNC_WEASEL_INSTALLER}"
+    SetOutPath "$INSTDIR"
+  !else
+    ; 兜底：旧布局（resources 里带安装包）只在 POSTINSTALL 之后才存在，
+    ; 但这里仍检查一次，便于“自定义模板先解压 resources”的场景。
+    IfFileExists "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}" 0 rimesync_pre_checked
+      StrCpy $R0 "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}"
+    rimesync_pre_checked:
+  !endif
+
+  StrCmp $R0 "" 0 rimesync_pre_run
+    DetailPrint "[rime-sync] 警告：未找到内嵌的小狼毫安装包，跳过输入法安装"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL missing weasel installer"
+    Call RimeSyncLog
     Return
 
-  rimesync_wi_found_res:
-    StrCpy $R0 "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}"
-    Goto rimesync_wi_run
+  rimesync_pre_run:
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=PREINSTALL 开始静默安装小狼毫"
+  StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL begin weasel install"
+  Call RimeSyncLog
 
-  rimesync_wi_found_root:
-    StrCpy $R0 "$INSTDIR\${RIMESYNC_WEASEL_INSTALLER}"
-
-  rimesync_wi_run:
-  DetailPrint "[rime-sync] 静默安装小狼毫：$R0 /S"
   ClearErrors
   ExecWait '"$R0" /S' $0
-  IfErrors rimesync_wi_launch_failed
-  StrCmp $0 "0" rimesync_wi_ok
+  IfErrors rimesync_pre_launch_failed
+
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=PREINSTALL 小狼毫安装器退出码 $0"
+  StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL weasel installer exit=$0"
+  Call RimeSyncLog
+  StrCmp $0 "0" rimesync_pre_ok
     DetailPrint "[rime-sync] 警告：小狼毫安装器退出码 $0（不阻断 rime-sync 安装）"
-    Return
+    Goto rimesync_pre_cleanup
 
-  rimesync_wi_launch_failed:
-    DetailPrint "[rime-sync] 警告：无法启动小狼毫安装器（不阻断 rime-sync 安装）"
-    Return
+  rimesync_pre_launch_failed:
+    Call RimeSyncStamp
+    DetailPrint "[rime-sync] [$R2] 警告：无法启动小狼毫安装器（不阻断 rime-sync 安装）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL exec failed"
+    Call RimeSyncLog
+    Goto rimesync_pre_cleanup
 
-  rimesync_wi_ok:
+  rimesync_pre_ok:
     DetailPrint "[rime-sync] 小狼毫静默安装完成"
+
+  rimesync_pre_cleanup:
+  !ifdef RIMESYNC_WEASEL_EMBEDDED
+    Delete "$PLUGINSDIR\rime-sync-weasel\${RIMESYNC_WEASEL_INSTALLER}"
+    RMDir "$PLUGINSDIR\rime-sync-weasel"
+  !endif
+  ; 关键：Tauri 模板紧接着会 File 主程序，必须把输出目录恢复成 $INSTDIR
+  SetOutPath "$INSTDIR"
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
@@ -179,16 +276,31 @@ FunctionEnd
 ; ---------------------------------------------------------------------------
 ; 宏：Tauri 插入点
 ; ---------------------------------------------------------------------------
+!macro NSIS_HOOK_PREINSTALL
+  ; 先装满输入法，再让 Tauri 拷主程序（宏返回后 Tauri 才 File 主程序 / resources）
+  CreateDirectory "$INSTDIR\resources"
+  Call RimeSyncInstallWeaselPre
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   ; 宏在安装段插入时才展开，此时 Tauri 已定义 MAINBINARYNAME / PRODUCTNAME
   StrCpy $R6 "$INSTDIR\${MAINBINARYNAME}.exe"
   StrCpy $R7 "$SMPROGRAMS\${RIMESYNC_NAME}\${PRODUCTNAME}.lnk"
-  ; 1) 先装小狼毫（静默），这样它的程序组已存在，第 3 步才能准确归位
-  Call RimeSyncInstallWeasel
-  ; 2) 自己的两个入口
+
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=POSTINSTALL 输入法已先安装，开始建快捷方式"
+  StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL begin shortcuts"
+  Call RimeSyncLog
+
+  ; 1) 自己的两个入口
   Call RimeSyncCreateOwnShortcuts
-  ; 3) 有 Weasel 就把「同步设置」也放进它的程序组
+  ; 2) 有 Weasel 就把「同步设置」也放进它的程序组
   Call RimeSyncCreateWeaselShortcut
+
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=POSTINSTALL 完成"
+  StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL done"
+  Call RimeSyncLog
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -208,7 +320,10 @@ FunctionEnd
   Delete "$SMPROGRAMS\Weasel\${RIMESYNC_NAME}.lnk"
   Delete "$DESKTOP\${RIMESYNC_NAME}.lnk"
 
-  ; 内嵌的小狼毫安装包与许可证文本（Tauri 也会清理 resources，这里显式兜底）
+  ; 安装顺序日志（静默安装的验收证据）
+  Delete "${RIMESYNC_ORDER_LOG}"
+
+  ; 旧版内嵌的小狼毫安装包与许可证文本（Tauri 也会清理 resources，这里显式兜底）
   Delete "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}"
   Delete "$INSTDIR\resources\WEASEL-NOTICE.txt"
   Delete "$INSTDIR\resources\GPL-3.0.txt"

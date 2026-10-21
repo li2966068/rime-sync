@@ -16,7 +16,13 @@ LOG=$LOGDIR/vendor-install.log
 say() { printf '[rime-sync] %s\n' "$*"; }
 
 rime_im_installed() {
-    [ "$(dpkg-query -W -f='${Status}' fcitx5-rime 2>/dev/null || true)" = "install ok installed" ]
+    # The offline bundle ships our own rime-inputmethod (Provides: fcitx5-rime),
+    # and dpkg-query does not resolve virtual packages by name, so check the
+    # concrete package first. Without this the postinst would queue a worker
+    # that tries to apt-install the distribution fcitx5-rime, which conflicts
+    # with rime-inputmethod and could remove it right after installation.
+    [ "$(dpkg-query -W -f='${Status}' rime-inputmethod 2>/dev/null || true)" = "install ok installed" ] ||
+        [ "$(dpkg-query -W -f='${Status}' fcitx5-rime 2>/dev/null || true)" = "install ok installed" ]
 }
 
 mkdir -p "$LOGDIR" 2>/dev/null && chmod 755 "$LOGDIR" 2>/dev/null

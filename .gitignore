@@ -15,6 +15,9 @@ packaging/out/
 *.AppImage
 *.msi
 
+# IME 从源码构建的 staging/产物（scripts/ime/**）
+build/
+
 # Rime / 同步数据（红线：LevelDB 目录与词库快照都不入库）
 *.userdb/
 *.userdb

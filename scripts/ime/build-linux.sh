@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Build the Rime input method (librime + fcitx5-rime + vendored schema data)
+# from the vendored sources inside Docker, then pack a distribution-specific
+# rime-inputmethod deb.
+#
+#   scripts/ime/build-linux.sh                       # ubuntu:22.04
+#   IMAGE=ubuntu:24.04 scripts/ime/build-linux.sh
+#   IMAGE=debian:12   scripts/ime/build-linux.sh
+#   ALL=1             scripts/ime/build-linux.sh     # all four, sequentially
+#   JOBS=8 STAGING=/tmp/stg scripts/ime/build-linux.sh
+#
+# Supported targets (each is a *separate* build; fcitx5 5.0 and 5.1 are not
+# ABI compatible, so a 22.04 artifact must never be reused on 24.04):
+#   ubuntu:22.04 -> ubuntu-22.04 / jammy
+#   ubuntu:24.04 -> ubuntu-24.04 / noble
+#   debian:12    -> debian-12    / bookworm
+#   debian:13    -> debian-13    / trixie
+#
+# Everything happens in the container: the host needs only docker (which is what
+# the ubuntu-22.04 GitHub runner already has, so CI can call this script as-is).
+#
+# Outputs, per distribution:
+#   build/ime-staging/<distro>/   root/ DESTDIR tree, build.log, build-info.txt,
+#                                 deps.txt, ldd-*.txt, smoke logs, rime-smoke
+#   build/deb/<distro>/rime-inputmethod_<ver>~<suite>_amd64.deb
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HERE/../.." && pwd)
+
+IMAGE=${IMAGE:-ubuntu:22.04}
+
+# Multi-distribution driver: ALL=1 or IMAGES="ubuntu:22.04 debian:12".
+if [ -z "${_RIME_BUILD_CHILD:-}" ]; then
+  IMAGES=${IMAGES:-}
+  if [ "${ALL:-0}" = "1" ]; then
+    IMAGES="ubuntu:22.04 ubuntu:24.04 debian:12 debian:13"
+  fi
+  if [ -n "$IMAGES" ]; then
+    rc=0
+    for img in $IMAGES; do
+      echo "########## $img"
+      _RIME_BUILD_CHILD=1 IMAGE="$img" "$0" || rc=1
+    done
+    exit "$rc"
+  fi
+fi
+
+case "$IMAGE" in
+  ubuntu:22.04) DEF_KEY=ubuntu-22.04; DEF_SUITE=jammy ;;
+  ubuntu:24.04) DEF_KEY=ubuntu-24.04; DEF_SUITE=noble ;;
+  debian:12)    DEF_KEY=debian-12;    DEF_SUITE=bookworm ;;
+  debian:13)    DEF_KEY=debian-13;    DEF_SUITE=trixie ;;
+  *)
+    echo "!! unsupported IMAGE '$IMAGE' (use ubuntu:22.04|ubuntu:24.04|debian:12|debian:13)" >&2
+    exit 2
+    ;;
+esac
+DISTRO_KEY=${DISTRO_KEY:-$DEF_KEY}
+SUITE=${SUITE:-$DEF_SUITE}
+
+JOBS=${JOBS:-$(nproc)}
+STAGING=${STAGING:-$REPO_ROOT/build/ime-staging/$DISTRO_KEY}
+OUT=${OUT:-$REPO_ROOT/build/deb/$DISTRO_KEY}
+
+# APT_MIRROR is a base URL used for both Ubuntu and Debian, e.g.
+#   http://mirrors.aliyun.com   (default: keep the image's official sources)
+APT_MIRROR=${APT_MIRROR:-}
+case "$APT_MIRROR" in
+  "") : ;;
+  http://*|https://*) : ;;
+  *) APT_MIRROR="http://$APT_MIRROR" ;;
+esac
+BASE_TAG=$(printf '%s' "$IMAGE" | tr -c 'a-zA-Z0-9_.-' '_')
+if [ -z "${BUILDER_IMAGE:-}" ]; then
+  BUILDER_IMAGE="rime-ime-builder:$BASE_TAG"
+fi
+
+mkdir -p "$STAGING" "$OUT"
+
+# Containers on the default bridge cannot always reach the host resolver (this
+# sandbox is one such case). Probe once and fall back to the host network.
+if [ -z "${DOCKER_NETWORK:-}" ]; then
+  PROBE_HOST=archive.ubuntu.com
+  case "$IMAGE" in debian:*) PROBE_HOST=deb.debian.org ;; esac
+  if docker run --rm "$IMAGE" getent hosts "$PROBE_HOST" >/dev/null 2>&1; then
+    DOCKER_NETWORK=bridge
+  else
+    DOCKER_NETWORK=host
+    echo "==> container DNS unavailable on the default bridge; using --network host"
+  fi
+fi
+
+echo "==> image         : $IMAGE"
+echo "==> distro key    : $DISTRO_KEY  (suite $SUITE)"
+echo "==> builder image : $BUILDER_IMAGE"
+echo "==> staging       : $STAGING"
+echo "==> deb output    : $OUT"
+echo "==> jobs          : $JOBS"
+[ -n "$APT_MIRROR" ] && echo "==> apt mirror    : $APT_MIRROR"
+
+echo "==> building dependency image (docker caches it on later runs)"
+if ! docker build -t "$BUILDER_IMAGE" --network "$DOCKER_NETWORK" \
+      --build-arg BASE_IMAGE="$IMAGE" --build-arg APT_MIRROR="$APT_MIRROR" \
+      -f "$HERE/Dockerfile" "$HERE" >"$STAGING/docker-build.log" 2>&1; then
+  echo "!! docker build failed; tail of $STAGING/docker-build.log:" >&2
+  tail -n 60 "$STAGING/docker-build.log" >&2
+  exit 1
+fi
+tail -n 1 "$STAGING/docker-build.log"
+
+START=$(date +%s)
+echo "==> compiling in container"
+if ! docker run --rm --network "$DOCKER_NETWORK" \
+      -e JOBS="$JOBS" \
+      -e BASE_IMAGE="$IMAGE" \
+      -e SRC=/src -e OUT=/out \
+      -v "$REPO_ROOT":/src:ro \
+      -v "$STAGING":/out \
+      -v "$HERE":/scripts:ro \
+      "$BUILDER_IMAGE" bash /scripts/container-build.sh 2>&1 | tee "$STAGING/build.log"; then
+  echo "!! container build failed; see $STAGING/build.log" >&2
+  exit 1
+fi
+ELAPSED=$(($(date +%s) - START))
+
+PLUGIN=$STAGING/root/usr/lib/x86_64-linux-gnu/fcitx5/rime.so
+
+echo
+echo "==> done in $ELAPSED s (docker image build excluded)"
+echo "==> staging size : $(du -sh "$STAGING/root" | cut -f1)"
+if [ -f "$PLUGIN" ]; then
+  echo "==> plugin       : $PLUGIN ($(stat -c %s "$PLUGIN") bytes)"
+  echo "==> ldd problems : $(grep -c 'not found' "$STAGING/ldd-rime.so.txt" || true)"
+else
+  echo "!! plugin not found at $PLUGIN" >&2
+  exit 1
+fi
+
+echo
+echo "==> packaging $DISTRO_KEY deb"
+STAGING="$STAGING" OUT="$OUT" SUITE="$SUITE" DISTRO_KEY="$DISTRO_KEY" \
+  "$HERE/package-ime-deb.sh"
+
+# Keep the rime-smoke probe next to the deb for the offline install test.
+cp -f "$STAGING/rime-smoke" "$OUT/rime-smoke" 2>/dev/null || true
+
+echo
+echo "==> build-info.txt"
+sed 's/^/    /' "$STAGING/build-info.txt"

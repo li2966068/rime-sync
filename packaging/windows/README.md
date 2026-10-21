@@ -1,88 +1,161 @@
-# Windows 打包（内嵌小狼毫 + 静默安装）
+# Windows 打包（自编译小狼毫 + 先装输入法）
 
-目标是「一个安装包装完即有小狼毫，且不自动弹任何窗口」。
+目标：一个安装包装完即有小狼毫，且安装顺序是「先装输入法、再装 Rime 同步」。
 
 ## 1. 文件
 
 | 文件 | 作用 |
 |---|---|
-| `fetch-weasel.ps1` | 下载固定版本的 Weasel 官方安装包到 `vendor/`，校验大小与 SHA-256 |
-| `vendor/` | 内嵌组件（**二进制不入库**，见 `.gitignore`）+ GPLv3 全文 + 来源说明 |
-| `../nsis-hooks.nsh` | NSIS 钩子：静默装 Weasel、建快捷方式、卸载清理 |
-| `../../src-tauri/tauri.conf.json` | `bundle.resources` 把 `vendor/` 打进 `$INSTDIR\resources\`；`installMode = perMachine` |
+| `../../scripts/ime/build-weasel.ps1` | **主路径**：用 MSVC 从 `third_party/weasel` 编译 Weasel，产出安装包 |
+| `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
+| `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
+| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 装输入法、POSTINSTALL 建快捷方式、卸载清理 |
+| `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine` |
 
-体积预期：NSIS 安装包会在原有体积上增加约 12MB（内嵌的 Weasel 安装器，LZMA 压缩后
-实际压缩率取决于 tauri 的 `compression` 设置；`installer.nsi` 默认 LZMA）。
+> 为什么 resources 里没有 `weasel-*.exe`：安装器用 NSIS 的 `File` 指令在**构建期**把
+> 它内嵌进 setup.exe（见第 3 节），再放进 resources 会让同一个 12MB 文件进包两次。
 
-## 2. 构建前置（**CI 必须做**）
+## 2. 构建（CI 由 release.yml 的 windows job 执行）
 
 ```powershell
-pwsh -File packaging/windows/fetch-weasel.ps1
+# 自编译（主路径）
+pwsh -NoProfile -File scripts/ime/build-weasel.ps1
+# 只做前置检查，不下载/不编译
+pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -Check
+
+# 然后是 Tauri 打包
 pnpm tauri build --bundles nsis
 ```
 
-`fetch-weasel.ps1` 必须在 `tauri build` **之前**执行，否则安装包里没有
-`resources\weasel-0.17.4.0-installer.exe`，安装器只会在日志里提示并跳过输入法安装
-（rime-sync 本体仍能装好，但「装完即有小狼毫」不成立）。
+脚本会依次做：
 
-release.yml 的 Windows job 建议插一步（另一个代理负责改 CI）：
+1. **前置检查**：`weasel.sln`、`output/install.nsi`、`get-rime.ps1`、`render.js`、
+   `output/7z.exe`、`curl.exe`、`WinSparkle.dll`、`resource/weasel.ico` 等。
+2. **boost 1.84.0**：下载源码（`archives.boost.io`，用 vendored 的 `output/7z.exe` 解压），
+   `bootstrap.bat` + `b2` 静态运行时构建 x64 与 x86 两份 `stage\lib`。
+   CI 用 `actions/cache` 缓存 `deps/boost_1_84_0/{boost,stage}`，命中则整体跳过。
+3. **librime**：跑上游 `get-rime.ps1 -use dev -tag 1.13.1`，把 rime/librime 的
+   Windows-msvc 预编译包（x64 + x86）落到 `lib64/`、`lib/`、`output/`、`output/Win32/`、
+   `include/`，并把 opencc 数据放进 `output/data/opencc/`。
+4. **数据脚手架**：复制 `LICENSE.txt`→`output/LICENSE.txt`、`README.md`→`output/README.txt`；
+   plum 为空时生成一个只打印提示的 `output/rime-install.bat`（`install.nsi` 要求它存在）。
+5. **weasel.props**：`cscript render.js` 把 `BOOST_ROOT` / `PLATFORM_TOOLSET=v143` /
+   版本号写进 props。
+6. **MSBuild**：`weasel.sln`，`Release|x64` + `Release|Win32`（32 位 TSF 组件，
+   64 位系统上的 32 位程序要用；`install.nsi` 在编译期就 `File` 它们）。
+7. **NSIS 3.08**：找不到 `makensis` 时先试 `choco install nsis`，再退回 SourceForge 静默安装；
+   先把 `output/install.nsi` 生成一份 `output/install.rime-sync.nsi`（只把两行 OpenCC 数据的
+   `File` 改成 `/nonfatal`，见下），再编译它
+   （`/DWEASEL_VERSION=0.17.4 /DWEASEL_BUILD=0 /DPRODUCT_VERSION=0.17.4.0`）。
+8. **产物断言**：复制到 `vendor/weasel-0.17.4.0-installer.exe`，打印大小与 SHA-256，
+   低于 `-MinInstallerMB`（默认 8 MiB）直接失败；写了 `GITHUB_STEP_SUMMARY`（CI 摘要）。
 
-```yaml
-- name: Fetch Weasel installer
-  shell: pwsh
-  run: ./packaging/windows/fetch-weasel.ps1
+> **OpenCC 数据（构建期改脚本的原因）**
+> librime 的 Windows 预编译包不含 `share/opencc`（那是 librime 构建时生成的），
+> vendored 树里 `librime/` 又是空子模块。上游 `install.nsi` 对
+> `File "data\opencc\*.json"` / `*.ocd*` 用的是**硬性** File（通配符没匹配到就中止编译），
+> 所以构建期生成一份只把这两行改成 `/nonfatal` 的 `install.rime-sync.nsi` 再编译，
+> **不改 vendored 源码**。后果：自编译安装包没有 OpenCC 转换数据（简繁转换等特性不可用），
+> 与「不含输入方案」同属已知差异，见 `docs/THIRD-PARTY.md`。
+
+### 依赖版本
+
+| 依赖 | 版本 | 来源 |
+|---|---|---|
+| Visual Studio | 2022 + v143（msvc-14.3） | windows-latest 自带 |
+| boost | 1.84.0 | 脚本下载源码 + b2 自建 |
+| librime | 1.13.1（预编译 msvc 包，可 `-LibrimeTag` 覆盖） | rime/librime releases |
+| NSIS | 3.08 | 脚本自动安装 |
+
+**没有 CMake 步骤**：Weasel 0.17.4 上游没有 Weasel 层的 CMakeLists.txt（官方是
+`build.bat`/MSBuild 或 `xbuild.bat`/xmake）；CMake 只属于 librime 子模块，而这里用
+librime 的官方预编译包，因此不需要 CMake。
+
+### CI 前置：vendored 源码必须入库
+
+`third_party/weasel` 目前在工作区里是**未跟踪**目录。要让 CI 自编译，必须先入库：
+
+```sh
+git add -f third_party/weasel          # -f 是必须的，见下
 ```
 
-Linux job **不需要**执行（`vendor/` 里只有 GPL 文本与说明，deb 里多几 KB 文档）。
-本机 PowerShell 语法自检：
+vendored 树自带的上游 `.gitignore` 忽略了 `output/*.exe`、`output/*.txt`、`output/*.bat`、
+`deps/`，而 `install.nsi` 恰恰要 `File` 这些文件（`7z.exe`、`curl.exe`、
+`7-zip-license.txt`、`rime-install-config.bat` …）。脚本的前置检查会明确列出缺失项并提示
+`git add -f`。
 
-```powershell
-pwsh -NoProfile -Command "[void][scriptblock]::Create((Get-Content -Raw packaging/windows/fetch-weasel.ps1))"
+## 3. 安装顺序的实现（证据点）
+
+Tauri 的 NSIS 模板在 `Section Install` 里的顺序是：
+
+```nsis
+SetOutPath $INSTDIR
+!insertmacro NSIS_HOOK_PREINSTALL     ; ← 我们在这里装输入法
+File "${MAINBINARYSRCPATH}"          ; ← 这里才开始拷 rime-sync
+File ...resources...
+!insertmacro NSIS_HOOK_POSTINSTALL    ; ← 只建快捷方式
 ```
 
-## 3. 安装行为
+因此 **PREINSTALL 阶段读不到 `$INSTDIR\resources`**（resources 是后面才解压的）。
+做法：
 
-1. **perMachine**：安装到 `C:\Program Files\rime-sync`，以管理员运行
-   （Weasel 自己要写 Program Files 与 HKLM，非提权装不了）。
-   代价：自动更新（NSIS 更新包）同样会弹 UAC，需要用户点一次「是」。
-2. 安装段的 POSTINSTALL 钩子里依次执行：
-   - 探测小狼毫：`<Program Files>\Rime\weasel-0.17.4\WeaselServer.exe`、
-     `<Program Files>\Rime\Weasel\WeaselServer.exe`（32/64 位都查）。
-     **已安装则跳过**，不重装、不降级用户现有的小狼毫。
-   - 未安装则执行（`ExecWait`，等它装完再继续）：
-     ```
-     "$INSTDIR\resources\weasel-0.17.4.0-installer.exe" /S
-     ```
-     Weasel 是 NSIS 安装器，`/S` 即静默；它默认装到
-     `C:\Program Files\Rime\weasel-0.17.4` 并自行注册输入法。
-   - 退出码非 0、或根本启动不了，都只写安装日志（`DetailPrint`），**不阻断** rime-sync 安装。
-3. **不启动主程序**：Tauri 模板的完成页有「运行 rime-sync」复选框，钩子用
-   `MUI_FINISHPAGE_RUN_NOTCHECKED` 把它的默认状态改成不勾选；钩子里没有任何
-   `Exec`/`ExecWait` 主程序的语句（只有上面那条 Weasel 安装）。
-4. 快捷方式（perMachine → 「所有用户」开始菜单
-   `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`）：
-   - `Rime 同步\Rime 同步.lnk` → `rime-sync-app.exe`
-   - `Rime 同步\同步设置.lnk` → `rime-sync-app.exe --setup`
-   - 若检测到 Weasel 程序组（`小狼毫输入法` / `小狼毫輸入法` / `Weasel`），再放一份
-     `同步设置.lnk` 进去；只补这一个文件，不动 Weasel 自己的快捷方式。
-   - Tauri 模板自动生成的 `Rime 同步\rime-sync.lnk` 会被删掉，保证文件夹里只有上述两项。
+1. 钩子里用 `${__FILEDIR__}`（Tauri 把 `installerHooks` canonicalize 成绝对路径再
+   `!include`，所以它等于 `<repo>\packaging`）定位
+   `windows\vendor\weasel-0.17.4.0-installer.exe`；
+2. 在 `PREINSTALL` 里用 NSIS `File` 指令把它解到 `$PLUGINSDIR\rime-sync-weasel\`；
+3. `ExecWait '"...\weasel-....exe" /S' $0` 等输入法装完，再 `SetOutPath $INSTDIR` 交还
+   给 Tauri 继续拷程序文件。
 
-## 4. 卸载行为
+可复核的证据：
 
-`PREUNINSTALL` 钩子只删本安装器创建的东西：
+| 证据 | 位置 |
+|---|---|
+| 编译期：内嵌缺失告警 | makensis 输出里的 `rime-sync: vendored weasel installer not found`（`!warning`） |
+| 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（UTF-8/ANSI 单行记录，含 `phase=PREINSTALL`、`exit=0`、`phase=POSTINSTALL`） |
+| 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=PREINSTALL ...` |
+| 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；内嵌的 Weasel 安装器约 12 MiB） |
 
-- `Rime 同步` 程序组里的两个快捷方式（组删空后一并 `RMDir`）；
-- Weasel 程序组里的 `同步设置.lnk`（**不删** Weasel 自己的快捷方式、不删程序组）；
-- 旧版钩子可能留下的 `Rime 同步.lnk` 与桌面快捷方式；
-- `resources\weasel-0.17.4.0-installer.exe`、`WEASEL-NOTICE.txt`、`GPL-3.0.txt`。
+静默安装看不到 DetailPrint，所以顺序日志写文件；卸载时删除该文件。
 
-**默认保留小狼毫**及其词库/配置：卸载 rime-sync 不等于卸载输入法。
-如需移除小狼毫，用「设置 → 应用」里的 Weasel 条目（或开始菜单里的卸载快捷方式）。
+## 4. CI（release.yml · windows job）
 
-## 5. 无法在本机验证的点
+| 步骤 | 作用 |
+|---|---|
+| `cache weasel build deps (boost 1.84.0)` | 缓存 `third_party/weasel/deps/boost_1_84_0/{boost,stage}` |
+| `build weasel installer from vendored source` | 调 `build-weasel.ps1`，`continue-on-error`（失败不直接红） |
+| `fetch upstream weasel installer (fallback / offline mode)` | 自编译失败或 `RIMESYNC_WEASEL_MODE=fetch` 时走官方安装包 |
+| `verify weasel vendor payload` | 必须有 `weasel-*.exe` 且 ≥ 10 MiB；摘要记录来源 |
+| `assert nsis setup embeds weasel` | 最终 setup ≥ 15 MiB |
 
-- NSIS 安装包只能在 Windows 上构建/执行：本仓库的 CI（windows-latest）负责最终验证。
-  本地已用 NSIS 3.11 的 `makensis` 加 stub 模板编译过钩子（见 PR 报告），确认语法、
-  宏展开与中文字符串编码没问题；`perMachine` + `SetShellVarContext all` 的实际路径
-  仍是 CI/真机验证项。
-- Weasel 静默安装在无交互 CI 会话里是否完整注册输入法（可能需要重启 explorer）未验证。
+在 CI 上确认自编译成功的检查项：
+
+1. `build weasel installer from vendored source` 步骤为绿色，日志末行有
+   `[ok] ...\weasel-0.17.4.0-installer.exe` 与 `sha256=...`；
+2. `verify weasel vendor payload` 打印 `weasel source: self-built from third_party/weasel @ 0.17.4`；
+3. makensis 日志里**没有** `vendored weasel installer not found` 告警；
+4. `assert nsis setup embeds weasel` 打印的 MiB 数 ≥ 15；
+5. 真机静默安装后 `%ProgramFiles%\rime-sync\install-ime-order.log` 含
+   `phase=PREINSTALL weasel installer exit=0`，且 `phase=POSTINSTALL` 在其后。
+
+## 5. 回退方案（自编译失败）
+
+任选其一：
+
+- **让 CI 自动兜底**：什么都不用做。自编译步骤失败时下一步自动跑
+  `fetch-weasel.ps1`，摘要里注明 `upstream official installer`。
+- **强制走官方安装包**：把仓库变量 `RIMESYNC_WEASEL_MODE` 设为 `fetch`
+  （Settings → Secrets and variables → Actions → Variables），或本地
+  `pwsh -File packaging/windows/fetch-weasel.ps1` 后再 `pnpm tauri build --bundles nsis`。
+- 两条路径产出的文件名一致（`weasel-0.17.4.0-installer.exe`），
+  钩子与 resources 布局不用改。
+
+## 6. 无法在本机验证的点（必须靠 CI / 真机）
+
+- 本机（Linux 开发机）没有 MSVC / NSIS / pwsh：`build-weasel.ps1` 只做了人工审读，
+  **PowerShell 语法检查与整链验证在 CI**。本地可用的替代检查：
+  `pwsh -NoProfile -Command "[void][scriptblock]::Create((Get-Content -Raw scripts/ime/build-weasel.ps1))"`。
+- Weasel 在无交互的 CI 会话里安装是否完整注册 TSF（可能需重启 explorer）未验证。
+- `get-rime.ps1` 依赖 `api.github.com`：限流/网络问题会失败（CI 传 `GITHUB_TOKEN` 缓解）。
+- boost 源码下载（`archives.boost.io`，约 120MB）可能慢；缓存命中可跳过。
+- 自编译安装包不含输入方案（plum 为空子模块）；需要方案时用 `-WithRimeData`
+  或走官方安装包，见 `docs/THIRD-PARTY.md`。

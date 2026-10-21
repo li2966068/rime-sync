@@ -2,6 +2,20 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.5.0 — 2026-10-22
+
+输入法不再是「打个包带上游 .deb」，而是**源码随仓库、每次一起编译**：
+
+1. **源码 vendoring**：`third_party/librime`（1.17.0）、`third_party/fcitx5-rime`（5.0.16）、`third_party/weasel`（0.17.4）、
+   `third_party/rime-data`（prelude/essay/luna-pinyin）随仓库走，每个目录有 FORK.md 记录上游 pin 与修改。
+2. **四发行版离线安装器**：`rime-sync-installer_<ver>~{jammy,noble,bookworm,trixie}.run`，内含自编译 IME deb +
+   同步 deb + 该发行版的依赖闭包；`--network none` 下四套全部实测通过（Loaded addon rime / deploy success / 候选「你好」）。
+3. **安装顺序严格为输入法 → 同步程序**，安装器失败即停并保留日志；支持 `--uninstall`（先同步后输入法，保留用户数据）。
+4. **fcitx5 配置页**：输入法设置里新增「Rime Sync」页，可直接编辑 WebDAV 地址/用户名/密码/远端目录/设备名，
+   并有「打开 Rime 同步」按钮（ExternalOption）。
+5. **Windows 自编译小狼毫**：CI 用 `third_party/weasel` 源码构建安装包，NSIS 在 PREINSTALL 阶段先装输入法
+   （写 `install-ime-order.log` 作为顺序证据），再安装同步程序；失败可回退上游安装包。
+6. **方案数据随包**：rime-prelude / rime-essay / luna_pinyin 打进 `/usr/share/rime-data`，装完即可输入。
 ## v0.4.0 — 2026-10-21
 
 本轮把「输入法与同步」合成一个安装包，并去掉安装后自动弹窗：
