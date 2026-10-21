@@ -174,4 +174,5 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --title "rime-sync $TAG" --generate-notes --verify-tag
-          gh release upload "$TAG" dist/* --clobber
+          # download-artifact 保留 deb/appimage/nsis 子目录，dist/* 会把目录当文件上传。
+          find dist -type f -print0 | xargs -0 gh release upload "$TAG" --clobber
