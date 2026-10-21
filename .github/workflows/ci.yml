@@ -93,3 +93,43 @@ jobs:
 
       - name: transport x2 (幂等 + userdb 红线)
         run: bash .github/scripts/e2e-rclone.sh
+
+  packaging-scripts:
+    name: packaging · vendor 脚本存在性 / 语法
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # 只做静态校验：脚本会下载几十 MB 的 vendor 资源，不在 CI 里真跑。
+      - name: scripts exist and release.yml still references them
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in packaging/linux/fetch-vendor-debs.sh packaging/windows/fetch-weasel.ps1; do
+            [ -f "$f" ] || { echo "::error::缺少 $f（发布产物需要它抓取 vendor 资源）"; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          # 改名或删步时这里立刻红，避免 vendor 静默缺席发布产物
+          for f in packaging/linux/fetch-vendor-debs.sh packaging/windows/fetch-weasel.ps1; do
+            grep -qF "$f" .github/workflows/release.yml || {
+              echo "::error::release.yml 未引用 $f，发布产物将缺少 vendor 资源"
+              exit 1
+            }
+          done
+
+      - name: bash -n packaging/linux/fetch-vendor-debs.sh
+        run: bash -n packaging/linux/fetch-vendor-debs.sh
+
+      - name: parse packaging/windows/fetch-weasel.ps1
+        run: |
+          pwsh -NoProfile -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("packaging/windows/fetch-weasel.ps1", [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host "::error::$_" }
+              exit 1
+            }
+            Write-Host "fetch-weasel.ps1 语法 OK"
+          '
+

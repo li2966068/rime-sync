@@ -1,0 +1,17 @@
+# Rime 默认方案模板（由 rime-sync 包提供，不覆盖用户已有文件）
+#
+# 用途：新装 fcitx5-rime 的用户目录里往往没有 default.custom.yaml，
+# 候选方案列表可能只有“朙月拼音”以外的默认项或为空。把本文件复制成
+#   ~/.local/share/fcitx5/rime/default.custom.yaml
+# 即可确保方案列表里有 luna_pinyin（朙月拼音）。
+#
+# 用法（普通用户，不要在 root 下执行，否则文件会落在 /root 里）：
+#   install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
+#     ~/.local/share/fcitx5/rime/default.custom.yaml
+# 然后重新部署：fcitx5-remote -r   或在 fcitx5 托盘菜单里选“重新部署”。
+#
+# 若你已经有 default.custom.yaml，请手工合并下面这一段，不要整份覆盖。
+
+patch:
+  schema_list:
+    - schema: luna_pinyin

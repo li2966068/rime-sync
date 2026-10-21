@@ -70,11 +70,52 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: fetch offline input-method deps (vendor .deb)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # ubuntu-22.04 runner 自带 docker；脚本在容器内解析 fcitx5-rime 依赖闭包。
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::runner 缺少 docker，packaging/linux/fetch-vendor-debs.sh 无法解析依赖闭包"
+            exit 1
+          fi
+          bash packaging/linux/fetch-vendor-debs.sh || {
+            echo "::error::抓取 vendor .deb 失败（需要联网 + docker）。deb 将缺少离线输入法依赖，中止发布。"
+            exit 1
+          }
+          count=$(find packaging/linux/vendor -maxdepth 1 -name '*.deb' | wc -l)
+          echo "vendor .deb 数量: $count"
+          du -sh packaging/linux/vendor
+          if [ "$count" -eq 0 ]; then
+            echo "::error::packaging/linux/vendor 仍没有 .deb，tauri deb.files 会打进一个空目录"
+            exit 1
+          fi
+
       - name: build bundles
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles deb,appimage
+
+      - name: assert deb ships vendor payload (> 20 MiB)
+        run: |
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          if [ ${#debs[@]} -eq 0 ]; then
+            echo "::error::没有生成 .deb 产物"
+            exit 1
+          fi
+          status=0
+          for f in "${debs[@]}"; do
+            size=$(stat -c %s "$f")
+            mib=$(( size / 1024 / 1024 ))
+            echo "$f: ${mib} MiB"
+            if [ "$size" -lt $(( 20 * 1024 * 1024 )) ]; then
+              echo "::error file=$f::deb 仅 ${mib} MiB（< 20 MiB），packaging/linux/vendor/*.deb 很可能没被打进包"
+              status=1
+            fi
+          done
+          exit $status
 
       - name: upload linux artifacts
         uses: actions/upload-artifact@v4
@@ -115,6 +156,26 @@ jobs:
 
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: fetch weasel installer (vendor payload)
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'packaging/windows/fetch-weasel.ps1')) {
+            Write-Host '::error::缺少 packaging/windows/fetch-weasel.ps1，NSIS 无法内置 weasel 安装包'
+            exit 1
+          }
+          pwsh -NoProfile -File packaging/windows/fetch-weasel.ps1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::packaging/windows/fetch-weasel.ps1 失败（exit $LASTEXITCODE），NSIS 将缺少 weasel 安装包"
+            exit 1
+          }
+          $exe = Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*.exe' -ErrorAction SilentlyContinue
+          if (-not $exe) {
+            Write-Host '::error::packaging/windows/vendor 下没有 weasel-*.exe，resources 会打进空目录'
+            exit 1
+          }
+          $exe | ForEach-Object { Write-Host ("vendor: {0} {1:N1} MiB" -f $_.Name, ($_.Length / 1MB)) }
 
       - name: build nsis
         env:

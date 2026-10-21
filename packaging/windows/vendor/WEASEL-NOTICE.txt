@@ -1,0 +1,31 @@
+小狼毫（Weasel）第三方组件说明
+================================
+
+组件名称: 小狼毫输入法 / Weasel（Rime 输入法引擎的 Windows 前端）
+版本    : 0.17.4.0
+版权    : Copyleft RIME Developers / 式恕堂
+许可证  : GNU General Public License v3.0（全文见同目录 GPL-3.0.txt）
+源码    : https://github.com/rime/weasel/tree/0.17.4
+发布页  : https://github.com/rime/weasel/releases/tag/0.17.4
+二进制  : weasel-0.17.4.0-installer.exe
+大小    : 12,431,118 字节
+SHA-256 : cf509534a8f5f8af9c98ed7cbb8f135439f145a8cbe7e50ede42bb5b5ab45c29
+下载地址: https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.17.4.0-installer.exe
+
+分发方式
+--------
+rime-sync 的 Windows 安装包原样内嵌上述官方安装包（未做任何修改），
+安装时以 "/S"（静默）方式执行，把 Weasel 装到其自身默认目录
+（通常为 C:\Program Files\Rime\weasel-0.17.4），随后由 Weasel 自行注册输入法。
+
+GPLv3 合规
+----------
+* 许可证全文随安装包一起分发：$INSTDIR\resources\GPL-3.0.txt
+* 对应源码可从上述源码地址获取；本仓库未修改 Weasel，二进制与官方发布一致
+  （可用上面的 SHA-256 与官方发布页比对）。
+* Weasel 与 rime-sync 相互独立：rime-sync 以独立进程方式调用 Weasel 的数据目录。
+
+卸载
+----
+卸载 rime-sync 时默认保留小狼毫及其词库/配置（详见 docs/THIRD-PARTY.md）。
+如需卸载小狼毫，请使用「程序和功能」中的 Weasel 条目或其开始菜单卸载快捷方式。

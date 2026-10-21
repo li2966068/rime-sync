@@ -1,0 +1,19 @@
+#!/bin/bash
+# rime-sync postrm
+# 卸载/清理后刷新菜单缓存，并清掉本包自己的运行时残留。
+# 用户数据（Rime 用户目录、同步配置）一律保留。
+set -u
+
+if [ "${1:-}" = "purge" ]; then
+    rm -rf /var/log/rime-sync 2>/dev/null
+    # 只删空目录；vendor/ 里是 dpkg 管理的文件，正常情况下已被 dpkg 删掉
+    rmdir /usr/share/rime-sync/vendor 2>/dev/null
+    rmdir /usr/share/rime-sync/defaults 2>/dev/null
+    rmdir /usr/share/rime-sync 2>/dev/null
+    rmdir /usr/lib/rime-sync 2>/dev/null
+fi
+
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications >/dev/null 2>&1
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1
+
+exit 0

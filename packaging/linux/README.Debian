@@ -1,0 +1,84 @@
+rime-sync — Debian/Ubuntu 安装说明（README.Debian）
+====================================================
+
+一、安装完必须做的一件事：把 fcitx5 设为输入法框架
+----------------------------------------------------
+本包会把 fcitx5 + fcitx5-rime 装好（有网时走 apt，没有网时从
+/usr/share/rime-sync/vendor/ 里的离线 .deb 装），但它不会替你改用户的
+输入法环境（deb 的 postinst 以 root 运行，也不该去动用户级设置）。
+
+请用当前桌面用户执行：
+
+    im-config -n fcitx5        # 让 X11/Wayland 会话默认用 fcitx5
+    # 注销后重新登录（或重启），然后在终端验证：
+    fcitx5-remote -o           # 打开输入法
+    fcitx5-remote -s rime      # 切到 Rime
+    fcitx5-remote -t           # 切换中/英
+
+GNOME/Wayland 下还需要在「设置 → 键盘 → 输入源」里加入「Fcitx 5」。
+之后可在 fcitx5 托盘菜单 → 「配置」→「输入法」里确认 rime 在列表中。
+
+二、首次启动 Rime
+------------------
+本包不会自动启动程序，也不会写入任何开机自启项（不碰 ~/.config/autostart）。
+需要做设置时从应用菜单手动打开「Rime 同步（完成设置）」
+（对应 /usr/share/applications/rime-sync-setup.desktop，Exec=rime-sync-app --setup）。
+
+首次使用会在 ~/.local/share/fcitx5/rime/ 里生成默认配置与词典快照。
+若方案列表里找不到朙月拼音（luna_pinyin），把本包提供的模板复制过去：
+
+    install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
+        ~/.local/share/fcitx5/rime/default.custom.yaml
+    fcitx5-remote -r           # 重新部署
+
+注意：模板只是模板，包不会覆盖用户已有的 default.custom.yaml。
+本包也不包含任何 Rime 词典数据（体积原因）；词典由 librime-data 提供，
+用户自定义词库请用 rime-sync 的 WebDAV 同步。
+
+三、完全离线安装（自带依赖）
+--------------------------
+本包自带一份 ubuntu 22.04 的 fcitx5-rime 依赖闭包（82 个 .deb，约 28 MB），
+装到 /usr/share/rime-sync/vendor/。安装期的 postinst 会排队一个后台任务：
+
+    有网  -> apt-get install fcitx5 fcitx5-rime librime-data
+    无网  -> 校验 VENDOR-INFO（发行版/版本）与 SHA256SUMS 后 dpkg -i 自带 .deb
+
+因为 dpkg 在跑 postinst 时持有 dpkg 锁，这段安装是"脱离进程 + 等锁重试"做的，
+postinst 本身立即返回，绝不会卡住或让安装失败。日志在
+/var/log/rime-sync/vendor-install.log。
+
+注意两点：
+
+1. 自带的只有"输入法"这一层依赖，不含 Tauri 自己的 GUI 栈
+   （libwebkit2gtk-4.1-0 / libgtk-3-0 / libayatana-appindicator3-1）。
+   桌面系统上这些本来就有；但如果你的系统缺它们，dpkg 会报依赖不满足并且
+   postinst 不会执行。此时先补 GUI 栈，再重装本包。完全无网又要连 GUI 栈一起装，
+   用下面的办法把 GUI 栈也抓进 vendor（体积会涨到 100 MB 以上）：
+
+       PKGS="fcitx5 fcitx5-rime librime-data libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1" \
+         packaging/linux/fetch-vendor-debs.sh
+
+2. 输入法三个包（fcitx5 / fcitx5-rime / librime-data）写在 Recommends，
+   不写在 Depends，原因是 dpkg 的死锁：配置阶段先查 Depends，不满足就直接
+   "leaving unconfigured" 并且**不执行 postinst**，而 postinst 正是负责安装
+   自带 .deb 的那个脚本。写成 Depends 时"离线自带依赖"根本走不到（实测）。
+   Recommends 是 Debian 表达"默认一起装、但不阻塞主包"的标准做法：
+   apt / aptitude 默认安装 Recommends（`apt install ./rime-sync.deb` 一样会把
+   输入法装上），`dpkg -i` 也不会因为它失败，postinst 才有机会补齐离线包。
+
+其余补救手段：
+
+    sudo apt-get update && sudo apt-get install fcitx5 fcitx5-rime librime-data
+    sudo dpkg -i /usr/share/rime-sync/vendor/*.deb     # 手工重放离线包
+    sudo apt-get -f install                            # 万一还有缺失依赖
+
+换一个发行版/版本重抓离线包（同样需要 docker 与网络）：
+
+    packaging/linux/fetch-vendor-debs.sh                            # ubuntu:22.04
+    IMAGE=ubuntu:24.04 VERSION_ID=24.04 packaging/linux/fetch-vendor-debs.sh
+
+四、卸载
+--------
+卸载只会删掉包自己的文件（/usr/bin/rime-sync-app、/usr/share/rime-sync/、
+菜单项、autostart）。用户数据 ~/.local/share/fcitx5/rime/ 与
+~/.config/rime-sync/ 一律保留，需要彻底清理请自行删除。

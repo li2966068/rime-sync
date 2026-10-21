@@ -1,0 +1,3 @@
+# 离线依赖 .deb 由 fetch-vendor-debs.sh 生成，体积大，不入库
+vendor/*
+!vendor/README.md

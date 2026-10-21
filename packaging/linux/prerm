@@ -1,0 +1,21 @@
+#!/bin/bash
+# rime-sync prerm
+# 只清理本包自己的系统级 autostart/desktop 残留；绝不删除用户数据
+# （~/.local/share/fcitx5/rime、~/.config/rime-sync 属于用户，不由 root 脚本动）。
+# 无论成功与否都 exit 0，避免卸载被卡住。
+set -u
+
+cleanup_own_files() {
+    # 系统级 autostart（若曾由我们/打包脚本创建）
+    rm -f /etc/xdg/autostart/rime-sync-app.desktop \
+          /etc/xdg/autostart/rime-sync.desktop 2>/dev/null
+    # 本包自带的"完成设置"菜单项（dpkg 也会删，这里在 upgrade 时先清掉避免残留旧内容）
+    case "${1:-}" in
+        upgrade|failed-upgrade) : ;;
+        *) rm -f /usr/share/applications/rime-sync-setup.desktop 2>/dev/null ;;
+    esac
+    return 0
+}
+
+cleanup_own_files "$@" || true
+exit 0

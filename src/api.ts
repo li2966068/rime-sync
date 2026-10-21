@@ -229,6 +229,8 @@ export const api = {
   getLog: (limit = 200) => invoke<string[]>("cmd_get_log", { limit }),
 
   needsSetup: () => invoke<boolean>("cmd_needs_setup"),
+  // --setup 启动参数：读取即清除，true = 本次强制进入同步设置向导。
+  takeSetupRequest: () => invoke<boolean>("cmd_take_setup_request"),
   secretStatus: () => invoke<SecretStatus>("cmd_secret_status"),
   firstTransport: (strategy: "pull" | "bidirectional") =>
     invoke<FirstRunResult>("cmd_first_transport", { strategy }),

@@ -1,0 +1,65 @@
+#!/bin/bash
+# rime-sync postinst
+# 原则：任何失败都不许让安装中断；不在 root 下弹窗；不碰用户数据目录。
+#
+# 为什么依赖安装是"后台排队"而不是同步执行：
+#   dpkg 在运行 postinst 期间持有 /var/lib/dpkg/lock-frontend 与数据库锁，
+#   postinst 里直接调 dpkg -i / apt-get install 会被锁拒掉
+#   （实测：dpkg: error: dpkg frontend lock was locked by another process）。
+#   所以这里只做检测 + 起一个脱离的后台 worker，由它等锁释放后再装。
+set -u
+
+WORKER=/usr/lib/rime-sync/install-vendor-deps.sh
+LOGDIR=/var/log/rime-sync
+LOG=$LOGDIR/vendor-install.log
+
+say() { printf '[rime-sync] %s\n' "$*"; }
+
+rime_im_installed() {
+    [ "$(dpkg-query -W -f='${Status}' fcitx5-rime 2>/dev/null || true)" = "install ok installed" ]
+}
+
+mkdir -p "$LOGDIR" 2>/dev/null && chmod 755 "$LOGDIR" 2>/dev/null
+
+if rime_im_installed; then
+    say "已检测到 fcitx5-rime，跳过输入法依赖安装。"
+else
+    if [ -r "$WORKER" ]; then
+        say "未检测到 fcitx5-rime：已排入后台安装队列（有网走 apt，无网用自带 .deb）。"
+        if command -v setsid >/dev/null 2>&1; then
+            setsid nohup bash "$WORKER" >>"$LOG" 2>&1 </dev/null &
+        else
+            nohup bash "$WORKER" >>"$LOG" 2>&1 </dev/null &
+        fi
+        say "安装日志：$LOG（另开终端 tail -f 可看进度）"
+    else
+        say "未检测到 fcitx5-rime，且缺少 $WORKER，请手工安装输入法（见下方提示）。"
+    fi
+fi
+
+# 刷新菜单与图标缓存（没有这些工具就算了）
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications >/dev/null 2>&1
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1
+
+cat <<'EOM'
+
+----------------------------------------------------------------
+ Rime 同步 安装完成。可在应用菜单打开「Rime 同步（完成设置）」。
+
+ 输入法还要两步（用你的桌面账号执行，不要用 root，否则配置会写进 /root）：
+
+   1. 让桌面会话使用 fcitx5：
+        im-config -n fcitx5        然后注销并重新登录
+      GNOME/Wayland 还需在「设置 → 键盘 → 输入源」里加入「Fcitx 5」。
+
+   2. 首次使用把默认方案模板放进用户目录（需要时才做）：
+        install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
+            ~/.local/share/fcitx5/rime/default.custom.yaml
+        fcitx5-remote -r
+
+ 安装不会自动启动程序，也不会写入开机自启项；需要设置时从应用菜单手动打开。
+ 详细说明（含离线安装失败的手工补救）：/usr/share/doc/rime-sync/README.Debian
+----------------------------------------------------------------
+EOM
+
+exit 0

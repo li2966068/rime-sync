@@ -2,9 +2,9 @@
 //!
 //! 这里只做进程调用，不链接 librime；headless 测试用 FakeTrigger。
 
+use crate::process::command;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 
 pub trait RimeTrigger: Send + Sync {
@@ -33,7 +33,7 @@ pub fn command_exists(program: &str) -> bool {
 }
 
 fn run(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<()> {
-    let output = Command::new(program)
+    let output = command(program)
         .args(args)
         .envs(envs.iter().map(|(key, value)| (*key, *value)))
         .output()
@@ -112,7 +112,7 @@ impl RimeTrigger for LinuxTrigger {
         }
         if command_exists("fcitx5-remote") {
             // 尽力而为：fcitx5 未运行时返回非零，不应让 apply 失败。
-            let _ = Command::new("fcitx5-remote").arg("-e").output();
+            let _ = command("fcitx5-remote").arg("-e").output();
         }
         Ok(())
     }
@@ -123,7 +123,7 @@ impl RimeTrigger for LinuxTrigger {
         }
         if command_exists("fcitx5") {
             // fcitx5 会 fork 守护进程并继承管道；用 null stdio + spawn 避免 output() 永久等待。
-            let _ = Command::new("fcitx5")
+            let _ = command("fcitx5")
                 .args(["-d", "--replace"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -176,7 +176,7 @@ impl WeaselTrigger {
 
     fn run_switch(&self, switch: &str) -> Result<()> {
         let exe = self.exe()?;
-        let output = Command::new(exe)
+        let output = command(exe)
             .arg(switch)
             .output()
             .with_context(|| format!("spawn {}", exe.display()))?;

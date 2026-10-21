@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rime 同步（完成设置）
+Name[en]=Rime Sync (Finish Setup)
+GenericName=Rime 输入法初始化
+Comment=完成 Rime 同步的首次设置：检查 fcitx5-rime 输入法并写入默认方案模板
+Exec=rime-sync-app --setup
+Icon=rime-sync-app
+Terminal=false
+Categories=Utility;
+Keywords=Rime;fcitx5;input method;同步;
+StartupNotify=true

@@ -36,6 +36,8 @@ const LOG_CAPACITY: usize = 1000;
 pub(crate) struct Inner {
     pub(crate) cancel: Mutex<Option<CancelToken>>,
     pub(crate) running: AtomicBool,
+    /// 启动参数 --setup：前端取走一次后清除，保证只强制打开一次向导。
+    pub(crate) setup_request: AtomicBool,
     pub(crate) log: Mutex<Vec<String>>,
     pub(crate) secret: Mutex<Option<Arc<SecretSelection>>>,
     pub(crate) watch: Mutex<Option<watch_cmds::WatchSession>>,
@@ -46,6 +48,7 @@ impl Default for Inner {
         Self {
             cancel: Mutex::new(None),
             running: AtomicBool::new(false),
+            setup_request: AtomicBool::new(false),
             log: Mutex::new(Vec::new()),
             secret: Mutex::new(None),
             watch: Mutex::new(None),
@@ -635,6 +638,21 @@ fn cmd_needs_setup(app: AppHandle, state: State<'_, AppState>) -> Result<bool, S
     Ok(config.webdav.url.trim().is_empty())
 }
 
+/// 前端启动时读取并清除 --setup 请求：true 表示本次必须进入同步设置向导。
+///
+/// 用 swap 而不是单纯读取：一次启动只强制打开一次，之后用户手动关闭不会被重新弹出。
+#[tauri::command]
+fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
+    let requested = state.0.setup_request.swap(false, Ordering::SeqCst);
+    if requested {
+        push_log(&state.0, "前端已接管 --setup：打开同步设置向导");
+        eprintln!(
+            "[rime-sync] setup wizard: frontend consumed --setup request; opening sync setup dialog"
+        );
+    }
+    requested
+}
+
 #[derive(Serialize)]
 struct SecretStatus {
     backend: String,
@@ -734,6 +752,13 @@ fn first_transport(
     }
 }
 
+const SETUP_FLAG: &str = "--setup";
+
+/// 安装完成后用 --setup 启动：无论是否首次运行，都强制进入同步设置向导。
+fn setup_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == SETUP_FLAG)
+}
+
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -747,6 +772,15 @@ pub fn run() {
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
             push_log(&state.0, "Rime 同步已启动");
+            let setup_requested = setup_requested(std::env::args());
+            state
+                .0
+                .setup_request
+                .store(setup_requested, Ordering::SeqCst);
+            if setup_requested {
+                push_log(&state.0, "检测到 --setup：强制进入同步设置向导");
+                eprintln!("[rime-sync] setup wizard: --setup detected; forcing sync setup dialog");
+            }
             // 托盘在 headless / 缺 appindicator 时会创建失败：只降级记日志，不 panic。
             match tray::setup(&handle) {
                 Ok(()) => push_log(&state.0, "托盘已就绪（关闭窗口默认隐藏到托盘）"),
@@ -791,6 +825,7 @@ pub fn run() {
             cmd_cancel,
             cmd_get_log,
             cmd_needs_setup,
+            cmd_take_setup_request,
             cmd_secret_status,
             cmd_first_transport,
             conflict_cmds::cmd_list_conflicts,

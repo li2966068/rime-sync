@@ -4,7 +4,6 @@
 //! 探测不到一律视为非计量——绝不能因为探测失败而阻止同步。
 
 use serde::Serialize;
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -187,7 +186,7 @@ fn udp_route_probe() -> Option<bool> {
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = crate::process::command(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }

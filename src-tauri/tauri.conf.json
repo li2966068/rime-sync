@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rime-sync",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "com.rimesync.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -54,13 +54,28 @@
     "category": "Utility",
     "shortDescription": "Rime 词库与配置的 WebDAV 双向同步",
     "longDescription": "把 Rime 的用户词库快照、custom.yaml 与词典源通过用户自有的 WebDAV 在 Windows 与 Linux 之间双向同步；支持只搬运不打断输入，以及手动合并生效。",
+    "resources": {
+      "../packaging/windows/vendor/": "resources/"
+    },
     "linux": {
       "deb": {
         "section": "utils",
-        "depends": [
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0"
-        ]
+        "depends": [],
+        "recommends": [
+          "fcitx5",
+          "fcitx5-rime",
+          "librime-data"
+        ],
+        "files": {
+          "/usr/share/rime-sync/vendor/": "../packaging/linux/vendor/",
+          "/usr/share/rime-sync/defaults/": "../packaging/linux/defaults/",
+          "/usr/share/doc/rime-sync/README.Debian": "../packaging/linux/README.Debian",
+          "/usr/share/applications/rime-sync-setup.desktop": "../packaging/linux/rime-sync-setup.desktop",
+          "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh"
+        },
+        "postInstallScript": "../packaging/linux/postinst",
+        "preRemoveScript": "../packaging/linux/prerm",
+        "postRemoveScript": "../packaging/linux/postrm"
       }
     },
     "windows": {
@@ -69,7 +84,7 @@
         "silent": true
       },
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "perMachine",
         "languages": [
           "SimpChinese",
           "English"

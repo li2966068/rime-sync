@@ -345,7 +345,7 @@
     <div class="wizard" id="wizard" hidden>
       <div class="wizard-card" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
         <div class="wizard-head">
-          <h2 id="wizard-title" data-i18n="wizard.title">首次运行向导</h2>
+          <h2 id="wizard-title" data-i18n="wizard.title">同步设置</h2>
           <span class="muted" id="wizard-step-label"></span>
         </div>
         <div class="wizard-progress"><div id="wizard-bar"></div></div>
@@ -360,6 +360,11 @@
               <button class="ghost small" id="wizard-detect" type="button" data-i18n="wizard.detect">自动探测</button>
             </div>
             <p class="hint" id="wizard-rime-status"></p>
+          </div>
+          <div class="field">
+            <label for="wizard-device" data-i18n="wizard.device"></label>
+            <input id="wizard-device" type="text" spellcheck="false" data-i18n-placeholder="wizard.devicePlaceholder" />
+            <p class="hint" data-i18n="wizard.deviceHint"></p>
           </div>
         </section>
 
@@ -389,6 +394,7 @@
           <div class="field">
             <label for="wizard-dir" data-i18n="conn.dir"></label>
             <input id="wizard-dir" type="text" spellcheck="false" data-i18n-placeholder="conn.dirPlaceholder" />
+            <p class="hint" data-i18n="wizard.dirHint"></p>
           </div>
         </section>
 
@@ -399,6 +405,7 @@
             <button class="secondary" id="wizard-test" type="button" data-i18n="conn.test"></button>
           </div>
           <div class="status" id="wizard-status" hidden></div>
+          <div class="wizard-result" id="wizard-details" hidden></div>
         </section>
 
         <section class="wizard-step" data-wizard-step="4">
@@ -406,21 +413,35 @@
           <p class="muted" data-i18n="wizard.step4Body"></p>
           <div class="strategy" id="wizard-strategy">
             <label class="strategy-card">
-              <input type="radio" name="wizard-strategy" value="pull" checked />
+              <input type="radio" name="wizard-strategy" value="preview" checked />
               <span>
-                <strong data-i18n="wizard.pullOnly"></strong>
-                <em data-i18n="wizard.pullOnlyDesc"></em>
+                <strong data-i18n="wizard.preview"></strong>
+                <em data-i18n="wizard.previewDesc"></em>
               </span>
             </label>
             <label class="strategy-card">
-              <input type="radio" name="wizard-strategy" value="bidirectional" />
+              <input type="radio" name="wizard-strategy" value="normal" />
               <span>
-                <strong data-i18n="wizard.twoWay"></strong>
-                <em data-i18n="wizard.twoWayDesc"></em>
+                <strong data-i18n="wizard.normal"></strong>
+                <em data-i18n="wizard.normalDesc"></em>
               </span>
             </label>
           </div>
+          <p class="hint" id="wizard-policy-hint"></p>
+          <label class="check">
+            <input type="checkbox" id="wizard-run-first" checked />
+            <span>
+              <span data-i18n="wizard.runFirst"></span>
+              <em data-i18n="wizard.runFirstHint"></em>
+            </span>
+          </label>
           <div class="wizard-result" id="wizard-result" hidden></div>
+        </section>
+
+        <section class="wizard-step" data-wizard-step="5">
+          <h3 data-i18n="wizard.doneTitle"></h3>
+          <p class="muted" data-i18n="wizard.doneBody"></p>
+          <div class="wizard-result" id="wizard-summary" hidden></div>
         </section>
 
         <div class="wizard-actions">
