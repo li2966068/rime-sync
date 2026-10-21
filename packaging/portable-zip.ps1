@@ -36,7 +36,17 @@ if ([string]::IsNullOrWhiteSpace($Version)) { throw "版本号为空" }
 
 $exe = Join-Path $TargetDir "rime-sync.exe"
 if (-not (Test-Path $exe)) {
-  throw "找不到 $exe；请先运行 pnpm tauri build --bundles nsis 或 cargo build --release"
+  # Cargo 包名是 rime-sync-app，产物文件名随包名走；两种名字都接受。
+  $exe = Join-Path $TargetDir "rime-sync-app.exe"
+}
+if (-not (Test-Path $exe)) {
+  $candidate = Get-ChildItem -Path $TargetDir -Filter *.exe -File |
+    Where-Object { $_.Name -notmatch 'setup|uninstall' } |
+    Select-Object -First 1
+  if ($candidate) { $exe = $candidate.FullName }
+}
+if (-not (Test-Path $exe)) {
+  throw "找不到可执行文件（$TargetDir 下无 rime-sync.exe / rime-sync-app.exe）；请先运行 pnpm tauri build --bundles nsis 或 cargo build --release"
 }
 
 $stage = Join-Path $OutDir ("rime-sync_" + $Version + "_x64-portable")
