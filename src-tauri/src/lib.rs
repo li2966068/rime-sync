@@ -222,7 +222,18 @@ fn server_kind(server: Option<&str>, dav: &[String]) -> String {
 
 #[tauri::command]
 fn cmd_get_config(app: AppHandle, state: State<'_, AppState>) -> Result<Config, String> {
-    ensure_config(&app, &state.0)
+    let mut config = ensure_config(&app, &state.0)?;
+    // 配置里的 Rime 目录可能已被删除（或来自旧机器/旧测试），启动时校验一次。
+    if let Some(dir) = config.rime_dir.clone() {
+        if !Path::new(&dir).is_dir() {
+            push_log(&state.0, format!("配置的 Rime 目录不存在，已重置以便重新探测：{dir}"));
+            config.rime_dir = None;
+            config
+                .save(&config_path(&app)?)
+                .map_err(|error| format!("写入配置失败：{error:#}"))?;
+        }
+    }
+    Ok(config)
 }
 
 #[tauri::command]
@@ -641,6 +652,30 @@ fn cmd_needs_setup(app: AppHandle, state: State<'_, AppState>) -> Result<bool, S
 /// 前端启动时读取并清除 --setup 请求：true 表示本次必须进入同步设置向导。
 ///
 /// 用 swap 而不是单纯读取：一次启动只强制打开一次，之后用户手动关闭不会被重新弹出。
+/// 原生目录选择器（设置页 / 向导里的「浏览…」）。取消时返回 None。
+#[tauri::command]
+async fn cmd_pick_folder(app: AppHandle, title: Option<String>) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app2.dialog()
+            .file()
+            .set_title(title.unwrap_or_else(|| "选择 Rime 用户目录".to_string()))
+            .pick_folder(move |path| {
+                let _ = tx.send(path);
+            });
+        rx.recv_timeout(std::time::Duration::from_secs(600))
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|path| path.into_path().ok())
+    .map(|path| path.display().to_string())
+}
+
 #[tauri::command]
 fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
     let requested = state.0.setup_request.swap(false, Ordering::SeqCst);
@@ -761,6 +796,7 @@ fn setup_requested(args: impl IntoIterator<Item = String>) -> bool {
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // 开机自启（SPEC-4 §B3）：带 --minimized 自启时静默进托盘。
         .plugin(tauri_plugin_autostart::init(
@@ -826,6 +862,7 @@ pub fn run() {
             cmd_get_log,
             cmd_needs_setup,
             cmd_take_setup_request,
+            cmd_pick_folder,
             cmd_secret_status,
             cmd_first_transport,
             conflict_cmds::cmd_list_conflicts,

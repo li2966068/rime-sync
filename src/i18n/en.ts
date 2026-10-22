@@ -109,6 +109,7 @@ export const en: Record<keyof Dict, string> = {
   "sync.rimeDir": "Current Rime user folder",
   "sync.rimeDirPlaceholder": "Use Detect, or type a path in Settings",
   "sync.detect": "Detect",
+  "sync.browse": "Browse…",
   "sync.detecting": "Detecting…",
   "sync.source": "Source: {source}",
   "sync.saved": "Saved folder",

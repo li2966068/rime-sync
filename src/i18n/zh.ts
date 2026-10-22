@@ -106,6 +106,7 @@ export const zh = {
   "sync.rimeDir": "当前 Rime 用户目录",
   "sync.rimeDirPlaceholder": "点击「自动探测」或在设置中手动填写",
   "sync.detect": "自动探测",
+  "sync.browse": "浏览…",
   "sync.detecting": "正在探测…",
   "sync.source": "来源：{source}",
   "sync.saved": "已保存的目录",

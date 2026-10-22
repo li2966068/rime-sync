@@ -36,6 +36,23 @@ PKG_VERSION=$VERSION
 test -d "$ROOT" || { echo "!! staging tree missing: $ROOT (run scripts/ime/build-linux.sh first)" >&2; exit 1; }
 test -f "$ROOT/usr/lib/x86_64-linux-gnu/fcitx5/rime.so" ||
   { echo "!! rime.so missing from staging" >&2; exit 1; }
+
+# The Rime Sync config page is a second, independent fcitx5 addon. If any of
+# these three files is missing, fcitx5-configtool shows no "Rime Sync" entry
+# (no gear icon, no page) — the exact regression this check exists for.
+ADDON_SO=$(find "$ROOT/usr/lib" -type f -name rimesync.so -print -quit 2>/dev/null || true)
+ADDON_CONF=$ROOT/usr/share/fcitx5/addon/rimesync.conf
+ADDON_BIN=$ROOT/usr/bin/rime-sync-open-setup
+test -n "$ADDON_SO" ||
+  { echo "!! rimesync.so missing from staging (fcitx5 config page not built)" >&2; exit 1; }
+test -f "$ADDON_CONF" ||
+  { echo "!! $ADDON_CONF missing from staging" >&2; exit 1; }
+test -f "$ADDON_BIN" ||
+  { echo "!! $ADDON_BIN missing from staging" >&2; exit 1; }
+test -x "$ADDON_BIN" ||
+  { echo "!! $ADDON_BIN is not executable in staging" >&2; exit 1; }
+grep -qx 'Configurable=True' "$ADDON_CONF" ||
+  { echo "!! $ADDON_CONF is not Configurable=True" >&2; exit 1; }
 test -f "$REPO_ROOT/third_party/rime-data/rime-prelude/default.yaml" ||
   { echo "!! third_party/rime-data is missing the vendored schema data" >&2; exit 1; }
 
@@ -150,7 +167,35 @@ fi
 dpkg-deb --root-owner-group -Zxz --build "$PKGROOT" "$DEB" >/dev/null
 cp "$PKGROOT/DEBIAN/control" "$OUT/control.txt"
 cp "$OUT/control.txt" "$STAGING/control.txt" 2>/dev/null || true
+# ------------------------------------------------------- deb contents ------
+# dpkg-deb -c is the ground truth for what a user actually installs; assert the
+# config page payload and its permissions straight out of the archive.
+DEB_LIST=$(dpkg-deb -c "$DEB")
+deb_assert() { # <path inside the package> <exact mode column> <description>
+  local path=$1 want=$2 desc=$3 got
+  got=$(printf '%s\n' "$DEB_LIST" | awk -v p="./$path" '$6 == p { print $1 }')
+  if [ -z "$got" ]; then
+    echo "!! $desc missing from $DEB: /$path" >&2
+    exit 1
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "!! $desc has mode $got in $DEB (want $want): /$path" >&2
+    exit 1
+  fi
+  printf '    ok %s /%s\n' "$got" "$path"
+}
+ADDON_SO_REL=${ADDON_SO#"$ROOT"/}
+deb_assert "$ADDON_SO_REL" -rw-r--r-- "rimesync.so (fcitx5 config page addon)"
+deb_assert usr/share/fcitx5/addon/rimesync.conf -rw-r--r-- "rimesync.conf (addon metadata)"
+deb_assert usr/bin/rime-sync-open-setup -rwxr-xr-x "rime-sync-open-setup (action button target)"
+if printf '%s\n' "$DEB_LIST" | grep -q 'rime-sync-config'; then
+  echo "!! the standalone Qt widgets config page leaked into $DEB" >&2
+  exit 1
+fi
+
 echo "==> $DEB ($(stat -c %s "$DEB") bytes)"
 echo "==> version: $PKG_VERSION  suite: ${SUITE:-none}  distro: $DISTRO_KEY"
 echo "==> deps: $DEPS"
 echo "==> conflicts: $CONFLICTS"
+echo "==> config page:"
+printf '%s\n' "$DEB_LIST" | grep -E 'rimesync|rime-sync-open-setup' | sed 's/^/    /'

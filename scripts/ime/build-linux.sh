@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the Rime input method (librime + fcitx5-rime + vendored schema data)
-# from the vendored sources inside Docker, then pack a distribution-specific
-# rime-inputmethod deb.
+# Build the Rime input method (librime + fcitx5-rime + the Rime Sync fcitx5
+# config page addon + vendored schema data) from the vendored sources inside
+# Docker, then pack a distribution-specific rime-inputmethod deb.
 #
 #   scripts/ime/build-linux.sh                       # ubuntu:22.04
 #   IMAGE=ubuntu:24.04 scripts/ime/build-linux.sh
@@ -71,6 +71,19 @@ case "$APT_MIRROR" in
   http://*|https://*) : ;;
   *) APT_MIRROR="http://$APT_MIRROR" ;;
 esac
+# apt inside the image build has no IPv6 route on some hosts (buildkit resolves
+# AAAA while the host only has v4). auto = force IPv4 only when the host itself
+# has no IPv6 default route; set to 0/1 to override.
+APT_FORCE_IPV4=${APT_FORCE_IPV4:-auto}
+if [ "$APT_FORCE_IPV4" = "auto" ]; then
+  if ip -6 route show default 2>/dev/null | grep -q .; then
+    APT_FORCE_IPV4=
+  else
+    APT_FORCE_IPV4=1
+    echo "==> no IPv6 default route; forcing apt to IPv4 inside the image build"
+  fi
+fi
+
 BASE_TAG=$(printf '%s' "$IMAGE" | tr -c 'a-zA-Z0-9_.-' '_')
 if [ -z "${BUILDER_IMAGE:-}" ]; then
   BUILDER_IMAGE="rime-ime-builder:$BASE_TAG"
@@ -97,7 +110,14 @@ fi
 # （ERROR: network mode "bridge" not supported by buildkit）。
 # 所以构建默认不传 --network（= buildkit 的 default），只有显式
 # BUILD_NETWORK=host 时（例如需要内网镜像源）才传。
+# buildkit's default (bridge) network hits the same broken resolver: when the
+# run probe above had to fall back to host, default the image build to host too.
+# An explicit BUILD_NETWORK always wins.
 BUILD_NETWORK=${BUILD_NETWORK:-}
+if [ -z "$BUILD_NETWORK" ] && [ "$DOCKER_NETWORK" = "host" ]; then
+  BUILD_NETWORK=host
+  echo "==> container DNS needs the host resolver; using --network host for docker build"
+fi
 case "$BUILD_NETWORK" in
   ""|default|host|none) : ;;
   *)
@@ -127,6 +147,7 @@ fi
 echo "==> building dependency image (docker caches it on later runs)"
 if ! docker build -t "$BUILDER_IMAGE" ${BUILD_NETWORK_ARGS[@]+"${BUILD_NETWORK_ARGS[@]}"} \
       --build-arg BASE_IMAGE="$IMAGE" --build-arg APT_MIRROR="$APT_MIRROR" \
+      --build-arg APT_FORCE_IPV4="$APT_FORCE_IPV4" \
       -f "$HERE/Dockerfile" "$HERE" >"$STAGING/docker-build.log" 2>&1; then
   echo "!! docker build failed; tail of $STAGING/docker-build.log:" >&2
   tail -n 60 "$STAGING/docker-build.log" >&2
@@ -150,6 +171,9 @@ fi
 ELAPSED=$(($(date +%s) - START))
 
 PLUGIN=$STAGING/root/usr/lib/x86_64-linux-gnu/fcitx5/rime.so
+ADDON_SO=$(find "$STAGING/root/usr/lib" -type f -name rimesync.so -print -quit 2>/dev/null || true)
+ADDON_CONF=$STAGING/root/usr/share/fcitx5/addon/rimesync.conf
+ADDON_BIN=$STAGING/root/usr/bin/rime-sync-open-setup
 
 echo
 echo "==> done in $ELAPSED s (docker image build excluded)"
@@ -161,6 +185,21 @@ else
   echo "!! plugin not found at $PLUGIN" >&2
   exit 1
 fi
+# The config page addon is the whole point of the packaging change: bail out
+# before packing an IME deb that fcitx5-configtool cannot show a page for.
+for f in "$ADDON_SO" "$ADDON_CONF" "$ADDON_BIN"; do
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    echo "!! fcitx5 config page file missing from staging: ${f:-rimesync.so}" >&2
+    exit 1
+  fi
+done
+if [ ! -x "$ADDON_BIN" ]; then
+  echo "!! $ADDON_BIN is not executable" >&2
+  exit 1
+fi
+echo "==> config page  : $ADDON_SO ($(stat -c %s "$ADDON_SO") bytes)"
+echo "==> config page  : $ADDON_CONF ($(grep -c . "$ADDON_CONF") metadata lines)"
+echo "==> config page  : $ADDON_BIN (0755)"
 
 echo
 echo "==> packaging $DISTRO_KEY deb"

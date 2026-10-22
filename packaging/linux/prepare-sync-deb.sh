@@ -22,6 +22,13 @@ for s in postinst prerm postrm; do
 done
 find "$tmp/root" -type d -exec chmod 0755 {} +
 find "$tmp/root" -type f -exec chmod 0644 {} +
+# 恢复可执行位：上面的 0644 会把 /usr/bin/rime-sync-app 变成不可执行（0.5.0 的实测 bug）。
+if [ -d "$tmp/root/usr/bin" ]; then
+  find "$tmp/root/usr/bin" -type f -exec chmod 0755 {} +
+fi
+if [ -d "$tmp/root/usr/lib/rime-sync" ]; then
+  find "$tmp/root/usr/lib/rime-sync" -type f -exec chmod 0755 {} +
+fi
 find "$tmp/root/DEBIAN" -type f -name 'post*' -exec chmod 0755 {} +
 find "$tmp/root/DEBIAN" -type f -name 'pre*' -exec chmod 0755 {} +
 dpkg-deb --root-owner-group -Zxz --build "$tmp/root" "$out" >/dev/null

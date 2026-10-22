@@ -9,10 +9,25 @@ FROM ${BASE_IMAGE}
 # and Debian >= 12. Empty = keep the image's official sources.
 ARG APT_MIRROR=
 
+# Some build hosts (and buildkit's host-network namespace) resolve AAAA but have
+# no IPv6 route, so apt fails with "Network is unreachable". Non-empty forces
+# apt to IPv4; scripts/ime/build-linux.sh enables it when the host has no IPv6
+# default route.
+ARG APT_FORCE_IPV4=
+
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8
 
-RUN if [ -n "$APT_MIRROR" ]; then \
+# The Rime Sync config page is a fcitx5 SharedLibrary addon (rimesync.so) that
+# uses Qt Core for its JSON access and Fcitx5Config for its option tree. It is
+# built by scripts/ime/container-build.sh and shipped in the IME deb.
+#
+# Qt major: qtbase5-dev is preferred because it is what every supported
+# distribution ships for fcitx5-config-qt and it pulls a far smaller runtime
+# closure than Qt6; qt6-base-dev is the fallback for images without Qt5.
+# libglib2.0-bin provides gdbus, used by the in-container load smoke test.
+RUN set -eux; \
+    if [ -n "$APT_MIRROR" ]; then \
       for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
         [ -f "$f" ] || continue; \
         sed -i -E \
@@ -23,15 +38,25 @@ RUN if [ -n "$APT_MIRROR" ]; then \
           -e "s#https?://security\.debian\.org/debian#$APT_MIRROR/debian#g" \
           "$f"; \
       done; \
-    fi \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    fi; \
+    if [ -n "$APT_FORCE_IPV4" ]; then \
+      echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4; \
+    fi; \
+    apt-get update; \
+    QT_DEV=qtbase5-dev; \
+    QT_CAND=$(apt-cache policy qtbase5-dev | sed -n 's/^ *Candidate: *//p'); \
+    case "$QT_CAND" in ""|"(none)") QT_DEV=qt6-base-dev ;; esac; \
+    echo "Qt development package: $QT_DEV"; \
+    apt-get install -y --no-install-recommends \
       build-essential cmake pkg-config gettext extra-cmake-modules \
       libboost-all-dev \
       libopencc-dev libyaml-cpp-dev libleveldb-dev libgoogle-glog-dev libmarisa-dev \
-      libfcitx5core-dev \
+      libfcitx5core-dev libfcitx5config-dev libfcitx5utils-dev \
       fcitx5 fcitx5-modules \
-      xvfb dbus-x11 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+      xvfb dbus-x11 libglib2.0-bin ca-certificates \
+      "$QT_DEV"; \
+    rm -rf /var/lib/apt/lists/*; \
+    dpkg-query -W -f='  ${Package} ${Version}\n' "$QT_DEV" libfcitx5config-dev
 
 # fcitx5 5.0.14 (Ubuntu 22.04) installs neither Fcitx5Module.cmake nor the
 # per-module public headers that fcitx5-rime includes (notifications_public.h,

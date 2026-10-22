@@ -52,6 +52,8 @@ const el = {
   rimeDir: byId<HTMLInputElement>("rime-dir"),
   rimeDirSource: byId<HTMLParagraphElement>("rime-dir-source"),
   detect: byId<HTMLButtonElement>("btn-detect"),
+  browseRime: byId<HTMLButtonElement>("btn-browse-rime"),
+  wizardBrowse: byId<HTMLButtonElement>("wizard-browse"),
   watchToggle: byId<HTMLInputElement>("watch-toggle"),
   watchStatus: byId<HTMLSpanElement>("watch-status"),
   watchLast: byId<HTMLSpanElement>("watch-last"),
@@ -590,7 +592,34 @@ async function saveRimeDir(): Promise<void> {
   }
 }
 
-async function detectRimeDir(target = el.rimeDir, status = el.rimeDirSource): Promise<void> {
+/// 原生目录选择器：设置页保存，向导只填输入框（点「下一步」时统一保存）。
+async function pickRimeDir(
+  target: HTMLInputElement,
+  status: HTMLParagraphElement,
+  save: boolean,
+): Promise<void> {
+  try {
+    const picked = await api.pickFolder(t("sync.rimeDir"));
+    if (!picked) {
+      return;
+    }
+    target.value = picked;
+    status.textContent = t("sync.manual");
+    if (save) {
+      const saved = await api.setConfig({ ...requireConfig(), rime_dir: picked });
+      renderConfig(saved);
+      toast(t("sync.saved"));
+    }
+  } catch (error) {
+    toast(t("sync.detectFail") + "：" + errorText(error));
+  }
+}
+
+async function detectRimeDir(
+  target = el.rimeDir,
+  status = el.rimeDirSource,
+  silent = false,
+): Promise<void> {
   el.detect.disabled = true;
   status.textContent = t("sync.detecting");
   try {
@@ -599,7 +628,9 @@ async function detectRimeDir(target = el.rimeDir, status = el.rimeDirSource): Pr
     status.textContent = t("sync.source", { source: detection.source });
     const saved = await api.setConfig({ ...requireConfig(), rime_dir: detection.path });
     renderConfig(saved);
-    toast(t("sync.detected"));
+    if (!silent) {
+      toast(t("sync.detected"));
+    }
   } catch (error) {
     status.textContent = t("sync.detectFail");
     toast(t("sync.detectFail") + "：" + errorText(error));
@@ -1667,6 +1698,12 @@ function bindEvents(): void {
   el.detect.addEventListener("click", () => {
     void detectRimeDir();
   });
+  el.browseRime.addEventListener("click", () => {
+    void pickRimeDir(el.rimeDir, el.rimeDirSource, true);
+  });
+  el.wizardBrowse.addEventListener("click", () => {
+    void pickRimeDir(el.wizardRime, el.wizardRimeStatus, false);
+  });
   el.rimeDir.addEventListener("change", () => {
     void saveRimeDir();
   });
@@ -1980,6 +2017,10 @@ async function init(): Promise<void> {
     const loaded = await api.getConfig();
     renderConfig(loaded);
     el.rimeDirSource.textContent = loaded.rime_dir ? t("sync.saved") : t("sync.notDetected");
+    // 启动时校验：配置里的目录被删掉后（后端已重置为 null），自动重新探测一次。
+    if (!loaded.rime_dir) {
+      void detectRimeDir(el.rimeDir, el.rimeDirSource, true);
+    }
     await loadPresets();
     await subscribe();
     await loadLog();

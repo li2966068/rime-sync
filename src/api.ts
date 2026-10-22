@@ -251,6 +251,8 @@ export const api = {
     invoke<PresetApply>("cmd_apply_preset", { presetId, rawUrl }),
   probeWrite: () => invoke<WriteProbe>("cmd_probe_write"),
 
+  pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
+
   exportDiagnostics: () => invoke<{ path: string }>("cmd_export_diagnostics"),
 
   watchStart: () => invoke<WatchStatus>("cmd_watch_start"),
