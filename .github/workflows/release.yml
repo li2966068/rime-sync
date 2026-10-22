@@ -276,10 +276,11 @@ jobs:
         with:
           name: ime-${{ matrix.distro }}
           if-no-files-found: error
+          # 注意：不要上传 rime-smoke（四个发行版同名，merge-multiple 后会撞名，
+          # gh release upload 报 HTTP 422 Validation Failed）。
           path: |
             packaging/linux/out/*.run
             build/deb/${{ matrix.distro }}/*.deb
-            build/deb/${{ matrix.distro }}/rime-smoke
 
   # 汇总 + 验收：只有四套 .run 与四个 IME deb 都在，publish 才会被触发。
   collect:
