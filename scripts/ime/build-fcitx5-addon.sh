@@ -22,8 +22,17 @@ OUT=${OUT:-$ADDON_DIR/build}
 JOBS=${JOBS:-$(nproc)}
 SMOKE=1
 FORCE_IMAGE=0
-# docker build 默认走 bridge 网络；本机 DNS 有问题时用 BUILD_NETWORK=host。
+# docker build 默认不传 --network（= buildkit 的 default）；buildkit 只接受
+# default/host/none，传 bridge 会直接失败。本机 DNS 有问题时用 BUILD_NETWORK=host。
 BUILD_NETWORK=${BUILD_NETWORK:-}
+case "$BUILD_NETWORK" in
+    ""|default|host|none) : ;;
+    *)
+        echo "不支持的 BUILD_NETWORK: $BUILD_NETWORK（可用 default|host|none）" >&2
+        exit 2
+        ;;
+esac
+if [ "$BUILD_NETWORK" = "default" ]; then BUILD_NETWORK=; fi
 
 usage() {
     sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'

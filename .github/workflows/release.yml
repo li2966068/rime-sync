@@ -35,45 +35,23 @@ jobs:
 #   linux   → deb + AppImage（+ 更新包 .AppImage.tar.gz 与 .sig）
 #             + 四发行版离线安装器（self-extracting .run：IME deb + 依赖闭包）
 #   windows → NSIS 安装包 + 便携版 zip（+ 更新包 .sig）
-  linux:
-    name: linux · deb + AppImage + 四发行版离线安装器
+  # 应用本体（deb + AppImage）。矩阵里的四个发行版 job 都复用这一个 rime-sync deb。
+  linux-app:
+    name: linux-app · deb + AppImage
     runs-on: ubuntu-22.04
-    timeout-minutes: 210
+    timeout-minutes: 60
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      # 预算：四套 docker 构建镜像（每套 1.5-2.5 GiB）+ 四份 vendor 闭包（~700 MiB）
-      # + 四份 .run（~600 MiB）。runner 默认只剩 ~14 GiB，先删掉本次构建用不到的预装 SDK。
       - name: free runner disk space
         run: |
           set -euo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
-
-      - name: preflight · docker + disk headroom
-        run: |
-          set -euo pipefail
-          command -v docker >/dev/null 2>&1 || {
-            echo "::error::runner 缺少 docker：scripts/ime/build-linux.sh 与 scripts/ime/fetch-vendor-deps.sh 都在容器里运行"
-            exit 1
-          }
-          docker info >/dev/null 2>&1 || {
-            echo "::error::docker daemon 不可用，四发行版构建无法进行"
-            exit 1
-          }
-          avail=$(df -Pk / | awk "NR==2 {print \$4}")
-          avail_gib=$(( avail / 1024 / 1024 ))
-          echo "docker: $(docker --version)"
-          echo "可用磁盘: ${avail_gib} GiB"
-          if [ "$avail_gib" -lt 12 ]; then
-            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 12 GiB）：四套 IME 镜像 + vendor 闭包装不下"
-            exit 1
-          fi
 
       - name: install linux system dependencies
         run: |
@@ -106,9 +84,9 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # 顺序是硬约束：tauri deb 的 bundle.linux.deb.files 把 packaging/linux/vendor/ 整个
-      # 拷进 /usr/share/rime-sync/vendor/。必须先于 vendor 闭包抓取构建，否则 deb 会吞下
-      # 四份发行版闭包（~700 MiB）且互相冲突。ci.yml 有对应的顺序守卫。
+      # 这里刻意不抓 vendor 闭包：tauri deb 的 bundle.linux.deb.files 会把
+      # packaging/linux/vendor/ 整个拷进 /usr/share/rime-sync/vendor/，四份发行版闭包
+      # 会互相冲突且撑到 ~700 MiB。闭包只在 ime-<distro> 里按发行版单份使用。
       - name: build bundles (deb + AppImage)
         timeout-minutes: 45
         env:
@@ -116,8 +94,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles deb,appimage
 
-      # fetch-vendor-deps.sh / build-offline-installer.sh 的默认输入
-      - name: stage rime-sync deb for offline bundles
+      - name: assert rime-sync deb
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -127,99 +104,205 @@ jobs:
             printf '  %s\n' "${debs[@]}"
             exit 1
           fi
-          mkdir -p packaging/out
-          cp -f "${debs[0]}" packaging/out/
           deb=$(basename "${debs[0]}")
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
           case "$deb" in
             "rime-sync_${ver}_"*) : ;;
             *) echo "::error::deb 名 $deb 与 tauri.conf.json 版本 $ver 不一致"; exit 1 ;;
           esac
-          echo "offline bundle 输入: packaging/out/$deb ($(( $(stat -c %s "packaging/out/$deb") / 1024 / 1024 )) MiB)"
+          echo "$deb ($(( $(stat -c %s "${debs[0]}") / 1024 / 1024 )) MiB)"
 
-      - name: build input-method debs for 4 distros (docker)
-        timeout-minutes: 60
+      # 单独成 artifact：矩阵的四个 job 只需要这几 MB 的 deb，不必拖 AppImage。
+      - name: upload sync deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-deb
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/deb/*.deb
+
+      - name: upload sync appimage
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-appimage
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
+            src-tauri/target/release/bundle/appimage/*.sig
+
+  # 四发行版各占一个 runner：镜像/闭包/.run 全部按发行版隔离，互不踩磁盘。
+  # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，组装 1-2 min。
+  ime:
+    name: ime · ${{ matrix.distro }}
+    needs: linux-app
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    strategy:
+      # 单个发行版失败不取消其它三个：一次跑完就能看出是哪几套坏了。
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-22.04
+            suite: jammy
+            image: ubuntu:22.04
+          - distro: ubuntu-24.04
+            suite: noble
+            image: ubuntu:24.04
+          - distro: debian-12
+            suite: bookworm
+            image: debian:12
+          - distro: debian-13
+            suite: trixie
+            image: debian:13
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: free runner disk space
         run: |
           set -euo pipefail
-          rc=0
-          ALL=1 bash scripts/ime/build-linux.sh || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::scripts/ime/build-linux.sh ALL=1 失败（exit $rc）；缺失的发行版："
-            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-              compgen -G "build/deb/$d/rime-inputmethod_*.deb" >/dev/null || \
-                echo "::error file=scripts/ime/build-linux.sh::$d 的 rime-inputmethod deb 未生成"
-            done
-            exit "$rc"
-          fi
-          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-            f=$(ls -1t build/deb/"$d"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
-            [ -n "$f" ] || { echo "::error::$d: 缺少 rime-inputmethod deb"; exit 1; }
-            echo "$d: $(basename "$f") ($(( $(stat -c %s "$f") / 1024 / 1024 )) MiB)"
-          done
-          du -sh build/deb
+          # 一套 builder 镜像 1.1-1.7 GiB + staging + 闭包 + .run ≈ 5 GiB；还是先删预装 SDK。
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
 
-      # 四套 builder 镜像此时只占地方：清掉给 vendor 闭包和四份目录 bundle 腾空间。
-      # if: always() —— 构建失败时也清，避免 runner 磁盘爆掉掩盖真正的错误。
-      - name: free disk after IME build
+      - name: preflight · docker + disk headroom
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null 2>&1 || {
+            echo "::error::runner 缺少 docker：scripts/ime/build-linux.sh 与 scripts/ime/fetch-vendor-deps.sh 都在容器里运行"
+            exit 1
+          }
+          docker info >/dev/null 2>&1 || {
+            echo "::error::docker daemon 不可用"
+            exit 1
+          }
+          avail=$(df -Pk / | awk "NR==2 {print \$4}")
+          avail_gib=$(( avail / 1024 / 1024 ))
+          echo "docker: $(docker --version)"
+          echo "可用磁盘: ${avail_gib} GiB"
+          if [ "$avail_gib" -lt 8 ]; then
+            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 8 GiB）：单发行版构建装不下"
+            exit 1
+          fi
+
+      # fetch-vendor-deps.sh / build-offline-installer.sh 的默认输入
+      - name: download rime-sync deb
+        uses: actions/download-artifact@v4
+        with:
+          name: sync-deb
+          path: packaging/out
+          merge-multiple: true
+
+      - name: build input-method deb (${{ matrix.distro }})
+        timeout-minutes: 20
+        env:
+          IMAGE: ${{ matrix.image }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -euo pipefail
+          ls -l packaging/out/
+          bash scripts/ime/build-linux.sh || {
+            echo "::error file=scripts/ime/build-linux.sh::${DISTRO} 的输入法源码构建失败（docker build / 容器编译）"
+            exit 1
+          }
+          f=$(ls -1t "build/deb/${DISTRO}"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
+          [ -n "$f" ] || { echo "::error::$DISTRO: 没有生成 rime-inputmethod deb"; exit 1; }
+          echo "$DISTRO: $(basename "$f") ($(( $(stat -c %s "$f") / 1024 / 1024 )) MiB)"
+
+      - name: fetch vendor dependency closure (${{ matrix.distro }})
+        timeout-minutes: 15
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -euo pipefail
+          bash scripts/ime/fetch-vendor-deps.sh "$DISTRO" || {
+            echo "::error file=scripts/ime/fetch-vendor-deps.sh::${DISTRO} 的依赖闭包抓取失败"
+            exit 1
+          }
+          dir=packaging/linux/vendor/$DISTRO
+          n=$(find "$dir" -maxdepth 1 -name "*.deb" | wc -l)
+          mib=$(du -sm "$dir" | cut -f1)
+          echo "$DISTRO: $n debs, ${mib} MiB"
+          if [ "$n" -lt 100 ]; then
+            echo "::error::$DISTRO: vendor 闭包只有 $n 个 .deb（< 100），apt 下载很可能不完整"
+            exit 1
+          fi
+          for f in VENDOR-INFO SHA256SUMS; do
+            [ -f "$dir/$f" ] || { echo "::error::$DISTRO: 缺少 $f"; exit 1; }
+          done
+
+      - name: assemble offline installer (${{ matrix.distro }})
+        timeout-minutes: 15
+        env:
+          DISTRO: ${{ matrix.distro }}
+          SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          bash packaging/linux/build-offline-installer.sh "$DISTRO" || {
+            echo "::error file=packaging/linux/build-offline-installer.sh::${DISTRO} 的 .run 组装失败"
+            exit 1
+          }
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          run_file=packaging/linux/out/rime-sync-installer_${ver}~${SUITE}.run
+          if [ ! -f "$run_file" ]; then
+            echo "::error::缺少 $DISTRO 的离线安装器 $run_file"
+            exit 1
+          fi
+          [ -x "$run_file" ] || { echo "::error file=$run_file::没有可执行位"; exit 1; }
+          size=$(stat -c %s "$run_file")
+          mib=$(( size / 1024 / 1024 ))
+          echo "$run_file: ${mib} MiB"
+          if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
+            echo "::error file=$run_file::${DISTRO} 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
+            exit 1
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "- $DISTRO ($SUITE): $(basename "$run_file") — ${mib} MiB / vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: cleanup docker images
         if: always()
         run: |
           set -uo pipefail
-          rm -rf build/ime-staging || true
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: fetch offline vendor dependency closure (4 distros)
-        timeout-minutes: 40
-        run: |
-          set -euo pipefail
-          rc=0
-          bash scripts/ime/fetch-vendor-deps.sh || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::scripts/ime/fetch-vendor-deps.sh 失败（exit $rc）"
-            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-              n=$(find "packaging/linux/vendor/$d" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l)
-              echo "::error::$d: vendor .deb = $n"
-            done
-            exit "$rc"
-          fi
-          status=0
-          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-            dir=packaging/linux/vendor/$d
-            if [ ! -d "$dir" ]; then
-              echo "::error::$d: 缺少 vendor 目录 $dir"
-              status=1
-              continue
-            fi
-            n=$(find "$dir" -maxdepth 1 -name "*.deb" | wc -l)
-            mib=$(du -sm "$dir" | cut -f1)
-            echo "$d: $n debs, ${mib} MiB"
-            if [ "$n" -lt 100 ]; then
-              echo "::error::$d: vendor 闭包只有 $n 个 .deb（< 100），apt 下载很可能不完整"
-              status=1
-            fi
-            [ -f "$dir/VENDOR-INFO" ] || { echo "::error::$d: 缺少 VENDOR-INFO"; status=1; }
-            [ -f "$dir/SHA256SUMS" ] || { echo "::error::$d: 缺少 SHA256SUMS"; status=1; }
-          done
-          du -sh packaging/linux/vendor
-          df -h /
-          exit $status
+      - name: upload ime artifacts (${{ matrix.distro }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: ime-${{ matrix.distro }}
+          if-no-files-found: error
+          path: |
+            packaging/linux/out/*.run
+            build/deb/${{ matrix.distro }}/*.deb
+            build/deb/${{ matrix.distro }}/rime-smoke
 
-      - name: free disk before assembling .run
-        run: |
-          set -uo pipefail
-          docker system prune -af --volumes >/dev/null 2>&1 || true
-          df -h /
+  # 汇总 + 验收：只有四套 .run 与四个 IME deb 都在，publish 才会被触发。
+  collect:
+    name: collect · 汇总并断言离线安装器
+    needs: [linux-app, ime]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
-      - name: assemble offline installers (.run × 4)
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          bash packaging/linux/build-offline-installer.sh || {
-            echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
-            exit 1
-          }
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-      - name: assert offline installers (> 100 MiB each, one per distro)
+      - name: list artifacts
+        run: du -sh dist && find dist -type f -printf '%P  %s bytes\n' | sort
+
+      - name: assert 4 installers + 4 input-method debs
         run: |
           set -euo pipefail
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
@@ -227,42 +310,38 @@ jobs:
           for pair in ubuntu-22.04:jammy ubuntu-24.04:noble debian-12:bookworm debian-13:trixie; do
             d=${pair%%:*}
             suite=${pair##*:}
-            f=packaging/linux/out/rime-sync-installer_${ver}~${suite}.run
-            if [ ! -f "$f" ]; then
-              echo "::error::缺少 $d 的离线安装器 $f"
+            run_file=dist/packaging/linux/out/rime-sync-installer_${ver}~${suite}.run
+            if [ ! -f "$run_file" ]; then
+              echo "::error::缺少 $d 的离线安装器（$run_file）"
               status=1
-              continue
+            else
+              size=$(stat -c %s "$run_file")
+              mib=$(( size / 1024 / 1024 ))
+              echo "$run_file: ${mib} MiB"
+              if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
+                echo "::error file=$run_file::${d} 安装器仅 ${mib} MiB（< 100 MiB）"
+                status=1
+              fi
             fi
-            if [ ! -x "$f" ]; then
-              echo "::error file=$f::没有可执行位（build-offline-installer.sh 的 chmod 0755 未生效）"
+            ime=$(ls -1 dist/build/deb/"$d"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
+            if [ -n "$ime" ]; then
+              echo "$ime: $(( $(stat -c %s "$ime") / 1024 / 1024 )) MiB"
+            else
+              echo "::error::缺少 $d 的 rime-inputmethod deb"
               status=1
-            fi
-            size=$(stat -c %s "$f")
-            mib=$(( size / 1024 / 1024 ))
-            echo "$f: ${mib} MiB"
-            if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
-              echo "::error file=$f::${d} 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
-              status=1
-            fi
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              echo "- $d ($suite): rime-sync-installer_${ver}~${suite}.run — ${mib} MiB" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          ls -lh packaging/linux/out/*.run || true
+          for f in "dist/rime-sync_${ver}_amd64.deb" "dist/rime-sync_${ver}_amd64.AppImage"; do
+            [ -f "$f" ] || { echo "::error::缺少 $f"; status=1; }
+          done
           exit $status
 
-      - name: upload linux artifacts
+      - name: upload linux bundles
         uses: actions/upload-artifact@v4
         with:
           name: linux-bundles
           if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
-            src-tauri/target/release/bundle/appimage/*.sig
-            packaging/linux/out/*.run
-            build/deb/**/*.deb
+          path: dist/**
 
   windows:
     name: windows · nsis + portable zip
@@ -414,7 +493,7 @@ jobs:
 
   publish:
     name: publish · 汇总产物并生成 latest.json
-    needs: [linux, windows]
+    needs: [collect, windows]
     runs-on: ubuntu-latest
     steps:
       - name: checkout
@@ -425,6 +504,9 @@ jobs:
       - name: download artifacts
         uses: actions/download-artifact@v4
         with:
+          # 只取 collect / windows 的最终产物：sync-deb、sync-appimage、ime-<distro>
+          # 是构建期的中间 artifact（不匹配 *-bundles），不必在这里重复下载。
+          pattern: "*-bundles"
           path: dist
           merge-multiple: true
 

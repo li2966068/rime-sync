@@ -151,25 +151,62 @@ jobs:
             exit 1
           }
 
-      # 顺序守卫：tauri deb 的 bundle.linux.deb.files 会把 packaging/linux/vendor/ 整个拷进
-      # /usr/share/rime-sync/vendor/，必须先 build deb 再填 per-distro vendor，否则 deb 会
-      # 吞下四份发行版闭包（~700 MiB）。
-      - name: ordering guard · tauri build before per-distro vendor fill
+      # buildkit 只接受 default/host/none：docker build 传 bridge 会直接失败（上一轮 CI 的真实炸点）。
+      # docker run 的网络探测（DOCKER_NETWORK=bridge/host）不受影响。
+      - name: guard · docker build must not use --network bridge
+        run: |
+          set -euo pipefail
+          bad=0
+          # ci.yml 自身带着这些模式文本，排除掉避免自己匹配自己。
+          if grep -rnIE --exclude=ci.yml 'docker[[:space:]]+build[^#]*--network[=[:space:]]+"?bridge' \
+               scripts packaging .github/workflows; then
+            echo "::error::docker build 传了 --network bridge（buildkit 只接受 default/host/none）"
+            bad=1
+          fi
+          if grep -rnIE --exclude=ci.yml 'docker[[:space:]]+build[^#]*DOCKER_NETWORK' \
+               scripts packaging .github/workflows; then
+            echo "::error::docker build 复用了 docker run 的探测变量 DOCKER_NETWORK（可能是 bridge）"
+            bad=1
+          fi
+          exit $bad
+
+      # 矩阵 + 汇总 job + publish 依赖：任一发行版缺席都不能发布。
+      - name: guard · release.yml matrix / collect / publish needs
         run: |
           set -euo pipefail
           wf=.github/workflows/release.yml
-          bundle=$(grep -nE '^[[:space:]]*run: pnpm tauri build' "$wf" | head -n 1 | cut -d: -f1 || true)
-          vendor=$(grep -nE '^[[:space:]]*bash scripts/ime/fetch-vendor-deps\.sh' "$wf" | head -n 1 | cut -d: -f1 || true)
-          if [ -z "$bundle" ] || [ -z "$vendor" ]; then
-            echo "::error::$wf 缺少 pnpm tauri build 或 fetch-vendor-deps 步骤"
+          for job in linux-app ime collect; do
+            grep -qE "^  ${job}:" "$wf" || { echo "::error::$wf 缺少 job $job"; exit 1; }
+          done
+          grep -qE '^    strategy:' "$wf" || { echo "::error::$wf 的 ime job 没有 matrix"; exit 1; }
+          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+            grep -qF "          - distro: $d" "$wf" || { echo "::error::$wf 的 matrix 缺少 $d"; exit 1; }
+          done
+          grep -qF 'matrix.image' "$wf" || { echo "::error::$wf 没把 matrix.image 传给 IMAGE"; exit 1; }
+          grep -qF 'IMAGE: ' "$wf" || { echo "::error::$wf 的 ime job 没有 IMAGE 环境变量"; exit 1; }
+          for f in "bash scripts/ime/build-linux.sh" 'fetch-vendor-deps.sh "$DISTRO"' 'build-offline-installer.sh "$DISTRO"'; do
+            grep -qF "$f" "$wf" || { echo "::error::$wf 未按发行版调用 $f"; exit 1; }
+          done
+          ime_needs=$(awk '/^  ime:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
+          case "$ime_needs" in
+            *linux-app*) : ;;
+            *) echo "::error::ime job 必须 needs: linux-app（否则拿不到 rime-sync deb）"; exit 1 ;;
+          esac
+          pub_needs=$(awk '/^  publish:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
+          for j in collect windows; do
+            case "$pub_needs" in
+              *"$j"*) : ;;
+              *) echo "::error::publish 必须 needs $j（保证任一发行版失败就不发布）"; exit 1 ;;
+            esac
+          done
+          # deb 必须先下载到 packaging/out/ 再抓依赖闭包
+          awk '/^  ime:/{f=1} /^  collect:/{f=0} f' "$wf" > /tmp/ime_job.yml
+          dl=$(grep -n 'download-artifact' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
+          fv=$(grep -n 'fetch-vendor-deps.sh "$DISTRO"' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
+          if [ -z "$dl" ] || [ -z "$fv" ] || [ "$dl" -ge "$fv" ]; then
+            echo "::error::ime job 里 download-artifact（第 ${dl:-?} 行）必须先于 fetch-vendor-deps（第 ${fv:-?} 行）"
             exit 1
           fi
-          if [ "$bundle" -ge "$vendor" ]; then
-            echo "::error::$wf 顺序反了：tauri build（第 $bundle 行）必须先于 fetch-vendor-deps（第 $vendor 行）"
-            exit 1
-          fi
-          echo "ordering OK: tauri build @$bundle < vendor fill @$vendor"
-
       - name: legacy flat vendor fetch stays out of release.yml
         run: |
           set -euo pipefail
@@ -189,4 +226,3 @@ jobs:
             }
             Write-Host "fetch-weasel.ps1 语法 OK"
           '
-

@@ -13,6 +13,23 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 APT_MIRROR=${APT_MIRROR:-}
 
+# buildkit 的 docker build 只接受 default/host/none，传 "bridge" 会直接失败
+# （ERROR: network mode "bridge" not supported by buildkit）。默认不传 --network，
+# 只有显式 BUILD_NETWORK=host 时才传（例如需要内网镜像源）。
+BUILD_NETWORK=${BUILD_NETWORK:-}
+case "$BUILD_NETWORK" in
+  ""|default|host|none) : ;;
+  *)
+    echo "!! unsupported BUILD_NETWORK '$BUILD_NETWORK' (use default|host|none)" >&2
+    exit 2
+    ;;
+esac
+if [ "$BUILD_NETWORK" = "default" ]; then BUILD_NETWORK=; fi
+BUILD_NETWORK_ARGS=()
+if [ -n "$BUILD_NETWORK" ]; then
+  BUILD_NETWORK_ARGS=(--network "$BUILD_NETWORK")
+fi
+
 image_for() {
   case "$1" in
     ubuntu-22.04) echo ubuntu:22.04 ;;
@@ -56,7 +73,7 @@ for d in "${DISTROS[@]}"; do
 
   echo "===== $d ($image) ====="
   echo "==> building test image (target + Xvfb)"
-  docker build -t "$tag" --network host \
+  docker build -t "$tag" ${BUILD_NETWORK_ARGS[@]+"${BUILD_NETWORK_ARGS[@]}"} \
     --build-arg BASE_IMAGE="$image" --build-arg APT_MIRROR="$APT_MIRROR" \
     -f "$HERE/test/Dockerfile" "$HERE/test" >"$ev/test-image.log" 2>&1 ||
     { tail -n 30 "$ev/test-image.log"; exit 1; }

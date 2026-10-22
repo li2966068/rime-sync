@@ -80,6 +80,7 @@ mkdir -p "$STAGING" "$OUT"
 
 # Containers on the default bridge cannot always reach the host resolver (this
 # sandbox is one such case). Probe once and fall back to the host network.
+# DOCKER_NETWORK only drives "docker run"; see BUILD_NETWORK below for "docker build".
 if [ -z "${DOCKER_NETWORK:-}" ]; then
   PROBE_HOST=archive.ubuntu.com
   case "$IMAGE" in debian:*) PROBE_HOST=deb.debian.org ;; esac
@@ -91,6 +92,25 @@ if [ -z "${DOCKER_NETWORK:-}" ]; then
   fi
 fi
 
+# docker build 的网络模式与 docker run 不是同一套：buildkit 只接受
+# default/host/none，传 "bridge" 会直接失败
+# （ERROR: network mode "bridge" not supported by buildkit）。
+# 所以构建默认不传 --network（= buildkit 的 default），只有显式
+# BUILD_NETWORK=host 时（例如需要内网镜像源）才传。
+BUILD_NETWORK=${BUILD_NETWORK:-}
+case "$BUILD_NETWORK" in
+  ""|default|host|none) : ;;
+  *)
+    echo "!! unsupported BUILD_NETWORK '$BUILD_NETWORK' (use default|host|none)" >&2
+    exit 2
+    ;;
+esac
+if [ "$BUILD_NETWORK" = "default" ]; then BUILD_NETWORK=; fi
+BUILD_NETWORK_ARGS=()
+if [ -n "$BUILD_NETWORK" ]; then
+  BUILD_NETWORK_ARGS=(--network "$BUILD_NETWORK")
+fi
+
 echo "==> image         : $IMAGE"
 echo "==> distro key    : $DISTRO_KEY  (suite $SUITE)"
 echo "==> builder image : $BUILDER_IMAGE"
@@ -98,9 +118,14 @@ echo "==> staging       : $STAGING"
 echo "==> deb output    : $OUT"
 echo "==> jobs          : $JOBS"
 [ -n "$APT_MIRROR" ] && echo "==> apt mirror    : $APT_MIRROR"
+if [ -n "$BUILD_NETWORK" ]; then
+  echo "==> build network : $BUILD_NETWORK"
+else
+  echo "==> build network : default (no --network passed to docker build)"
+fi
 
 echo "==> building dependency image (docker caches it on later runs)"
-if ! docker build -t "$BUILDER_IMAGE" --network "$DOCKER_NETWORK" \
+if ! docker build -t "$BUILDER_IMAGE" ${BUILD_NETWORK_ARGS[@]+"${BUILD_NETWORK_ARGS[@]}"} \
       --build-arg BASE_IMAGE="$IMAGE" --build-arg APT_MIRROR="$APT_MIRROR" \
       -f "$HERE/Dockerfile" "$HERE" >"$STAGING/docker-build.log" 2>&1; then
   echo "!! docker build failed; tail of $STAGING/docker-build.log:" >&2
