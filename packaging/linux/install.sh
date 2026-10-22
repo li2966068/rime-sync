@@ -224,6 +224,25 @@ say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")"
 dpkg -i "$SYNC_DEB" || fail "同步程序安装失败（$(basename "$SYNC_DEB")）"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
 
+# --------------------------------------------------- recommended user config
+# 只在调用者自己的 Rime 目录缺文件时写入，不覆盖用户已有配置。
+TARGET_USER=${SUDO_USER:-}
+if [ -n "$TARGET_USER" ] && [ -f /usr/share/rime-sync/defaults/default.custom.yaml ]; then
+  TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+  if [ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ]; then
+    RIME_USER_DIR="$TARGET_HOME/.local/share/fcitx5/rime"
+    install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
+    chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
+    if [ ! -f "$RIME_USER_DIR/default.custom.yaml" ]; then
+      install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null &&
+        chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
+      say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 4 个方案）"
+    else
+      say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
+    fi
+  fi
+fi
+
 say "输入法数据：/usr/share/rime-data（$(find /usr/share/rime-data -maxdepth 1 -type f 2>/dev/null | wc -l) 个文件）"
 say "安装日志：$LOG"
 say "安装完成，输入法设置或应用菜单里打开同步设置"

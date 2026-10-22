@@ -1,0 +1,7 @@
+# rime-sync 随包默认：小狼毫候选词横向排列（每页 8 个见 default.custom.yaml）。
+# 安装器只在用户 Rime 目录里没有同名文件时写入，绝不覆盖用户已有配置。
+patch:
+  "style/color_scheme": ink
+  "style/candidate_list_layout": linear
+  "style/text_orientation": horizontal
+  "style/horizontal": true

@@ -57,7 +57,9 @@
     "resources": {
       "../packaging/windows/vendor/GPL-3.0.txt": "resources/GPL-3.0.txt",
       "../packaging/windows/vendor/WEASEL-NOTICE.txt": "resources/WEASEL-NOTICE.txt",
-      "../packaging/windows/vendor/README.md": "resources/README.md"
+      "../packaging/windows/vendor/README.md": "resources/README.md",
+      "../packaging/rime/default.custom.yaml": "resources/default.custom.yaml",
+      "../packaging/rime/weasel.custom.yaml": "resources/weasel.custom.yaml"
     },
     "linux": {
       "deb": {
@@ -69,7 +71,7 @@
           "librime-data"
         ],
         "files": {
-          "/usr/share/rime-sync/defaults/": "../packaging/linux/defaults/",
+          "/usr/share/rime-sync/defaults/default.custom.yaml": "../packaging/rime/default.custom.yaml",
           "/usr/share/doc/rime-sync/README.Debian": "../packaging/linux/README.Debian",
           "/usr/share/applications/rime-sync-setup.desktop": "../packaging/linux/rime-sync-setup.desktop",
           "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh"

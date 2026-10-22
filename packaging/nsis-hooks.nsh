@@ -1,4 +1,4 @@
-﻿; rime-sync · NSIS 安装钩子
+; rime-sync · NSIS 安装钩子
 ; 由 src-tauri/tauri.conf.json 的 bundle.windows.nsis.installerHooks 引用。
 ; Tauri 在 installer.nsi / uninstaller.nsi 里以 !ifmacrodef 方式插入这些宏，
 ; 因此本文件只定义宏与私有函数，不覆盖 Tauri 自己的安装逻辑。
@@ -83,6 +83,34 @@ Function RimeSyncLog
   FileWrite $R4 "$R3$\r$\n"
   FileClose $R4
   rimesync_log_done:
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 写入推荐 Rime 配置：只在用户 Rime 目录缺文件时复制，绝不覆盖用户已有配置。
+; per-machine 安装下 $APPDATA 属于提权用户（通常是安装者本人）；若该目录还不存在
+; （用户尚未初始化小狼毫），只记录日志，模板仍留在 $INSTDIR\resources\ 里。
+; ---------------------------------------------------------------------------
+Function RimeSyncSeedRimeConfig
+  StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed rime config"
+  Call RimeSyncLog
+  IfFileExists "$APPDATA\Rime\*.*" rimesync_seed_dir_ready
+    DetailPrint "[rime-sync] $APPDATA\Rime 不存在（用户尚未初始化小狼毫），跳过推荐配置写入"
+    StrCpy $R3 "[rime-sync] $R2 seed skipped: no Rime user dir"
+    Call RimeSyncLog
+    Return
+  rimesync_seed_dir_ready:
+  IfFileExists "$APPDATA\Rime\default.custom.yaml" rimesync_seed_skip_default
+    CopyFiles /SILENT "$INSTDIR\resources\default.custom.yaml" "$APPDATA\Rime\default.custom.yaml"
+    DetailPrint "[rime-sync] 写入推荐 default.custom.yaml（每页 8 个候选 / 4 个方案）"
+    StrCpy $R3 "[rime-sync] $R2 seed default.custom.yaml"
+    Call RimeSyncLog
+  rimesync_seed_skip_default:
+  IfFileExists "$APPDATA\Rime\weasel.custom.yaml" rimesync_seed_skip_weasel
+    CopyFiles /SILENT "$INSTDIR\resources\weasel.custom.yaml" "$APPDATA\Rime\weasel.custom.yaml"
+    DetailPrint "[rime-sync] 写入推荐 weasel.custom.yaml（候选横向排列）"
+    StrCpy $R3 "[rime-sync] $R2 seed weasel.custom.yaml"
+    Call RimeSyncLog
+  rimesync_seed_skip_weasel:
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
@@ -296,6 +324,8 @@ FunctionEnd
   Call RimeSyncCreateOwnShortcuts
   ; 2) 有 Weasel 就把「同步设置」也放进它的程序组
   Call RimeSyncCreateWeaselShortcut
+  ; 3) 推荐输入法配置（仅在用户目录缺文件时写入）
+  Call RimeSyncSeedRimeConfig
 
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=POSTINSTALL 完成"
