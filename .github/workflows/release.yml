@@ -518,12 +518,14 @@ jobs:
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
+          # 更新提示直接用 CHANGELOG 的中文段落（用户要求：提示里显示本版更新内容）。
+          python3 .github/scripts/changelog-notes.py --version "$VERSION" --out dist/notes.md
           python3 .github/scripts/make-latest-json.py \
             --dir dist \
             --version "$VERSION" \
             --repo "${{ github.repository }}" \
             --tag "$TAG" \
-            --notes "变更见 CHANGELOG.md（${{ github.repository }}/blob/$TAG/CHANGELOG.md）" \
+            --notes-file dist/notes.md \
             --out dist/latest.json
 
       - name: publish release
@@ -531,7 +533,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "rime-sync $TAG" --generate-notes --verify-tag
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file dist/notes.md
+          else
+            gh release create "$TAG" --title "rime-sync $TAG" --notes-file dist/notes.md --verify-tag
+          fi
           # download-artifact 保留 deb/appimage/nsis 子目录，dist/* 会把目录当文件上传。
           find dist -type f -print0 | xargs -0 gh release upload "$TAG" --clobber

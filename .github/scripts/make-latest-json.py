@@ -42,6 +42,7 @@ def main() -> int:
     parser.add_argument("--repo", required=True, help="GitHub 仓库，owner/name")
     parser.add_argument("--tag", required=True, help="发布 tag，如 v0.2.0")
     parser.add_argument("--notes", default="", help="release notes 摘要")
+    parser.add_argument("--notes-file", help="从文件读取 release notes（优先于 --notes，通常是 CHANGELOG 的版本段落）")
     parser.add_argument("--out", required=True, help="输出 latest.json 路径")
     parser.add_argument("--allow-partial", action="store_true", help="缺少某个平台时不报错")
     args = parser.parse_args()
@@ -81,9 +82,17 @@ def main() -> int:
             print(f"error: {message}", file=sys.stderr)
             return 1
 
+    notes = args.notes
+    if args.notes_file:
+        notes_path = pathlib.Path(args.notes_file)
+        if not notes_path.is_file():
+            print(f"error: notes 文件不存在：{notes_path}", file=sys.stderr)
+            return 2
+        notes = notes_path.read_text(encoding="utf-8").strip()
+
     payload = {
         "version": args.version.lstrip("v"),
-        "notes": args.notes,
+        "notes": notes,
         "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "platforms": platforms,
     }
