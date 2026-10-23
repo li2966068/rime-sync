@@ -5,6 +5,7 @@ import {
   api,
   type BackupEntry,
   type Config,
+  type ConflictChoice,
   type ConflictEntry,
   type DeviceInfo,
   type NetworkStatus,
@@ -93,8 +94,10 @@ const el = {
   conflictsRefresh: byId<HTMLButtonElement>("btn-conflicts-refresh"),
   conflictsKeepAll: byId<HTMLButtonElement>("btn-conflicts-keep-all"),
   conflictsTakeAll: byId<HTMLButtonElement>("btn-conflicts-take-all"),
+  conflictsTakeRemoteAll: byId<HTMLButtonElement>("btn-conflicts-remote-all"),
   conflictLocal: byId<HTMLButtonElement>("btn-conflict-local"),
   conflictCopy: byId<HTMLButtonElement>("btn-conflict-copy"),
+  conflictRemote: byId<HTMLButtonElement>("btn-conflict-remote"),
 
   devicesRefresh: byId<HTMLButtonElement>("btn-devices-refresh"),
   deviceBody: byId<HTMLTableSectionElement>("device-body"),
@@ -174,6 +177,8 @@ let logCache: string[] = [];
 let toastTimer = 0;
 let modalResolve: ((value: boolean) => void) | null = null;
 let conflicts: ConflictEntry[] = [];
+/// 远端大小是否已成功取到（false 时冲突页显示“远端未知”而不是“不存在”）。
+let remoteSizesKnown = false;
 let activeConflict: string | null = null;
 let devices: DeviceInfo[] = [];
 let backups: BackupEntry[] = [];
@@ -497,7 +502,14 @@ function renderReport(report: Report): void {
     notes.push(t("sync.reportError", { error: report.error }));
   }
   if (report.conflicts.length > 0) {
-    notes.push(t("sync.reportConflictPrefix", { list: report.conflicts.slice(0, 4).join(", ") }));
+    notes.push(t("sync.reportConflicts", { count: report.conflicts.length }));
+    const shown = report.conflicts.slice(0, 5);
+    for (const entry of shown) {
+      notes.push("· " + entry);
+    }
+    if (report.conflicts.length > shown.length) {
+      notes.push(t("sync.reportConflictMore", { count: report.conflicts.length - shown.length }));
+    }
   }
   if (report.skipped.length > 0) {
     notes.push(t("sync.reportSkip", { count: report.skipped.length }));
@@ -534,6 +546,7 @@ function setBusy(value: boolean, label = t("busy.default")): void {
   el.probe.disabled = value;
   el.conflictsKeepAll.disabled = value;
   el.conflictsTakeAll.disabled = value;
+  el.conflictsTakeRemoteAll.disabled = value;
   el.firstSyncSwitch.disabled = value || !config || config.first_sync_policy === "normal";
 }
 
@@ -918,6 +931,23 @@ function rowsHtml(rows: DiffRow[]): string {
     .join("");
 }
 
+function metaLine(label: string, valueHtml: string): string {
+  return '<div><span class="muted">' + escapeHtml(label) + "</span> " + valueHtml + "</div>";
+}
+
+function remoteSizeText(entry: ConflictEntry): string {
+  if (!remoteSizesKnown) {
+    return t("conflicts.remoteUnknown");
+  }
+  return entry.remote_size === null ? t("conflicts.remoteMissing") : formatBytes(entry.remote_size);
+}
+
+function keysHtml(keys: string[]): string {
+  return keys.length > 0
+    ? keys.map((key) => "<code>" + escapeHtml(key) + "</code>").join(" ")
+    : '<span class="muted">' + escapeHtml(t("conflicts.keysNone")) + "</span>";
+}
+
 function renderConflictList(): void {
   el.conflictsCount.textContent = t("conflicts.count", { count: conflicts.length });
   if (conflicts.length === 0) {
@@ -927,9 +957,13 @@ function renderConflictList(): void {
     return;
   }
   el.conflictList.innerHTML = conflicts
-    .map(
-      (entry) =>
-        '<button type="button" role="listitem" class="conflict-item' +
+    .map((entry) => {
+      const remote =
+        remoteSizesKnown && entry.remote_size !== null
+          ? t("conflicts.remoteShort", { size: formatBytes(entry.remote_size) })
+          : remoteSizeText(entry);
+      return (
+        '<div role="listitem" tabindex="0" class="conflict-item' +
         (entry.path === activeConflict ? " is-active" : "") +
         '" data-path="' +
         escapeHtml(entry.path) +
@@ -942,9 +976,27 @@ function renderConflictList(): void {
         "</span>" +
         '<span class="muted small">' +
         escapeHtml(formatTimestamp(entry.modified_at)) +
+        " · " +
+        escapeHtml(t("conflicts.localShort", { size: formatBytes(entry.target_size) })) +
+        " / " +
+        escapeHtml(t("conflicts.remoteShort", { size: remote })) +
         "</span>" +
-        "</button>",
-    )
+        (entry.keys.length > 0 ? '<span class="conflict-keys">' + keysHtml(entry.keys) + "</span>" : "") +
+        '<span class="conflict-actions">' +
+        '<button type="button" class="ghost small" data-path="' +
+        escapeHtml(entry.path) +
+        '" data-choice="remote">' +
+        escapeHtml(t("conflicts.takeRemoteShort")) +
+        "</button>" +
+        '<button type="button" class="ghost small" data-path="' +
+        escapeHtml(entry.path) +
+        '" data-choice="local">' +
+        escapeHtml(t("conflicts.keepLocal")) +
+        "</button>" +
+        "</span>" +
+        "</div>"
+      );
+    })
     .join("");
   el.conflictEmpty.hidden = activeConflict !== null;
   if (!activeConflict || !conflicts.some((entry) => entry.path === activeConflict)) {
@@ -957,22 +1009,16 @@ function renderDiff(entry: ConflictEntry): void {
   renderConflictList();
   el.conflictBody.hidden = false;
   el.conflictEmpty.hidden = true;
+  const remote = escapeHtml(remoteSizeText(entry));
   el.conflictMeta.innerHTML =
-    '<div><span class="muted">' +
-    escapeHtml(t("conflicts.target")) +
-    '</span> <code>' +
-    escapeHtml(entry.target) +
-    "</code></div>" +
-    '<div><span class="muted">' +
-    escapeHtml(t("conflicts.copyFile")) +
-    '</span> <code>' +
-    escapeHtml(entry.path) +
-    "</code></div>" +
-    '<div><span class="muted">' +
-    escapeHtml(t("conflicts.modified")) +
-    "</span> " +
-    escapeHtml(formatTimestamp(entry.modified_at)) +
-    "</div>";
+    metaLine(t("conflicts.target"), "<code>" + escapeHtml(entry.target) + "</code>") +
+    metaLine(t("conflicts.copyFile"), "<code>" + escapeHtml(entry.path) + "</code>") +
+    metaLine(t("conflicts.modified"), escapeHtml(formatTimestamp(entry.modified_at))) +
+    metaLine(t("conflicts.localSize"), escapeHtml(formatBytes(entry.target_size))) +
+    metaLine(t("conflicts.remoteSize"), remote) +
+    metaLine(t("conflicts.copySize"), escapeHtml(formatBytes(entry.conflict_size))) +
+    metaLine(t("conflicts.keys"), keysHtml(entry.keys)) +
+    (entry.note ? metaLine(t("conflicts.note"), escapeHtml(entry.note)) : "");
 
   if (entry.target_content === null || entry.conflict_content === null) {
     const notice = '<p class="muted pad-note">' + escapeHtml(t("conflicts.binary")) + "</p>";
@@ -989,6 +1035,7 @@ function renderDiff(entry: ConflictEntry): void {
 
 async function loadConflicts(): Promise<void> {
   try {
+    remoteSizesKnown = false;
     const list = await api.listConflicts();
     conflicts = list;
     if (activeConflict && !list.some((entry) => entry.path === activeConflict)) {
@@ -1001,6 +1048,7 @@ async function loadConflicts(): Promise<void> {
         renderDiff(first);
       }
     }
+    void loadRemoteSizes();
   } catch (error) {
     el.conflictList.innerHTML =
       '<p class="muted empty">' + escapeHtml(t("conflicts.loadFail", { error: errorText(error) })) + "</p>";
@@ -1009,27 +1057,76 @@ async function loadConflicts(): Promise<void> {
   }
 }
 
-async function resolveOne(path: string, choice: "local" | "conflict"): Promise<void> {
+async function loadRemoteSizes(): Promise<void> {
+  const snapshot = conflicts;
+  try {
+    const info = await api.conflictRemoteSizes();
+    if (snapshot !== conflicts || !info.reachable) {
+      return;
+    }
+    remoteSizesKnown = true;
+    for (const entry of conflicts) {
+      entry.remote_size = info.sizes[entry.target] ?? null;
+    }
+    renderConflictList();
+    if (activeConflict) {
+      const entry = conflicts.find((item) => item.path === activeConflict);
+      if (entry) {
+        renderDiff(entry);
+      }
+    }
+  } catch {
+    // 远端不可达：保持“远端未知”，不影响本地冲突处理。
+  }
+}
+
+async function resolveOne(path: string, choice: ConflictChoice): Promise<void> {
   const entry = conflicts.find((item) => item.path === path);
   try {
     await api.resolveConflict(path, choice);
-    toast(t("conflicts.resolveOk", { target: entry?.target ?? path }));
+    toast(
+      choice === "remote"
+        ? t("conflicts.resolveRemoteOk", { target: entry?.target ?? path })
+        : t("conflicts.resolveOk", { target: entry?.target ?? path }),
+    );
   } catch (error) {
     toast(t("conflicts.resolveFail", { error: errorText(error) }));
   }
 }
 
-async function resolveAll(choice: "local" | "conflict"): Promise<void> {
+function confirmResolve(entry: ConflictEntry, choice: ConflictChoice): Promise<boolean> {
+  const body =
+    choice === "remote"
+      ? t("conflicts.takeRemoteConfirm", { target: entry.target })
+      : t("conflicts.takeConfirm", { target: entry.target });
+  return confirmDialog(t("modal.confirmTitle"), body);
+}
+
+async function resolveFromList(path: string, choice: ConflictChoice): Promise<void> {
+  const entry = conflicts.find((item) => item.path === path);
+  if (!entry) {
+    return;
+  }
+  if (choice !== "local" && !(await confirmResolve(entry, choice))) {
+    return;
+  }
+  await resolveOne(path, choice);
+  await loadConflicts();
+}
+
+async function resolveAll(choice: ConflictChoice): Promise<void> {
   const targets = conflicts.map((entry) => entry.path);
   if (targets.length === 0) {
     return;
   }
-  const confirmed = await confirmDialog(
-    t("modal.confirmTitle"),
-    choice === "local"
-      ? t("conflicts.keepAllConfirm", { count: targets.length })
-      : t("conflicts.takeAllConfirm", { count: targets.length }),
-  );
+  const count = targets.length;
+  const body =
+    choice === "remote"
+      ? t("conflicts.takeRemoteAllConfirm", { count })
+      : choice === "local"
+        ? t("conflicts.keepAllConfirm", { count })
+        : t("conflicts.takeAllConfirm", { count });
+  const confirmed = await confirmDialog(t("modal.confirmTitle"), body);
   if (!confirmed) {
     return;
   }
@@ -1754,8 +1851,19 @@ function bindEvents(): void {
   el.conflictsTakeAll.addEventListener("click", () => {
     void resolveAll("conflict");
   });
+  el.conflictsTakeRemoteAll.addEventListener("click", () => {
+    void resolveAll("remote");
+  });
   el.conflictList.addEventListener("click", (event) => {
-    const target = (event.target as HTMLElement).closest<HTMLElement>("[data-path]");
+    const node = event.target as HTMLElement;
+    const action = node.closest<HTMLElement>("[data-choice]");
+    const actionPath = action?.dataset.path;
+    const actionChoice = action?.dataset.choice;
+    if (actionPath && actionChoice) {
+      void resolveFromList(actionPath, actionChoice as ConflictChoice);
+      return;
+    }
+    const target = node.closest<HTMLElement>("[data-path]");
     const path = target?.dataset.path;
     if (!path) {
       return;
@@ -1765,26 +1873,59 @@ function bindEvents(): void {
       renderDiff(entry);
     }
   });
+  el.conflictList.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    if ((event.target as HTMLElement).closest("button")) {
+      return;
+    }
+    const item = (event.target as HTMLElement).closest<HTMLElement>(".conflict-item");
+    const path = item?.dataset.path;
+    if (!path) {
+      return;
+    }
+    event.preventDefault();
+    const entry = conflicts.find((itemEntry) => itemEntry.path === path);
+    if (entry) {
+      renderDiff(entry);
+    }
+  });
   el.conflictLocal.addEventListener("click", () => {
-    if (activeConflict) {
-      void resolveOne(activeConflict, "local").then(loadConflicts);
+    const path = activeConflict;
+    if (path) {
+      void resolveOne(path, "local").then(loadConflicts);
     }
   });
   el.conflictCopy.addEventListener("click", () => {
-    if (!activeConflict) {
+    const path = activeConflict;
+    if (!path) {
       return;
     }
-    const entry = conflicts.find((item) => item.path === activeConflict);
+    const entry = conflicts.find((item) => item.path === path);
     if (!entry) {
       return;
     }
-    void confirmDialog(t("modal.confirmTitle"), t("conflicts.takeConfirm", { target: entry.target })).then(
-      (confirmed) => {
-        if (confirmed && activeConflict) {
-          void resolveOne(activeConflict, "conflict").then(loadConflicts);
-        }
-      },
-    );
+    void confirmResolve(entry, "conflict").then((confirmed) => {
+      if (confirmed) {
+        void resolveOne(path, "conflict").then(loadConflicts);
+      }
+    });
+  });
+  el.conflictRemote.addEventListener("click", () => {
+    const path = activeConflict;
+    if (!path) {
+      return;
+    }
+    const entry = conflicts.find((item) => item.path === path);
+    if (!entry) {
+      return;
+    }
+    void confirmResolve(entry, "remote").then((confirmed) => {
+      if (confirmed) {
+        void resolveOne(path, "remote").then(loadConflicts);
+      }
+    });
   });
 
   let syncingScroll = false;
@@ -1936,6 +2077,12 @@ function refreshLanguageDependent(): void {
   renderFirstSyncBanner();
   renderWatch();
   renderConflictList();
+  if (activeConflict) {
+    const entry = conflicts.find((item) => item.path === activeConflict);
+    if (entry) {
+      renderDiff(entry);
+    }
+  }
   renderDevices();
   renderBackups();
   renderUpdate();

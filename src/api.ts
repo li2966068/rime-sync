@@ -104,6 +104,8 @@ export interface RemoteList {
   shared: RemoteShared[];
 }
 
+export type ConflictChoice = "local" | "conflict" | "remote";
+
 export interface ConflictEntry {
   path: string;
   target: string;
@@ -111,12 +113,23 @@ export interface ConflictEntry {
   target_content: string | null;
   conflict_content: string | null;
   modified_at: number;
+  target_size: number;
+  conflict_size: number;
+  remote_size: number | null;
+  keys: string[];
+  note: string | null;
+}
+
+export interface ConflictRemoteSizes {
+  reachable: boolean;
+  sizes: Record<string, number>;
 }
 
 export interface ConflictResolve {
   target: string;
   choice: string;
   removed: boolean;
+  bytes: number | null;
 }
 
 export interface DeviceInfo {
@@ -238,7 +251,8 @@ export const api = {
     invoke<FirstRunResult>("cmd_first_transport", { strategy }),
 
   listConflicts: () => invoke<ConflictEntry[]>("cmd_list_conflicts"),
-  resolveConflict: (targetPath: string, choice: "local" | "conflict") =>
+  conflictRemoteSizes: () => invoke<ConflictRemoteSizes>("cmd_conflict_remote_sizes"),
+  resolveConflict: (targetPath: string, choice: ConflictChoice) =>
     invoke<ConflictResolve>("cmd_resolve_conflict", { targetPath, choice }),
 
   listDevices: () => invoke<DeviceInfo[]>("cmd_list_devices"),

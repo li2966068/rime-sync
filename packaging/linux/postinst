@@ -11,6 +11,11 @@ set -u
 
 WORKER=/usr/lib/rime-sync/install-vendor-deps.sh
 LOGDIR=/var/log/rime-sync
+
+# 桌面入口用 pkexec 直接执行卸载脚本；dpkg-deb 打包自定义文件时不一定保留执行位
+# （tauri 的 deb.files 由打包器复制），这里补一次 0755。
+UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
+[ -f "$UNINSTALLER" ] && chmod 0755 "$UNINSTALLER" 2>/dev/null
 LOG=$LOGDIR/vendor-install.log
 
 say() { printf '[rime-sync] %s\n' "$*"; }

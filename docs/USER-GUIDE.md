@@ -275,6 +275,8 @@ code --diff default.custom.yaml default.custom.yaml.conflict-laptop-20261020T130
 
 ## 8. 卸载
 
-- Windows：设置 → 应用 → rime-sync → 卸载；配置在 `%APPDATA%\rime-sync`，手动删。
+- Windows：设置 → 应用 → rime-sync → 卸载。默认会连小狼毫一起卸载（仅当小狼毫是跟着
+  rime-sync 装的；安装前已有的输入法不动）。想保留输入法：`uninstall.exe /KEEPWEASEL`
+  或先设 `RIMESYNC_KEEP_WEASEL=1`。配置在 `%APPDATA%\rime-sync`，手动删。
 - Linux deb：`sudo apt remove rime-sync`；AppImage 直接删文件。
 - 卸载**不会**动你的 Rime 用户目录；远端数据需自行在 WebDAV 里删。

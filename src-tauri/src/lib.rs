@@ -593,6 +593,8 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
     if let Some(error) = &report.error {
         push_log(inner, format!("{label}错误：{error}"));
     }
+    // 冲突页需要“哪个键冲突”：把本轮 Report.conflicts 落到 state_dir。
+    conflict_cmds::record_conflicts(app, &report.conflicts);
     let _ = app.emit("sync://done", &report);
     Ok(report)
 }
@@ -867,6 +869,7 @@ pub fn run() {
             cmd_first_transport,
             conflict_cmds::cmd_list_conflicts,
             conflict_cmds::cmd_resolve_conflict,
+            conflict_cmds::cmd_conflict_remote_sizes,
             device_cmds::cmd_list_devices,
             device_cmds::cmd_revoke_device,
             backup_cmds::cmd_list_backups,

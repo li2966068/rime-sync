@@ -54,7 +54,8 @@ fi
 
 mkdir -p "$OUT_ROOT" "$RUN_DIR"
 cp -f "$HERE/install.sh" "$OUT_ROOT/install.sh"
-chmod 0755 "$OUT_ROOT/install.sh"
+cp -f "$HERE/uninstall.sh" "$OUT_ROOT/uninstall.sh"
+chmod 0755 "$OUT_ROOT/install.sh" "$OUT_ROOT/uninstall.sh"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/rime-run.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
@@ -89,7 +90,7 @@ for d in "${DISTROS[@]}"; do
   stage=$WORK/stage
   rm -rf "$stage"
   mkdir -p "$stage"
-  cp -f "$HERE/install.sh" "$stage/install.sh"
+  cp -f "$HERE/install.sh" "$HERE/uninstall.sh" "$stage/"
   cp -a "$dir" "$stage/$d"
   tar -C "$stage" -czf "$WORK/payload.tar.gz" .
   runfile=$RUN_DIR/rime-sync-installer_${VERSION}~${suite}.run

@@ -22,6 +22,29 @@
 ;   $INSTDIR\install-ime-order.log
 ; （静默安装看不到 DetailPrint，这个文件是唯一可复核的证据；卸载时删除）
 ;
+; 所有权（卸载时才知道该不该连小狼毫一起卸）：
+;   安装前先探测小狼毫是否已存在（RimeSyncFindWeaselRoot）。
+;   - 已存在   → 不是我们装的，**不写标记**，卸载时保留。
+;   - 不存在   → 静默安装内嵌的小狼毫；安装器退出码 0 后写所有权标记：
+;                  HKLM\Software\rime-sync（64 位视图）
+;                    BundledWeasel   = 1
+;                    WeaselRoot      = 探测到的 Weasel 程序目录
+;                    WeaselUninstall = Weasel 的 UninstallString（带引号的卸载器）
+;                    BundledAt       = 安装时间戳
+;                卸载时据此决定是否连小狼毫一起卸；升级安装（小狼毫已存在）不会清掉旧标记。
+;
+; 卸载（PREUNINSTALL）：
+;   1. 读 HKLM\Software\rime-sync 的 BundledWeasel；不是 1 → 保留小狼毫。
+;   2. 命令行 /KEEPWEASEL 或环境变量 RIMESYNC_KEEP_WEASEL=1 → 保留，并清掉标记
+;      （所有权交还用户，避免以后再有人替用户卸输入法）。
+;   3. 否则先跑标记里的 UninstallString（追加 /S），失败再跑 <WeaselRoot>\uninstall.exe /S；
+;      两条都失败只记日志，**不 Abort**，rime-sync 继续卸载。
+;   4. 无论 Weasel 卸载成功与否，都删掉标记。
+;   5. 卸载日志：$TEMP\rime-sync-uninstall.log（不随 $INSTDIR 删除，便于事后复核）。
+;   用户数据 %APPDATA%\Rime 与 rime-sync 自己的配置/备份**始终不动**：
+;   本文件没有任何针对 $APPDATA 的 Delete/RMDir，Weasel 0.17.4 的卸载器同样只删
+;   安装目录、程序组与注册表（见 third_party/weasel/output/install.nsi 的 Section "Uninstall"）。
+;
 ; 前提（见 tauri.conf.json 的 bundle.windows.nsis）：
 ;   installMode = perMachine  → 安装器以管理员运行，$SMPROGRAMS / $INSTDIR 都是
 ;   「所有用户」上下文（Tauri 的 SetContext 宏已 SetShellVarContext all）。
@@ -34,11 +57,19 @@
 ; ${PRODUCTNAME} 要等 Tauri 模板在 include 之后才定义，所以这两个符号只在
 ; 宏体里使用，由宏在插入时展开后经 $R6 / $R7 传给函数。
 
+; /KEEPWEASEL 用 ${GetOptions} 解析（Tauri 模板也 include 了 FileFunc.nsh，
+; 该头文件自带 FILEFUNC_INCLUDED 保护，重复 include 安全）。
+!include "FileFunc.nsh"
+
 !define RIMESYNC_NAME "Rime 同步"
 !define RIMESYNC_SETUP_NAME "同步设置"
 !define RIMESYNC_WEASEL_INSTALLER "weasel-0.17.4.0-installer.exe"
 !define RIMESYNC_WEASEL_DIRVER "0.17.4"
 !define RIMESYNC_ORDER_LOG "$INSTDIR\install-ime-order.log"
+!define RIMESYNC_UNINSTALL_LOG "$TEMP\rime-sync-uninstall.log"
+
+; 所有权标记（卸载时读同一个键）；64 位视图，与 perMachine 安装上下文一致。
+!define RIMESYNC_REG_KEY "Software\rime-sync"
 
 ; 构建期由 scripts/ime/build-weasel.ps1 放到 packaging/windows/vendor/。
 ; 不存在时不直接报错：允许“离线兜底/根本没编译”的构建继续，只给编译告警，
@@ -58,7 +89,10 @@
 ; 时间戳：$R2 = "YYYY-MM-DD HH:MM:SS"（本地时间）
 ; 占用 $1..$9（都是函数内 scratch），$0 / $R0..$R9 不受影响。
 ; ---------------------------------------------------------------------------
-Function RimeSyncStamp
+; 安装器与卸载器的 $R2/$R1 都是独立的寄存器，函数体用宏共用，${UN} 前缀区分两套名字
+; （卸载段里只能 Call un.*；宏内标签也必须带前缀，否则重复定义）。
+!macro RIMESYNC_FN_STAMP UN
+Function ${UN}RimeSyncStamp
   System::Call '*(&i2,&i2,&i2,&i2,&i2,&i2,&i2,&i2) p .r1'
   System::Call 'kernel32::GetLocalTime(p r1)'
   System::Call '*$1(&i2.r2,&i2.r3,&i2.r4,&i2.r5,&i2.r6,&i2.r7,&i2.r8,&i2.r9)'
@@ -71,9 +105,12 @@ Function RimeSyncStamp
   IntFmt $8 "%.2u" $8
   StrCpy $R2 "$2-$3-$5 $6:$7:$8"
 FunctionEnd
+!macroend
+!insertmacro RIMESYNC_FN_STAMP ""
+!insertmacro RIMESYNC_FN_STAMP "un."
 
 ; ---------------------------------------------------------------------------
-; 顺序日志：入参 $R3 = 单行文本（保持 ASCII，避免代码页问题）
+; 顺序日志（安装）：入参 $R3 = 单行文本（保持 ASCII，避免代码页问题）
 ; 追加到 $INSTDIR\install-ime-order.log
 ; ---------------------------------------------------------------------------
 Function RimeSyncLog
@@ -84,6 +121,23 @@ Function RimeSyncLog
   FileClose $R4
   rimesync_log_done:
 FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 卸载日志：入参 $R3 = 单行文本
+; 追加到 $TEMP\rime-sync-uninstall.log。与安装日志不同，它不在 $INSTDIR 里，
+; 卸载器把程序目录删掉之后仍可复核（静默卸载唯一的证据）。
+; ---------------------------------------------------------------------------
+!macro RIMESYNC_FN_UNINSTALL_LOG UN
+Function ${UN}RimeSyncUninstallLog
+  ClearErrors
+  FileOpen $R4 "${RIMESYNC_UNINSTALL_LOG}" a
+  IfErrors rimesync_ulog_${UN}done
+  FileWrite $R4 "$R3$\r$\n"
+  FileClose $R4
+  rimesync_ulog_${UN}done:
+FunctionEnd
+!macroend
+!insertmacro RIMESYNC_FN_UNINSTALL_LOG "un."
 
 ; ---------------------------------------------------------------------------
 ; 写入推荐 Rime 配置：只在用户 Rime 目录缺文件时复制，绝不覆盖用户已有配置。
@@ -114,11 +168,35 @@ Function RimeSyncSeedRimeConfig
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
+; 探测：$R5 的候选目录命中则写入 $R8（未命中不动 $R8）
+; Weasel 的 InstallDir 注册值指向父目录（<...>\Rime），真正的程序目录是它下面的
+; weasel-<ver>；WeaselRoot 则直接是程序目录。两种布局都试，自定义安装目录才不会漏。
+; ---------------------------------------------------------------------------
+!macro RIMESYNC_FN_WEASEL_ROOT_FROM_DIR UN
+Function ${UN}RimeSyncWeaselRootFromDir
+  StrCmp $R5 "" rimesync_wrfd_${UN}done
+  IfFileExists "$R5\WeaselServer.exe" rimesync_wrfd_${UN}direct rimesync_wrfd_${UN}try_versioned
+  rimesync_wrfd_${UN}try_versioned:
+  IfFileExists "$R5\weasel-${RIMESYNC_WEASEL_DIRVER}\WeaselServer.exe" rimesync_wrfd_${UN}versioned
+  Goto rimesync_wrfd_${UN}done
+  rimesync_wrfd_${UN}direct:
+    StrCpy $R8 "$R5"
+    Goto rimesync_wrfd_${UN}done
+  rimesync_wrfd_${UN}versioned:
+    StrCpy $R8 "$R5\weasel-${RIMESYNC_WEASEL_DIRVER}"
+  rimesync_wrfd_${UN}done:
+FunctionEnd
+!macroend
+!insertmacro RIMESYNC_FN_WEASEL_ROOT_FROM_DIR ""
+!insertmacro RIMESYNC_FN_WEASEL_ROOT_FROM_DIR "un."
+
+; ---------------------------------------------------------------------------
 ; 探测：$R8 = 小狼毫安装根目录（含 WeaselServer.exe），未安装则空字符串
 ; 说明：Weasel 0.17 的安装根目录是 <Program Files>\Rime\weasel-0.17.4，
-;       老版本是 <Program Files>\Rime\Weasel；自定义目录无法枚举，由程序组探测兜底。
+;       老版本是 <Program Files>\Rime\Weasel；自定义目录无法枚举，由注册表兜底。
 ; ---------------------------------------------------------------------------
-Function RimeSyncFindWeaselRoot
+!macro RIMESYNC_FN_FIND_WEASEL_ROOT UN
+Function ${UN}RimeSyncFindWeaselRoot
   StrCpy $R8 ""
   ; 1) 注册表：Weasel 写 HKLM\Software\Rime\Weasel 的 WeaselRoot / InstallDir。
   ;    自定义安装目录只能靠这一条；64/32 位视图都读（Weasel 的 NSIS 是 32 位，
@@ -126,39 +204,43 @@ Function RimeSyncFindWeaselRoot
   ;    （本工程只出 x64/arm64 安装包，与 Tauri SetContext 的默认一致）。
   SetRegView 64
   ReadRegStr $R5 HKLM "Software\Rime\Weasel" "WeaselRoot"
-  IfFileExists "$R5\WeaselServer.exe" rimesync_root_set_reg
+  Call ${UN}RimeSyncWeaselRootFromDir
+  StrCmp $R8 "" 0 rimesync_root_${UN}done
   ReadRegStr $R5 HKLM "Software\Rime\Weasel" "InstallDir"
-  IfFileExists "$R5\WeaselServer.exe" rimesync_root_set_reg
+  Call ${UN}RimeSyncWeaselRootFromDir
+  StrCmp $R8 "" 0 rimesync_root_${UN}done
   SetRegView 32
   ReadRegStr $R5 HKLM "Software\Rime\Weasel" "WeaselRoot"
-  IfFileExists "$R5\WeaselServer.exe" rimesync_root_set_reg
+  Call ${UN}RimeSyncWeaselRootFromDir
+  StrCmp $R8 "" 0 rimesync_root_${UN}done
   ReadRegStr $R5 HKLM "Software\Rime\Weasel" "InstallDir"
-  IfFileExists "$R5\WeaselServer.exe" rimesync_root_set_reg
+  Call ${UN}RimeSyncWeaselRootFromDir
   SetRegView 64
+  StrCmp $R8 "" 0 rimesync_root_${UN}done
   ; 2) 默认安装目录
-  StrCmp $PROGRAMFILES64 "" rimesync_root_pf32
-    IfFileExists "$PROGRAMFILES64\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}\WeaselServer.exe" rimesync_root_set64ver
-    IfFileExists "$PROGRAMFILES64\Rime\Weasel\WeaselServer.exe" rimesync_root_set64
-  rimesync_root_pf32:
-    IfFileExists "$PROGRAMFILES\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}\WeaselServer.exe" rimesync_root_set32ver
-    IfFileExists "$PROGRAMFILES\Rime\Weasel\WeaselServer.exe" rimesync_root_set32
-  Goto rimesync_root_done
-  rimesync_root_set_reg:
-    StrCpy $R8 "$R5"
-    Goto rimesync_root_done
-  rimesync_root_set64ver:
+  StrCmp $PROGRAMFILES64 "" rimesync_root_${UN}pf32
+    IfFileExists "$PROGRAMFILES64\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}\WeaselServer.exe" rimesync_root_${UN}set64ver
+    IfFileExists "$PROGRAMFILES64\Rime\Weasel\WeaselServer.exe" rimesync_root_${UN}set64
+  rimesync_root_${UN}pf32:
+    IfFileExists "$PROGRAMFILES\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}\WeaselServer.exe" rimesync_root_${UN}set32ver
+    IfFileExists "$PROGRAMFILES\Rime\Weasel\WeaselServer.exe" rimesync_root_${UN}set32
+  Goto rimesync_root_${UN}done
+  rimesync_root_${UN}set64ver:
     StrCpy $R8 "$PROGRAMFILES64\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}"
-    Goto rimesync_root_done
-  rimesync_root_set64:
+    Goto rimesync_root_${UN}done
+  rimesync_root_${UN}set64:
     StrCpy $R8 "$PROGRAMFILES64\Rime\Weasel"
-    Goto rimesync_root_done
-  rimesync_root_set32ver:
+    Goto rimesync_root_${UN}done
+  rimesync_root_${UN}set32ver:
     StrCpy $R8 "$PROGRAMFILES\Rime\weasel-${RIMESYNC_WEASEL_DIRVER}"
-    Goto rimesync_root_done
-  rimesync_root_set32:
+    Goto rimesync_root_${UN}done
+  rimesync_root_${UN}set32:
     StrCpy $R8 "$PROGRAMFILES\Rime\Weasel"
-  rimesync_root_done:
+  rimesync_root_${UN}done:
 FunctionEnd
+!macroend
+!insertmacro RIMESYNC_FN_FIND_WEASEL_ROOT ""
+!insertmacro RIMESYNC_FN_FIND_WEASEL_ROOT "un."
 
 ; ---------------------------------------------------------------------------
 ; 探测：$R9 = 已存在的 Weasel 程序组路径，没有则空字符串
@@ -182,15 +264,67 @@ Function RimeSyncFindWeaselGroup
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
+; 读出 Weasel 自己的卸载命令：$R5 = 带引号的卸载器路径，找不到则空字符串。
+; Weasel 的安装器是 32 位 NSIS，键写在 Wow6432Node（32 位视图）；个别构建/自定义
+; 安装可能落到 64 位视图，两个都读。只碰 $R1 / $R5，不动 $R8。
+; 值形如 "C:\Program Files\Rime\weasel-0.17.4\uninstall.exe"（已带引号）；
+; 万一没带引号，这里补上，后面才能安全地拼 " /S"。
+; ---------------------------------------------------------------------------
+!macro RIMESYNC_FN_FIND_WEASEL_UNINST UN
+Function ${UN}RimeSyncFindWeaselUninstallString
+  StrCpy $R5 ""
+  SetRegView 32
+  ReadRegStr $R5 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Weasel" "UninstallString"
+  StrCmp $R5 "" 0 rimesync_uninst_${UN}normalize
+  SetRegView 64
+  ReadRegStr $R5 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Weasel" "UninstallString"
+  StrCmp $R5 "" rimesync_uninst_${UN}done
+  rimesync_uninst_${UN}normalize:
+    StrCpy $R1 $R5 1
+    StrCmp $R1 '"' rimesync_uninst_${UN}done
+    StrCpy $R5 '"$R5"'
+  rimesync_uninst_${UN}done:
+  SetRegView 64
+FunctionEnd
+!macroend
+!insertmacro RIMESYNC_FN_FIND_WEASEL_UNINST ""
+!insertmacro RIMESYNC_FN_FIND_WEASEL_UNINST "un."
+
+; ---------------------------------------------------------------------------
+; 写所有权标记（只在“本次安装前没有小狼毫、且内嵌安装器正常退出”的分支调用）
+; 入参：$R8 = 小狼毫根目录（可为空），$R2 = 时间戳
+; 写入失败极少见，只记日志，不阻断安装（卸载时会退回“保留小狼毫”）。
+; ---------------------------------------------------------------------------
+Function RimeSyncMarkBundledWeasel
+  Call RimeSyncFindWeaselUninstallString
+  ClearErrors
+  SetRegView 64
+  WriteRegStr HKLM "${RIMESYNC_REG_KEY}" "BundledWeasel" "1"
+  WriteRegStr HKLM "${RIMESYNC_REG_KEY}" "WeaselRoot" "$R8"
+  WriteRegStr HKLM "${RIMESYNC_REG_KEY}" "WeaselUninstall" "$R5"
+  WriteRegStr HKLM "${RIMESYNC_REG_KEY}" "BundledAt" "$R2"
+  IfErrors rimesync_mark_failed
+    DetailPrint "[rime-sync] 已记录小狼毫所有权：卸载 rime-sync 时会连小狼毫一起卸载（用户数据保留）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL ownership marker written"
+    Call RimeSyncLog
+    Return
+  rimesync_mark_failed:
+    DetailPrint "[rime-sync] 警告：写小狼毫所有权标记失败，卸载 rime-sync 时将保留小狼毫"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL ownership marker write failed"
+    Call RimeSyncLog
+FunctionEnd
+
+; ---------------------------------------------------------------------------
 ; PREINSTALL：先装小狼毫（在 Tauri 拷主程序与 resources 之前）
 ; 已安装则跳过（避免把用户现有小狼毫重装/降级）；失败只写日志，不阻断主安装。
+; 只有“原本没有、由本次安装装上”的情况才写所有权标记。
 ; ---------------------------------------------------------------------------
 Function RimeSyncInstallWeaselPre
   Call RimeSyncFindWeaselRoot
   StrCmp $R8 "" rimesync_pre_install
     DetailPrint "[rime-sync] 已检测到小狼毫（$R8），跳过内嵌安装包"
     Call RimeSyncStamp
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL skip existing weasel=$R8"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL skip existing weasel"
     Call RimeSyncLog
     Return
 
@@ -235,7 +369,7 @@ Function RimeSyncInstallWeaselPre
   StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL weasel installer exit=$0"
   Call RimeSyncLog
   StrCmp $0 "0" rimesync_pre_ok
-    DetailPrint "[rime-sync] 警告：小狼毫安装器退出码 $0（不阻断 rime-sync 安装）"
+    DetailPrint "[rime-sync] 警告：小狼毫安装器退出码 $0（不阻断 rime-sync 安装，也不写所有权标记）"
     Goto rimesync_pre_cleanup
 
   rimesync_pre_launch_failed:
@@ -247,6 +381,11 @@ Function RimeSyncInstallWeaselPre
 
   rimesync_pre_ok:
     DetailPrint "[rime-sync] 小狼毫静默安装完成"
+    ; 装完再探测一次：注册表/默认目录此时才出现 WeaselServer.exe。
+    ; 探测不到也照样写标记（安装器已成功退出，说明是我们装的），
+    ; 卸载时再用 UninstallString 兜底。
+    Call RimeSyncFindWeaselRoot
+    Call RimeSyncMarkBundledWeasel
 
   rimesync_pre_cleanup:
   !ifdef RIMESYNC_WEASEL_EMBEDDED
@@ -302,6 +441,156 @@ Function RimeSyncCreateWeaselShortcut
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
+; 卸载小狼毫（仅当安装时记录了所有权标记）
+; 调用链：
+;   1. HKLM\Software\rime-sync 读 BundledWeasel / WeaselUninstall / WeaselRoot
+;   2. 没有标记 → 保留（不是我们装的）
+;   3. /KEEPWEASEL 或 RIMESYNC_KEEP_WEASEL 非空非 0 → 保留，并清掉标记
+;   4. 先跑标记里的 UninstallString + /S；非 0/error/timeout 时再跑
+;      <WeaselRoot>\uninstall.exe /S（与第一次同一条命令则不重复跑）
+;   5. 无论成功失败都删标记，然后继续 rime-sync 自己的卸载（不 Abort）
+; 用户数据：%APPDATA%\Rime 从未被本函数或 Weasel 卸载器删除。
+; 寄存器：进入时压栈、退出时恢复（本宏是 Tauri 卸载段的第一条语句，
+;         后面还有 CheckIfAppIsRunning 等宏依赖 $R0/$R1）。
+; ---------------------------------------------------------------------------
+Function un.RimeSyncUninstallBundledWeasel
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  Push $8
+  Push $9
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  Push $R8
+  Push $R9
+
+  Call un.RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=PREUNINSTALL 开始卸载（用户数据 %APPDATA%\Rime 始终保留）"
+  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL begin keep-userdata"
+  Call un.RimeSyncUninstallLog
+
+  SetRegView 64
+  ReadRegStr $R6 HKLM "${RIMESYNC_REG_KEY}" "BundledWeasel"
+  ReadRegStr $R9 HKLM "${RIMESYNC_REG_KEY}" "WeaselUninstall"
+  ReadRegStr $R7 HKLM "${RIMESYNC_REG_KEY}" "WeaselRoot"
+  StrCmp $R6 "1" rimesync_un_owned
+    DetailPrint "[rime-sync] 没有小狼毫所有权标记：保留当前小狼毫（不是本安装器装的）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL no ownership marker, keep weasel"
+    Call un.RimeSyncUninstallLog
+    Goto rimesync_un_done
+
+  rimesync_un_owned:
+  ; 保留选项：/KEEPWEASEL 或环境变量 RIMESYNC_KEEP_WEASEL（非空且非 0）
+  ; 先看命令行开关，再退到环境变量（GetOptions 会用到 $0..$5，故 env 在其后读）
+  ${GetOptions} $CMDLINE "/KEEPWEASEL" $R0
+  IfErrors rimesync_un_keep_env
+    StrCpy $R1 "1"
+    Goto rimesync_un_keep_decide
+  rimesync_un_keep_env:
+    ReadEnvStr $R1 "RIMESYNC_KEEP_WEASEL"
+  rimesync_un_keep_decide:
+  StrCmp $R1 "" rimesync_un_locate
+  StrCmp $R1 "0" rimesync_un_locate
+    DetailPrint "[rime-sync] 收到保留选项（/KEEPWEASEL）：保留小狼毫，并把所有权交还用户"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL keepweasel requested, keep weasel"
+    Call un.RimeSyncUninstallLog
+    Goto rimesync_un_clear_marker
+
+  rimesync_un_locate:
+  ; $R8 = 安装时记录的根目录；为空则现场探测（用户改过安装目录/换过版本）
+  StrCpy $R8 $R7
+  StrCmp $R8 "" 0 rimesync_un_locate_cmd
+    Call un.RimeSyncFindWeaselRoot
+  rimesync_un_locate_cmd:
+  ; $R9 = 安装时记录的 UninstallString；为空则现场读注册表
+  ; （不能放在 $R5：RimeSyncFindWeaselRoot 会拿 $R5 当 scratch）
+  StrCmp $R9 "" 0 rimesync_un_attempt1
+    Call un.RimeSyncFindWeaselUninstallString
+    StrCpy $R9 $R5
+  rimesync_un_attempt1:
+  StrCmp $R9 "" rimesync_un_attempt2
+    DetailPrint "[rime-sync] 静默卸载小狼毫：$R9 /S"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstall attempt=uninstallstring"
+    Call un.RimeSyncUninstallLog
+    nsExec::ExecToLog '$R9 /S'
+    Pop $0
+    StrCmp $0 "0" rimesync_un_ok
+      DetailPrint "[rime-sync] 警告：小狼毫卸载器退出码 $0（UninstallString），改试安装目录下的 uninstall.exe"
+      StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstall failed exit=$0 via=uninstallstring"
+      Call un.RimeSyncUninstallLog
+
+  rimesync_un_attempt2:
+  StrCmp $R8 "" rimesync_un_missing
+  IfFileExists "$R8\uninstall.exe" 0 rimesync_un_missing
+  StrCmp $R9 '"$R8\uninstall.exe"' rimesync_un_missing
+    DetailPrint "[rime-sync] 静默卸载小狼毫：$R8\uninstall.exe /S"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstall attempt=root-uninstaller"
+    Call un.RimeSyncUninstallLog
+    nsExec::ExecToLog '"$R8\uninstall.exe" /S'
+    Pop $0
+    StrCmp $0 "0" rimesync_un_ok
+      DetailPrint "[rime-sync] 警告：小狼毫卸载失败（$R8\uninstall.exe 退出码 $0），继续卸载 rime-sync"
+      StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstall failed exit=$0 via=root"
+      Call un.RimeSyncUninstallLog
+      Goto rimesync_un_clear_marker
+
+  rimesync_un_missing:
+    DetailPrint "[rime-sync] 警告：找不到小狼毫卸载器（可能已被手动卸载），跳过"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstaller not found"
+    Call un.RimeSyncUninstallLog
+    Goto rimesync_un_clear_marker
+
+  rimesync_un_ok:
+    DetailPrint "[rime-sync] 小狼毫已静默卸载；用户数据 %APPDATA%\Rime 保留"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstalled, user data kept"
+    Call un.RimeSyncUninstallLog
+
+  rimesync_un_clear_marker:
+  ; 标记只表示「rime-sync 装的、且仍归 rime-sync 管」；卸载流程结束时一律清掉
+  SetRegView 64
+  DeleteRegValue HKLM "${RIMESYNC_REG_KEY}" "BundledWeasel"
+  DeleteRegValue HKLM "${RIMESYNC_REG_KEY}" "WeaselRoot"
+  DeleteRegValue HKLM "${RIMESYNC_REG_KEY}" "WeaselUninstall"
+  DeleteRegValue HKLM "${RIMESYNC_REG_KEY}" "BundledAt"
+  DeleteRegKey /ifempty HKLM "${RIMESYNC_REG_KEY}"
+  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL ownership marker cleared"
+  Call un.RimeSyncUninstallLog
+
+  rimesync_un_done:
+  Pop $R9
+  Pop $R8
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+  Pop $9
+  Pop $8
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
 ; 宏：Tauri 插入点
 ; ---------------------------------------------------------------------------
 !macro NSIS_HOOK_PREINSTALL
@@ -334,8 +623,11 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  ; 只删本安装器创建的东西；小狼毫本体、词库与它的程序组**默认保留**
-  ; （卸载说明见 docs/THIRD-PARTY.md 与安装包内 resources\WEASEL-NOTICE.txt）
+  ; 先处理小狼毫（仅当是我们装的；没标记/带 /KEEPWEASEL 时保留）
+  ; 必须放在最前面：$INSTDIR 这时还在，后面 Tauri 会把程序目录删掉
+  Call un.RimeSyncUninstallBundledWeasel
+
+  ; 再删本安装器创建的东西；小狼毫的程序组只在它自己卸载时才消失
   Delete "$SMPROGRAMS\${RIMESYNC_NAME}\${RIMESYNC_NAME}.lnk"
   Delete "$SMPROGRAMS\${RIMESYNC_NAME}\${RIMESYNC_SETUP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${RIMESYNC_NAME}"

@@ -79,6 +79,72 @@ pub fn merge3_digests(
     }
 }
 
+/// Rime 自定义配置文件（Weasel/ibus-rime 都会写 `customization:` 头）。
+pub fn is_custom_yaml(rel: &str) -> bool {
+    rel.ends_with(".custom.yaml")
+}
+
+/// *.custom.yaml 的规范化摘要：只对 `patch:` 段做确定性序列化后再哈希。
+///
+/// 小狼毫每次改设置都会重写文件头的 `customization:`（modified_time /
+/// distribution_version），整文件 sha256 会把纯 metadata 变化当成内容变化，
+/// 让 base/local/remote 三方永远不同 → 每轮都报冲突。这里只比较 patch 段。
+///
+/// 解析失败或没有 patch 映射时回退原始字节：拿不准就按老规则比较，
+/// 绝不因为规范化失败而放过真实内容差异。
+pub fn custom_yaml_digest(bytes: &[u8]) -> String {
+    match normalize_custom_yaml(bytes) {
+        Some(normalized) => sha256_hex(&normalized),
+        None => sha256_hex(bytes),
+    }
+}
+
+/// 只保留 `patch:` 段并做确定性序列化（映射键排序、递归），用于比较而非写盘。
+///
+/// 返回 None 表示「无法规范化」：解析失败、顶层不是映射、patch 不是映射。
+pub fn normalize_custom_yaml(bytes: &[u8]) -> Option<Vec<u8>> {
+    let doc = parse_yaml(bytes)?;
+    let patch = patch_mapping(&doc)?;
+    let canonical = canonical_value(&Value::Mapping(patch.clone()));
+    serde_yaml::to_string(&canonical)
+        .ok()
+        .map(String::into_bytes)
+}
+
+/// 递归重建 Value：映射按键排序，序列保持原顺序（序列顺序有语义）。
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Mapping(map) => {
+            let mut entries: Vec<(String, &Value, Value)> = map
+                .iter()
+                .map(|(key, item)| (canonical_key(key), key, canonical_value(item)))
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut sorted = Mapping::new();
+            for (_, key, item) in entries {
+                sorted.insert(key.clone(), item);
+            }
+            Value::Mapping(sorted)
+        }
+        Value::Sequence(items) => Value::Sequence(items.iter().map(canonical_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// 键的排序依据：带类型前缀，避免 `1`（数字）与 `"1"`（字符串）排成同一个位置。
+fn canonical_key(key: &Value) -> String {
+    match key {
+        Value::String(text) => format!("s:{text}"),
+        Value::Bool(flag) => format!("b:{flag}"),
+        Value::Number(number) => format!("n:{number:?}"),
+        Value::Null => "z:".to_string(),
+        other => format!(
+            "o:{}",
+            serde_yaml::to_string(other).unwrap_or_default().trim()
+        ),
+    }
+}
+
 /// YAML 段落级合并结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -422,5 +488,90 @@ mod patch_tests {
             }
             MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    const HEADER_OLD: &str = concat!(
+        "# Rime settings\n",
+        "patch:\n",
+        "  \"menu/page_size\": 9\n",
+        "  style:\n",
+        "    color_scheme: dark\n",
+        "    font_point: 12\n",
+        "customization:\n",
+        "  distribution_code_name: Weasel\n",
+        "  distribution_version: \"0.16.3\"\n",
+        "  modified_time: \"Tue Oct 21 10:00:00 2025\"\n",
+    );
+
+    /// 同一份 patch，只有 customization 头不同（小狼毫每次改设置都会重写）。
+    const HEADER_NEW: &str = concat!(
+        "patch:\n",
+        "  style:\n",
+        "    font_point: 12\n",
+        "    color_scheme: dark\n",
+        "  \"menu/page_size\": 9\n",
+        "customization:\n",
+        "  distribution_code_name: Weasel\n",
+        "  distribution_version: \"0.17.0\"\n",
+        "  modified_time: \"Wed Oct 22 11:11:11 2025\"\n",
+    );
+
+    #[test]
+    fn customization_header_is_ignored() {
+        let old = HEADER_OLD.as_bytes();
+        let new = HEADER_NEW.as_bytes();
+        assert_ne!(
+            sha256_hex(old),
+            sha256_hex(new),
+            "raw bytes must differ (that is the reported bug)"
+        );
+        assert_eq!(custom_yaml_digest(old), custom_yaml_digest(new));
+    }
+
+    #[test]
+    fn key_order_does_not_change_the_digest() {
+        let first = b"patch:\n  a: 1\n  b: 2\n";
+        let second = b"patch:\n  b: 2\n  a: 1\n";
+        assert_eq!(custom_yaml_digest(first), custom_yaml_digest(second));
+    }
+
+    #[test]
+    fn real_patch_change_changes_the_digest() {
+        let base = HEADER_OLD.as_bytes();
+        let changed = HEADER_OLD.replace("menu/page_size\": 9", "menu/page_size\": 6");
+        assert_ne!(
+            custom_yaml_digest(base),
+            custom_yaml_digest(changed.as_bytes())
+        );
+    }
+
+    #[test]
+    fn non_yaml_falls_back_to_raw_bytes() {
+        let broken = b"\tbad: yaml";
+        assert!(normalize_custom_yaml(broken).is_none());
+        assert_eq!(custom_yaml_digest(broken), sha256_hex(broken));
+    }
+
+    #[test]
+    fn missing_patch_mapping_falls_back_to_raw_bytes() {
+        let no_patch = b"not_patch:\n  a: 1\n";
+        assert!(normalize_custom_yaml(no_patch).is_none());
+        assert_eq!(custom_yaml_digest(no_patch), sha256_hex(no_patch));
+
+        let scalar_patch = b"patch: scalar\n";
+        assert!(normalize_custom_yaml(scalar_patch).is_none());
+        assert_eq!(custom_yaml_digest(scalar_patch), sha256_hex(scalar_patch));
+    }
+
+    #[test]
+    fn non_mapping_document_falls_back_to_raw_bytes() {
+        let sequence = b"- patch: 1\n";
+        assert!(normalize_custom_yaml(sequence).is_none());
+        assert_eq!(custom_yaml_digest(sequence), sha256_hex(sequence));
     }
 }

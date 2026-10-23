@@ -3,7 +3,7 @@
 #
 #   sudo ./install.sh                     # 自动识别发行版并安装
 #   sudo ./install.sh --payload DIR       # 指定离线包根目录
-#   sudo ./install.sh --uninstall         # 先卸同步、再卸输入法（保留用户数据）
+#   sudo ./install.sh --uninstall [--yes] [--keep-ime]  # 交给统一卸载脚本（保留用户数据）
 #
 # 目录约定（.run 自解压后也是这个结构）：
 #   install.sh
@@ -22,9 +22,10 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PAYLOAD=""
 DO_UNINSTALL=0
 ASSUME_YES=0
+KEEP_IME=0
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
     --payload) shift; PAYLOAD=${1:-} ;;
     --payload=*) PAYLOAD=${1#--payload=} ;;
     --yes|-y) ASSUME_YES=1 ;;
+    --keep-ime) KEEP_IME=1 ;;
     -h|--help) usage ;;
     *) echo "未知参数: $1（--help 查看用法）" >&2; exit 64 ;;
   esac
@@ -77,15 +79,21 @@ OS_PRETTY=${PRETTY_NAME:-$OS_ID $OS_VER}
 
 # ------------------------------------------------------------------ uninstall
 if [ "$DO_UNINSTALL" -eq 1 ]; then
-  say "卸载 rime-sync 与 rime-inputmethod（先同步、后输入法）"
-  step "uninstall rime-sync"
-  dpkg -P rime-sync || say "rime-sync 未安装或卸载失败，继续"
-  step "uninstall rime-inputmethod"
-  dpkg -P rime-inputmethod || say "rime-inputmethod 未安装或卸载失败，继续"
-  say "卸载完成。用户数据保留："
-  say "  ~/.local/share/fcitx5/rime（Rime 用户词库）"
-  say "  ~/.config/rime-sync（同步配置）"
-  exit 0
+  # 卸载逻辑只有一份：/usr/lib/rime-sync/uninstall.sh（随 rime-sync 包安装）；
+  # 离线包/ .run 自解压目录里也带同名脚本，未装或已半卸时用同目录那一份。
+  UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
+  [ -f "$UNINSTALLER" ] || UNINSTALLER=$SCRIPT_DIR/uninstall.sh
+  if [ ! -f "$UNINSTALLER" ]; then
+    say "找不到统一卸载脚本：/usr/lib/rime-sync/uninstall.sh 与 $SCRIPT_DIR/uninstall.sh 都不存在"
+    say "可改用：apt remove rime-sync；或 dpkg -r rime-inputmethod"
+    exit 4
+  fi
+  uninstall_args=()
+  [ "$ASSUME_YES" -eq 1 ] && uninstall_args+=(--yes)
+  [ "$KEEP_IME" -eq 1 ] && uninstall_args+=(--keep-ime)
+  step "exec uninstall.sh"
+  say "调用卸载脚本：$UNINSTALLER"
+  exec bash "$UNINSTALLER" "${uninstall_args[@]}"
 fi
 
 say "rime-sync 离线安装器"

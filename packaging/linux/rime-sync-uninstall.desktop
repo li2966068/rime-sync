@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=卸载 Rime 同步与输入法
+Name[en]=Uninstall Rime Sync and Input Method
+GenericName=卸载 Rime 同步
+Comment=删除 rime-sync 与 rime-inputmethod 两个软件包，保留 Rime 用户词库与同步配置
+Comment[en]=Remove the rime-sync and rime-inputmethod packages; user dictionaries and sync config are kept
+Exec=sh -c "command -v pkexec >/dev/null 2>&1 && exec pkexec /usr/lib/rime-sync/uninstall.sh; exec /usr/lib/rime-sync/uninstall.sh"
+Icon=edit-delete
+Terminal=true
+Categories=Utility;
+Keywords=Rime;rime-sync;uninstall;remove;卸载;
+StartupNotify=false

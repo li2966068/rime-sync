@@ -9,7 +9,7 @@
 | `../../scripts/ime/build-weasel.ps1` | **主路径**：用 MSVC 从 `third_party/weasel` 编译 Weasel，产出安装包 |
 | `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
 | `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
-| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 装输入法、POSTINSTALL 建快捷方式、卸载清理 |
+| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 装输入法并记所有权、POSTINSTALL 建快捷方式、PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
 | `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine` |
 
 > 为什么 resources 里没有 `weasel-*.exe`：安装器用 NSIS 的 `File` 指令在**构建期**把
@@ -117,6 +117,14 @@ File ...resources...
 
 静默安装看不到 DetailPrint，所以顺序日志写文件；卸载时删除该文件。
 
+卸载相关的证据：
+
+| 证据 | 位置 |
+|---|---|
+| 所有权标记 | `HKLM\Software\rime-sync` 的 `BundledWeasel` / `WeaselRoot` / `WeaselUninstall` / `BundledAt` |
+| 安装日志 | `%ProgramFiles%\rime-sync\install-ime-order.log` 里的 `phase=PREINSTALL ownership marker written` |
+| 卸载日志 | `%TEMP%\rime-sync-uninstall.log`（卸载后仍在，逐行带 `phase=PREUNINSTALL`） |
+
 ## 4. CI（release.yml · windows job）
 
 | 步骤 | 作用 |
@@ -159,3 +167,28 @@ File ...resources...
 - boost 源码下载（`archives.boost.io`，约 120MB）可能慢；缓存命中可跳过。
 - 自编译安装包不含输入方案（plum 为空子模块）；需要方案时用 `-WithRimeData`
   或走官方安装包，见 `docs/THIRD-PARTY.md`。
+
+## 7. 卸载顺序（实现与证据点）
+
+`NSIS_HOOK_PREUNINSTALL` 是 Tauri `Section Uninstall` 的第一条语句（此时 `$INSTDIR` 还在），
+顺序是「先卸小狼毫（仅当是我们装的）→ 再删 rime-sync 自己的快捷方式/日志」。
+
+| 阶段 | 行为 |
+|---|---|
+| 所有权 | 只在「安装前没有小狼毫、内嵌安装器退出码 0」时写 `HKLM\Software\rime-sync`：`BundledWeasel=1`、`WeaselRoot`、`WeaselUninstall`、`BundledAt`（64 位视图） |
+| 判断 | 读不到 `BundledWeasel=1` → 保留小狼毫，只清理 rime-sync 自己 |
+| 保留选项 | `uninstall.exe /KEEPWEASEL` 或环境变量 `RIMESYNC_KEEP_WEASEL=1`：跳过小狼毫卸载并删除标记（所有权交还用户） |
+| 第 1 次尝试 | `nsExec::ExecToLog '$R9 /S'`，`$R9` = 标记里的 UninstallString（Weasel 自己的卸载器，键在 32 位视图 `...\Uninstall\Weasel`） |
+| 第 2 次尝试 | 退出码非 0 / error / timeout 时 `nsExec::ExecToLog '"$R8\uninstall.exe" /S'`；与第 1 次同一条命令则不重跑 |
+| 失败处理 | 只 `DetailPrint` + 写日志，**不 Abort**，rime-sync 继续卸载；标记照样删除 |
+| 用户数据 | 钩子不删 `%APPDATA%\Rime` 与 rime-sync 配置；Weasel 卸载器也不删（`third_party/weasel/output/install.nsi` 的 `Section "Uninstall"`） |
+
+真机验证点（本机 Linux 只能验 NSIS 语法，见第 6 节）：
+
+1. 干净系统装 rime-sync → `reg query HKLM\Software\rime-sync` 有 4 个值；卸载 → 小狼毫消失、
+   `%APPDATA%\Rime` 仍在、`HKLM\Software\rime-sync` 被删空。
+2. 先手动装 Weasel 再装 rime-sync → 没有标记；卸载 → Weasel 仍在。
+3. `uninstall.exe /KEEPWEASEL` → Weasel 仍在，标记被删。
+4. 卸载时把 `<WeaselRoot>\uninstall.exe` 改名 → 第 1 次尝试报 error、第 2 次找不到文件，
+   日志里是 `weasel uninstall failed` / `weasel uninstaller not found`，rime-sync 仍被正常卸载。
+5. 卸载后再装一次 rime-sync → 会重新装小狼毫并重新写标记。

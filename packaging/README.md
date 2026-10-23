@@ -94,6 +94,10 @@ deb 的 `depends` 已写入 `tauri.conf.json` 的 `bundle.linux.deb.depends`。A
   （同时受 `bundle.windows.nsis.startMenuFolder` 控制，二者一致）。
 - 若检测到 `小狼毫` 或 `Weasel` 程序组，再在其中放一份快捷方式；不新建、不改动 Weasel 自身文件。
 - 卸载时删除上述快捷方式与空的「Rime 同步」程序组；**不删** `%APPDATA%\rime-sync` 配置与备份。
+- **默认连小狼毫一起卸载**：安装时若本机原本没有 Weasel，会在 `HKLM\Software\rime-sync` 写
+  `BundledWeasel=1`（含 WeaselRoot / UninstallString），卸载时据此静默运行 Weasel 卸载器；
+  原本就有 Weasel 的用户不受影响。需要保留输入法时用 `uninstall.exe /KEEPWEASEL`
+  （或设 `RIMESYNC_KEEP_WEASEL=1`）。用户词库 `%APPDATA%\Rime` 始终保留。
 
 ## 6. 便携版（portable-zip.ps1）
 

@@ -2,6 +2,21 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.5.3 — 2026-10-23
+
+修掉两台 Windows 之间「配置不同步」的假冲突，并把安装/卸载统一成一个产品：
+
+1. **忽略 customization 头**：`*.custom.yaml` 的三向比较只比 `patch`，Weasel 每次改设置重写的
+   `modified_time`/`distribution_version` 不再制造冲突；只差元数据时直接采用远端内容并更新基线。
+2. **冲突可解决**：冲突页新增「用远端覆盖本地」「全部用远端覆盖」；远端覆盖先 GET 成功再原子写本地、
+   更新 index 基线，最后才删冲突副本，任一步失败都不动本地文件。「采用副本」注明等价于保留本地。
+3. **冲突可见**：报告区列出冲突文件（最多 5 条），冲突页显示文件、冲突键（如 `patch.menu/page_size`）、
+   本地/远端/副本大小。
+4. **Windows 配置立即生效**：transport 改动过 `*.custom.yaml` 后自动执行 `WeaselDeployer /deploy`。
+5. **统一卸载（Windows）**：安装时若本机原本没有小狼毫，记录所有权标记；卸载默认连 Weasel 一起静默卸载，
+   原本已装的用户不受影响；`/KEEPWEASEL` 可保留输入法；`%APPDATA%\Rime` 始终保留。
+6. **统一卸载（Linux）**：新增 `/usr/lib/rime-sync/uninstall.sh` 与桌面菜单「卸载 Rime 同步与输入法」，
+   先卸同步、再卸自编译输入法，保留用户目录与配置；`install.sh --uninstall` 复用同一脚本。
 ## v0.5.2 — 2026-10-23
 
 修复「同步显示成功但词库没合并」以及 Linux 输入法设置页：

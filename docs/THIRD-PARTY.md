@@ -60,8 +60,22 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
 - 安装器把带时间戳的顺序写入 `$INSTDIR\install-ime-order.log`（静默安装的唯一可复核证据，
   卸载时删除），同时 `DetailPrint` 一份到安装日志。
 - 只有检测不到小狼毫时才静默安装，已安装则跳过（不覆盖用户版本）。
-- **卸载 rime-sync 默认保留小狼毫**及其词库、配置与程序组；
-  卸载 rime-sync 不等于卸载输入法。移除 Weasel 请用「设置 → 应用」中的 Weasel 条目。
+- **卸载 rime-sync 默认连小狼毫一起卸载，但只卸「rime-sync 装的」那个**：
+  - 安装前先探测小狼毫是否已存在。原本不存在、由本次安装装上时，安装器在
+    `HKLM\Software\rime-sync`（64 位视图）记录所有权标记：
+    `BundledWeasel=1`、`WeaselRoot=<程序目录>`、`WeaselUninstall=<Weasel 的 UninstallString>`、
+    `BundledAt=<时间戳>`。卸载时按标记决定是否连小狼毫一起卸。
+  - 安装前就有小狼毫（用户自己装的，或更早的 rime-sync 没留标记）→ **不写标记**，卸载时保留。
+  - 卸载调用链：先跑标记里的 `UninstallString`（追加 `/S`，用 `nsExec::ExecToLog` 等它结束）；
+    退出码非 0 / 启动失败 / 超时则退回 `<WeaselRoot>\uninstall.exe /S`（与第一条相同则不重跑）；
+    两条都失败只写日志，**不阻断** rime-sync 自己的卸载。无论成功失败都删除标记。
+  - 保留选项：`uninstall.exe /KEEPWEASEL`（或环境变量 `RIMESYNC_KEEP_WEASEL=1`）跳过小狼毫卸载，
+    并把所有权交还用户（删除标记）。
+  - 卸载日志：`%TEMP%\rime-sync-uninstall.log`（不在 `$INSTDIR` 里，卸载后仍可复核）。
+- **用户数据始终保留**：`%APPDATA%\Rime`（词库、配置、同步备份）不在删除范围内。
+  钩子里没有任何针对 `%APPDATA%` 的删除操作；Weasel 0.17.4 的卸载器同样只删安装目录、
+  程序组与 `HKLM\Software\Rime`，不碰用户目录（见 `third_party/weasel/output/install.nsi`
+  的 `Section "Uninstall"`）。rime-sync 自己的配置目录同样不在卸载清理范围内。
 
 ### 已知差异与离线兜底
 

@@ -15,7 +15,9 @@ use crate::config::Config;
 use crate::history::{self, HistoryEntry};
 use crate::index::{sha256_hex, FileIndex, FileMeta};
 use crate::lock::{self, LockGuard};
-use crate::merge3::{merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult};
+use crate::merge3::{
+    custom_yaml_digest, is_custom_yaml, merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult,
+};
 use crate::plan;
 use crate::platform::RimeTrigger;
 use crate::retry::RetryState;
@@ -47,6 +49,10 @@ pub struct Report {
     /// *.userdb.txt 词条级冲突统计；统计失败时整体降级为 null（不影响主流程）。
     #[serde(default)]
     pub conflict_details: Option<Vec<ConflictDetail>>,
+    /// 本轮有 *.custom.yaml 被拉取 / 合并 / 写入本地：Windows 上需要重新部署
+    /// （WeaselDeployer /deploy），否则改动不会生效。
+    #[serde(default)]
+    pub config_changed: bool,
     /// 本轮拉到新的/变化的 *.userdb.txt：transport 只搬文件，必须再跑 apply
     /// （rime_dict_manager --sync）才算真正合并进本地词库。
     #[serde(default)]
@@ -259,6 +265,17 @@ impl Engine {
                 if report.error.is_none() {
                     report.error = Some(format!("save index: {error:#}"));
                 }
+            }
+        }
+        // Windows：配置类文件（*.custom.yaml）落到本地后必须让 Weasel 重新部署，
+        // 否则用户要手动「重新部署」才生效。Linux/macOS 不触发（会打断输入法）。
+        if report.ok && report.config_changed && cfg!(windows) {
+            self.emit("deploy", 0, 0, "deploying weasel configuration");
+            match self.trigger.deploy(&self.rime_dir) {
+                Ok(()) => tracing::info!("weasel deploy triggered after custom yaml update"),
+                Err(error) => tracing::warn!(
+                    "weasel deploy after config sync failed (config files are still on disk): {error:#}"
+                ),
             }
         }
         dedupe(&mut report.conflicts);
@@ -811,11 +828,55 @@ impl Engine {
             let local_hash = local_bytes.as_ref().map(|bytes| sha256_hex(bytes));
             let base = self.index.files.get(rel).cloned();
             let remote_meta = manifest.files.get(rel).cloned();
-            let decision = merge3_digests(
-                base.as_ref().map(|meta| meta.sha256.as_str()),
-                local_hash.as_deref(),
-                remote_meta.as_ref().map(|meta| meta.sha256.as_str()),
-            );
+            let base_hash = base.as_ref().map(|meta| meta.sha256.clone());
+            let remote_hash = remote_meta.as_ref().map(|meta| meta.sha256.clone());
+
+            // *.custom.yaml 用「patch 段规范化摘要」做三向判定：小狼毫每次改设置都会
+            // 重写 customization 头，整文件摘要会把纯 metadata 变化当成内容变化。
+            let custom = is_custom_yaml(rel);
+            let mut remote_bytes: Option<Vec<u8>> = None;
+            let mut metadata_only = false;
+            let decision = if custom
+                && local_hash.is_some()
+                && remote_hash.is_some()
+                && local_hash != remote_hash
+            {
+                let Some(bytes) = self.fetch_shared_remote(rel, remote_meta.as_ref(), report)?
+                else {
+                    continue;
+                };
+                let local = local_bytes.as_deref().expect("local hash implies bytes");
+                let normalized_local = custom_yaml_digest(local);
+                let normalized_remote = custom_yaml_digest(&bytes);
+                let normalized_base = self
+                    .load_base(base_hash.as_deref())
+                    .as_deref()
+                    .map(custom_yaml_digest);
+                remote_bytes = Some(bytes);
+                if normalized_local == normalized_remote {
+                    // patch 完全一致，只有文件头不同：不是冲突，采用远端字节让本地彻底对齐。
+                    metadata_only = true;
+                    MergeResult::Unchanged
+                } else {
+                    match normalized_base {
+                        Some(digest) if digest == normalized_local => MergeResult::TakeRemote,
+                        Some(digest) if digest == normalized_remote => MergeResult::TakeLocal,
+                        Some(_) => MergeResult::Conflict,
+                        // 基线内容不可用（升级后首轮）：退回原始摘要，结论只会更保守。
+                        None => merge3_digests(
+                            base_hash.as_deref(),
+                            local_hash.as_deref(),
+                            remote_hash.as_deref(),
+                        ),
+                    }
+                }
+            } else {
+                merge3_digests(
+                    base_hash.as_deref(),
+                    local_hash.as_deref(),
+                    remote_hash.as_deref(),
+                )
+            };
             self.emit(
                 "merge",
                 index,
@@ -825,6 +886,23 @@ impl Engine {
 
             match decision {
                 MergeResult::Unchanged => {
+                    if metadata_only {
+                        // 纯 metadata 差异：把远端字节写成本地文件并更新 index/基线，
+                        // 下一轮本地与远端整文件一致，不再反复进入这条路径。
+                        let bytes = remote_bytes.expect("metadata-only implies fetched bytes");
+                        let meta = remote_meta
+                            .clone()
+                            .expect("metadata-only implies remote metadata");
+                        write_file(&self.rime_dir, rel, &bytes)?;
+                        self.remember_base(Some(&meta.sha256), Some(&bytes));
+                        self.index.files.insert(rel.clone(), meta);
+                        report.merged += 1;
+                        report.config_changed = true;
+                        tracing::info!(
+                            "{rel}: only the customization header differs (metadata-only); adopting remote bytes"
+                        );
+                        continue;
+                    }
                     self.remember_base(local_hash.as_deref(), local_bytes.as_deref());
                     match remote_meta {
                         Some(meta) => {
@@ -868,17 +946,27 @@ impl Engine {
                     let meta =
                         remote_meta.ok_or_else(|| anyhow!("missing remote metadata for {rel}"))?;
                     let remote_path = format!("shared/files/{rel}");
-                    let Some(bytes) = self.dav.get(&remote_path)? else {
-                        report
-                            .conflicts
-                            .push(format!("{rel}: manifest entry has no remote file"));
-                        continue;
+                    let bytes = match remote_bytes.take() {
+                        Some(bytes) => bytes,
+                        None => {
+                            let Some(bytes) = self.dav.get(&remote_path)? else {
+                                report
+                                    .conflicts
+                                    .push(format!("{rel}: manifest entry has no remote file"));
+                                continue;
+                            };
+                            bytes
+                        }
                     };
                     if sha256_hex(&bytes) != meta.sha256 {
                         report
                             .conflicts
                             .push(format!("{rel}: remote hash does not match manifest"));
                         continue;
+                    }
+                    // 本地字节即将被替换：Windows 上需要重新部署。
+                    if custom {
+                        report.config_changed = true;
                     }
                     write_file(&self.rime_dir, rel, &bytes)?;
                     self.remember_base(Some(&meta.sha256), Some(&bytes));
@@ -889,11 +977,12 @@ impl Engine {
                 MergeResult::Conflict => {
                     // *.custom.yaml 先试段落级合并；任何不适配都静默回落文件级冲突。
                     if !read_only
-                        && rel.ends_with(".custom.yaml")
+                        && custom
                         && self.merge_custom_yaml(
                             rel,
                             local_bytes.as_deref(),
                             remote_meta.as_ref(),
+                            remote_bytes.as_deref(),
                             base.as_ref(),
                             &mut manifest,
                             report,
@@ -947,12 +1036,41 @@ impl Engine {
         Ok(())
     }
 
+    /// 取 shared/files/<rel> 并按 manifest 校验摘要；不一致时记冲突并返回 None。
+    fn fetch_shared_remote(
+        &self,
+        rel: &str,
+        meta: Option<&FileMeta>,
+        report: &mut Report,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.dav.get(&format!("shared/files/{rel}"))? else {
+            report
+                .conflicts
+                .push(format!("{rel}: manifest entry has no remote file"));
+            return Ok(None);
+        };
+        if sha256_hex(&bytes) != meta.sha256 {
+            report
+                .conflicts
+                .push(format!("{rel}: remote hash does not match manifest"));
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
     /// *.custom.yaml 段落级合并：成功返回 true（调用方继续下一项），不适配返回 false。
+    ///
+    /// known_remote 是调用方已经取回并校验过的远端字节，避免同一轮重复 GET。
+    #[allow(clippy::too_many_arguments)]
     fn merge_custom_yaml(
         &mut self,
         rel: &str,
         local: Option<&[u8]>,
         remote_meta: Option<&FileMeta>,
+        known_remote: Option<&[u8]>,
         base: Option<&FileMeta>,
         manifest: &mut FileIndex,
         report: &mut Report,
@@ -961,8 +1079,14 @@ impl Engine {
             return Ok(false);
         };
         let remote_path = format!("shared/files/{rel}");
-        let Some(remote_bytes) = self.dav.get(&remote_path)? else {
-            return Ok(false);
+        let remote_bytes = match known_remote {
+            Some(bytes) => bytes.to_vec(),
+            None => {
+                let Some(bytes) = self.dav.get(&remote_path)? else {
+                    return Ok(false);
+                };
+                bytes
+            }
         };
         if sha256_hex(&remote_bytes) != meta.sha256 {
             return Ok(false);
@@ -979,6 +1103,7 @@ impl Engine {
         let hash = sha256_hex(&bytes);
         if hash != sha256_hex(local_bytes) {
             write_file(&self.rime_dir, rel, &bytes)?;
+            report.config_changed = true;
         }
         if hash != meta.sha256 {
             match self.dav.put(&remote_path, &bytes, meta.etag.as_deref())? {
@@ -1242,12 +1367,14 @@ mod tests {
                 both_changed: 3,
                 sample: vec!["-a".into()],
             }]),
+            config_changed: true,
             pending_merge: true,
             merged_entries: Some(42),
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);
         assert_eq!(json["pending_merge"], true);
+        assert_eq!(json["config_changed"], true);
         assert_eq!(json["merged_entries"], 42);
         assert_eq!(json["conflicts"][0], "a");
         assert_eq!(json["backup_id"], "20240101-000000");

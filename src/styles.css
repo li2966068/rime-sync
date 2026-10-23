@@ -454,8 +454,13 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
   color: var(--text);
 }
 .conflict-item:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.conflict-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .conflict-item.is-active { border-color: var(--accent); background: var(--accent-soft); }
 .conflict-target { font-size: 12px; font-weight: 600; word-break: break-all; }
+.conflict-keys { display: flex; flex-wrap: wrap; gap: 4px; font-size: 10px; }
+.conflict-keys code { background: var(--surface); border-radius: 4px; padding: 0 4px; word-break: break-all; }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.conflict-actions button { padding: 3px 7px; font-size: 11px; }
 .small { font-size: 10px; }
 .conflict-detail { min-width: 0; display: flex; flex-direction: column; }
 .conflict-meta { font-size: 11px; display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; word-break: break-all; }

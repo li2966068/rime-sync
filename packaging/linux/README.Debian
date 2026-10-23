@@ -79,6 +79,17 @@ postinst 本身立即返回，绝不会卡住或让安装失败。日志在
 
 四、卸载
 --------
+应用菜单里的「卸载 Rime 同步与输入法」会经 pkexec 调用
+/usr/lib/rime-sync/uninstall.sh，一次卸掉 rime-sync 与 rime-inputmethod。
+命令行等价写法：
+
+    sudo /usr/lib/rime-sync/uninstall.sh              # 交互确认
+    sudo /usr/lib/rime-sync/uninstall.sh --yes        # 不询问（脚本用）
+    sudo /usr/lib/rime-sync/uninstall.sh --keep-ime   # 只卸同步，保留输入法
+
+只卸同步程序也可以用 apt remove rime-sync（输入法会留在系统里）。离线包
+install.sh --uninstall 调用的也是同一个脚本。
+
 卸载只会删掉包自己的文件（/usr/bin/rime-sync-app、/usr/share/rime-sync/、
 菜单项、autostart）。用户数据 ~/.local/share/fcitx5/rime/ 与
 ~/.config/rime-sync/ 一律保留，需要彻底清理请自行删除。

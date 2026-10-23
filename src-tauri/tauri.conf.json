@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rime-sync",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "identifier": "com.rimesync.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -74,7 +74,9 @@
           "/usr/share/rime-sync/defaults/default.custom.yaml": "../packaging/rime/default.custom.yaml",
           "/usr/share/doc/rime-sync/README.Debian": "../packaging/linux/README.Debian",
           "/usr/share/applications/rime-sync-setup.desktop": "../packaging/linux/rime-sync-setup.desktop",
-          "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh"
+          "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh",
+          "/usr/lib/rime-sync/uninstall.sh": "../packaging/linux/uninstall.sh",
+          "/usr/share/applications/rime-sync-uninstall.desktop": "../packaging/linux/rime-sync-uninstall.desktop"
         },
         "postInstallScript": "../packaging/linux/postinst",
         "preRemoveScript": "../packaging/linux/prerm",

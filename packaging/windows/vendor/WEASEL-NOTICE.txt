@@ -33,5 +33,9 @@ GPLv3 合规
 ----------
 * 安装顺序：先装小狼毫，再装 rime-sync（rime-sync 的 NSIS 安装器在 PREINSTALL
   阶段静默执行本安装器，并等待其退出）。
-* 卸载 rime-sync 时默认保留小狼毫及其词库/配置（详见 docs/THIRD-PARTY.md）。
-  如需卸载小狼毫，请使用「程序和功能」中的 Weasel 条目或其开始菜单卸载快捷方式。
+* 卸载 rime-sync 时默认连小狼毫一起卸载，但仅当小狼毫是跟着 rime-sync 装的
+  （安装前不存在 → rime-sync 记录所有权标记）；安装前已有的小狼毫不受影响。
+  详见 docs/THIRD-PARTY.md。
+* 想保留小狼毫：卸载器支持 /KEEPWEASEL（或环境变量 RIMESYNC_KEEP_WEASEL=1）。
+* 用户数据 %APPDATA%\Rime（词库/配置/同步备份）在两种情况下都保留。
+* 单独卸载小狼毫：使用「程序和功能」中的 Weasel 条目或其开始菜单卸载快捷方式。

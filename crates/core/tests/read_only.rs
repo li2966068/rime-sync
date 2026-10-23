@@ -529,3 +529,113 @@ fn normal_policy_still_pushes_bidirectionally() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---- *.custom.yaml 规范化比较：metadata 变化不再算冲突 ----
+
+/// Weasel 改设置后重写的文件头（patch 完全一样，只有 customization 不同）。
+const META_LOCAL: &[u8] = b"# Rime settings\npatch:\n  \"menu/page_size\": 9\ncustomization:\n  distribution_code_name: Weasel\n  distribution_version: \"0.16.3\"\n  modified_time: \"Tue Oct 21 10:00:00 2025\"\n";
+const META_REMOTE: &[u8] = b"# Rime settings\npatch:\n  \"menu/page_size\": 9\ncustomization:\n  distribution_code_name: Weasel\n  distribution_version: \"0.17.0\"\n  modified_time: \"Wed Oct 22 11:11:11 2025\"\n";
+const PATCH_LOCAL: &[u8] = b"patch:\n  menu/page_size: 9\n";
+const PATCH_REMOTE: &[u8] = b"patch:\n  menu/page_size: 6\n";
+
+fn conflict_copies(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".conflict-"))
+        .collect()
+}
+
+#[test]
+fn metadata_only_custom_yaml_is_adopted_without_conflict() {
+    let manifest = manifest_for(&[(SHARED_REL, META_REMOTE)]);
+    let mock = MockDav::start(vec![
+        ("shared/manifest.json", manifest),
+        ("shared/files/default.custom.yaml", META_REMOTE.to_vec()),
+    ]);
+    let root = temp_dir("meta-only");
+    let rime = root.join("rime");
+    fs::create_dir_all(&rime).expect("rime");
+    fs::write(rime.join(SHARED_REL), META_LOCAL).expect("local custom");
+    let state = root.join("state");
+    fs::create_dir_all(&state).expect("state");
+
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let first = engine.transport();
+    assert!(first.ok, "transport failed: {first:?}");
+    assert!(
+        first.conflicts.is_empty(),
+        "metadata-only difference must not conflict: {first:?}"
+    );
+    assert!(
+        conflict_copies(&rime).is_empty(),
+        "no conflict copy may be produced"
+    );
+    assert!(
+        first.config_changed,
+        "adopting a custom yaml must ask for a redeploy: {first:?}"
+    );
+    // 本地被远端字节完全覆盖：下一轮整文件一致。
+    assert_eq!(
+        fs::read(rime.join(SHARED_REL)).expect("local custom"),
+        META_REMOTE
+    );
+
+    let second = engine.transport();
+    assert!(second.ok, "second transport failed: {second:?}");
+    assert!(
+        second.conflicts.is_empty(),
+        "the bug was a conflict on every round: {second:?}"
+    );
+    assert!(
+        !second.config_changed,
+        "nothing new to deploy on the second round: {second:?}"
+    );
+    assert_eq!(
+        fs::read(rime.join(SHARED_REL)).expect("local custom"),
+        META_REMOTE
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn differing_custom_yaml_patch_conflicts_with_file_and_keys() {
+    let manifest = manifest_for(&[(SHARED_REL, PATCH_REMOTE)]);
+    let mock = MockDav::start(vec![
+        ("shared/manifest.json", manifest),
+        ("shared/files/default.custom.yaml", PATCH_REMOTE.to_vec()),
+    ]);
+    let root = temp_dir("patch-conflict");
+    let rime = root.join("rime");
+    fs::create_dir_all(&rime).expect("rime");
+    fs::write(rime.join(SHARED_REL), PATCH_LOCAL).expect("local custom");
+    let state = root.join("state");
+    fs::create_dir_all(&state).expect("state");
+
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let report = engine.transport();
+    assert!(report.ok, "transport failed: {report:?}");
+    let entry = report
+        .conflicts
+        .iter()
+        .find(|item| item.contains(SHARED_REL))
+        .unwrap_or_else(|| panic!("conflict entry must name the file: {report:?}"));
+    assert!(
+        entry.contains("patch.menu/page_size"),
+        "conflict entry must name the patch key: {entry}"
+    );
+    assert!(
+        !conflict_copies(&rime).is_empty(),
+        "local copy must be preserved as a conflict copy"
+    );
+    assert!(
+        fs::read_to_string(rime.join(SHARED_REL))
+            .expect("local custom")
+            .contains("menu/page_size: 9"),
+        "local patch value wins until the user resolves it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
