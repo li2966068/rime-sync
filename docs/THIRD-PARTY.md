@@ -72,10 +72,12 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
   - 保留选项：`uninstall.exe /KEEPWEASEL`（或环境变量 `RIMESYNC_KEEP_WEASEL=1`）跳过小狼毫卸载，
     并把所有权交还用户（删除标记）。
   - 卸载日志：`%TEMP%\rime-sync-uninstall.log`（不在 `$INSTDIR` 里，卸载后仍可复核）。
-- **用户数据始终保留**：`%APPDATA%\Rime`（词库、配置、同步备份）不在删除范围内。
-  钩子里没有任何针对 `%APPDATA%` 的删除操作；Weasel 0.17.4 的卸载器同样只删安装目录、
+- **用户数据默认保留**：`%APPDATA%\Rime`（词库、配置、同步备份）与 `%APPDATA%\com.rimesync.app`
+  （rime-sync 配置/备份）不在默认删除范围内。只有卸载时显式确认才删：交互模式在 MessageBox
+  里选「是」（默认「否」），静默模式必须带 `/PURGEDATA`；删除严格限定这两条路径，失败只写
+  `%TEMP%\rime-sync-uninstall.log`、不中止卸载。Weasel 0.17.4 的卸载器本身只删安装目录、
   程序组与 `HKLM\Software\Rime`，不碰用户目录（见 `third_party/weasel/output/install.nsi`
-  的 `Section "Uninstall"`）。rime-sync 自己的配置目录同样不在卸载清理范围内。
+  的 `Section "Uninstall"`）。
 
 ### 已知差异与离线兜底
 

@@ -93,11 +93,14 @@ deb 的 `depends` 已写入 `tauri.conf.json` 的 `bundle.linux.deb.depends`。A
 - 安装后创建 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Rime 同步\Rime 同步.lnk`
   （同时受 `bundle.windows.nsis.startMenuFolder` 控制，二者一致）。
 - 若检测到 `小狼毫` 或 `Weasel` 程序组，再在其中放一份快捷方式；不新建、不改动 Weasel 自身文件。
-- 卸载时删除上述快捷方式与空的「Rime 同步」程序组；**不删** `%APPDATA%\rime-sync` 配置与备份。
+- 卸载时删除上述快捷方式与空的「Rime 同步」程序组；用户数据默认**不删**
+  （`%APPDATA%\Rime`、`%APPDATA%\com.rimesync.app`）。交互卸载会弹窗询问是否删除（默认否），
+  静默卸载只有带 `/PURGEDATA` 才删，详见 `windows/README.md` 第 7 节。
 - **默认连小狼毫一起卸载**：安装时若本机原本没有 Weasel，会在 `HKLM\Software\rime-sync` 写
   `BundledWeasel=1`（含 WeaselRoot / UninstallString），卸载时据此静默运行 Weasel 卸载器；
   原本就有 Weasel 的用户不受影响。需要保留输入法时用 `uninstall.exe /KEEPWEASEL`
-  （或设 `RIMESYNC_KEEP_WEASEL=1`）。用户词库 `%APPDATA%\Rime` 始终保留。
+  （或设 `RIMESYNC_KEEP_WEASEL=1`）。用户词库 `%APPDATA%\Rime` 默认保留，只有卸载时显式
+  确认删除（交互选「是」或 `/S /PURGEDATA`）才会删。
 
 ## 6. 便携版（portable-zip.ps1）
 

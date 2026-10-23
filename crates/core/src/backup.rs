@@ -296,6 +296,27 @@ impl BackupManager {
         })
     }
 
+    /// 删除单份备份。id 只允许数字与连字符，且目标必须落在备份根目录内。
+    pub fn delete(&self, id: &str) -> Result<()> {
+        if !is_valid_backup_id(id) {
+            bail!("invalid backup id: {id}");
+        }
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("backup root {} is not readable", self.root.display()))?;
+        let dir = self.root.join(id);
+        if !dir.exists() {
+            bail!("backup {id} does not exist");
+        }
+        // canonicalize 会解析符号链接：指向根目录之外的条目一律拒绝。
+        let target = fs::canonicalize(&dir)
+            .with_context(|| format!("resolve backup dir {}", dir.display()))?;
+        if target == root || !target.starts_with(&root) {
+            bail!("backup {id} is outside the backup root, refusing to delete");
+        }
+        fs::remove_dir_all(&target).with_context(|| format!("remove {}", target.display()))?;
+        Ok(())
+    }
+
     /// 按 id 倒序保留最新 keep 份，返回被删除的 id。
     pub fn prune(&self, keep: usize) -> Result<Vec<String>> {
         let infos = self.list()?;
@@ -325,6 +346,16 @@ fn read_manifest(dir: &Path) -> Result<BackupManifest> {
     let manifest: BackupManifest =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(manifest)
+}
+
+/// 备份 id（时间戳形态）只含 ASCII 数字与 '-'，长度受限以防异常路径。
+const MAX_BACKUP_ID_LEN: usize = 64;
+
+fn is_valid_backup_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_BACKUP_ID_LEN
+        && id.chars().all(|c| c.is_ascii_digit() || c == '-')
+        && id.chars().any(|c| c.is_ascii_digit())
 }
 
 fn validate_backup_id(id: &str) -> Result<()> {
@@ -489,6 +520,120 @@ mod tests {
         let removed = manager.prune(2).expect("prune");
         assert_eq!(removed, vec!["20240100-000000".to_string()]);
         assert_eq!(manager.list().expect("list").len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn seed_backup(manager: &BackupManager, id: &str) -> PathBuf {
+        let dir = manager.root().join(id);
+        fs::create_dir_all(dir.join("files")).expect("backup files dir");
+        fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"id":"{id}","created_at":0,"created_at_text":"x","reason":"r","app_version":"0","files":[]}}"#
+            ),
+        )
+        .expect("manifest");
+        dir
+    }
+
+    #[test]
+    fn delete_removes_backup_dir() {
+        let root = temp_root("delete");
+        let manager = BackupManager::new(&root, &root.join("backups"));
+        let dir = seed_backup(&manager, "20240101-000000");
+        manager.delete("20240101-000000").expect("delete");
+        assert!(!dir.exists());
+        assert!(manager.list().expect("list").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_rejects_invalid_ids() {
+        let root = temp_root("delete-badid");
+        let manager = BackupManager::new(&root, &root.join("backups"));
+        let long_id = "1".repeat(200);
+        for id in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "20240101-000000/..",
+            "2024/01",
+            "abc",
+            "2024_01_01",
+            "20240101-000000a",
+            " 20240101-000000",
+            "-",
+            long_id.as_str(),
+        ] {
+            assert!(manager.delete(id).is_err(), "id should be rejected: {id:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_reports_missing_backup() {
+        let root = temp_root("delete-missing");
+        let manager = BackupManager::new(&root, &root.join("backups"));
+        fs::create_dir_all(manager.root()).expect("root");
+        let error = manager.delete("20240101-000000").expect_err("must fail");
+        assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_rejects_symlink_escape() {
+        let root = temp_root("delete-symlink");
+        let manager = BackupManager::new(&root, &root.join("backups"));
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("keep.txt"), b"keep").expect("keep");
+        fs::create_dir_all(manager.root()).expect("root");
+        std::os::unix::fs::symlink(&outside, manager.root().join("20240101-000000"))
+            .expect("symlink");
+        let error = manager.delete("20240101-000000").expect_err("must fail");
+        assert!(
+            format!("{error:#}").contains("refusing to delete"),
+            "{error:#}"
+        );
+        assert!(outside.join("keep.txt").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_with_keep_one_leaves_newest() {
+        let root = temp_root("prune-one");
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        let manager = BackupManager::new(&rime, &root.join("backups"));
+        for index in 0..3 {
+            seed_backup(&manager, &format!("2024010{index}-000000"));
+        }
+        let removed = manager.prune(1).expect("prune");
+        assert_eq!(
+            removed,
+            vec!["20240101-000000".to_string(), "20240100-000000".to_string()]
+        );
+        let left = manager.list().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "20240102-000000");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_with_keep_above_count_removes_nothing() {
+        let root = temp_root("prune-none");
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        let manager = BackupManager::new(&rime, &root.join("backups"));
+        seed_backup(&manager, "20240100-000000");
+        seed_backup(&manager, "20240101-000000");
+        let removed = manager.prune(50).expect("prune");
+        assert!(removed.is_empty());
+        assert_eq!(manager.list().expect("list").len(), 2);
+        assert!(manager.delete("20240100-000000").is_ok());
+        assert_eq!(manager.list().expect("list").len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 

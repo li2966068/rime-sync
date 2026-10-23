@@ -328,7 +328,7 @@ impl Engine {
                 };
             }
         };
-        if let Err(error) = backups.prune(crate::backup::DEFAULT_KEEP) {
+        if let Err(error) = backups.prune(self.config.backup_keep as usize) {
             tracing::warn!("prune backups: {error:#}");
         }
         let mut report = self.transport_inner();

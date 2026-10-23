@@ -3,7 +3,8 @@
 #
 #   sudo ./install.sh                     # 自动识别发行版并安装
 #   sudo ./install.sh --payload DIR       # 指定离线包根目录
-#   sudo ./install.sh --uninstall [--yes] [--keep-ime]  # 交给统一卸载脚本（保留用户数据）
+#   sudo ./install.sh --uninstall [--yes] [--keep-ime] [--purge-data]
+#                                         # 交给统一卸载脚本（默认保留用户数据；--purge-data 才删）
 #
 # 目录约定（.run 自解压后也是这个结构）：
 #   install.sh
@@ -15,7 +16,8 @@
 # 行为约定：
 #   * 必须先装 rime-inputmethod，再装 rime-sync；任一步失败立即停止并保留日志
 #   * 不启动任何应用、不写 autostart
-#   * 卸载时保留 ~/.local/share/fcitx5/rime 与 ~/.config/rime-sync
+#   * 卸载时默认保留用户数据（~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
+#     ~/.config/rime-sync）；只有显式加 --purge-data 才随卸载一起删除（破坏性、不可恢复）
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -23,9 +25,10 @@ PAYLOAD=""
 DO_UNINSTALL=0
 ASSUME_YES=0
 KEEP_IME=0
+PURGE_DATA=0
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -u$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -36,6 +39,7 @@ while [ $# -gt 0 ]; do
     --payload=*) PAYLOAD=${1#--payload=} ;;
     --yes|-y) ASSUME_YES=1 ;;
     --keep-ime) KEEP_IME=1 ;;
+    --purge-data) PURGE_DATA=1 ;;
     -h|--help) usage ;;
     *) echo "未知参数: $1（--help 查看用法）" >&2; exit 64 ;;
   esac
@@ -91,6 +95,7 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
   uninstall_args=()
   [ "$ASSUME_YES" -eq 1 ] && uninstall_args+=(--yes)
   [ "$KEEP_IME" -eq 1 ] && uninstall_args+=(--keep-ime)
+  [ "$PURGE_DATA" -eq 1 ] && uninstall_args+=(--purge-data)
   step "exec uninstall.sh"
   say "调用卸载脚本：$UNINSTALLER"
   exec bash "$UNINSTALLER" "${uninstall_args[@]}"

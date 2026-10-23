@@ -23,10 +23,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod autostart_cmds;
 mod backup_cmds;
 mod conflict_cmds;
+mod dedupe_cmds;
 mod device_cmds;
 mod diagnostics;
 mod platform_prefs;
 mod preset_cmds;
+mod remote_tree;
 mod tray;
 mod update_cmds;
 mod watch_cmds;
@@ -226,7 +228,10 @@ fn cmd_get_config(app: AppHandle, state: State<'_, AppState>) -> Result<Config, 
     // 配置里的 Rime 目录可能已被删除（或来自旧机器/旧测试），启动时校验一次。
     if let Some(dir) = config.rime_dir.clone() {
         if !Path::new(&dir).is_dir() {
-            push_log(&state.0, format!("配置的 Rime 目录不存在，已重置以便重新探测：{dir}"));
+            push_log(
+                &state.0,
+                format!("配置的 Rime 目录不存在，已重置以便重新探测：{dir}"),
+            );
             config.rime_dir = None;
             config
                 .save(&config_path(&app)?)
@@ -255,8 +260,12 @@ fn cmd_set_config(
         .rime_dir
         .map(|dir| dir.trim().to_string())
         .filter(|dir| !dir.is_empty());
+    // 前端可能传来任意值（含 0）：统一夹到 1..=100 再落盘。
+    config.backup_keep = config::clamp_backup_keep(config.backup_keep);
 
-    if config.device_id.trim().is_empty() {
+    // 用户在界面上显式填写的 ID（空 = 交给后端生成，不套用严格校验规则）。
+    let submitted_id = config.device_id.trim().to_string();
+    if submitted_id.is_empty() {
         let detected = config
             .rime_dir
             .as_deref()
@@ -272,6 +281,12 @@ fn cmd_set_config(
     let path = config_path(&app)?;
     let selection = secret_selection(&app, &state.0)?;
     let previous = load_config(&app, &state.0).ok();
+    if let Some(previous) = previous.as_ref() {
+        if !submitted_id.is_empty() && previous.device_id != config.device_id {
+            config::validate_device_id(&config.device_id)
+                .map_err(|error| format!("设备 ID 无效：{error:#}"))?;
+        }
+    }
     let typed_password = std::mem::take(&mut config.webdav.password);
     if typed_password.is_empty() {
         // 前端只拿得到空的密码字段（Config 序列化时已跳过 password）。
@@ -822,10 +837,9 @@ pub fn run() {
             // 托盘在 headless / 缺 appindicator 时会创建失败：只降级记日志，不 panic。
             match tray::setup(&handle) {
                 Ok(()) => push_log(&state.0, "托盘已就绪（关闭窗口默认隐藏到托盘）"),
-                Err(error) => push_log(
-                    &state.0,
-                    format!("托盘不可用，关闭窗口将直接退出：{error}"),
-                ),
+                Err(error) => {
+                    push_log(&state.0, format!("托盘不可用，关闭窗口将直接退出：{error}"))
+                }
             }
             if std::env::args().any(|arg| arg == "--minimized") && tray::ready() {
                 if let Some(window) = handle.get_webview_window("main") {
@@ -872,9 +886,15 @@ pub fn run() {
             conflict_cmds::cmd_conflict_remote_sizes,
             device_cmds::cmd_list_devices,
             device_cmds::cmd_revoke_device,
+            device_cmds::cmd_check_device_id,
+            device_cmds::cmd_migrate_device,
+            dedupe_cmds::cmd_dedupe_preview,
+            dedupe_cmds::cmd_dedupe_apply,
             backup_cmds::cmd_list_backups,
             backup_cmds::cmd_create_backup,
             backup_cmds::cmd_restore_backup,
+            backup_cmds::cmd_delete_backup,
+            backup_cmds::cmd_prune_backups,
             preset_cmds::cmd_list_presets,
             preset_cmds::cmd_apply_preset,
             preset_cmds::cmd_probe_write,

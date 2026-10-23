@@ -80,7 +80,10 @@ fn handle_menu(app: &AppHandle, id: &str) {
         "conflicts" => {
             show_main(app);
             // 前端按需监听；没有监听方时 emit 只是空操作。
-            let _ = app.emit("tray://action", serde_json::json!({ "action": "conflicts" }));
+            let _ = app.emit(
+                "tray://action",
+                serde_json::json!({ "action": "conflicts" }),
+            );
             push_log(&app.state::<AppState>().0, "托盘：切换到冲突页");
         }
         "quit" => {

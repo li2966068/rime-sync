@@ -277,6 +277,18 @@ code --diff default.custom.yaml default.custom.yaml.conflict-laptop-20261020T130
 
 - Windows：设置 → 应用 → rime-sync → 卸载。默认会连小狼毫一起卸载（仅当小狼毫是跟着
   rime-sync 装的；安装前已有的输入法不动）。想保留输入法：`uninstall.exe /KEEPWEASEL`
-  或先设 `RIMESYNC_KEEP_WEASEL=1`。配置在 `%APPDATA%\rime-sync`，手动删。
-- Linux deb：`sudo apt remove rime-sync`；AppImage 直接删文件。
-- 卸载**不会**动你的 Rime 用户目录；远端数据需自行在 WebDAV 里删。
+  或先设 `RIMESYNC_KEEP_WEASEL=1`。
+- Windows 删本地数据：卸载时会弹窗「是否同时删除本地用户数据？」（默认「否」，直接关掉
+  窗口也算否）。选「是」会**永久删除** `%APPDATA%\Rime`（词库、方案自定义、同步备份）与
+  `%APPDATA%\com.rimesync.app`（rime-sync 的配置与备份），不可恢复。静默卸载（`/S`）默认
+  保留，只有 `uninstall.exe /S /PURGEDATA` 才删。结果写在 `%TEMP%\rime-sync-uninstall.log`
+  的 `purge-userdata=...` 行里。
+- Linux deb：`sudo apt remove rime-sync`（只卸包，用户数据一律保留）；也可以用
+  `sudo /usr/lib/rime-sync/uninstall.sh` 交互卸载；AppImage 直接删文件。
+- Linux 删本地数据：`sudo /usr/lib/rime-sync/uninstall.sh --purge-data`（加 `--yes` 无人值守）。
+  不加参数时，只要 stdin 是终端，脚本会先列出将要删除的绝对路径，再问
+  「是否同时删除本地用户数据？(y/N)」，默认 N（回车即保留）。删除范围仅三条：Rime 用户
+  目录（`~/.local/share/fcitx5/rime`，或 fcitx5 的 `~/.config/fcitx5/conf/rime.conf` 里
+  `UserDataDirPath` 指定的目录）、`~/.config/com.rimesync.app`、旧版 `~/.config/rime-sync`；
+  每条都校验在 home 之下，删除失败会打印原因（不影响其它目录，退出码非 0）。
+- 卸载**默认不会**动你的 Rime 用户目录；远端数据需自行在 WebDAV 里删。

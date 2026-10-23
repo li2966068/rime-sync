@@ -248,10 +248,11 @@
               <div class="field">
                 <label for="device-id" data-i18n="settings.deviceId">设备 ID</label>
                 <div class="input-with-action">
-                  <input id="device-id" type="text" readonly />
+                  <input id="device-id" type="text" spellcheck="false" maxlength="64" autocomplete="off" />
                   <button class="ghost small" id="btn-regen-device" type="button" data-i18n="settings.regen">重新生成</button>
                 </div>
                 <p class="hint" data-i18n="settings.deviceHint"></p>
+                <p class="hint" data-i18n="settings.deviceIdRules"></p>
               </div>
             </div>
 
@@ -279,10 +280,36 @@
           <div class="card">
             <div class="card-head">
               <h3 data-i18n="settings.backups">备份区</h3>
-              <button class="ghost small" id="btn-backup-create" type="button" data-i18n="settings.backupCreate">新建备份</button>
+              <div class="card-actions">
+                <button class="ghost small" id="btn-backup-prune" type="button" data-i18n="settings.backupPrune">清理旧备份</button>
+                <button class="ghost small" id="btn-backup-create" type="button" data-i18n="settings.backupCreate">新建备份</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="backup-keep" data-i18n="settings.backupKeep">保留份数</label>
+              <select id="backup-keep">
+                <option value="5">5</option>
+                <option value="10">10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+              </select>
+              <p class="hint" data-i18n="settings.backupKeepHint"></p>
             </div>
             <p class="hint" data-i18n="settings.backupsDesc"></p>
             <div class="backup-list" id="backup-list"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3 data-i18n="settings.maintenance">维护 / 去重</h3>
+              <div class="card-actions">
+                <button class="ghost small" id="btn-dedupe-scan" type="button" data-i18n="settings.dedupeScan">扫描</button>
+                <button class="ghost small danger-text" id="btn-dedupe-apply" type="button" disabled data-i18n="settings.dedupeApply">执行清理</button>
+              </div>
+            </div>
+            <p class="hint" data-i18n="settings.dedupeDesc"></p>
+            <p class="muted small" id="dedupe-status"></p>
+            <div class="dedupe-sections" id="dedupe-sections"></div>
           </div>
 
           <div class="card">
@@ -342,6 +369,18 @@
         <div class="modal-actions">
           <button class="ghost" id="modal-cancel" type="button" data-i18n="common.cancel">取消</button>
           <button class="primary danger" id="modal-confirm" type="button" data-i18n="common.confirm">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" id="device-modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="device-modal-title">
+        <h3 id="device-modal-title" data-i18n="settings.deviceChangeTitle"></h3>
+        <p id="device-modal-body"></p>
+        <div class="modal-actions device-choice-actions">
+          <button class="primary" id="device-migrate" type="button" data-i18n="settings.deviceMigrate"></button>
+          <button class="secondary" id="device-local" type="button" data-i18n="settings.deviceLocalOnly"></button>
+          <button class="ghost" id="device-cancel" type="button" data-i18n="common.cancel"></button>
         </div>
       </div>
     </div>

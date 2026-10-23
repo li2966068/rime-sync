@@ -41,9 +41,17 @@
 ;      两条都失败只记日志，**不 Abort**，rime-sync 继续卸载。
 ;   4. 无论 Weasel 卸载成功与否，都删掉标记。
 ;   5. 卸载日志：$TEMP\rime-sync-uninstall.log（不随 $INSTDIR 删除，便于事后复核）。
-;   用户数据 %APPDATA%\Rime 与 rime-sync 自己的配置/备份**始终不动**：
-;   本文件没有任何针对 $APPDATA 的 Delete/RMDir，Weasel 0.17.4 的卸载器同样只删
-;   安装目录、程序组与注册表（见 third_party/weasel/output/install.nsi 的 Section "Uninstall"）。
+;
+; 用户数据（默认保留，必须显式确认才删）：
+;   - 交互卸载（非静默）：MessageBox MB_YESNO|MB_ICONEXCLAMATION 询问
+;     「是否同时删除本地用户数据？」，默认「否」（直接关掉窗口也算否）。
+;   - 静默卸载（/S）：只有命令行带 /PURGEDATA 才删，否则一律保留。
+;   - 删除范围严格限定两条：%APPDATA%\Rime（Rime 用户词库与方案自定义）与
+;     %APPDATA%\com.rimesync.app（rime-sync 的配置与备份）。先 RMDir /r，再检查是否
+;     真的消失；失败只写卸载日志并继续卸载，绝不 Abort；不碰这两条路径的父目录。
+;   - 询问与每条删除结果都写进 $TEMP\rime-sync-uninstall.log
+;     （phase=PREUNINSTALL purge-userdata=...）。Weasel 0.17.4 的卸载器同样不删用户数据
+;     （见 third_party/weasel/output/install.nsi 的 Section "Uninstall"）。
 ;
 ; 前提（见 tauri.conf.json 的 bundle.windows.nsis）：
 ;   installMode = perMachine  → 安装器以管理员运行，$SMPROGRAMS / $INSTDIR 都是
@@ -70,6 +78,14 @@
 
 ; 所有权标记（卸载时读同一个键）；64 位视图，与 perMachine 安装上下文一致。
 !define RIMESYNC_REG_KEY "Software\rime-sync"
+
+; 卸载时用户数据的处理决定（1 = 删除，0 = 保留）与来源（prompt / /PURGEDATA / none）。
+; 用全局 Var 而不是寄存器：Section Uninstall 里要跨两次函数调用保存它。
+!ifndef RIMESYNC_USERDATA_VARS
+  !define RIMESYNC_USERDATA_VARS
+  Var /GLOBAL RimeSyncPurgeUserData
+  Var /GLOBAL RimeSyncPurgeSource
+!endif
 
 ; 构建期由 scripts/ime/build-weasel.ps1 放到 packaging/windows/vendor/。
 ; 不存在时不直接报错：允许“离线兜底/根本没编译”的构建继续，只给编译告警，
@@ -476,8 +492,8 @@ Function un.RimeSyncUninstallBundledWeasel
   Push $R9
 
   Call un.RimeSyncStamp
-  DetailPrint "[rime-sync] [$R2] 阶段=PREUNINSTALL 开始卸载（用户数据 %APPDATA%\Rime 始终保留）"
-  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL begin keep-userdata"
+  DetailPrint "[rime-sync] [$R2] 阶段=PREUNINSTALL 开始卸载（本地用户数据默认保留）"
+  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL begin"
   Call un.RimeSyncUninstallLog
 
   SetRegView 64
@@ -552,8 +568,8 @@ Function un.RimeSyncUninstallBundledWeasel
     Goto rimesync_un_clear_marker
 
   rimesync_un_ok:
-    DetailPrint "[rime-sync] 小狼毫已静默卸载；用户数据 %APPDATA%\Rime 保留"
-    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstalled, user data kept"
+    DetailPrint "[rime-sync] 小狼毫已静默卸载；本地用户数据按用户选择处理（见 purge-userdata 日志）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL weasel uninstalled"
     Call un.RimeSyncUninstallLog
 
   rimesync_un_clear_marker:
@@ -591,6 +607,154 @@ Function un.RimeSyncUninstallBundledWeasel
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
+; 卸载：询问是否删除本地用户数据（默认保留）
+; 交互模式弹 MessageBox（默认「否」，关掉窗口也算否）；静默模式只在命令行带
+; /PURGEDATA 时删。这里只记决定，真正的删除交给 un.RimeSyncPurgeUserData，
+; 放在 Section Uninstall 末尾（等小狼毫卸载器跑完，免得它把文件又写回去）。
+; ---------------------------------------------------------------------------
+Function un.RimeSyncAskPurgeUserData
+  Push $0
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+
+  ; 目标目录取进程环境里的 %APPDATA%（当前用户）。不直接用 $APPDATA：
+  ; perMachine 卸载器执行过 SetShellVarContext all，shell 变量可能被映射到
+  ; 「所有用户」上下文，那样会指到 ProgramData。
+  ReadEnvStr $R0 "APPDATA"
+  StrCmp $R0 "" 0 rimesync_pua_have_appdata
+    StrCpy $R0 "$APPDATA"
+  rimesync_pua_have_appdata:
+
+  StrCpy $RimeSyncPurgeUserData "0"
+  StrCpy $RimeSyncPurgeSource "none"
+
+  IfSilent rimesync_pua_silent
+    MessageBox MB_YESNO|MB_ICONEXCLAMATION "是否同时删除本地用户数据？$\r$\n$\r$\n将被永久删除（不可恢复）：$\r$\n$R0\Rime（Rime 用户词库与方案自定义）$\r$\n$R0\com.rimesync.app（rime-sync 的配置与备份）$\r$\n$\r$\n选择「否」会保留这些数据（默认，推荐）。" IDYES rimesync_pua_accept IDNO rimesync_pua_decline
+    Goto rimesync_pua_decline
+
+  rimesync_pua_silent:
+    ${GetOptions} $CMDLINE "/PURGEDATA" $R1
+    IfErrors rimesync_pua_decline
+    StrCpy $RimeSyncPurgeUserData "1"
+    StrCpy $RimeSyncPurgeSource "/PURGEDATA"
+    Goto rimesync_pua_log
+
+  rimesync_pua_accept:
+    StrCpy $RimeSyncPurgeUserData "1"
+    StrCpy $RimeSyncPurgeSource "prompt"
+    Goto rimesync_pua_log
+
+  rimesync_pua_decline:
+    StrCpy $RimeSyncPurgeUserData "0"
+    StrCpy $RimeSyncPurgeSource "none"
+
+  rimesync_pua_log:
+  Call un.RimeSyncStamp
+  StrCmp $RimeSyncPurgeUserData "1" rimesync_pua_log_yes
+    DetailPrint "[rime-sync] 保留本地用户数据（未选择删除）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata=no source=$RimeSyncPurgeSource"
+    Call un.RimeSyncUninstallLog
+    Goto rimesync_pua_done
+  rimesync_pua_log_yes:
+    DetailPrint "[rime-sync] 已确认删除本地用户数据（source=$RimeSyncPurgeSource）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata=yes source=$RimeSyncPurgeSource"
+    Call un.RimeSyncUninstallLog
+  rimesync_pua_done:
+
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 删除一条用户数据目录：入参 $0 = 绝对路径，$R2 = 时间戳
+; 先 RMDir /r 再检查是否真的消失；失败只写卸载日志，绝不 Abort（不中止卸载）。
+; 只删这一条明确给出的路径，不碰父目录。
+; ---------------------------------------------------------------------------
+Function un.RimeSyncPurgeDir
+  Push $0
+  Push $R3
+
+  StrCmp $0 "" rimesync_pudir_done
+  IfFileExists "$0\*.*" rimesync_pudir_exists
+  IfFileExists "$0" rimesync_pudir_exists
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata skip-not-found $0"
+    Call un.RimeSyncUninstallLog
+    DetailPrint "[rime-sync] 本地用户数据目录不存在，跳过：$0"
+    Goto rimesync_pudir_done
+
+  rimesync_pudir_exists:
+  ClearErrors
+  RMDir /r "$0"
+  IfFileExists "$0\*.*" rimesync_pudir_failed
+  IfFileExists "$0" rimesync_pudir_failed
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata removed $0"
+    Call un.RimeSyncUninstallLog
+    DetailPrint "[rime-sync] 已删除本地用户数据：$0"
+    Goto rimesync_pudir_done
+
+  rimesync_pudir_failed:
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata failed $0"
+    Call un.RimeSyncUninstallLog
+    DetailPrint "[rime-sync] 警告：删除本地用户数据失败（继续卸载）：$0"
+
+  rimesync_pudir_done:
+  Pop $R3
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 卸载：按既定决定删除本地用户数据（严格两条路径）
+;   1. %APPDATA%\Rime            Rime 用户词库与方案自定义
+;   2. %APPDATA%\com.rimesync.app rime-sync 的配置与备份
+; 读不到 %APPDATA% 时什么都不删（宁可少删，也不猜一个路径去 RMDir /r）。
+; ---------------------------------------------------------------------------
+Function un.RimeSyncPurgeUserData
+  Push $0
+  Push $1
+  Push $R2
+  Push $R3
+
+  StrCmp $RimeSyncPurgeUserData "1" 0 rimesync_pud_done
+  Call un.RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata begin source=$RimeSyncPurgeSource"
+  Call un.RimeSyncUninstallLog
+  DetailPrint "[rime-sync] 开始删除本地用户数据（Rime 用户目录 + rime-sync 配置/备份）"
+
+  ReadEnvStr $1 "APPDATA"
+  StrCmp $1 "" 0 rimesync_pud_have_appdata
+    StrCpy $1 "$APPDATA"
+  rimesync_pud_have_appdata:
+  StrCmp $1 "" rimesync_pud_no_appdata
+
+  StrCpy $0 "$1\Rime"
+  Call un.RimeSyncPurgeDir
+  StrCpy $0 "$1\com.rimesync.app"
+  Call un.RimeSyncPurgeDir
+  Goto rimesync_pud_done_log
+
+  rimesync_pud_no_appdata:
+    DetailPrint "[rime-sync] 警告：读不到 %APPDATA%，跳过用户数据删除（未删除任何文件）"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata skipped no-appdata"
+    Call un.RimeSyncUninstallLog
+
+  rimesync_pud_done_log:
+  Call un.RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=PREUNINSTALL purge-userdata done"
+  Call un.RimeSyncUninstallLog
+
+  rimesync_pud_done:
+  Pop $R3
+  Pop $R2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
 ; 宏：Tauri 插入点
 ; ---------------------------------------------------------------------------
 !macro NSIS_HOOK_PREINSTALL
@@ -623,8 +787,12 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  ; 先处理小狼毫（仅当是我们装的；没标记/带 /KEEPWEASEL 时保留）
-  ; 必须放在最前面：$INSTDIR 这时还在，后面 Tauri 会把程序目录删掉
+  ; 0) 先问「是否同时删除本地用户数据」（默认否；静默模式需 /PURGEDATA）
+  ;    只记决定，删除放到本宏最后（等小狼毫卸载器跑完，免得它把文件写回去）
+  Call un.RimeSyncAskPurgeUserData
+
+  ; 1) 再处理小狼毫（仅当是我们装的；没标记/带 /KEEPWEASEL 时保留）
+  ; 卸载器这时还在 $INSTDIR 里，后面 Tauri 会把程序目录删掉
   Call un.RimeSyncUninstallBundledWeasel
 
   ; 再删本安装器创建的东西；小狼毫的程序组只在它自己卸载时才消失
@@ -651,4 +819,7 @@ FunctionEnd
   Delete "$INSTDIR\resources\GPL-3.0.txt"
   Delete "$INSTDIR\resources\README.md"
   RMDir "$INSTDIR\resources"
+
+  ; 2) 最后按用户选择删除本地用户数据（%APPDATA% 里的两条路径；已在上一步确认）
+  Call un.RimeSyncPurgeUserData
 !macroend

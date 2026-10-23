@@ -3,6 +3,7 @@
 pub mod backup;
 pub mod cancel;
 pub mod config;
+pub mod dedupe;
 pub mod engine;
 pub mod history;
 pub mod index;

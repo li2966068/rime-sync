@@ -86,10 +86,27 @@ postinst 本身立即返回，绝不会卡住或让安装失败。日志在
     sudo /usr/lib/rime-sync/uninstall.sh              # 交互确认
     sudo /usr/lib/rime-sync/uninstall.sh --yes        # 不询问（脚本用）
     sudo /usr/lib/rime-sync/uninstall.sh --keep-ime   # 只卸同步，保留输入法
+    sudo /usr/lib/rime-sync/uninstall.sh --purge-data # 连本地用户数据一起删（破坏性）
 
 只卸同步程序也可以用 apt remove rime-sync（输入法会留在系统里）。离线包
 install.sh --uninstall 调用的也是同一个脚本。
 
 卸载只会删掉包自己的文件（/usr/bin/rime-sync-app、/usr/share/rime-sync/、
-菜单项、autostart）。用户数据 ~/.local/share/fcitx5/rime/ 与
-~/.config/rime-sync/ 一律保留，需要彻底清理请自行删除。
+菜单项、autostart）。**用户数据默认一律保留**：
+
+    ~/.local/share/fcitx5/rime/     Rime 用户词库与方案自定义
+    ~/.config/com.rimesync.app/    同步程序的配置与备份
+    ~/.config/rime-sync/           旧版配置目录（若存在）
+
+需要连用户数据一起删（**破坏性、不可恢复**）时用 --purge-data：
+
+    sudo /usr/lib/rime-sync/uninstall.sh --purge-data
+    sudo /usr/lib/rime-sync/uninstall.sh --purge-data --yes   # 无人值守
+
+也可以不加参数：只要 stdin 是终端，脚本会先列出将要删除的绝对路径，再问
+「是否同时删除本地用户数据？(y/N)」，默认 N（回车即保留）。删除范围是写死的
+白名单：Rime 用户目录（读 ~/.config/fcitx5/conf/rime.conf 的 UserDataDirPath，
+去尾斜杠、展开 ~；为空则 ~/.local/share/fcitx5/rime）、~/.config/com.rimesync.app、
+~/.config/rime-sync。每条删除前都会校验「绝对路径且严格位于调用者 home 之下」，
+绝不递归父目录、不删 home 本身；每条删除结果都会打印，失败继续并把退出码置 1。
+注意 /var/log/rime-sync/ 的安装/卸载日志不在删除范围内，需要时自行清理。

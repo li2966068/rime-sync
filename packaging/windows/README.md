@@ -171,7 +171,8 @@ File ...resources...
 ## 7. 卸载顺序（实现与证据点）
 
 `NSIS_HOOK_PREUNINSTALL` 是 Tauri `Section Uninstall` 的第一条语句（此时 `$INSTDIR` 还在），
-顺序是「先卸小狼毫（仅当是我们装的）→ 再删 rime-sync 自己的快捷方式/日志」。
+顺序是「先问是否删本地用户数据（默认否）→ 卸小狼毫（仅当是我们装的）→ 删 rime-sync 自己的
+快捷方式/日志 → 最后按选择删 `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app`」。
 
 | 阶段 | 行为 |
 |---|---|
@@ -181,7 +182,14 @@ File ...resources...
 | 第 1 次尝试 | `nsExec::ExecToLog '$R9 /S'`，`$R9` = 标记里的 UninstallString（Weasel 自己的卸载器，键在 32 位视图 `...\Uninstall\Weasel`） |
 | 第 2 次尝试 | 退出码非 0 / error / timeout 时 `nsExec::ExecToLog '"$R8\uninstall.exe" /S'`；与第 1 次同一条命令则不重跑 |
 | 失败处理 | 只 `DetailPrint` + 写日志，**不 Abort**，rime-sync 继续卸载；标记照样删除 |
-| 用户数据 | 钩子不删 `%APPDATA%\Rime` 与 rime-sync 配置；Weasel 卸载器也不删（`third_party/weasel/output/install.nsi` 的 `Section "Uninstall"`） |
+| 用户数据（默认） | 默认**保留** `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app`；Weasel 卸载器也不删它们（`third_party/weasel/output/install.nsi` 的 `Section "Uninstall"`） |
+| 删数据选项 | 交互卸载弹 `MessageBox MB_YESNO\|MB_ICONEXCLAMATION`「是否同时删除本地用户数据？」，默认「否」；静默卸载只在命令行带 `/PURGEDATA` 时删（`IfSilent` + `${GetOptions}`） |
+| 删除范围 | 只有 `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app` 两条（父目录不碰）；先 `RMDir /r` 再 `IfFileExists` 复查，失败只写日志、不 Abort |
+| 删数据日志 | `%TEMP%\rime-sync-uninstall.log` 里的 `purge-userdata=yes|no`、`purge-userdata removed|failed <path>` |
+
+删数据的目标目录取**进程环境变量** `%APPDATA%`（`ReadEnvStr`），
+不用 NSIS 的 `$APPDATA`：perMachine 卸载器执行过 `SetShellVarContext all`，
+shell 变量可能被映射到「所有用户」上下文。读不到 `%APPDATA%` 时一条都不删。
 
 真机验证点（本机 Linux 只能验 NSIS 语法，见第 6 节）：
 
@@ -192,3 +200,10 @@ File ...resources...
 4. 卸载时把 `<WeaselRoot>\uninstall.exe` 改名 → 第 1 次尝试报 error、第 2 次找不到文件，
    日志里是 `weasel uninstall failed` / `weasel uninstaller not found`，rime-sync 仍被正常卸载。
 5. 卸载后再装一次 rime-sync → 会重新装小狼毫并重新写标记。
+6. 交互卸载（直接跑 uninstaller.exe）→ 出现「是否同时删除本地用户数据？」；点「否」→
+   `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app` 都在，日志是 `purge-userdata=no`；
+   点「是」→ 两条目录都没了，日志是 `purge-userdata=yes source=prompt`。
+7. 静默卸载：`uninstall.exe /S` → 用户数据全保留（日志 `purge-userdata=no`）；
+   `uninstall.exe /S /PURGEDATA` → 两条目录都被删（日志 `purge-userdata=yes source=/PURGEDATA`）。
+8. 把 `%APPDATA%\Rime` 里的文件用别的进程占住（或设只读）再 `/S /PURGEDATA` →
+   日志出现 `purge-userdata failed <path>`，卸载本身仍正常结束（不 Abort）。

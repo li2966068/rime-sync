@@ -1,16 +1,25 @@
 #!/bin/bash
-# rime-sync 统一卸载入口：一次卸掉「Rime 同步」与自编译输入法，保留用户数据。
+# rime-sync 统一卸载入口：一次卸掉「Rime 同步」与自编译输入法，默认保留用户数据。
 #
-#   pkexec /usr/lib/rime-sync/uninstall.sh              # 应用菜单「卸载 Rime 同步与输入法」
-#   sudo /usr/lib/rime-sync/uninstall.sh                # 终端里交互确认
-#   sudo /usr/lib/rime-sync/uninstall.sh --yes          # 不再询问（脚本/自动化）
-#   sudo /usr/lib/rime-sync/uninstall.sh --keep-ime     # 只卸同步程序，保留输入法
+#   pkexec /usr/lib/rime-sync/uninstall.sh                # 应用菜单「卸载 Rime 同步与输入法」
+#   sudo /usr/lib/rime-sync/uninstall.sh                  # 终端里交互确认
+#   sudo /usr/lib/rime-sync/uninstall.sh --yes            # 不再询问（脚本/自动化）
+#   sudo /usr/lib/rime-sync/uninstall.sh --keep-ime       # 只卸同步程序，保留输入法
+#   sudo /usr/lib/rime-sync/uninstall.sh --purge-data     # 连本地用户数据一起删（破坏性、不可恢复）
 #
 # 行为约定：
 #   * 顺序固定：先 rime-sync，再 rime-inputmethod；单个失败只打印 dpkg 给出的原因，
 #     然后继续处理下一个（两个包可能只装了一个）。
 #   * 清理我们安装的桌面项与 autostart，不动其它桌面文件。
-#   * 绝不删除 ~/.local/share/fcitx5/rime、~/.config/rime-sync 等用户数据，最后打印保留路径。
+#   * 默认不删用户数据：只有带 --purge-data，或在终端里对「是否同时删除本地用户数据」
+#     回答 y 才删（默认 N）。删除前列出全部绝对路径，删除后逐条打印成功/失败；
+#     失败继续处理后面的目录，最终退出码非 0。
+#   * 删除范围是写死的白名单，只取调用者 home 下的这几条目录：
+#       Rime 用户目录：读 ~/.config/fcitx5/conf/rime.conf 的 UserDataDirPath
+#                      （去尾斜杠、展开 ~），为空则 ~/.local/share/fcitx5/rime
+#       ~/.config/com.rimesync.app   同步程序的配置与备份
+#       ~/.config/rime-sync          旧版目录名（存在才删）
+#     绝不递归父目录，也不删 home 本身；每条删除前再校验一次「绝对路径且严格位于 home 下」。
 #   * 本脚本属于 rime-sync 包，卸载时它自身的文件会被 dpkg 删除；bash 是边读边执行的，
 #     源文件中途消失会出现 "unexpected EOF"，所以先把自己复制到临时目录再执行。
 set -u
@@ -19,11 +28,15 @@ PKG_SYNC=rime-sync
 PKG_IME=rime-inputmethod
 ASSUME_YES=0
 KEEP_IME=0
+PURGE_DATA=0
 FAILED=0
+ARGV=("$@")
 declare -a FINAL=()
+declare -a PURGE_LIST=()
+declare -a PURGED=()
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -u$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -49,6 +62,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y) ASSUME_YES=1 ;;
     --keep-ime) KEEP_IME=1 ;;
+    --purge-data) PURGE_DATA=1 ;;
     -h|--help) usage ;;
     *) echo "未知参数：$1（--help 查看用法）" >&2; exit 64 ;;
   esac
@@ -57,14 +71,38 @@ done
 
 say() { printf '[rime-sync] %s\n' "$*"; }
 
+# ------------------------------------------------------------ invoking user
+invoking_user() {
+  local uid=${PKEXEC_UID:-}
+  [ -n "$uid" ] || uid=${SUDO_UID:-}
+  if [ -n "$uid" ]; then
+    getent passwd "$uid" | cut -d: -f1
+    return 0
+  fi
+  if [ -n "${SUDO_USER:-}" ]; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+  return 1
+}
+
+# 调用者的 home（root 直接跑且没有 SUDO_UID/PKEXEC_UID 时为空 → 绝不删数据）
+INVOKER_HOME=""
+if user=$(invoking_user) && [ -n "$user" ]; then
+  home=$(getent passwd "$user" | cut -d: -f6)
+  if [ -n "$home" ] && [ -d "$home" ]; then
+    INVOKER_HOME=$home
+  fi
+fi
+
 # --------------------------------------------------------------------- root
 if [ "$(id -u)" -ne 0 ]; then
   cat >&2 <<EOF
 [rime-sync] 卸载软件包需要 root 权限（会写入 /var/lib/dpkg）。
 
 请任选一种方式重新执行：
-  pkexec $0 $*        # 桌面环境会弹出认证窗口
-  sudo $0 $*
+  pkexec $0 ${ARGV[*]}        # 桌面环境会弹出认证窗口
+  sudo $0 ${ARGV[*]}
 EOF
   [ -t 0 ] && read -r -p "按回车键关闭…" _ || true
   exit 1
@@ -116,21 +154,6 @@ remove_pkg() {
   FINAL+=("$pkg|已卸载")
 }
 
-# ------------------------------------------------------------ invoking user
-invoking_user() {
-  local uid=${PKEXEC_UID:-}
-  [ -n "$uid" ] || uid=${SUDO_UID:-}
-  if [ -n "$uid" ]; then
-    getent passwd "$uid" | cut -d: -f1
-    return 0
-  fi
-  if [ -n "${SUDO_USER:-}" ]; then
-    printf '%s\n' "$SUDO_USER"
-    return 0
-  fi
-  return 1
-}
-
 cleanup_files() {
   local p
   for p in "$@"; do
@@ -143,13 +166,100 @@ cleanup_files() {
   done
 }
 
+# ------------------------------------------------- 用户数据路径（白名单解析）
+# Rime 用户目录：fcitx5 的 rime addon 把自定义目录记在 rime.conf 的 UserDataDirPath。
+rime_user_dir() {
+  local home=$1 conf raw=""
+  conf="$home/.config/fcitx5/conf/rime.conf"
+  if [ -r "$conf" ]; then
+    raw=$(sed -n 's/^[[:space:]]*UserDataDirPath[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null | head -n 1)
+    raw=$(printf '%s' "$raw" | sed 's/[[:space:]]*$//; s/^"//; s/"$//')
+  fi
+  case "$raw" in
+    ""|"~"|"~/") printf '%s\n' "$home/.local/share/fcitx5/rime"; return 0 ;;
+    "~/"*) raw=$home/${raw#\~/} ;;
+  esac
+  # 去尾斜杠（"/" 除外）
+  while [ "${raw%/}" != "$raw" ] && [ "$raw" != "/" ]; do raw=${raw%/}; done
+  printf '%s\n' "$raw"
+}
+
+# 绝对路径、严格位于 home 之下、不等于 home 本身、不是根目录
+path_under_home() {
+  local p=$1 real_home
+  real_home=$(realpath -m -- "$2" 2>/dev/null) || real_home=$2
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ "$real_home" != "/" ] && [ -n "$real_home" ] || return 1
+  [ "$p" != "/" ] || return 1
+  [ "$p" != "$real_home" ] || return 1
+  case "$p" in
+    "$real_home"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# 追加一条待删目录（先规范化，再校验；不合规只警告，不进列表）
+add_purge_candidate() {
+  local p=$1 real existing
+  [ -n "$p" ] || return 0
+  [ -n "$INVOKER_HOME" ] || return 0
+  real=$(realpath -m -- "$p" 2>/dev/null) || real=$p
+  if ! path_under_home "$real" "$INVOKER_HOME"; then
+    say "!! 拒绝删除（不在调用者 home 之下，或就是 home 本身）：$p"
+    return 0
+  fi
+  for existing in "${PURGE_LIST[@]:-}"; do
+    [ "$existing" = "$real" ] && return 0
+  done
+  [ -d "$real" ] || [ -L "$real" ] || return 0
+  PURGE_LIST+=("$real")
+}
+
+if [ -n "$INVOKER_HOME" ]; then
+  add_purge_candidate "$(rime_user_dir "$INVOKER_HOME")"
+  add_purge_candidate "$INVOKER_HOME/.config/com.rimesync.app"
+  add_purge_candidate "$INVOKER_HOME/.config/rime-sync"
+fi
+
 # -------------------------------------------------------------------- plan
 say "将要卸载：$PKG_SYNC"
 [ "$KEEP_IME" -eq 1 ] || say "将要卸载：$PKG_IME"
 if [ "$KEEP_IME" -eq 1 ]; then
   say "（--keep-ime：保留输入法 $PKG_IME）"
 fi
-say "用户数据不会被删除。"
+
+# 询问之前先把「会删哪些绝对路径」摆出来
+say "---- 本地用户数据 ----"
+if [ -z "$INVOKER_HOME" ]; then
+  say "未能确定调用者 home（没有 SUDO_UID / PKEXEC_UID），不会删除任何用户数据。"
+elif [ "${#PURGE_LIST[@]}" -eq 0 ]; then
+  say "没有找到可删除的用户数据目录（已被删除或从未创建）。"
+else
+  if [ "$PURGE_DATA" -eq 1 ]; then
+    say "以下目录将被永久删除（--purge-data，不可恢复）："
+  else
+    say "以下目录默认保留（删除后不可恢复）："
+  fi
+  for p in "${PURGE_LIST[@]}"; do say "  $p"; done
+fi
+
+if [ "$PURGE_DATA" -eq 0 ] && [ -n "$INVOKER_HOME" ] && [ "${#PURGE_LIST[@]}" -gt 0 ] && [ -t 0 ]; then
+  read -r -p "是否同时删除上面列出的本地用户数据？删除后不可恢复 (y/N) " purge_answer
+  case "${purge_answer:-}" in
+    y|Y|yes|YES) PURGE_DATA=1 ;;
+    *) PURGE_DATA=0 ;;
+  esac
+  if [ "$PURGE_DATA" -eq 1 ]; then say "用户数据：将删除"; else say "用户数据：保留"; fi
+fi
+
+if [ "$PURGE_DATA" -eq 1 ]; then
+  say "注意：卸载完成后会删除上面列出的用户数据（Rime 词库/方案自定义、同步配置与备份）。"
+else
+  say "用户数据不会被删除。"
+fi
 
 if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
   read -r -p "继续？[y/N] " answer
@@ -176,21 +286,54 @@ cleanup_files \
 
 # 开机自启由应用自身以用户身份写入（tauri-plugin-autostart），root 脚本只能按
 # 已知文件名清理调用者的那一份，绝不遍历其他用户的目录。
-INVOKER_HOME=""
-if user=$(invoking_user) && [ -n "$user" ]; then
-  home=$(getent passwd "$user" | cut -d: -f6)
-  if [ -n "$home" ] && [ -d "$home" ]; then
-    INVOKER_HOME=$home
-    cleanup_files \
-      "$home/.config/autostart/rime-sync.desktop" \
-      "$home/.config/autostart/rime-sync-app.desktop" \
-      "$home/.config/autostart/com.rimesync.app.desktop"
-  fi
+if [ -n "$INVOKER_HOME" ]; then
+  cleanup_files \
+    "$INVOKER_HOME/.config/autostart/rime-sync.desktop" \
+    "$INVOKER_HOME/.config/autostart/rime-sync-app.desktop" \
+    "$INVOKER_HOME/.config/autostart/com.rimesync.app.desktop"
 fi
 
 # 刷新菜单缓存（工具不存在就跳过）
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+
+# ----------------------------------------------------------- purge user data
+purge_dir() {
+  local p=$1 real
+  if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+    say "  跳过（已不存在）：$p"
+    PURGED+=("$p|跳过")
+    return 0
+  fi
+  # 删除前再校验一次：只删这一条明确列出的路径，不碰父目录
+  real=$(realpath -m -- "$p" 2>/dev/null) || real=$p
+  if ! path_under_home "$real" "$INVOKER_HOME"; then
+    FAILED=1
+    say "  !! 拒绝删除（校验未通过）：$p"
+    PURGED+=("$p|拒绝")
+    return 0
+  fi
+  if rm -rf -- "$real" 2>/dev/null && [ ! -e "$real" ] && [ ! -L "$real" ]; then
+    say "  OK  已删除：$p"
+    PURGED+=("$p|已删除")
+    return 0
+  fi
+  FAILED=1
+  say "  !!  删除失败：$p"
+  PURGED+=("$p|失败")
+}
+
+if [ "$PURGE_DATA" -eq 1 ]; then
+  say "---- 删除本地用户数据 ----"
+  if [ -z "$INVOKER_HOME" ]; then
+    FAILED=1
+    say "!! 未能确定调用者 home，未删除任何用户数据（请用 sudo 或 pkexec 运行）"
+  elif [ "${#PURGE_LIST[@]}" -eq 0 ]; then
+    say "没有需要删除的用户数据目录。"
+  else
+    for p in "${PURGE_LIST[@]}"; do purge_dir "$p"; done
+  fi
 fi
 
 # ----------------------------------------------------------------- summary
@@ -199,18 +342,31 @@ for entry in "${FINAL[@]}"; do
   printf '[rime-sync]   %-18s %s\n' "${entry%%|*}" "${entry##*|}"
 done
 
-say "---- 保留的用户数据（未删除）----"
-if [ -n "$INVOKER_HOME" ]; then
-  say "  $INVOKER_HOME/.local/share/fcitx5/rime   Rime 用户词库与方案自定义"
-  say "  $INVOKER_HOME/.config/rime-sync          同步配置与远程仓库信息"
+if [ "$PURGE_DATA" -eq 1 ]; then
+  say "---- 用户数据 ----"
+  if [ "${#PURGED[@]}" -eq 0 ]; then
+    say "  未删除任何目录"
+  fi
+  for entry in "${PURGED[@]}"; do
+    printf '[rime-sync]   %-8s %s\n' "${entry##*|}" "${entry%%|*}"
+  done
 else
-  say "  ~/.local/share/fcitx5/rime               Rime 用户词库与方案自定义"
-  say "  ~/.config/rime-sync                      同步配置与远程仓库信息"
+  say "---- 保留的用户数据（未删除）----"
+  if [ -n "$INVOKER_HOME" ]; then
+    say "  $(rime_user_dir "$INVOKER_HOME")   Rime 用户词库与方案自定义"
+    say "  $INVOKER_HOME/.config/com.rimesync.app   同步配置与备份"
+    say "  $INVOKER_HOME/.config/rime-sync          旧版配置目录（若存在）"
+  else
+    say "  ~/.local/share/fcitx5/rime               Rime 用户词库与方案自定义"
+    say "  ~/.config/com.rimesync.app               同步配置与备份"
+    say "  ~/.config/rime-sync                      旧版配置目录（若存在）"
+  fi
+  say "（确认不要时可重跑：$0 --purge-data，或自行删除）"
 fi
 say "  /var/log/rime-sync                       安装/卸载日志（不需要可自行删除）"
 
 if [ "$FAILED" -ne 0 ]; then
-  say "部分软件包未能卸载，请按上面的 dpkg 报错处理后重试。"
+  say "部分步骤失败（软件包未能卸载或用户数据未能删除），请按上面的报错处理后重试。"
   [ -t 0 ] && read -r -p "按回车键关闭…" _ || true
   exit 1
 fi

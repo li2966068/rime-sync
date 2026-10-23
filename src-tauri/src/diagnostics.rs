@@ -145,7 +145,10 @@ fn mask(value: &str) -> String {
 }
 
 /// 诊断包里允许出现的配置字段（白名单）。密码永不进入，URL 只保留 host。
-fn config_diagnostics(config: &rime_sync_core::config::Config, has_password: bool) -> serde_json::Value {
+fn config_diagnostics(
+    config: &rime_sync_core::config::Config,
+    has_password: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "rime_dir": config.rime_dir,
         "device_id": config.device_id,
@@ -275,7 +278,10 @@ mod tests {
         let text = serde_json::to_string(&config_diagnostics(&config, true))
             .unwrap()
             .to_lowercase();
-        assert!(!text.contains("password"), "config view leaked a password field");
+        assert!(
+            !text.contains("password"),
+            "config view leaked a password field"
+        );
         assert!(!text.contains("hunter2"), "config view leaked the password");
         assert!(!text.contains("token123"), "config view leaked a URL token");
         assert!(!text.contains("alice:"), "config view leaked URL userinfo");

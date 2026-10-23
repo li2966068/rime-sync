@@ -14,6 +14,43 @@ use crate::secret::SecretStore;
 /// config.json 当前 schema 版本（SPEC-4 §A4）。
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
+/// 备份保留份数：默认 10，允许 1..=100（0 会清空所有备份，必须拒绝）。
+pub const BACKUP_KEEP_DEFAULT: u32 = 10;
+pub const BACKUP_KEEP_MIN: u32 = 1;
+pub const BACKUP_KEEP_MAX: u32 = 100;
+
+pub fn default_backup_keep() -> u32 {
+    BACKUP_KEEP_DEFAULT
+}
+
+/// 配置里的保留份数一律夹到合法区间；越界值静默修正而不是报错。
+pub fn clamp_backup_keep(value: u32) -> u32 {
+    value.clamp(BACKUP_KEEP_MIN, BACKUP_KEEP_MAX)
+}
+
+/// 设备 ID 会直接成为远端 sync/<id> 目录名：64 字节内、只允许小写字母/数字/连字符。
+pub const DEVICE_ID_MAX_LEN: usize = 64;
+
+pub fn validate_device_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("device id is empty");
+    }
+    if id.len() > DEVICE_ID_MAX_LEN {
+        bail!("device id must be at most {DEVICE_ID_MAX_LEN} bytes");
+    }
+    if id == "." || id == ".." {
+        bail!("device id must not be . or ..");
+    }
+    if id
+        .chars()
+        .any(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'))
+    {
+        bail!("device id may only contain lowercase letters, digits and '-'");
+    }
+    crate::plan::validate_rel_path(id).context("device id is not a safe path segment")?;
+    Ok(())
+}
+
 /// 首次接入策略：preview=只拉不推并提示；pull-only=只拉不推；normal=双向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -117,6 +154,9 @@ pub struct Config {
     pub rime_dir: Option<String>,
     pub device_id: String,
     pub transport_interval_minutes: u32,
+    /// 每次合并生效后自动清理，只保留最新这么多份备份。
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: u32,
     pub sync_kinds: SyncKinds,
     pub exclude_globs: Vec<String>,
     pub stop_fcitx5_during_apply: bool,
@@ -140,6 +180,7 @@ impl Default for Config {
             rime_dir: None,
             device_id: String::new(),
             transport_interval_minutes: 10,
+            backup_keep: BACKUP_KEEP_DEFAULT,
             sync_kinds: SyncKinds::default(),
             exclude_globs: Vec::new(),
             stop_fcitx5_during_apply: true,
@@ -160,6 +201,8 @@ impl Config {
                 config.legacy_password = has_plaintext_password(&text);
                 config.schema_detected = detected_schema_version(&text);
                 config.schema_version = config.schema_detected;
+                // 旧配置缺字段时 serde 已回落到默认值；此处再夹一次区间。
+                config.backup_keep = clamp_backup_keep(config.backup_keep);
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -271,7 +314,10 @@ impl Config {
                     .with_context(|| format!("create {}", parent.display()))?;
             }
         }
-        let text = serde_json::to_string_pretty(self)?;
+        // save 拿的是 &self：序列化前夹一次，保证落盘值始终合法。
+        let mut snapshot = self.clone();
+        snapshot.backup_keep = clamp_backup_keep(snapshot.backup_keep);
+        let text = serde_json::to_string_pretty(&snapshot)?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -604,6 +650,46 @@ mod tests {
     }
 
     #[test]
+    fn missing_backup_keep_defaults_to_ten() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-keep-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"webdav":{"url":"http://127.0.0.1:1"}}"#).expect("write");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.backup_keep, BACKUP_KEEP_DEFAULT);
+        assert_eq!(Config::default().backup_keep, 10);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_keep_is_clamped_on_load_and_save() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-keep-clamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+
+        fs::write(&path, r#"{"backup_keep":0}"#).expect("write");
+        assert_eq!(Config::load(&path).expect("load zero").backup_keep, 1);
+
+        fs::write(&path, r#"{"backup_keep":9999}"#).expect("write");
+        assert_eq!(Config::load(&path).expect("load huge").backup_keep, 100);
+
+        let mut config = Config {
+            backup_keep: 9999,
+            ..Default::default()
+        };
+        config.save(&path).expect("save");
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(raw["backup_keep"], 100);
+        assert_eq!(Config::load(&path).expect("reload").backup_keep, 100);
+
+        config.backup_keep = 0;
+        config.save(&path).expect("save zero");
+        assert_eq!(Config::load(&path).expect("reload zero").backup_keep, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn device_id_falls_back_to_installation_yaml() {
         let dir = std::env::temp_dir().join(format!("rime-sync-dev-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("mkdir");
@@ -621,6 +707,27 @@ mod tests {
         let id = generate_device_id();
         assert!(!id.contains('/'));
         assert!(id.len() > 7);
+    }
+
+    #[test]
+    fn device_id_validation_rejects_unsafe_values() {
+        assert!(validate_device_id("laptop-abc123").is_ok());
+        assert!(validate_device_id("a").is_ok());
+        for bad in [
+            "",
+            ".",
+            "..",
+            "Upper-Case",
+            "under_score",
+            "with space",
+            r"with\slash",
+            "with/slash",
+            "~/home",
+            "../escape",
+            &"a".repeat(DEVICE_ID_MAX_LEN + 1),
+        ] {
+            assert!(validate_device_id(bad).is_err(), "must reject {bad:?}");
+        }
     }
 
     #[test]

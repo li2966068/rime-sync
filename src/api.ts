@@ -21,6 +21,8 @@ export interface Config {
   rime_dir: string | null;
   device_id: string;
   transport_interval_minutes: number;
+  // 备份保留份数（后端加载/保存时夹到 1..=100）。
+  backup_keep: number;
   sync_kinds: SyncKinds;
   exclude_globs: string[];
   stop_fcitx5_during_apply: boolean;
@@ -147,6 +149,77 @@ export interface RevokeResult {
   removed: boolean;
 }
 
+export interface DeviceIdCheck {
+  id: string;
+  /// 语法可用（远端是否已有同名目录由 remote_exists 单独回报）。
+  ok: boolean;
+  error: string | null;
+  remote_exists: boolean | null;
+  remote_error: string | null;
+}
+
+export interface MigrateStep {
+  step: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface MigrateResult {
+  old_id: string;
+  new_id: string;
+  copied_files: number;
+  copied_dirs: number;
+  removed: number;
+  freed_bytes: number;
+  steps: MigrateStep[];
+}
+
+export interface DedupeItem {
+  id: string;
+  label: string;
+  size: number;
+  suggested: boolean;
+  is_keep: boolean;
+  heartbeat_ts: number;
+  hostname: string;
+  os: string;
+}
+
+export type DedupeKind = "devices" | "snapshots" | "backups";
+
+export interface DedupeGroup {
+  key: string;
+  tag: "device" | "unknown" | "same_dir" | "cross_dir" | "backup" | string;
+  items: DedupeItem[];
+}
+
+export interface DedupeSection {
+  groups: DedupeGroup[];
+  suggested: string[];
+  reclaimable: number;
+  suggested_bytes: number;
+  warnings: string[];
+}
+
+export interface DedupePreview {
+  self_id: string;
+  generated_at: number;
+  devices: DedupeSection;
+  snapshots: DedupeSection;
+  backups: DedupeSection;
+}
+
+export interface DedupeFailure {
+  id: string;
+  error: string;
+}
+
+export interface DedupeResult {
+  removed: string[];
+  freed_bytes: number;
+  failed: DedupeFailure[];
+}
+
 export interface BackupEntry {
   id: string;
   created_at: number;
@@ -165,6 +238,12 @@ export interface RestoreResult {
   backup_id: string;
   pre_restore_id: string | null;
   restored: number;
+}
+
+export interface PruneResult {
+  keep: number;
+  removed: string[];
+  remaining: number;
 }
 
 export interface PresetInfo {
@@ -257,10 +336,19 @@ export const api = {
 
   listDevices: () => invoke<DeviceInfo[]>("cmd_list_devices"),
   revokeDevice: (id: string) => invoke<RevokeResult>("cmd_revoke_device", { id }),
+  checkDeviceId: (id: string) => invoke<DeviceIdCheck>("cmd_check_device_id", { id }),
+  migrateDevice: (oldId: string, newId: string) =>
+    invoke<MigrateResult>("cmd_migrate_device", { old: oldId, new: newId }),
+
+  dedupePreview: () => invoke<DedupePreview>("cmd_dedupe_preview"),
+  dedupeApply: (kind: DedupeKind, ids: string[]) =>
+    invoke<DedupeResult>("cmd_dedupe_apply", { kind, ids }),
 
   listBackups: () => invoke<BackupEntry[]>("cmd_list_backups"),
   createBackup: () => invoke<CreatedBackup>("cmd_create_backup"),
   restoreBackup: (id: string) => invoke<RestoreResult>("cmd_restore_backup", { id }),
+  deleteBackup: (id: string) => invoke<void>("cmd_delete_backup", { id }),
+  pruneBackups: () => invoke<PruneResult>("cmd_prune_backups"),
 
   listPresets: () => invoke<PresetInfo[]>("cmd_list_presets"),
   applyPreset: (presetId: string, rawUrl: string) =>

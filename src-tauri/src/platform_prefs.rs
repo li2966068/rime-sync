@@ -54,7 +54,10 @@ pub(crate) fn should_hide_on_close(app: &AppHandle, inner: &Inner) -> bool {
     match load(app) {
         Ok(prefs) => prefs.close_to_tray,
         Err(error) => {
-            push_log(inner, format!("读取窗口偏好失败（按默认隐藏处理）：{error}"));
+            push_log(
+                inner,
+                format!("读取窗口偏好失败（按默认隐藏处理）：{error}"),
+            );
             true
         }
     }

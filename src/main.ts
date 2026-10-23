@@ -7,6 +7,11 @@ import {
   type Config,
   type ConflictChoice,
   type ConflictEntry,
+  type DedupeGroup,
+  type DedupeItem,
+  type DedupeKind,
+  type DedupePreview,
+  type DeviceIdCheck,
   type DeviceInfo,
   type NetworkStatus,
   type PresetInfo,
@@ -106,6 +111,11 @@ const el = {
   interval: byId<HTMLInputElement>("interval"),
   deviceId: byId<HTMLInputElement>("device-id"),
   regenDevice: byId<HTMLButtonElement>("btn-regen-device"),
+  deviceModal: byId<HTMLDivElement>("device-modal"),
+  deviceModalBody: byId<HTMLParagraphElement>("device-modal-body"),
+  deviceMigrate: byId<HTMLButtonElement>("device-migrate"),
+  deviceLocal: byId<HTMLButtonElement>("device-local"),
+  deviceCancel: byId<HTMLButtonElement>("device-cancel"),
   kindUserdict: byId<HTMLInputElement>("kind-userdict"),
   kindYaml: byId<HTMLInputElement>("kind-yaml"),
   kindDict: byId<HTMLInputElement>("kind-dict"),
@@ -116,6 +126,14 @@ const el = {
 
   backupList: byId<HTMLDivElement>("backup-list"),
   backupCreate: byId<HTMLButtonElement>("btn-backup-create"),
+  backupPrune: byId<HTMLButtonElement>("btn-backup-prune"),
+  backupKeep: byId<HTMLSelectElement>("backup-keep"),
+
+  dedupeSections: byId<HTMLDivElement>("dedupe-sections"),
+  dedupeStatus: byId<HTMLParagraphElement>("dedupe-status"),
+  dedupeScan: byId<HTMLButtonElement>("btn-dedupe-scan"),
+  dedupeApply: byId<HTMLButtonElement>("btn-dedupe-apply"),
+
   diag: byId<HTMLButtonElement>("btn-diag"),
   diagResult: byId<HTMLDivElement>("diag-result"),
   diagPath: byId<HTMLElement>("diag-path"),
@@ -182,6 +200,10 @@ let remoteSizesKnown = false;
 let activeConflict: string | null = null;
 let devices: DeviceInfo[] = [];
 let backups: BackupEntry[] = [];
+let backupKeepPending: Promise<void> = Promise.resolve();
+let dedupe: DedupePreview | null = null;
+type DeviceChoice = "migrate" | "local" | "cancel";
+let deviceChoiceResolve: ((choice: DeviceChoice) => void) | null = null;
 let watchState: WatchStatus = { running: false, last_event_at: null };
 let secretState: SecretStatus | null = null;
 let pendingUpdate: string | null = null;
@@ -349,6 +371,7 @@ function renderConfig(next: Config): void {
   el.kindDict.checked = next.sync_kinds.dict_sources;
   el.excludes.value = next.exclude_globs.join("\n");
   el.stopFcitx5.checked = next.stop_fcitx5_during_apply;
+  renderBackupKeep(next.backup_keep);
   el.footerConfig.textContent = next.device_id ? t("footer.device", { id: next.device_id }) : "";
   renderFirstSyncBanner();
 }
@@ -410,6 +433,28 @@ function connectionDraft(): Config {
   };
 }
 
+const BACKUP_KEEP_DEFAULT = 10;
+
+function clampBackupKeep(value: number): number {
+  if (!Number.isFinite(value)) {
+    return BACKUP_KEEP_DEFAULT;
+  }
+  return Math.min(100, Math.max(1, Math.trunc(value)));
+}
+
+/** 下拉固定 5/10/20/50；配置里是其它值时补一个选项，避免静默改配置。 */
+function renderBackupKeep(value: number): void {
+  const keep = clampBackupKeep(value);
+  const text = String(keep);
+  if (!Array.from(el.backupKeep.options).some((option) => option.value === text)) {
+    const option = document.createElement("option");
+    option.value = text;
+    option.textContent = text;
+    el.backupKeep.append(option);
+  }
+  el.backupKeep.value = text;
+}
+
 function settingsDraft(): Config {
   const base = requireConfig();
   const minutes = Number.parseInt(el.interval.value, 10);
@@ -418,6 +463,7 @@ function settingsDraft(): Config {
     transport_interval_minutes: Number.isFinite(minutes)
       ? Math.min(1440, Math.max(0, minutes))
       : base.transport_interval_minutes,
+    backup_keep: clampBackupKeep(Number.parseInt(el.backupKeep.value, 10)),
     sync_kinds: {
       userdict: el.kindUserdict.checked,
       custom_yaml: el.kindYaml.checked,
@@ -1256,11 +1302,18 @@ function renderBackups(): void {
         " · " +
         escapeHtml(formatBytes(backup.bytes)) +
         "</div>" +
+        '<div class="backup-actions">' +
         '<button type="button" class="ghost small" data-restore="' +
         escapeHtml(backup.id) +
         '">' +
         escapeHtml(t("settings.backupRestore")) +
         "</button>" +
+        '<button type="button" class="ghost small danger-text" data-delete="' +
+        escapeHtml(backup.id) +
+        '">' +
+        escapeHtml(t("settings.backupDelete")) +
+        "</button>" +
+        "</div>" +
         "</div>",
     )
     .join("");
@@ -1289,6 +1342,68 @@ async function createBackup(): Promise<void> {
   }
 }
 
+async function deleteBackup(id: string): Promise<void> {
+  const confirmed = await confirmDialog(
+    t("settings.backupDeleteConfirmTitle"),
+    t("settings.backupDeleteConfirmBody", { id }),
+  );
+  if (!confirmed) {
+    return;
+  }
+  try {
+    await api.deleteBackup(id);
+    toast(t("settings.backupDeleted", { id }));
+    await loadBackups();
+  } catch (error) {
+    toast(t("settings.backupFail", { error: errorText(error) }));
+  }
+}
+
+/** 下拉改动立即落盘，保证「清理旧备份」按同一个份数执行。 */
+async function saveBackupKeep(): Promise<void> {
+  const keep = clampBackupKeep(Number.parseInt(el.backupKeep.value, 10));
+  try {
+    const saved = await api.setConfig({ ...requireConfig(), backup_keep: keep });
+    // 只回写份数：renderConfig 会重置设置页里尚未保存的其它输入。
+    config = saved;
+    el.backupKeep.value = String(clampBackupKeep(saved.backup_keep));
+    toast(t("settings.backupKeepSaved", { keep }));
+  } catch (error) {
+    toast(t("conn.saveFail", { error: errorText(error) }));
+  }
+}
+
+async function pruneBackups(): Promise<void> {
+  if (!config) {
+    return;
+  }
+  // 等一次可能还在飞行的「保留份数」保存，避免按旧配置清理。
+  await backupKeepPending;
+  const keep = clampBackupKeep(requireConfig().backup_keep);
+  const removable = Math.max(0, backups.length - keep);
+  if (removable === 0) {
+    toast(t("settings.backupPruneNone", { keep }));
+    return;
+  }
+  const confirmed = await confirmDialog(
+    t("settings.backupPruneConfirmTitle"),
+    t("settings.backupPruneConfirmBody", { count: removable, keep }),
+  );
+  if (!confirmed) {
+    return;
+  }
+  el.backupPrune.disabled = true;
+  try {
+    const result = await api.pruneBackups();
+    toast(t("settings.backupPruneOk", { count: result.removed.length, remaining: result.remaining }));
+    await loadBackups();
+  } catch (error) {
+    toast(t("settings.backupFail", { error: errorText(error) }));
+  } finally {
+    el.backupPrune.disabled = false;
+  }
+}
+
 async function restoreBackup(id: string): Promise<void> {
   const confirmed = await confirmDialog(
     t("settings.restoreConfirmTitle"),
@@ -1306,6 +1421,342 @@ async function restoreBackup(id: string): Promise<void> {
     await loadBackups();
   } catch (error) {
     toast(t("settings.backupFail", { error: errorText(error) }));
+  }
+}
+
+/* ---------- 设备 ID 与去重 ---------- */
+
+const DEVICE_ID_MAX = 64;
+
+function deviceIdError(id: string): string | null {
+  if (!id) {
+    return t("settings.deviceInvalidEmpty");
+  }
+  if (id.length > DEVICE_ID_MAX) {
+    return t("settings.deviceInvalidLong");
+  }
+  if (id === "." || id === "..") {
+    return t("settings.deviceInvalidReserved");
+  }
+  if (!/^[a-z0-9-]+$/.test(id)) {
+    return t("settings.deviceInvalidChars");
+  }
+  return null;
+}
+
+function randomDeviceId(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  let suffix = "";
+  for (const byte of bytes) {
+    suffix += alphabet[byte % alphabet.length];
+  }
+  return "device-" + suffix;
+}
+
+function deviceChoiceDialog(body: string): Promise<DeviceChoice> {
+  el.deviceModalBody.textContent = body;
+  el.deviceModal.hidden = false;
+  el.deviceMigrate.focus();
+  return new Promise((resolve) => {
+    deviceChoiceResolve = resolve;
+  });
+}
+
+function settleDeviceChoice(choice: DeviceChoice): void {
+  el.deviceModal.hidden = true;
+  const resolve = deviceChoiceResolve;
+  deviceChoiceResolve = null;
+  resolve?.(choice);
+}
+
+async function saveSettings(): Promise<void> {
+  if (!config || busy) {
+    return;
+  }
+  const nextId = el.deviceId.value.trim();
+  const invalid = deviceIdError(nextId);
+  if (invalid) {
+    el.settingsHint.textContent = invalid;
+    toast(invalid);
+    return;
+  }
+  const previousId = config.device_id;
+  if (nextId === previousId) {
+    el.settingsHint.textContent = "";
+    await persist(settingsDraft(), t("settings.saved"));
+    return;
+  }
+
+  el.settingsHint.textContent = t("settings.deviceChecking");
+  let check: DeviceIdCheck;
+  try {
+    check = await api.checkDeviceId(nextId);
+  } catch (error) {
+    const text = t("settings.deviceCheckFail", { error: errorText(error) });
+    el.settingsHint.textContent = text;
+    toast(text);
+    return;
+  }
+  if (!check.ok) {
+    const text = check.error ?? t("settings.deviceInvalidChars");
+    el.settingsHint.textContent = text;
+    toast(text);
+    return;
+  }
+
+  const body = check.remote_exists
+    ? t("settings.deviceChangeBodyExists", { old: previousId, new: nextId })
+    : t("settings.deviceChangeBody", { old: previousId, new: nextId });
+  const choice = await deviceChoiceDialog(body);
+  if (choice === "cancel") {
+    el.settingsHint.textContent = "";
+    return;
+  }
+  if (choice === "migrate") {
+    el.settingsHint.textContent = t("settings.deviceChecking");
+    try {
+      const result = await api.migrateDevice(previousId, nextId);
+      toast(t("settings.deviceMigrateOk", { files: result.copied_files }));
+    } catch (error) {
+      const text = t("settings.deviceMigrateFail", { error: errorText(error) });
+      el.settingsHint.textContent = text;
+      toast(text);
+      return;
+    }
+  }
+  try {
+    await persist(
+      { ...settingsDraft(), device_id: nextId },
+      choice === "migrate" ? t("settings.deviceMigrateDone") : t("settings.deviceLocalDone"),
+    );
+    el.settingsHint.textContent = "";
+  } catch (error) {
+    const text = t("conn.saveFail", { error: errorText(error) });
+    el.settingsHint.textContent = text;
+    toast(text);
+  }
+}
+
+const DEDUPE_KINDS: DedupeKind[] = ["devices", "snapshots", "backups"];
+
+function dedupeSectionLabel(kind: DedupeKind): string {
+  switch (kind) {
+    case "devices":
+      return t("settings.dedupeDeviceSection");
+    case "snapshots":
+      return t("settings.dedupeSnapshotSection");
+    default:
+      return t("settings.dedupeBackupSection");
+  }
+}
+
+function dedupeItemDetail(kind: DedupeKind, item: DedupeItem): string {
+  const parts: string[] = [];
+  if (kind === "devices") {
+    if (item.hostname) {
+      parts.push(item.hostname);
+    }
+    if (item.os) {
+      parts.push(item.os);
+    }
+    if (item.heartbeat_ts) {
+      parts.push(formatTimestamp(item.heartbeat_ts));
+    }
+    if (dedupe && item.id === dedupe.self_id) {
+      parts.push(t("settings.dedupeSelf"));
+    }
+  } else if (item.label) {
+    parts.push(item.label);
+  }
+  parts.push(formatBytes(item.size));
+  return parts.join(" · ");
+}
+
+function dedupeGroupNote(group: DedupeGroup): string {
+  if (group.tag === "cross_dir") {
+    return '<p class="muted small">' + escapeHtml(t("settings.dedupeCrossDir")) + "</p>";
+  }
+  if (group.tag === "unknown") {
+    return '<p class="muted small">' + escapeHtml(t("settings.dedupeUnknown")) + "</p>";
+  }
+  return "";
+}
+
+function dedupeGroupHtml(kind: DedupeKind, group: DedupeGroup): string {
+  const items = group.items
+    .map((item) => {
+      const keep = item.is_keep
+        ? ' <span class="badge">' + escapeHtml(t("settings.dedupeKeep")) + "</span>"
+        : "";
+      const checked = item.suggested ? " checked" : "";
+      return (
+        '<label class="check dedupe-item">' +
+        '<input type="checkbox" data-dedupe-kind="' +
+        kind +
+        '" data-dedupe-size="' +
+        item.size +
+        '" value="' +
+        escapeHtml(item.id) +
+        '"' +
+        checked +
+        " />" +
+        "<span><code>" +
+        escapeHtml(item.id) +
+        "</code>" +
+        keep +
+        "<em>" +
+        escapeHtml(dedupeItemDetail(kind, item)) +
+        "</em></span></label>"
+      );
+    })
+    .join("");
+  return '<div class="dedupe-group">' + dedupeGroupNote(group) + '<div class="checks">' + items + "</div></div>";
+}
+
+function renderDedupe(): void {
+  if (!dedupe) {
+    el.dedupeSections.innerHTML = "";
+    updateDedupeApply();
+    return;
+  }
+  const preview = dedupe;
+  el.dedupeSections.innerHTML = DEDUPE_KINDS.map((kind) => {
+    const section = preview[kind];
+    const itemCount = section.groups.reduce((sum, group) => sum + group.items.length, 0);
+    const groups = section.groups.map((group) => dedupeGroupHtml(kind, group)).join("");
+    const warnings =
+      section.warnings.length > 0
+        ? '<p class="muted small">' +
+          escapeHtml(
+            t("settings.dedupeWarnings", {
+              count: section.warnings.length,
+              detail: section.warnings.join("; "),
+            }),
+          ) +
+          "</p>"
+        : "";
+    const body =
+      section.groups.length === 0
+        ? section.warnings.length === 0
+          ? '<p class="muted empty">' + escapeHtml(t("settings.dedupeEmpty")) + "</p>"
+          : ""
+        : '<details class="dedupe-details"><summary>' +
+          escapeHtml(t("settings.dedupeExpand", { count: itemCount })) +
+          "</summary>" +
+          groups +
+          "</details>";
+    return (
+      '<div class="dedupe-section" data-section="' +
+      kind +
+      '">' +
+      '<div class="dedupe-head"><strong>' +
+      escapeHtml(dedupeSectionLabel(kind)) +
+      "</strong>" +
+      '<span class="muted small">' +
+      escapeHtml(t("settings.dedupeGroups", { count: section.groups.length })) +
+      " · " +
+      escapeHtml(t("settings.dedupeReclaimable", { size: formatBytes(section.reclaimable) })) +
+      "</span></div>" +
+      body +
+      warnings +
+      "</div>"
+    );
+  }).join("");
+  updateDedupeApply();
+}
+
+function selectedDedupe(): { kind: DedupeKind; ids: string[] }[] {
+  const nodes = Array.from(
+    el.dedupeSections.querySelectorAll<HTMLInputElement>("input[data-dedupe-kind]:checked"),
+  );
+  const grouped = new Map<DedupeKind, string[]>();
+  for (const node of nodes) {
+    const kind = node.dataset.dedupeKind as DedupeKind | undefined;
+    if (!kind || !DEDUPE_KINDS.includes(kind)) {
+      continue;
+    }
+    const list = grouped.get(kind) ?? [];
+    list.push(node.value);
+    grouped.set(kind, list);
+  }
+  return Array.from(grouped, ([kind, ids]) => ({ kind, ids }));
+}
+
+function selectedDedupeBytes(): number {
+  const nodes = Array.from(
+    el.dedupeSections.querySelectorAll<HTMLInputElement>("input[data-dedupe-kind]:checked"),
+  );
+  return nodes.reduce((sum, node) => sum + Number(node.dataset.dedupeSize ?? "0"), 0);
+}
+
+function updateDedupeApply(): void {
+  el.dedupeApply.disabled = selectedDedupe().length === 0;
+}
+
+async function loadDedupe(): Promise<void> {
+  if (busy) {
+    return;
+  }
+  el.dedupeScan.disabled = true;
+  el.dedupeApply.disabled = true;
+  el.dedupeStatus.textContent = t("settings.dedupeScanning");
+  try {
+    dedupe = await api.dedupePreview();
+    el.dedupeStatus.textContent = t("settings.dedupeScanned", {
+      time: formatTimestamp(dedupe.generated_at),
+    });
+    renderDedupe();
+  } catch (error) {
+    el.dedupeStatus.textContent = t("settings.dedupeScanFail", { error: errorText(error) });
+  } finally {
+    el.dedupeScan.disabled = false;
+    updateDedupeApply();
+  }
+}
+
+async function applyDedupe(): Promise<void> {
+  if (busy) {
+    return;
+  }
+  const selection = selectedDedupe();
+  const count = selection.reduce((sum, group) => sum + group.ids.length, 0);
+  if (count === 0) {
+    toast(t("settings.dedupeNone"));
+    return;
+  }
+  const confirmed = await confirmDialog(
+    t("settings.dedupeConfirmTitle"),
+    t("settings.dedupeConfirmBody", { count, size: formatBytes(selectedDedupeBytes()) }),
+  );
+  if (!confirmed) {
+    return;
+  }
+  el.dedupeApply.disabled = true;
+  el.dedupeScan.disabled = true;
+  let removed = 0;
+  let freed = 0;
+  const failures: string[] = [];
+  for (const group of selection) {
+    try {
+      const result = await api.dedupeApply(group.kind, group.ids);
+      removed += result.removed.length;
+      freed += result.freed_bytes;
+      for (const failure of result.failed) {
+        failures.push(failure.error);
+      }
+    } catch (error) {
+      failures.push(errorText(error));
+    }
+  }
+  await loadDedupe();
+  if (failures.length > 0) {
+    const text = t("settings.dedupePartial", { count: failures.length, error: failures[0] });
+    el.dedupeStatus.textContent = text;
+    toast(text);
+  } else if (removed > 0) {
+    toast(t("settings.dedupeDone", { count: removed, size: formatBytes(freed) }));
   }
 }
 
@@ -1954,36 +2405,61 @@ function bindEvents(): void {
   });
 
   el.saveSettings.addEventListener("click", () => {
-    void persist(settingsDraft(), t("settings.saved")).catch((error: unknown) => {
+    void saveSettings().catch((error: unknown) => {
       toast(t("conn.saveFail", { error: errorText(error) }));
     });
   });
+  // 「重新生成」只填一个新 ID，保存时仍走「迁移 / 仅本地 / 取消」三选一。
   el.regenDevice.addEventListener("click", () => {
-    void confirmDialog(t("modal.confirmTitle"), t("settings.regenConfirm")).then((confirmed) => {
-      if (!confirmed) {
-        return;
-      }
-      void api
-        .setConfig({ ...requireConfig(), device_id: "" })
-        .then((saved) => {
-          renderConfig(saved);
-          toast(t("settings.regenDone"));
-          localLog(t("settings.regenDone") + ": " + saved.device_id);
-        })
-        .catch((error: unknown) => {
-          toast(t("settings.regenFail", { error: errorText(error) }));
-        });
-    });
+    el.deviceId.value = randomDeviceId();
+    toast(t("settings.regenFilled"));
+  });
+
+  el.dedupeScan.addEventListener("click", () => {
+    void loadDedupe();
+  });
+  el.dedupeApply.addEventListener("click", () => {
+    void applyDedupe();
+  });
+  el.dedupeSections.addEventListener("change", (event) => {
+    if ((event.target as HTMLElement).matches("input[data-dedupe-kind]")) {
+      updateDedupeApply();
+    }
+  });
+  el.deviceMigrate.addEventListener("click", () => {
+    settleDeviceChoice("migrate");
+  });
+  el.deviceLocal.addEventListener("click", () => {
+    settleDeviceChoice("local");
+  });
+  el.deviceCancel.addEventListener("click", () => {
+    settleDeviceChoice("cancel");
+  });
+  el.deviceModal.addEventListener("click", (event) => {
+    if (event.target === el.deviceModal) {
+      settleDeviceChoice("cancel");
+    }
   });
 
   el.backupCreate.addEventListener("click", () => {
     void createBackup();
   });
+  el.backupPrune.addEventListener("click", () => {
+    void pruneBackups();
+  });
+  el.backupKeep.addEventListener("change", () => {
+    backupKeepPending = saveBackupKeep();
+    void backupKeepPending;
+  });
   el.backupList.addEventListener("click", (event) => {
-    const target = (event.target as HTMLElement).closest<HTMLElement>("[data-restore]");
-    const id = target?.dataset.restore;
-    if (id) {
-      void restoreBackup(id);
+    const restore = (event.target as HTMLElement).closest<HTMLElement>("[data-restore]");
+    if (restore?.dataset.restore) {
+      void restoreBackup(restore.dataset.restore);
+      return;
+    }
+    const remove = (event.target as HTMLElement).closest<HTMLElement>("[data-delete]");
+    if (remove?.dataset.delete) {
+      void deleteBackup(remove.dataset.delete);
     }
   });
 
@@ -2017,7 +2493,13 @@ function bindEvents(): void {
     }
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el.modal.hidden) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    if (!el.deviceModal.hidden) {
+      settleDeviceChoice("cancel");
+    }
+    if (!el.modal.hidden) {
       settleModal(false);
     }
   });
@@ -2085,6 +2567,7 @@ function refreshLanguageDependent(): void {
   }
   renderDevices();
   renderBackups();
+  renderDedupe();
   renderUpdate();
   if (lastReport) {
     renderReport(lastReport);
