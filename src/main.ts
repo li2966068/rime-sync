@@ -487,6 +487,12 @@ function renderReport(report: Report): void {
     : "";
 
   const notes: string[] = [];
+  if (report.pending_merge) {
+    notes.push(t("sync.pendingMerge"));
+  }
+  if (report.merged_entries != null) {
+    notes.push(t("sync.mergedEntries", { count: report.merged_entries }));
+  }
   if (report.error) {
     notes.push(t("sync.reportError", { error: report.error }));
   }

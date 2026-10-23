@@ -72,6 +72,19 @@ pub fn diff_stats(local: &[u8], remote: &[u8]) -> Option<UserdbStats> {
     Some(stats)
 }
 
+/// 一次 userdb 导出文本里的词条数（非空、非注释行）；非 UTF-8 返回 None。
+pub fn entry_count(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    Some(
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .count(),
+    )
+}
+
 fn push_sample(sample: &mut Vec<String>, item: String) {
     if sample.len() < SAMPLE_LIMIT {
         sample.push(item);
@@ -124,5 +137,12 @@ mod tests {
         // 空快照是合法的：0 冲突。
         let stats = diff_stats(b"", b"").expect("empty");
         assert_eq!(stats.only_local + stats.only_remote + stats.both_changed, 0);
+    }
+
+    #[test]
+    fn entry_count_skips_blank_and_comment_lines() {
+        assert_eq!(entry_count(b""), Some(0));
+        assert_eq!(entry_count(b"# comment\n\na\t1\nb\t2\n"), Some(2));
+        assert_eq!(entry_count(&[0xff, 0xfe]), None);
     }
 }

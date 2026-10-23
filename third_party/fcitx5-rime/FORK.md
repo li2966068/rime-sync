@@ -46,7 +46,43 @@ shim step is skipped automatically.
 
 ## Local modifications
 
-None.
+### 1. `UserDataDirPath` — a real Rime user directory setting (2026-10-22)
+
+Problem: upstream ships only `ExternalOption userDataDir` (`src/rimeengine.h`,
+key `UserDataDir`), which renders as a button running `xdg-open <default dir>`.
+Picking a different directory in the file manager had no effect, because
+`rimeStart()` (`src/rimeengine.cpp`) always used
+`StandardPath::userDirectory(PkgData)/rime`.
+
+Changes:
+
+- `src/rimeengine.h`: new `Option<std::string> userDataDirPath` with key
+  `UserDataDirPath`, label `_("User data directory (empty = default)")`,
+  default `""`. The old ExternalOption was renamed to key `OpenUserDataDir`
+  with label `_("Open user data directory")` so the two keys cannot collide
+  (fcitx5-configtool writes one ini entry per key; reusing `UserDataDir` for
+  both an external action and a string would corrupt `conf/rime.conf`).
+- `src/rimeengine.cpp`: `resolveRimeUserDir()` returns the configured path when
+  non-empty (`~` expanded from `HOME`, trailing slashes stripped, relative
+  paths refused with a log line and fallback to the default), otherwise the
+  upstream default. `rimeStart()` creates the directory (`fs::makePath`) and
+  falls back to the default if creation fails; the resolved path is logged via
+  `RIME_INFO()` ("Rime user data dir: ...").
+- `src/rimeengine.h`: added the `RIME_INFO()` macro next to `RIME_DEBUG()`.
+- `po/fcitx5-rime.pot`, `po/zh_CN.po`: the two new strings, with Chinese
+  translations (`打开用户目录`, `用户数据目录（留空 = 默认）`); the obsolete
+  `User data dir` msgid was dropped.
+
+Behaviour notes:
+
+- Empty value = upstream behaviour, so existing installs keep using
+  `~/.local/share/fcitx5/rime`; no migration is performed when the value
+  changes.
+- The `OpenUserDataDir` button still opens the *default* directory, because an
+  `ExternalOption` URI is computed once at startup and cannot follow the
+  string option.
+- Config page changes take effect on save: `setConfig()` → `updateConfig()` →
+  `rimeStart()`.
 
 ## How to upgrade
 

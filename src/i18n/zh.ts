@@ -106,6 +106,8 @@ export const zh = {
   "sync.rimeDir": "当前 Rime 用户目录",
   "sync.rimeDirPlaceholder": "点击「自动探测」或在设置中手动填写",
   "sync.detect": "自动探测",
+  "sync.pendingMerge": "发现新的词库快照，请点「立即合并生效」把它们合进本地词库。",
+  "sync.mergedEntries": "本地词库合并后条目数：{count}",
   "sync.browse": "浏览…",
   "sync.detecting": "正在探测…",
   "sync.source": "来源：{source}",

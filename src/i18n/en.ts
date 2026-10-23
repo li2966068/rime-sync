@@ -109,6 +109,8 @@ export const en: Record<keyof Dict, string> = {
   "sync.rimeDir": "Current Rime user folder",
   "sync.rimeDirPlaceholder": "Use Detect, or type a path in Settings",
   "sync.detect": "Detect",
+  "sync.pendingMerge": "New userdb snapshots were pulled. Click \"Apply now\" to merge them into the local dictionary.",
+  "sync.mergedEntries": "Entries after merge: {count}",
   "sync.browse": "Browse…",
   "sync.detecting": "Detecting…",
   "sync.source": "Source: {source}",

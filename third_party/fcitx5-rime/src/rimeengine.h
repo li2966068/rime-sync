@@ -40,8 +40,16 @@ FCITX_CONFIGURATION(
     Option<bool> commitWhenDeactivate{
         this, "Commit when deactivate",
         _("Commit current text when deactivating"), true};
-    ExternalOption userDataDir{
-        this, "UserDataDir", _("User data dir"),
+    // A real setting: the Rime user directory (where *.userdb, build/ and
+    // installation.yaml live). Empty keeps the upstream default,
+    // <PkgData>/rime, so existing installs are unaffected.
+    Option<std::string> userDataDirPath{
+        this, "UserDataDirPath", _("User data directory (empty = default)"),
+        std::string()};
+    // Shortcut that opens the *default* user directory in the file manager.
+    // It is not a path setting, so its key must not be UserDataDir anymore.
+    ExternalOption openUserDataDir{
+        this, "OpenUserDataDir", _("Open user data directory"),
         stringutils::concat(
             "xdg-open \"",
             stringutils::replaceAll(
@@ -155,6 +163,7 @@ public:
 
 FCITX_DECLARE_LOG_CATEGORY(rime);
 
+#define RIME_INFO() FCITX_LOGC(rime, Info)
 #define RIME_DEBUG() FCITX_LOGC(rime, Debug)
 #define RIME_ERROR() FCITX_LOGC(rime, Error)
 

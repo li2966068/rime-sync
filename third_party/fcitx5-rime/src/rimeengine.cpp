@@ -7,6 +7,7 @@
 #include "rimeengine.h"
 #include "notifications_public.h"
 #include "rimestate.h"
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcitx-utils/event.h>
@@ -47,6 +48,43 @@ parseAppOptions(rime_api_t *api, RimeConfig *config) {
     }
     api->config_end(&appIter);
     return appOptions;
+}
+
+std::string defaultRimeUserDir() {
+    return stringutils::joinPath(
+        StandardPath::global().userDirectory(StandardPath::Type::PkgData),
+        "rime");
+}
+
+// Resolve the "User data directory" option. Empty means the upstream default
+// (<PkgData>/rime). "~" is expanded from HOME; a non-absolute path is refused,
+// since librime would resolve it against fcitx5's working directory, which is
+// not stable across logins and would scatter the user's data.
+std::string resolveRimeUserDir(const std::string &configured) {
+    if (configured.empty()) {
+        return defaultRimeUserDir();
+    }
+    std::string path = configured;
+    if (path == "~" || stringutils::startsWith(path, "~/")) {
+        const char *home = getenv("HOME");
+        if (!home || !*home) {
+            RIME_ERROR() << "UserDataDirPath='" << configured
+                         << "' uses ~ but HOME is unset; using "
+                         << defaultRimeUserDir();
+            return defaultRimeUserDir();
+        }
+        path = std::string(home) + path.substr(1);
+    }
+    if (!stringutils::startsWith(path, "/")) {
+        RIME_ERROR() << "UserDataDirPath='" << configured
+                     << "' is not an absolute path; using "
+                     << defaultRimeUserDir();
+        return defaultRimeUserDir();
+    }
+    while (path.size() > 1 && path.back() == '/') {
+        path.pop_back();
+    }
+    return path;
 }
 } // namespace
 
@@ -158,14 +196,21 @@ void RimeEngine::rimeStart(bool fullcheck) {
 
     RIME_DEBUG() << "Rime Start (fullcheck: " << fullcheck << ")";
 
-    auto userDir = stringutils::joinPath(
-        StandardPath::global().userDirectory(StandardPath::Type::PkgData),
-        "rime");
-    if (!fs::makePath(userDir)) {
+    auto userDir = resolveRimeUserDir(*config_.userDataDirPath);
+    fs::makePath(userDir);
+    if (!fs::isdir(userDir)) {
+        const auto fallback = defaultRimeUserDir();
+        RIME_ERROR() << "Failed to create Rime user directory: " << userDir
+                     << "; falling back to " << fallback;
+        userDir = fallback;
+        fs::makePath(userDir);
         if (!fs::isdir(userDir)) {
-            RIME_ERROR() << "Failed to create user directory: " << userDir;
+            RIME_ERROR() << "Failed to create Rime user directory: " << userDir;
         }
     }
+    RIME_INFO() << "Rime user data dir: " << userDir
+                << (userDir == defaultRimeUserDir() ? " (default)"
+                                                   : " (UserDataDirPath)");
     const char *sharedDataDir = RIME_DATA_DIR;
 
     RIME_STRUCT(RimeTraits, fcitx_rime_traits);

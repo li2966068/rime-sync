@@ -52,6 +52,10 @@ msgstr "自动加载可用插件"
 msgid "Modules"
 msgstr "模块"
 
+#: src/rimeengine.h:52
+msgid "Open user data directory"
+msgstr "打开用户目录"
+
 #: src/rimeengine.h:57
 msgid "Plugins"
 msgstr "插件"
@@ -111,6 +115,6 @@ msgstr "同步"
 msgid "Traditional Chinese is enabled."
 msgstr "已启用繁体中文。"
 
-#: src/rimeengine.h:44
-msgid "User data dir"
-msgstr "用户数据目录"
+#: src/rimeengine.h:47
+msgid "User data directory (empty = default)"
+msgstr "用户数据目录（留空 = 默认）"

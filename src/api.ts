@@ -40,6 +40,8 @@ export interface Report {
   backup_id?: string | null;
   first_sync?: boolean;
   mode?: string;
+  pending_merge?: boolean;
+  merged_entries?: number | null;
   conflict_details?: {
     path: string;
     only_local: number;

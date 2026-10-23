@@ -47,6 +47,10 @@ msgstr ""
 msgid "Modules"
 msgstr ""
 
+#: src/rimeengine.h:52
+msgid "Open user data directory"
+msgstr ""
+
 #: src/rimeengine.h:57
 msgid "Plugins"
 msgstr ""
@@ -106,6 +110,6 @@ msgstr ""
 msgid "Traditional Chinese is enabled."
 msgstr ""
 
-#: src/rimeengine.h:44
-msgid "User data dir"
+#: src/rimeengine.h:47
+msgid "User data directory (empty = default)"
 msgstr ""

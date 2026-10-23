@@ -2,6 +2,22 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.5.2 — 2026-10-23
+
+修复「同步显示成功但词库没合并」以及 Linux 输入法设置页：
+
+1. **快照目录名改用 installation_id**：librime/小狼毫把快照写在 `sync/<installation_id>/`，而旧版用
+   `config.device_id` 去找 `sync/<device_id>/`，目录不存在就静默跳过——这就是 `pushed=0`、远端没有
+   快照、Linux 端始终打不出新词的原因。现在 push/pull 都用 `installation.yaml` 的 installation_id
+   （缺失时回退 device_id），并兼容旧的 device_id 目录。
+2. **合并加固**：apply 会轮询确认 fcitx5 真正退出（避免 LevelDB 锁），再 `rime_dict_manager --sync`
+   → `rime_deployer --build` → 启回；合并前后各导出一次 userdb 并在结果里显示条目数。
+3. **新快照提醒**：transport 拉到新的 `*.userdb.txt` 时结果区提示「请点『立即合并生效』」。
+4. **fcitx5 配置页**：新增真正的「用户数据目录（留空 = 默认）」设置项（`UserDataDirPath`），原按钮
+   改名「打开用户目录」；补 zh_CN 翻译，配置页在中文环境下完整显示中文。
+5. **rime-sync 目录探测**：优先读取 fcitx5-rime 的 `UserDataDirPath`，让输入法与同步使用同一目录。
+6. **Debian 安装冲突**：IME 包新增 `Conflicts/Replaces: rime-data, rime-prelude, rime-essay, rime-luna-pinyin`，
+   修复 `apt install ./rime-inputmethod.deb` 报 `trying to overwrite /usr/share/rime-data/default.yaml`。
 ## v0.5.1 — 2026-10-22
 
 修复 0.5.0 安装后「找不到同步设置」的两个打包缺陷：

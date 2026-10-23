@@ -47,6 +47,13 @@ pub struct Report {
     /// *.userdb.txt 词条级冲突统计；统计失败时整体降级为 null（不影响主流程）。
     #[serde(default)]
     pub conflict_details: Option<Vec<ConflictDetail>>,
+    /// 本轮拉到新的/变化的 *.userdb.txt：transport 只搬文件，必须再跑 apply
+    /// （rime_dict_manager --sync）才算真正合并进本地词库。
+    #[serde(default)]
+    pub pending_merge: bool,
+    /// apply 合并后本地词库的条目数（merge 后 userdb 导出）；导出失败或未 apply 时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_entries: Option<usize>,
 }
 
 /// 单份 userdb 快照的词条差异统计（只统计，不自动合并）。
@@ -57,6 +64,22 @@ pub struct ConflictDetail {
     pub only_remote: usize,
     pub both_changed: usize,
     pub sample: Vec<String>,
+}
+
+/// apply 前后导出词库条目数用的 schema 名。
+const USERDB_EXPORT_SCHEMA: &str = "luna_pinyin";
+
+/// 临时导出文件：离开作用域即删除（清理失败的告警不能反过来影响 apply）。
+struct TempPath(PathBuf);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("remove temp file {}: {error}", self.0.display());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +121,7 @@ pub struct Engine {
     config: Config,
     rime_dir: PathBuf,
     sync_dir: PathBuf,
+    state_dir: PathBuf,
     index_path: PathBuf,
     lock_path: PathBuf,
     backup_root: PathBuf,
@@ -141,6 +165,7 @@ impl Engine {
             config,
             rime_dir,
             sync_dir,
+            state_dir: state_dir.clone(),
             index_path,
             lock_path: state_dir.join("sync.lock"),
             backup_root: state_dir.join("backups"),
@@ -295,23 +320,51 @@ impl Engine {
             report.duration_ms = started.elapsed().as_millis() as u64;
             return report;
         }
-        self.emit("deploy", 0, 3, "stopping input method");
+        self.emit("deploy", 0, 4, "stopping input method");
+        tracing::info!(
+            "apply: stopping input method before rime_dict_manager (trigger={})",
+            self.trigger.name()
+        );
         let mut deploy_error: Option<anyhow::Error> = None;
         if let Err(error) = self.trigger.stop_ime() {
             deploy_error = Some(error);
         }
+        let mut before_entries: Option<usize> = None;
         if deploy_error.is_none() {
-            self.emit("deploy", 1, 3, "rime_dict_manager --sync");
-            if let Err(error) = self.trigger.sync_userdb(&self.rime_dir) {
-                deploy_error = Some(error);
+            // 合并前基线：顺带证明 LevelDB 已可读（fcitx5 确实退出）。
+            before_entries = self.export_userdb_count("pre-merge");
+            self.emit("deploy", 1, 4, "rime_dict_manager --sync");
+            match self.trigger.sync_userdb(&self.rime_dir) {
+                Ok(()) => {
+                    // 快照已导入 LevelDB：pending_merge 的债还清了。
+                    // 之后的 post-deploy transport 若又拉到新快照会重新置位。
+                    report.pending_merge = false;
+                }
+                Err(error) => deploy_error = Some(error),
             }
         }
+        let after_entries = if deploy_error.is_none() {
+            self.export_userdb_count("post-merge")
+        } else {
+            None
+        };
+        report.merged_entries = after_entries;
+        match (before_entries, after_entries) {
+            (Some(before), Some(after)) => tracing::info!(
+                "apply: userdb entries {before} -> {after} (delta {:+})",
+                after as i64 - before as i64
+            ),
+            _ => tracing::info!(
+                "apply: userdb entry counts unavailable (before={before_entries:?} after={after_entries:?})"
+            ),
+        }
         if deploy_error.is_none() {
-            self.emit("deploy", 2, 3, "rime_deployer --build");
+            self.emit("deploy", 2, 4, "rime_deployer --build");
             if let Err(error) = self.trigger.deploy(&self.rime_dir) {
                 deploy_error = Some(error);
             }
         }
+        tracing::info!("apply: restarting input method");
         let start_result = self.trigger.start_ime();
         if let Some(error) = deploy_error {
             report.ok = false;
@@ -372,16 +425,62 @@ impl Engine {
         }
     }
 
+    /// sync/ 下本机目录名：优先 installation.yaml 的 installation_id，缺失时回退 device_id。
+    fn local_sync_id(&self) -> String {
+        rime_dir::local_sync_id_in(&self.rime_dir, &self.config.device_id)
+    }
+
+    /// 导出本地词库并统计条目数（rime_dict_manager -e，要求输入法已停止）。
+    /// 失败只 warn：统计是加固信息，不阻断 apply。
+    fn export_userdb_count(&self, label: &str) -> Option<usize> {
+        let dir = self.state_dir.join("tmp");
+        if let Err(error) = fs::create_dir_all(&dir) {
+            tracing::warn!("create {}: {error:#}", dir.display());
+            return None;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dest = TempPath(dir.join(format!(
+            "userdb-{label}-{}-{unique}.txt",
+            std::process::id()
+        )));
+        if let Err(error) =
+            self.trigger
+                .export_userdb(&self.rime_dir, USERDB_EXPORT_SCHEMA, &dest.0)
+        {
+            tracing::warn!("userdb export ({label}) failed, continuing without counts: {error:#}");
+            return None;
+        }
+        let bytes = match fs::read(&dest.0) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    "read userdb export ({label}) {}: {error:#}",
+                    dest.0.display()
+                );
+                return None;
+            }
+        };
+        let count = crate::userdb::entry_count(&bytes);
+        tracing::info!("userdb export ({label}): entries={count:?}");
+        count
+    }
+
     fn do_transport(&mut self, report: &mut Report) -> Result<()> {
         let device = self.config.device_id.clone();
         plan::validate_rel_path(&device).context("invalid device_id")?;
         if device.contains('/') {
             bail!("device_id must be a single path segment: {device}");
         }
-        let remote_sync = format!("sync/{device}");
+        // librime / 小狼毫把快照写在 sync/<installation_id>/，不是 sync/<device_id>/。
+        let local_id = self.local_sync_id();
+        plan::validate_rel_path(&local_id).context("invalid installation_id")?;
+        let remote_sync = format!("sync/{local_id}");
         self.cancelled()?;
 
-        report.first_sync = self.detect_first_sync(&device)?;
+        report.first_sync = self.detect_first_sync(&local_id, &device)?;
         if self.config.first_sync_policy.pull_only() {
             // 只读策略：policy != normal 时永远只拉不推（与是否首轮无关）。
             // 不 ensure_base / ensure_dir、不写 owner.json、不写 shared、不上传任何文件。
@@ -426,7 +525,7 @@ impl Engine {
     /// SPEC-4 §A1：首次接入 = 本地无 index.json 且远端已有别的设备目录或 shared 数据。
     ///
     /// 只读探测：这里不创建任何远端目录/文件。
-    fn detect_first_sync(&self, device: &str) -> Result<bool> {
+    fn detect_first_sync(&self, local_id: &str, device: &str) -> Result<bool> {
         if self.index_existed {
             return Ok(false);
         }
@@ -438,7 +537,8 @@ impl Engine {
                 continue;
             }
             let name = entry.path.rsplit('/').next().unwrap_or_default();
-            if name.is_empty() || name == device || name.starts_with('.') {
+            // 自己的目录：installation_id 或旧版 device_id 都算自己。
+            if name.is_empty() || name == local_id || name == device || name.starts_with('.') {
                 continue;
             }
             other_devices += 1;
@@ -497,6 +597,7 @@ impl Engine {
     }
 
     fn pull_snapshots(&mut self, report: &mut Report) -> Result<()> {
+        let local_id = self.local_sync_id();
         let device = self.config.device_id.clone();
         let entries = self.dav.propfind("sync", 1)?;
         let mut dirs = Vec::new();
@@ -512,7 +613,8 @@ impl Engine {
             let Some(name) = dir.rsplit('/').next() else {
                 continue;
             };
-            if name == device || name.is_empty() || name.starts_with('.') {
+            // 自己的目录：installation_id 或旧版 device_id 都算自己。
+            if name.is_empty() || name == local_id || name == device || name.starts_with('.') {
                 continue;
             }
             if let Err(error) = plan::validate_rel_path(dir) {
@@ -547,16 +649,21 @@ impl Engine {
                 let Some(bytes) = self.dav.get(&entry.path)? else {
                     continue;
                 };
+                let is_userdb = entry.path.ends_with(".userdb.txt");
                 if let Ok(current) = fs::read(&local) {
                     if current == bytes {
                         continue;
                     }
-                    if entry.path.ends_with(".userdb.txt") {
+                    if is_userdb {
                         self.note_userdb_conflict(&entry.path, &current, &bytes, report);
                     }
                 }
                 write_bytes(&local, &bytes)?;
                 report.pulled += 1;
+                if is_userdb {
+                    // 新/变化的 *.userdb.txt 只是落盘，还需 apply 才会导入 LevelDB。
+                    report.pending_merge = true;
+                }
             }
         }
         Ok(())
@@ -589,8 +696,10 @@ impl Engine {
     }
 
     fn push_snapshots(&mut self, report: &mut Report) -> Result<()> {
-        let device = self.config.device_id.clone();
-        let local_root = self.sync_dir.join(&device);
+        // 远端路径由本地 rel 路径推导，所以目录名换成 installation_id 后
+        // 上传目标自然是 sync/<installation_id>/。
+        let local_id = self.local_sync_id();
+        let local_root = self.sync_dir.join(&local_id);
         if !local_root.is_dir() {
             return Ok(());
         }
@@ -1133,9 +1242,13 @@ mod tests {
                 both_changed: 3,
                 sample: vec!["-a".into()],
             }]),
+            pending_merge: true,
+            merged_entries: Some(42),
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);
+        assert_eq!(json["pending_merge"], true);
+        assert_eq!(json["merged_entries"], 42);
         assert_eq!(json["conflicts"][0], "a");
         assert_eq!(json["backup_id"], "20240101-000000");
         assert_eq!(json["first_sync"], true);

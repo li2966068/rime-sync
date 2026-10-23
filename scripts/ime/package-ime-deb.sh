@@ -77,7 +77,10 @@ DEPS=$(printf '%s' "$DEPS" | sed -E \
 # librime1t64; list both unconditionally (Conflicts with a package that does
 # not exist is harmless) so a package built for jammy can never coexist with a
 # t64 librime by accident.
-CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data"}
+# Debian 12/13 split the distro rime data into rime-data/rime-prelude/rime-essay/
+# rime-luna-pinyin; we ship the same files under /usr/share/rime-data, so apt
+# (unlike plain dpkg -i) would fail with "trying to overwrite ... default.yaml".
+CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data, rime-data, rime-prelude, rime-essay, rime-luna-pinyin"}
 if [ -f "$STAGING/conflicts-extra.txt" ]; then
   while read -r extra; do
     [ -n "$extra" ] || continue
@@ -188,6 +191,27 @@ ADDON_SO_REL=${ADDON_SO#"$ROOT"/}
 deb_assert "$ADDON_SO_REL" -rw-r--r-- "rimesync.so (fcitx5 config page addon)"
 deb_assert usr/share/fcitx5/addon/rimesync.conf -rw-r--r-- "rimesync.conf (addon metadata)"
 deb_assert usr/bin/rime-sync-open-setup -rwxr-xr-x "rime-sync-open-setup (action button target)"
+# Without this .mo every option of the rime addon (including the new
+# UserDataDirPath) is displayed in English even under LANG=zh_CN.UTF-8.
+deb_assert usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo -rw-r--r-- \
+  "zh_CN translation of the rime addon"
+LC_CHECK=$(mktemp -d)
+LC_ENTRIES=0
+if dpkg-deb -x "$DEB" "$LC_CHECK" 2>/dev/null; then
+  # .mo stores msgstr as plain UTF-8 bytes, so grep works without gettext on the
+  # packaging host (whose only job here is to prove the strings are inside).
+  for s in '用户数据目录（留空 = 默认）' '打开用户目录'; do
+    if grep -qa -- "$s" "$LC_CHECK/usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo"; then
+      LC_ENTRIES=$((LC_ENTRIES + 1))
+    fi
+  done
+fi
+rm -rf "$LC_CHECK"
+if [ "$LC_ENTRIES" -lt 2 ]; then
+  echo "!! zh_CN fcitx5-rime.mo in $DEB does not translate the new rime labels ($LC_ENTRIES/2)" >&2
+  exit 1
+fi
+printf '    ok zh_CN mo translates UserDataDirPath/OpenUserDataDir (%s/2 strings)\n' "$LC_ENTRIES"
 if printf '%s\n' "$DEB_LIST" | grep -q 'rime-sync-config'; then
   echo "!! the standalone Qt widgets config page leaked into $DEB" >&2
   exit 1

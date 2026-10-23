@@ -75,6 +75,17 @@ cmake -S "$SRC/third_party/fcitx5-rime" -B "$WORK/fcitx5-rime" \
   -DRIME_DATA_DIR=$RIME_DATA_DIR
 cmake --build "$WORK/fcitx5-rime" -j"$JOBS"
 DESTDIR="$ROOT" cmake --install "$WORK/fcitx5-rime"
+# The addon is unusable in a Chinese session without its catalogs: every option
+# (including the UserDataDirPath added in FORK.md) would fall back to English.
+# Assert the staged .mo exists AND carries the new labels, so a broken po ->
+# msgfmt path fails the build instead of silently shipping an English UI.
+RIME_MO="$ROOT$PREFIX/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo"
+test -f "$RIME_MO" || { echo "!! missing $RIME_MO"; exit 1; }
+for label in '用户数据目录（留空 = 默认）' '打开用户目录'; do
+  grep -qa -- "$label" "$RIME_MO" || {
+    echo "!! $RIME_MO does not contain '$label'"; exit 1; }
+done
+echo "locale: $(find "$ROOT$PREFIX/share/locale" -name 'fcitx5-rime.mo' | wc -l) catalogs, zh_CN has the UserDataDirPath labels"
 T3=$(stamp)
 echo "fcitx5-rime build+install: $((T3 - T2)) s"
 
