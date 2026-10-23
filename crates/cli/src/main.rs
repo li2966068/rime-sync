@@ -1,5 +1,7 @@
 //! rime-sync-cli：headless 入口，供 E2E 与无 GUI 环境使用。
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};

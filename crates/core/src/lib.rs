@@ -1,5 +1,9 @@
 //! rime-sync-core: Rime WebDAV 同步引擎（无 GUI 依赖）。
 
+// 非测试代码一律不允许 unwrap/expect：集成测试是独立 crate，不受此约束；
+// src 内的单测模块只在 cfg(test) 下编译，同样不受影响。
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod backup;
 pub mod cancel;
 pub mod config;
@@ -25,7 +29,10 @@ pub mod webdav;
 pub use backup::{BackupInfo, BackupManager, BackupManifest, RestoreReport};
 pub use cancel::CancelToken;
 pub use config::{Config, FirstSyncPolicy, MigrationReport, PasswordRef, CONFIG_SCHEMA_VERSION};
-pub use engine::{ConflictDetail, Engine, Progress, ProgressSink, Report};
+pub use engine::{
+    ConflictDetail, Engine, PlanAction, PlanCounts, PlanKind, PlanReport, Progress, ProgressSink,
+    Report,
+};
 pub use history::{HistoryEntry, HISTORY_LIMIT};
 pub use lock::{acquire as acquire_lock, inspect as inspect_lock, LockGuard, LockInfo, LockStatus};
 pub use log::{LogWriter, RotatingLog, DEFAULT_KEEP, DEFAULT_MAX_BYTES};

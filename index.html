@@ -117,6 +117,9 @@
             <p class="hint" data-i18n="sync.watchSub"></p>
 
             <div class="actions big">
+              <button class="ghost" id="btn-plan" type="button">
+                <span data-i18n="sync.plan">预览同步</span><small data-i18n="sync.planSub">只读，不写入任何数据</small>
+              </button>
               <button class="primary" id="btn-transport" type="button">
                 <span data-i18n="sync.transport">立即搬运</span><small data-i18n="sync.transportSub">不打断输入</small>
               </button>
@@ -145,6 +148,22 @@
               <div class="report-item wide backup"><span class="label" data-i18n="sync.backup">备份</span><span class="value mono" id="report-backup">—</span></div>
               <div class="report-mode" id="report-mode" hidden></div>
               <div class="report-note" id="report-note" hidden></div>
+            </div>
+          </div>
+
+          <div class="card" id="plan-card" hidden>
+            <div class="panel-head">
+              <div>
+                <h2 data-i18n="plan.title">同步预览</h2>
+                <p class="muted" data-i18n="plan.desc"></p>
+              </div>
+            </div>
+            <p class="plan-summary" id="plan-summary"></p>
+            <p class="plan-note" id="plan-note" hidden></p>
+            <div class="plan-groups" id="plan-groups" aria-live="polite"></div>
+            <div class="actions">
+              <button class="primary" id="btn-plan-run" type="button" data-i18n="plan.run">按此执行</button>
+              <button class="ghost" id="btn-plan-close" type="button" data-i18n="plan.close">收起</button>
             </div>
           </div>
 

@@ -62,6 +62,28 @@ FCITX_CONFIGURATION(
                                       "rime"),
                 "\"", "\"\"\""),
             "\"")};
+    // Action buttons for the rime-sync package. Each URI is a fixed command
+    // (no user input); sh -c makes a missing binary a silent no-op. The
+    // absolute paths are single quoted inside the double-quoted script so both
+    // fcitx5-configtool (program + args) and Plasma (launchExternal) run it.
+    ExternalOption openSyncPanel{
+        this, "OpenSyncPanel",
+        _("打开同步面板 / Open sync panel"),
+        stringutils::concat("sh -c \"if [ -x '", "/usr/bin/rime-sync-app",
+                            "' ]; then exec '", "/usr/bin/rime-sync-app",
+                            "' --setup; fi\"")};
+    ExternalOption syncNow{
+        this, "SyncNow",
+        _("立即同步 / Sync now"),
+        stringutils::concat("sh -c \"if [ -x '", "/usr/bin/rime-sync-cli",
+                            "' ]; then exec '", "/usr/bin/rime-sync-cli",
+                            "' transport; fi\"")};
+    ExternalOption showSyncStatus{
+        this, "ShowSyncStatus",
+        _("查看同步状态 / Sync status"),
+        stringutils::concat("sh -c \"if [ -x '", "/usr/bin/rime-sync-status",
+                            "' ]; then exec '", "/usr/bin/rime-sync-status",
+                            "'; fi\"")};
 #ifdef FCITX_RIME_LOAD_PLUGIN
     Option<bool> autoloadPlugins{this, "AutoloadPlugins",
                                  _("Load available plugins automatically"),

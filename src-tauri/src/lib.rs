@@ -3,6 +3,9 @@
 //! 同步逻辑（文件分类、三向合并、WebDAV、librime 触发）全部在 rime-sync-core；
 //! 本文件只负责把命令参数翻译成引擎调用，并把进度/结果转发给前端。
 
+// 非测试代码一律不允许 unwrap/expect（命令层错误一律转成 anyhow/String 上报前端）。
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use rime_sync_core::backup::BackupManager;
 use rime_sync_core::cancel::CancelToken;
 use rime_sync_core::config::{self, Config};
-use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
+use rime_sync_core::engine::{Engine, PlanReport, Progress, ProgressSink, Report};
 use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::platform;
 use rime_sync_core::retry::RetryState;
@@ -633,6 +636,71 @@ async fn cmd_apply(app: AppHandle, state: State<'_, AppState>) -> Result<Report,
         .map_err(|error| format!("同步任务异常结束：{error}"))?
 }
 
+/// 预览同步（dry-run）：只 GET/HEAD/PROPFIND + 本地比较，不写本地、不写远端、不动 index。
+///
+/// 刻意不做的事：不存配置、不做备份、不记录 history/retry、不创建锁、不触发输入法。
+#[tauri::command]
+async fn cmd_plan_sync(app: AppHandle, state: State<'_, AppState>) -> Result<PlanReport, String> {
+    let inner = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || run_plan(&app, &inner))
+        .await
+        .map_err(|error| format!("预览任务异常结束：{error}"))?
+}
+
+pub(crate) fn run_plan(app: &AppHandle, inner: &Arc<Inner>) -> Result<PlanReport, String> {
+    if inner
+        .running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("已有同步任务正在运行，请等待完成或先取消".to_string());
+    }
+    let outcome = run_plan_inner(app, inner);
+    inner.running.store(false, Ordering::SeqCst);
+    if let Err(error) = &outcome {
+        push_log(inner, format!("预览失败：{error}"));
+    }
+    outcome
+}
+
+fn run_plan_inner(app: &AppHandle, inner: &Arc<Inner>) -> Result<PlanReport, String> {
+    let mut config = load_config(app, inner)?;
+    let detected = detect_rime(&config)?;
+    // 只在内存里补全：预览不落盘，配置文件的字节数必须保持原样。
+    if config.rime_dir.as_deref() != Some(detected.path.to_string_lossy().as_ref()) {
+        config.rime_dir = Some(detected.path.display().to_string());
+    }
+    if config.device_id.trim().is_empty() {
+        config.device_id = config.resolve_device_id(&detected.path);
+    }
+    config.device_id = config.device_id.trim().to_string();
+    if let Err(error) = config.validate() {
+        return Err(format!("配置不完整：{error:#}"));
+    }
+
+    // FakeTrigger：预览绝不调用 rime_dict_manager / WeaselDeployer / fcitx5。
+    let trigger: Box<dyn rime_sync_core::platform::RimeTrigger> =
+        Box::new(rime_sync_core::platform::FakeTrigger::new());
+    let mut engine = Engine::new(config, detected.path, state_dir(app)?, trigger)
+        .map_err(|error| format!("初始化同步引擎失败：{error:#}"))?;
+    let report = engine.plan();
+    push_log(
+        inner,
+        format!(
+            "预览完成（未写入任何数据）：拉取 {}，推送 {}，冲突 {}，跳过 {}，耗时 {} ms",
+            report.counts.pull,
+            report.counts.push,
+            report.counts.conflict,
+            report.counts.skip,
+            report.duration_ms
+        ),
+    );
+    if let Some(error) = &report.error {
+        push_log(inner, format!("预览错误：{error}"));
+    }
+    Ok(report)
+}
+
 #[tauri::command]
 fn cmd_cancel(state: State<'_, AppState>) -> Result<(), String> {
     let guard = state
@@ -874,6 +942,7 @@ pub fn run() {
             cmd_list_remote,
             cmd_transport,
             cmd_apply,
+            cmd_plan_sync,
             cmd_cancel,
             cmd_get_log,
             cmd_needs_setup,

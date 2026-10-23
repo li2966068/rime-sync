@@ -84,6 +84,50 @@ Behaviour notes:
 - Config page changes take effect on save: `setConfig()` → `updateConfig()` →
   `rimeStart()`.
 
+### 2. Sync action buttons on the Rime config page (2026-10-24)
+
+The `rime-sync` package ships three entry points that the Rime addon page now
+exposes as `ExternalOption` buttons, right after `OpenUserDataDir`
+(`src/rimeengine.h`):
+
+| key | label | command |
+|---|---|---|
+| `OpenSyncPanel` | `打开同步面板 / Open sync panel` | `sh -c "if [ -x '/usr/bin/rime-sync-app' ]; then exec '/usr/bin/rime-sync-app' --setup; fi"` |
+| `SyncNow` | `立即同步 / Sync now` | `sh -c "if [ -x '/usr/bin/rime-sync-cli' ]; then exec '/usr/bin/rime-sync-cli' transport; fi"` |
+| `ShowSyncStatus` | `查看同步状态 / Sync status` | `sh -c "if [ -x '/usr/bin/rime-sync-status' ]; then exec '/usr/bin/rime-sync-status'; fi"` |
+
+Why this shape:
+
+- fcitx5-configtool turns an `ExternalOption` value into
+  `QProcess::startDetached(program, args)`, and Plasma's QML widget calls
+  `launchExternal()`; both split the string into program + arguments. The whole
+  shell snippet is therefore double quoted, and each absolute path is single
+  quoted inside it — nothing else needs escaping.
+- `sh -c` plus the `[ -x ... ]` test make a missing `rime-sync` package a
+  silent no-op instead of a button that fails with no feedback
+  (`rime-sync-status` is provided by that package; this tree does not ship it).
+- The commands are fixed literals; no user input is interpolated. The
+  `xdg-open` button keeps its own `stringutils::replaceAll` escaping because
+  its path *is* derived from the environment.
+- `po/fcitx5-rime.pot` and `po/zh_CN.po` carry the three bilingual msgids
+  (`打开同步面板`, `立即同步`, `查看同步状态`). Other catalogs are untouched:
+  the labels already contain both languages, so deleting `*.mo` (localepurge)
+  never hides them.
+
+Verification:
+
+- `msgfmt -c` on `po/fcitx5-rime.pot` and `po/zh_CN.po`.
+- Build the addon in the container image (`scripts/ime/build-linux.sh` →
+  `scripts/ime/container-build.sh` compiles `third_party/fcitx5-rime`), then
+  check the config page over DBus:
+  `gdbus call --session --dest org.fcitx.Fcitx5 --object-path /controller
+  --method org.fcitx.Fcitx.Controller1.GetConfig 'fcitx://config/addon/rime'`
+  and look for `External=sh -c ...` entries under `OpenSyncPanel`,
+  `SyncNow`, `ShowSyncStatus`.
+- Manual: in `fcitx5-configtool` → Rime → the three buttons must open the
+  setup wizard, run `rime-sync-cli transport`, and show the notification. On a
+  machine without the `rime-sync` package the buttons must do nothing.
+
 ## How to upgrade
 
 ```sh

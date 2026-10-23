@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "WeaselServerApp.h"
 #include <filesystem>
+#include <RimeSync.h>
 
 WeaselServerApp::WeaselServerApp()
     : m_handler(std::make_unique<RimeWithWeaselHandler>(&m_ui)),
@@ -61,6 +62,9 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(
       ID_WEASELTRAY_SYNC,
       std::bind(execute, dir / L"WeaselDeployer.exe", std::wstring(L"/sync")));
+  m_server.AddMenuHandler(
+      ID_WEASELTRAY_RIMESYNC,
+      [] { return rime_sync::LaunchSetup(nullptr); });
   m_server.AddMenuHandler(ID_WEASELTRAY_WIKI,
                           std::bind(open, L"https://rime.im/docs/"));
   m_server.AddMenuHandler(ID_WEASELTRAY_HOMEPAGE,

@@ -1,0 +1,29 @@
+#pragma once
+// Stand-in for <filesystem> with a Windows-like wchar_t path value_type.
+#include <string>
+#include <system_error>
+namespace std {
+namespace filesystem {
+class path {
+ public:
+  typedef wchar_t value_type;
+  path() {}
+  path(const wchar_t* s) : value_(s ? s : L"") {}
+  path(const std::wstring& s) : value_(s) {}
+  path& operator/=(const wchar_t* s) { return append(s); }
+  path& operator/=(const path& s) { return append(s.value_.c_str()); }
+  path operator/(const wchar_t* s) const { path p(*this); p.append(s); return p; }
+  path operator/(const path& s) const { path p(*this); p.append(s.value_.c_str()); return p; }
+  bool empty() const { return value_.empty(); }
+  const value_type* c_str() const { return value_.c_str(); }
+ private:
+  path& append(const wchar_t* s) {
+    if (!value_.empty() && value_.back() != L'\\') value_ += L'\\';
+    value_ += s;
+    return *this;
+  }
+  std::wstring value_;
+};
+bool is_regular_file(const path&, std::error_code&);
+}  // namespace filesystem
+}  // namespace std

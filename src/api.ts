@@ -53,6 +53,43 @@ export interface Report {
   }[];
 }
 
+export type PlanKind =
+  | "pull"
+  | "push"
+  | "conflict"
+  | "skip"
+  | "delete_local"
+  | "delete_remote";
+
+/// 预览里的一条动作；kind 与真实运输的写操作一一对应。
+export interface PlanAction {
+  kind: PlanKind;
+  path: string;
+  detail: string;
+}
+
+export interface PlanCounts {
+  pull: number;
+  push: number;
+  conflict: number;
+  skip: number;
+  delete_local: number;
+  delete_remote: number;
+}
+
+/// 同步预览（dry-run）结果：actions 就是「立即搬运」接下来会做的事。
+export interface PlanReport {
+  actions: PlanAction[];
+  counts: PlanCounts;
+  total: number;
+  mode: string;
+  first_sync: boolean;
+  dry_run: boolean;
+  ok: boolean;
+  error: string | null;
+  duration_ms: number;
+}
+
 export interface Progress {
   phase: string;
   current: number;
@@ -318,6 +355,7 @@ export const api = {
   networkStatus: () => invoke<NetworkStatus>("cmd_network_status"),
   listRemote: () => invoke<RemoteList>("cmd_list_remote"),
   transport: () => invoke<Report>("cmd_transport"),
+  planSync: () => invoke<PlanReport>("cmd_plan_sync"),
   apply: () => invoke<Report>("cmd_apply"),
   cancel: () => invoke<void>("cmd_cancel"),
   getLog: (limit = 200) => invoke<string[]>("cmd_get_log", { limit }),

@@ -1,0 +1,54 @@
+#!/bin/sh
+# rime-sync-status — 把最近一次同步结果显示成桌面通知。
+# 由 fcitx5-rime 的「查看同步状态」按钮调用（ExternalOption ShowSyncStatus）。
+set -u
+
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/com.rimesync.app"
+HISTORY="$STATE_DIR/history.jsonl"
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "Rime 同步" -i accessories-dictionary "$1" "${2:-}"
+  else
+    printf '%s\n%s\n' "$1" "${2:-}"
+  fi
+}
+
+if [ ! -f "$HISTORY" ]; then
+  notify "Rime 同步：尚无记录" "还没有执行过同步。"
+  exit 0
+fi
+
+LAST=$(tail -n 1 "$HISTORY" 2>/dev/null)
+[ -n "$LAST" ] || { notify "Rime 同步：尚无记录" "还没有执行过同步。"; exit 0; }
+
+# 只依赖 python3 解析 JSON；没有 python3 时退回原文摘要。
+if command -v python3 >/dev/null 2>&1; then
+  SUMMARY=$(printf '%s' "$LAST" | python3 -c '
+import json, sys, datetime
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("无法解析同步记录"); raise SystemExit(0)
+ts = d.get("ts") or 0
+when = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "未知时间"
+mode = d.get("mode") or "?"
+ok = d.get("ok")
+head = ("同步成功" if ok else "同步失败") + "（" + mode + "）"
+parts = []
+if d.get("pulled"): parts.append("拉取 %s" % d["pulled"])
+if d.get("pushed"): parts.append("推送 %s" % d["pushed"])
+if d.get("merged"): parts.append("合并 %s" % d["merged"])
+if d.get("conflicts"): parts.append("冲突 %s" % d["conflicts"])
+body = "%s · %s" % (when, "，".join(parts) if parts else "无变化")
+err = (d.get("error") or "").strip()
+if err:
+    body += "\n" + err[:200]
+print(head + "\n" + body)
+')
+  TITLE=$(printf '%s\n' "$SUMMARY" | head -n 1)
+  BODY=$(printf '%s\n' "$SUMMARY" | tail -n +2)
+  notify "$TITLE" "$BODY"
+else
+  notify "Rime 同步：最近一次记录" "$(printf '%s' "$LAST" | cut -c1-200)"
+fi

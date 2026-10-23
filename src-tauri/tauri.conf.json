@@ -76,7 +76,8 @@
           "/usr/share/applications/rime-sync-setup.desktop": "../packaging/linux/rime-sync-setup.desktop",
           "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh",
           "/usr/lib/rime-sync/uninstall.sh": "../packaging/linux/uninstall.sh",
-          "/usr/share/applications/rime-sync-uninstall.desktop": "../packaging/linux/rime-sync-uninstall.desktop"
+          "/usr/share/applications/rime-sync-uninstall.desktop": "../packaging/linux/rime-sync-uninstall.desktop",
+          "/usr/bin/rime-sync-status": "../packaging/linux/rime-sync-status"
         },
         "postInstallScript": "../packaging/linux/postinst",
         "preRemoveScript": "../packaging/linux/prerm",

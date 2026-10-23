@@ -94,6 +94,48 @@ jobs:
       - name: transport x2 (幂等 + userdb 红线)
         run: bash .github/scripts/e2e-rclone.sh
 
+  e2e-dav:
+    name: e2e · dav 两台设备（test-conn / transport / apply / 冲突副本）
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rclone
+        run: |
+          sudo apt-get update
+          # pkg-config/libdbus-1-dev：keyring 依赖，缺了 cargo build 起不来（与 rust job 一致）。
+          sudo apt-get install -y rclone curl python3 pkg-config libdbus-1-dev
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: build cli
+        run: cargo build -p rime-sync-cli --locked
+
+      # runner 上没有 librime：apply 的 deploy 阶段脚本按 SKIP 处理，硬校验的是 transport 阶段。
+      - name: dav e2e (两台设备 + 冲突副本)
+        env:
+          E2E_WORK_DIR: ${{ runner.temp }}
+          RIME_SYNC_CLI: ${{ github.workspace }}/target/debug/rime-sync-cli
+        run: bash scripts/e2e/dav-e2e.sh
+
+      - name: upload e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dav-e2e-logs
+          path: |
+            ${{ runner.temp }}/rime-sync-dav-e2e.*/rclone.log
+            ${{ runner.temp }}/rime-sync-dav-e2e.*/*.json
+            ${{ runner.temp }}/rime-sync-dav-e2e.*/*.err
+            ${{ runner.temp }}/rime-sync-dav-e2e.*/e2e-dev*/log.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
   packaging-scripts:
     name: packaging · vendor 脚本存在性 / 语法
     runs-on: ubuntu-22.04
@@ -132,7 +174,7 @@ jobs:
       - name: bash -n every packaging shell script
         run: |
           set -euo pipefail
-          mapfile -t files < <(find scripts/ime packaging/linux -maxdepth 2 -type f -name '*.sh' | sort)
+          mapfile -t files < <(find scripts/ime scripts/e2e packaging/linux -maxdepth 2 -type f -name '*.sh' | sort)
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           echo "bash -n OK: ${#files[@]} 个脚本"
@@ -214,6 +256,19 @@ jobs:
             echo "::error::release.yml 又跑回了旧的扁平 vendor 抓取（packaging/linux/fetch-vendor-debs.sh）：与四发行版 vendor/<distro>/ 布局冲突"
             exit 1
           fi
+
+      # 新的真实 WebDAV e2e 不能悄悄掉线：job 在 → 脚本被调用 → push/PR 都触发。
+      - name: guard · ci.yml keeps the dav e2e wired on push + pull_request
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/ci.yml
+          grep -qE '^  e2e-dav:' "$wf" || { echo "::error::$wf 缺少 e2e-dav job"; exit 1; }
+          grep -qF 'bash scripts/e2e/dav-e2e.sh' "$wf" || { echo "::error::$wf 未调用 scripts/e2e/dav-e2e.sh"; exit 1; }
+          [ -x scripts/e2e/dav-e2e.sh ] || { echo "::error::scripts/e2e/dav-e2e.sh 不存在或不可执行"; exit 1; }
+          for trigger in push pull_request; do
+            grep -qE "^  ${trigger}:" "$wf" || { echo "::error::ci.yml 的 on: 缺少 ${trigger}（该 e2e 必须在 push/PR 都跑）"; exit 1; }
+          done
+          echo "dav e2e 接线 OK"
 
       - name: parse packaging/windows/fetch-weasel.ps1
         run: |

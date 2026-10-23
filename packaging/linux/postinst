@@ -16,6 +16,9 @@ LOGDIR=/var/log/rime-sync
 # （tauri 的 deb.files 由打包器复制），这里补一次 0755。
 UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
 [ -f "$UNINSTALLER" ] && chmod 0755 "$UNINSTALLER" 2>/dev/null
+# fcitx5-rime 配置页的「查看同步状态」按钮调用它，同样需要执行位。
+STATUS_HELPER=/usr/bin/rime-sync-status
+[ -f "$STATUS_HELPER" ] && chmod 0755 "$STATUS_HELPER" 2>/dev/null
 LOG=$LOGDIR/vendor-install.log
 
 say() { printf '[rime-sync] %s\n' "$*"; }

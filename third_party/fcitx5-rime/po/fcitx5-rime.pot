@@ -51,6 +51,18 @@ msgstr ""
 msgid "打开用户目录 / Open user data directory"
 msgstr ""
 
+#: src/rimeengine.h:71
+msgid "打开同步面板 / Open sync panel"
+msgstr ""
+
+#: src/rimeengine.h:77
+msgid "立即同步 / Sync now"
+msgstr ""
+
+#: src/rimeengine.h:83
+msgid "查看同步状态 / Sync status"
+msgstr ""
+
 #: src/rimeengine.h:57
 msgid "Plugins"
 msgstr ""

@@ -309,6 +309,17 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 .report-note { grid-column: 1 / -1; margin-top: 2px; font-size: 11px; color: var(--danger); white-space: pre-wrap; word-break: break-all; }
 .report-mode { grid-column: 1 / -1; margin-top: 2px; font-size: 11px; color: var(--warn); white-space: pre-wrap; }
 
+/* ---------- 同步预览 ---------- */
+.plan-summary { margin: 10px 0 6px; font-size: 12px; color: var(--muted); }
+.plan-note { margin: 0 0 8px; font-size: 11px; color: var(--warn); }
+.plan-groups { display: grid; gap: 10px; max-height: 320px; overflow-y: auto; }
+.plan-group h3 { font-size: 12px; margin: 0 0 4px; color: var(--muted); font-weight: 600; }
+.plan-group ul { margin: 0; padding-left: 16px; display: grid; gap: 2px; }
+.plan-group li { font-size: 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.plan-group code { font-family: var(--mono); font-size: 11px; word-break: break-all; }
+.plan-detail { color: var(--muted); font-size: 11px; }
+#plan-card .actions { margin-top: 12px; }
+
 /* ---------- log ---------- */
 .log-card { padding: 0; overflow: hidden; }
 .log-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; }

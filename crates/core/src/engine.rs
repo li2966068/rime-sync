@@ -62,6 +62,73 @@ pub struct Report {
     pub merged_entries: Option<usize>,
 }
 
+/// 预演里的单个动作类型。语义与真实 transport 的写操作一一对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanKind {
+    /// 将写入本地（远端 -> 本地）。
+    Pull,
+    /// 将写入远端（本地 -> 远端）。
+    Push,
+    /// 两侧都改过，需要用户处理（预览不写冲突副本）。
+    Conflict,
+    /// 因策略/分类/路径规则跳过。
+    Skip,
+    /// 将删除本地文件（远端已删，本地未改）。
+    DeleteLocal,
+    /// 将删除远端文件（本地已删，远端未改）。
+    DeleteRemote,
+}
+
+impl PlanKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlanKind::Pull => "pull",
+            PlanKind::Push => "push",
+            PlanKind::Conflict => "conflict",
+            PlanKind::Skip => "skip",
+            PlanKind::DeleteLocal => "delete_local",
+            PlanKind::DeleteRemote => "delete_remote",
+        }
+    }
+}
+
+/// 「这次会做什么」的一条记录。path 是动作真正作用的那一侧路径：
+/// 快照是 sync/<installation_id>/<schema>.userdb.txt，shared 文件是 shared/files/<rel>。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanAction {
+    pub kind: PlanKind,
+    pub path: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCounts {
+    pub pull: usize,
+    pub push: usize,
+    pub conflict: usize,
+    pub skip: usize,
+    pub delete_local: usize,
+    pub delete_remote: usize,
+}
+
+/// 预演结果：只有读操作发生过，actions 就是接下来 transport 会做的写动作。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanReport {
+    pub actions: Vec<PlanAction>,
+    pub counts: PlanCounts,
+    /// actions.len()，避免前端再算一次。
+    pub total: usize,
+    /// 本次判定采用的策略模式（normal / preview / pull-only）。
+    pub mode: String,
+    pub first_sync: bool,
+    /// 恒为 true：预演不会真的改任何东西。
+    pub dry_run: bool,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// 单份 userdb 快照的词条差异统计（只统计，不自动合并）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictDetail {
@@ -142,6 +209,10 @@ pub struct Engine {
     trigger: Box<dyn RimeTrigger>,
     progress: Option<ProgressSink>,
     cancel: Option<CancelToken>,
+    /// 预演模式：写操作只记录进 actions，不发 PUT/DELETE、不落盘、不动 index。
+    dry_run: bool,
+    /// 本次预演记录的动作，顺序与真实执行顺序一致。
+    actions: Vec<PlanAction>,
 }
 
 impl Engine {
@@ -185,6 +256,8 @@ impl Engine {
             trigger,
             progress: None,
             cancel: None,
+            dry_run: false,
+            actions: Vec::new(),
         })
     }
 
@@ -294,6 +367,117 @@ impl Engine {
             ),
         );
         report
+    }
+
+    /// 预演（dry-run）：完整跑一遍 transport 的判定链路，但所有写动作只记录不执行。
+    ///
+    /// 只发 GET / HEAD / PROPFIND；不 PUT、不 DELETE、不 MKCOL、不写本地文件，
+    /// 也不写 index.json / base 缓存 / history / retry，不触发输入法部署。
+    pub fn plan(&mut self) -> PlanReport {
+        let started = Instant::now();
+        self.actions.clear();
+        // 预演会就地推进内存基线（否则同一轮里会被反复判定），结束后整体回滚，
+        // 保证 Engine 之后仍按「什么都没发生过」的状态执行真实同步。
+        let saved_index = self.index.clone();
+        self.dry_run = true;
+        let mut report = Report {
+            ok: true,
+            mode: "normal".to_string(),
+            conflict_details: Some(Vec::new()),
+            ..Report::default()
+        };
+        self.emit("plan", 0, 0, "dry run");
+        let outcome = self.do_transport(&mut report);
+        self.dry_run = false;
+        self.index = saved_index;
+        if let Err(error) = outcome {
+            report.ok = false;
+            report.error = Some(format!("{error:#}"));
+            tracing::warn!("plan failed: {error:#}");
+        }
+        dedupe(&mut report.skipped);
+        let mut actions = std::mem::take(&mut self.actions);
+        // 跳过原因与真实同步写进 report.skipped 的完全同一句，统一投影成 Skip。
+        for entry in &report.skipped {
+            let (path, detail) = entry.split_once(": ").unwrap_or((entry.as_str(), ""));
+            actions.push(PlanAction {
+                kind: PlanKind::Skip,
+                path: path.to_string(),
+                detail: detail.to_string(),
+            });
+        }
+        let mut counts = PlanCounts::default();
+        for action in &actions {
+            match action.kind {
+                PlanKind::Pull => counts.pull += 1,
+                PlanKind::Push => counts.push += 1,
+                PlanKind::Conflict => counts.conflict += 1,
+                PlanKind::Skip => counts.skip += 1,
+                PlanKind::DeleteLocal => counts.delete_local += 1,
+                PlanKind::DeleteRemote => counts.delete_remote += 1,
+            }
+        }
+        self.emit(
+            "done",
+            0,
+            actions.len(),
+            format!(
+                "plan: pull={} push={} conflict={} skip={}",
+                counts.pull, counts.push, counts.conflict, counts.skip
+            ),
+        );
+        PlanReport {
+            total: actions.len(),
+            actions,
+            counts,
+            mode: report.mode,
+            first_sync: report.first_sync,
+            dry_run: true,
+            ok: report.ok,
+            error: report.error,
+            duration_ms: started.elapsed().as_millis() as u64,
+        }
+    }
+
+    fn record(&mut self, kind: PlanKind, path: impl Into<String>, detail: impl Into<String>) {
+        self.actions.push(PlanAction {
+            kind,
+            path: path.into(),
+            detail: detail.into(),
+        });
+    }
+
+    /// PUT 闸门：预演时只记一条 Push 并假装成功，让后续判定沿真实路径继续。
+    fn put(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        if_match: Option<&str>,
+        detail: &str,
+    ) -> Result<PutOutcome> {
+        if self.dry_run {
+            self.record(PlanKind::Push, path, detail);
+            return Ok(PutOutcome::Written);
+        }
+        self.dav.put(path, bytes, if_match)
+    }
+
+    /// DELETE 闸门（远端）。
+    fn delete_remote(&mut self, path: &str, detail: &str) -> Result<()> {
+        if self.dry_run {
+            self.record(PlanKind::DeleteRemote, path, detail);
+            return Ok(());
+        }
+        self.dav.delete(path)
+    }
+
+    /// 本地写入闸门：远端 -> 本地，以及合并结果落盘。
+    fn write_pulled(&mut self, rel: &str, bytes: &[u8], detail: &str) -> Result<()> {
+        if self.dry_run {
+            self.record(PlanKind::Pull, rel, detail);
+            return Ok(());
+        }
+        write_file(&self.rime_dir, rel, bytes)
     }
 
     /// 合并 + 部署 + 再 push（librime 会产出新快照）。
@@ -525,13 +709,16 @@ impl Engine {
             );
         }
 
-        self.emit("pull", 0, 0, "ensure remote layout");
-        self.dav.ensure_base()?;
-        self.dav.ensure_dir("sync")?;
-        self.dav.ensure_dir(&remote_sync)?;
-        self.dav.ensure_dir("shared")?;
-        self.dav.ensure_dir("shared/files")?;
-        self.write_owner(&remote_sync)?;
+        // MKCOL / owner.json 都是写操作：预演一律不做（目录不存在也不影响后续读取）。
+        if !self.dry_run {
+            self.emit("pull", 0, 0, "ensure remote layout");
+            self.dav.ensure_base()?;
+            self.dav.ensure_dir("sync")?;
+            self.dav.ensure_dir(&remote_sync)?;
+            self.dav.ensure_dir("shared")?;
+            self.dav.ensure_dir("shared/files")?;
+            self.write_owner(&remote_sync)?;
+        }
 
         self.pull_snapshots(report)?;
         self.sync_shared(report, false)?;
@@ -675,7 +862,11 @@ impl Engine {
                         self.note_userdb_conflict(&entry.path, &current, &bytes, report);
                     }
                 }
-                write_bytes(&local, &bytes)?;
+                if self.dry_run {
+                    self.record(PlanKind::Pull, &entry.path, "snapshot download");
+                } else {
+                    write_bytes(&local, &bytes)?;
+                }
                 report.pulled += 1;
                 if is_userdb {
                     // 新/变化的 *.userdb.txt 只是落盘，还需 apply 才会导入 LevelDB。
@@ -755,7 +946,7 @@ impl Engine {
                 continue;
             }
             self.emit("push", index, total, format!("upload {rel}"));
-            match self.dav.put(&rel, &bytes, None)? {
+            match self.put(&rel, &bytes, None, "snapshot upload")? {
                 PutOutcome::Written => {}
                 PutOutcome::PreconditionFailed => {
                     report
@@ -845,7 +1036,12 @@ impl Engine {
                 else {
                     continue;
                 };
-                let local = local_bytes.as_deref().expect("local hash implies bytes");
+                let local = local_bytes.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "local hash present but file unreadable: {rel} ({})",
+                        local_path.display()
+                    )
+                })?;
                 let normalized_local = custom_yaml_digest(local);
                 let normalized_remote = custom_yaml_digest(&bytes);
                 let normalized_base = self
@@ -889,11 +1085,17 @@ impl Engine {
                     if metadata_only {
                         // 纯 metadata 差异：把远端字节写成本地文件并更新 index/基线，
                         // 下一轮本地与远端整文件一致，不再反复进入这条路径。
-                        let bytes = remote_bytes.expect("metadata-only implies fetched bytes");
-                        let meta = remote_meta
-                            .clone()
-                            .expect("metadata-only implies remote metadata");
-                        write_file(&self.rime_dir, rel, &bytes)?;
+                        let bytes = remote_bytes.ok_or_else(|| {
+                            anyhow!("metadata-only merge without fetched bytes: {rel}")
+                        })?;
+                        let meta = remote_meta.clone().ok_or_else(|| {
+                            anyhow!("metadata-only merge without remote metadata: {rel}")
+                        })?;
+                        self.write_pulled(
+                            rel,
+                            &bytes,
+                            "shared merge: metadata-only, adopt remote",
+                        )?;
                         self.remember_base(Some(&meta.sha256), Some(&bytes));
                         self.index.files.insert(rel.clone(), meta);
                         report.merged += 1;
@@ -926,7 +1128,12 @@ impl Engine {
                         local_bytes.ok_or_else(|| anyhow!("local file disappeared: {rel}"))?;
                     let if_match = remote_meta.as_ref().and_then(|meta| meta.etag.as_deref());
                     let remote_path = format!("shared/files/{rel}");
-                    match self.dav.put(&remote_path, &bytes, if_match)? {
+                    match self.put(
+                        &remote_path,
+                        &bytes,
+                        if_match,
+                        "shared upload: local changed",
+                    )? {
                         PutOutcome::Written => {
                             let meta = FileMeta::local(&bytes);
                             self.remember_base(Some(&meta.sha256), Some(&bytes));
@@ -968,7 +1175,7 @@ impl Engine {
                     if custom {
                         report.config_changed = true;
                     }
-                    write_file(&self.rime_dir, rel, &bytes)?;
+                    self.write_pulled(rel, &bytes, "shared merge: take remote")?;
                     self.remember_base(Some(&meta.sha256), Some(&bytes));
                     self.index.files.insert(rel.clone(), meta);
                     report.pulled += 1;
@@ -990,17 +1197,31 @@ impl Engine {
                     {
                         continue;
                     }
-                    if let Some(bytes) = &local_bytes {
-                        if !self.has_conflict_copy(rel)? {
-                            let conflict_rel = conflict_path(rel, &self.config.device_id)?;
-                            write_file(&self.rime_dir, &conflict_rel, bytes)?;
+                    // 预演不写冲突副本：只报冲突，等用户决定后再由真实同步落盘。
+                    if !self.dry_run {
+                        if let Some(bytes) = &local_bytes {
+                            if !self.has_conflict_copy(rel)? {
+                                let conflict_rel = conflict_path(rel, &self.config.device_id)?;
+                                write_file(&self.rime_dir, &conflict_rel, bytes)?;
+                            }
                         }
+                    } else {
+                        self.record(PlanKind::Conflict, rel, "both sides changed");
                     }
                     report.conflicts.push(rel.clone());
                 }
                 MergeResult::DeleteLocal => {
                     if local_path.exists() {
-                        fs::remove_file(&local_path).with_context(|| format!("remove {rel}"))?;
+                        if self.dry_run {
+                            self.record(
+                                PlanKind::DeleteLocal,
+                                rel,
+                                "deleted remotely, local unchanged",
+                            );
+                        } else {
+                            fs::remove_file(&local_path)
+                                .with_context(|| format!("remove {rel}"))?;
+                        }
                     }
                     self.index.files.remove(rel);
                     manifest.files.remove(rel);
@@ -1013,7 +1234,10 @@ impl Engine {
                         ));
                         continue;
                     }
-                    self.dav.delete(&format!("shared/files/{rel}"))?;
+                    self.delete_remote(
+                        &format!("shared/files/{rel}"),
+                        "shared delete: removed locally",
+                    )?;
                     manifest.files.remove(rel);
                     self.index.files.remove(rel);
                     report.pushed += 1;
@@ -1030,7 +1254,12 @@ impl Engine {
         if !read_only {
             let bytes = serde_json::to_vec_pretty(&manifest)?;
             if manifest_bytes.as_deref() != Some(bytes.as_slice()) {
-                self.dav.put("shared/manifest.json", &bytes, None)?;
+                self.put(
+                    "shared/manifest.json",
+                    &bytes,
+                    None,
+                    "shared manifest update",
+                )?;
             }
         }
         Ok(())
@@ -1102,11 +1331,16 @@ impl Engine {
         };
         let hash = sha256_hex(&bytes);
         if hash != sha256_hex(local_bytes) {
-            write_file(&self.rime_dir, rel, &bytes)?;
+            self.write_pulled(rel, &bytes, "patch merge result")?;
             report.config_changed = true;
         }
         if hash != meta.sha256 {
-            match self.dav.put(&remote_path, &bytes, meta.etag.as_deref())? {
+            match self.put(
+                &remote_path,
+                &bytes,
+                meta.etag.as_deref(),
+                "patch merge upload",
+            )? {
                 PutOutcome::Written => {
                     let new_meta = FileMeta::local(&bytes);
                     self.remember_base(Some(&hash), Some(&bytes));
@@ -1126,10 +1360,14 @@ impl Engine {
         if conflicts.is_empty() {
             tracing::debug!("patch merge resolved {rel}");
         } else {
+            // 段落级合并成功但仍有键冲突：真实同步会额外写冲突副本，预览要说清楚。
+            if self.dry_run {
+                self.record(PlanKind::Conflict, rel, conflicts.join(", "));
+            }
             report
                 .conflicts
                 .push(format!("{rel}: {}", conflicts.join(", ")));
-            if !self.has_conflict_copy(rel)? {
+            if !self.dry_run && !self.has_conflict_copy(rel)? {
                 let conflict_rel = conflict_path(rel, &self.config.device_id)?;
                 write_file(&self.rime_dir, &conflict_rel, local_bytes)?;
             }
@@ -1139,6 +1377,10 @@ impl Engine {
 
     /// 基线内容缓存（内容寻址，只用于 *.custom.yaml 的段落级合并）。
     fn remember_base(&self, hash: Option<&str>, bytes: Option<&[u8]>) {
+        // 基线缓存写 state_dir，也是磁盘副作用：预演不写。
+        if self.dry_run {
+            return;
+        }
         let (Some(hash), Some(bytes)) = (hash, bytes) else {
             return;
         };
@@ -1396,6 +1638,40 @@ mod tests {
             !first_sync_needed(true, 1, 5),
             "existing index means not first sync"
         );
+    }
+
+    #[test]
+    fn plan_report_serializes_actions() {
+        let report = PlanReport {
+            actions: vec![
+                PlanAction {
+                    kind: PlanKind::Push,
+                    path: "sync/devA/main.userdb.txt".into(),
+                    detail: "snapshot upload".into(),
+                },
+                PlanAction {
+                    kind: PlanKind::DeleteLocal,
+                    path: "default.custom.yaml".into(),
+                    detail: "deleted remotely".into(),
+                },
+            ],
+            counts: PlanCounts {
+                push: 1,
+                delete_local: 1,
+                ..PlanCounts::default()
+            },
+            total: 2,
+            mode: "normal".into(),
+            dry_run: true,
+            ok: true,
+            ..PlanReport::default()
+        };
+        let json = serde_json::to_value(&report).expect("json");
+        assert_eq!(json["actions"][0]["kind"], "push");
+        assert_eq!(json["actions"][1]["kind"], "delete_local");
+        assert_eq!(json["counts"]["push"], 1);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["dry_run"], true);
     }
 
     #[test]

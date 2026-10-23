@@ -6,6 +6,7 @@
 #include <rime_levers_api.h>
 #include <WeaselUtility.h>
 #include "WeaselDeployer.h"
+#include <RimeSync.h>
 
 SwitcherSettingsDialog::SwitcherSettingsDialog(RimeSwitcherSettings* settings)
     : settings_(settings), loaded_(false), modified_(false) {
@@ -153,6 +154,11 @@ LRESULT SwitcherSettingsDialog::OnGetSchemata(WORD, WORD, HWND hWndCtl, BOOL&) {
     }
   }
   RegCloseKey(hKey);
+  return 0;
+}
+
+LRESULT SwitcherSettingsDialog::OnRimeSync(WORD, WORD, HWND, BOOL&) {
+  rime_sync::LaunchSetup(m_hWnd);
   return 0;
 }
 
