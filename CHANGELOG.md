@@ -2,6 +2,18 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.5.5 — 2026-10-23
+
+修复「立即合并生效」在 Linux 上必然失败的问题：
+
+1. **rime_dict_manager 工作目录**：该工具按「当前目录」读取 `installation.yaml` 与 `<schema>.userdb`，
+   旧版只在父进程工作目录里运行（并仅设 `RIME_USER_DATA_DIR`），于是打开的是不存在/错误的 LevelDB，
+   报 `Error opening db ... read-only`。现在 `--sync` 与 `-e/--export` 都在 `<rime_dir>` 内执行。
+2. **僵尸进程误判**：`fcitx5 -d` 启动后父进程未 `wait()`，遗留 `comm=fcitx5` 的僵尸；旧判定只看
+   `/proc/<pid>/comm`，把僵尸当成「仍在运行」，apply 恒超时。现在读取 `/proc/<pid>/stat` 的 state，
+   跳过 `Z/X`，并在启动后 `try_wait` 回收子进程。
+3. **停止输入法升级序列**：`fcitx5-remote -e` → 2s → `SIGTERM` → 3s → `SIGKILL`，超时报错带 `pid(state)`。
+4. **锁错误重试**：`rime_dict_manager --sync` 遇到 `read-only`/`Error opening db`/`lock` 时每秒重试，最多 3 次。
 ## v0.5.4 — 2026-10-23
 
 解决 localepurge 清掉翻译后输入法设置页变英文的问题：
