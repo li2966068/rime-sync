@@ -157,11 +157,29 @@ Description: Rime input method engine for fcitx5 (self-built)
  packages and works offline.
 EOF
 
+# localepurge deletes *.mo files for locales outside its whitelist, which makes
+# the fcitx5-rime settings page fall back to English. The labels are bilingual
+# now, but tell the user how to get the pure-Chinese catalogs back.
+cat >"$PKGROOT/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if dpkg-query -W -f='${Status}' localepurge 2>/dev/null | grep -q 'install ok installed'; then
+  echo "[rime-inputmethod] 检测到 localepurge：它会清理 /usr/share/locale 下的翻译文件。" >&2
+  echo "[rime-inputmethod] 配置页标签已是中英双语；如需纯中文，请把 zh_CN 加入 /etc/locale.nopurge 后重装本包。" >&2
+fi
+exit 0
+EOF
+chmod 0755 "$PKGROOT/DEBIAN/postinst"
+
 # The staging tree comes out of the container world-writable and this file
 # system hands out umask 000; dpkg-deb rejects loose DEBIAN permissions, so
 # normalise the whole tree right before packing.
 find "$PKGROOT" -type d -exec chmod 0755 {} +
 find "$PKGROOT" -type f -exec chmod 0644 {} +
+# Maintainer scripts must stay executable after the normalisation above.
+if [ -f "$PKGROOT/DEBIAN/postinst" ]; then
+  chmod 0755 "$PKGROOT/DEBIAN/postinst"
+fi
 if [ -d "$PKGROOT/usr/bin" ]; then
   find "$PKGROOT/usr/bin" -type f -exec chmod 0755 {} +
 fi

@@ -2,6 +2,15 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.5.4 — 2026-10-23
+
+解决 localepurge 清掉翻译后输入法设置页变英文的问题：
+
+1. **配置页标签中英双语**：`fcitx5-rime` 的五个设置项标签直接写成「中文 / English」，
+   即使 `/usr/share/locale` 下的 `.mo` 被清理（localepurge、localepurge 类工具），页面仍然是中文；
+   有语言包时仍显示对应语言。
+2. **安装提示**：IME 包安装时若检测到 `localepurge`，postinst 会提示把 `zh_CN` 加入
+   `/etc/locale.nopurge` 并重装，即可恢复纯中文目录。
 ## v0.5.3 — 2026-10-23
 
 修掉两台 Windows 之间「配置不同步」的假冲突，并把安装/卸载统一成一个产品：

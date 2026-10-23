@@ -21,7 +21,7 @@ msgstr ""
 "Plural-Forms: nplurals=1; plural=0;\n"
 
 #: src/rimeengine.h:42
-msgid "Commit current text when deactivating"
+msgid "取消激活时提交当前文本 / Commit text when deactivating"
 msgstr "取消激活输入法时提交当前文本"
 
 #: src/rimeengine.cpp:117
@@ -29,7 +29,7 @@ msgid "Deploy"
 msgstr "重新部署"
 
 #: src/rimeengine.h:39
-msgid "Fix embedded preedit cursor at the beginning of the preedit"
+msgid "预编辑光标固定在开头 / Fix preedit cursor at the beginning"
 msgstr "固定嵌入预编辑文本光标在预编辑的开头"
 
 #: src/rimeengine.cpp:369
@@ -53,7 +53,7 @@ msgid "Modules"
 msgstr "模块"
 
 #: src/rimeengine.h:52
-msgid "Open user data directory"
+msgid "打开用户目录 / Open user data directory"
 msgstr "打开用户目录"
 
 #: src/rimeengine.h:57
@@ -100,7 +100,7 @@ msgid ""
 msgstr "Rime 正在进行维护程序。可能需要几秒钟。请等待完成……"
 
 #: src/rimeengine.h:35
-msgid "Show preedit within application"
+msgid "在程序中显示预编辑文本 / Show preedit within application"
 msgstr "在程序中显示预编辑文本"
 
 #: src/rimeengine.cpp:381
@@ -116,5 +116,5 @@ msgid "Traditional Chinese is enabled."
 msgstr "已启用繁体中文。"
 
 #: src/rimeengine.h:47
-msgid "User data directory (empty = default)"
+msgid "用户数据目录（留空 = 默认） / User data dir"
 msgstr "用户数据目录（留空 = 默认）"

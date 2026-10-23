@@ -31,25 +31,29 @@ class RimeState;
 
 FCITX_CONFIGURATION(
     RimeEngineConfig,
-    Option<bool> showPreeditInApplication{this, "PreeditInApplication",
-                                          _("Show preedit within application"),
-                                          true};
+    // Labels are bilingual on purpose: distribution tools such as localepurge
+    // may delete every *.mo under /usr/share/locale, and the config page must
+    // still be readable in Chinese without any gettext catalog.
+    Option<bool> showPreeditInApplication{
+        this, "PreeditInApplication",
+        _("在程序中显示预编辑文本 / Show preedit within application"), true};
     Option<bool> preeditCursorPositionAtBeginning{
         this, "PreeditCursorPositionAtBeginning",
-        _("Fix embedded preedit cursor at the beginning of the preedit"), true};
+        _("预编辑光标固定在开头 / Fix preedit cursor at the beginning"), true};
     Option<bool> commitWhenDeactivate{
         this, "Commit when deactivate",
-        _("Commit current text when deactivating"), true};
+        _("取消激活时提交当前文本 / Commit text when deactivating"), true};
     // A real setting: the Rime user directory (where *.userdb, build/ and
     // installation.yaml live). Empty keeps the upstream default,
     // <PkgData>/rime, so existing installs are unaffected.
     Option<std::string> userDataDirPath{
-        this, "UserDataDirPath", _("User data directory (empty = default)"),
-        std::string()};
+        this, "UserDataDirPath",
+        _("用户数据目录（留空 = 默认） / User data dir"), std::string()};
     // Shortcut that opens the *default* user directory in the file manager.
     // It is not a path setting, so its key must not be UserDataDir anymore.
     ExternalOption openUserDataDir{
-        this, "OpenUserDataDir", _("Open user data directory"),
+        this, "OpenUserDataDir",
+        _("打开用户目录 / Open user data directory"),
         stringutils::concat(
             "xdg-open \"",
             stringutils::replaceAll(
