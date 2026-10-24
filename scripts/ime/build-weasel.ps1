@@ -75,6 +75,7 @@ $ErrorActionPreference = 'Stop'
 # 由 Resolve-BuildContext / Get-VsInstallation / Ensure-Boost 填充（StrictMode 下必须先声明）
 $script:VsInstallation = $null
 $script:BoostSource = 'unknown'
+$script:B2Version = ''
 
 # ---- 固定版本（改版本时必须同步 packaging/nsis-hooks.nsh 的 RIMESYNC_WEASEL_*）----
 $WeaselVersion   = '0.17.4'
@@ -143,15 +144,14 @@ function Invoke-Native {
     return $code
 }
 
-# 在 VS 开发者环境（VsDevCmd/vcvars）里跑一条命令行。
-# 用临时 .cmd 而不是把环境导回 PowerShell：b2 需要 cl.exe 所在的那个“视图”，
+# 在 VS 开发者环境（VsDevCmd/vcvars）里跑命令：一次性 .cmd = dev shell + 三个 boost 定位变量
+# + 用户命令行 + RC 透传。不把环境导出回 PowerShell 是因为 b2 需要 cl.exe 所在的那个“视图”，
 # x86 与 x64 各要一次，导出/覆盖 env 反而容易串味。
-function Invoke-InDevShell {
+function New-DevShellBatch {
     param(
         [Parameter(Mandatory = $true)][string]$Arch,        # amd64 / x86
         [Parameter(Mandatory = $true)][string]$CommandLine,
-        [Parameter(Mandatory = $true)][string]$WorkDir,
-        [switch]$AllowFailure
+        [Parameter(Mandatory = $true)][string]$WorkDir
     )
     $vs = Get-VsInstallation
     $bat = Join-Path ([System.IO.Path]::GetTempPath()) ("rime-sync-weasel-{0}.cmd" -f ([guid]::NewGuid().ToString('N')))
@@ -168,10 +168,23 @@ function Invoke-InDevShell {
         ('set "VS170COMNTOOLS=' + $vs.CommonTools + '"'),
         ('cd /d "' + $WorkDir + '"'),
         $CommandLine,
+        # 显式落 RC 再 exit /b：中间不允许再有别的命令改写 ERRORLEVEL
         'set "RIMESYNC_RC=%ERRORLEVEL%"',
         'exit /b %RIMESYNC_RC%'
     )
     Set-Content -LiteralPath $bat -Value $lines -Encoding (Get-TextEncodingName)
+    return $bat
+}
+
+# 跑一条命令行，输出直通日志，返回退出码。
+function Invoke-InDevShell {
+    param(
+        [Parameter(Mandatory = $true)][string]$Arch,        # amd64 / x86
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$WorkDir,
+        [switch]$AllowFailure
+    )
+    $bat = New-DevShellBatch -Arch $Arch -CommandLine $CommandLine -WorkDir $WorkDir
     try {
         & cmd.exe /c $bat 2>&1 | Out-Host
         $code = Get-LastExitCode
@@ -182,6 +195,24 @@ function Invoke-InDevShell {
         throw "开发者环境命令失败（exit $code）：$CommandLine"
     }
     return $code
+}
+
+# 跑一条命令行并**捕获**输出（给“只认输出不认退出码”的探测用，比如 b2 --version）。
+function Get-DevShellOutput {
+    param(
+        [Parameter(Mandatory = $true)][string]$Arch,
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$WorkDir
+    )
+    $bat = New-DevShellBatch -Arch $Arch -CommandLine $CommandLine -WorkDir $WorkDir
+    try {
+        $out = @(& cmd.exe /c $bat 2>&1)
+        $code = Get-LastExitCode
+    } finally {
+        Remove-Item -LiteralPath $bat -Force -ErrorAction SilentlyContinue
+    }
+    $text = (@($out) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    return [pscustomobject]@{ ExitCode = $code; Text = $text }
 }
 
 function Get-VsInstallation {
@@ -361,16 +392,36 @@ function Assert-DevShellCompiler {
 # "### unable to detect your toolset installation" 并让 bootstrap 以 1 退出 —— v0.6.1 就死在这里
 # （build.bat 自己都提示 "You can specify the toolset as the argument, i.e. .\build.bat msvc"）。
 # 显式传 vc143 会直接进 config_toolset.bat 的 Config_VC143，跳过 guess。
+# b2 的退出码不可靠：`b2 --version` 在 4.10-git 这类构建里会先打印版本号，
+# 之后仍以 1 退出（v0.6.1 修复后的首次 CI：输出了 "B2 4.10-git"，脚本却读到 exit 1）。
+# 所以验活只认输出里的版本号，不认 $LASTEXITCODE，并把原始输出写进日志方便以后 grep。
+function Get-B2Version {
+    param([Parameter(Mandatory = $true)][string]$B2)
+    $probe = Get-DevShellOutput -Arch 'amd64' -WorkDir $script:BoostDir -CommandLine ('call "' + $B2 + '" --version')
+    $text = $probe.Text.Trim()
+    Write-Host ("[boost] b2 --version 原始输出（exit {0}）：" -f $probe.ExitCode)
+    if ($text) {
+        foreach ($line in ($text -split '\r?\n')) { Write-Host ('  ' + $line) }
+    } else {
+        Write-Host '  <空>'
+    }
+    $m = [regex]::Match($text, '(?m)^\s*B2\s+([0-9]+\.[0-9]+)')
+    if (-not $m.Success) { return '' }
+    $version = $m.Value.Trim()
+    Write-Host "[boost] b2 版本=$version"
+    return $version
+}
+
 function Initialize-B2 {
     $b2 = Join-Path $script:BoostDir 'b2.exe'
     if (Test-Path -LiteralPath $b2) {
-        $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -AllowFailure -CommandLine ('call "' + $b2 + '" --version')
-        if ($code -eq 0) {
+        $script:B2Version = Get-B2Version -B2 $b2
+        if ($script:B2Version) {
             $script:BoostSource = 'reused-b2'
-            Write-Host "[boost] 复用已存在的 b2.exe：$b2"
+            Write-Host "[boost] 复用已存在的 b2.exe：$b2（$script:B2Version）"
             return
         }
-        Write-Warning "[boost] 已存在的 b2.exe 跑不起来（exit $code），重新 bootstrap"
+        Write-Warning '[boost] 已存在的 b2.exe 输出里没有 B2 版本号，重新 bootstrap'
         Remove-Item -LiteralPath $b2 -Force -ErrorAction SilentlyContinue
     }
 
@@ -402,9 +453,12 @@ function Initialize-B2 {
         $script:BoostSource = 'engine-build-vc143'
     }
 
-    $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -AllowFailure -CommandLine ('call "' + $b2 + '" --version')
-    if ($code -ne 0) { throw "b2.exe 生成了但无法执行（exit $code）：$b2" }
-    Write-Host "[boost] b2 就绪：$b2（来源 $script:BoostSource）"
+    $script:B2Version = Get-B2Version -B2 $b2
+    if (-not $script:B2Version) {
+        throw ('b2.exe 生成了但验活失败：b2 --version 的输出里没有 "B2 <major>.<minor>"。' + [Environment]::NewLine +
+               '上面的原始输出通常写着真正的原因（所在目录没有 Jamfile、缺 DLL、cl 不可用等）。')
+    }
+    Write-Host "[boost] b2 就绪：$b2（$script:B2Version，来源 $script:BoostSource）"
 }
 
 function Ensure-Boost {
