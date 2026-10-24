@@ -72,6 +72,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# 由 Resolve-BuildContext / Get-VsInstallation / Ensure-Boost 填充（StrictMode 下必须先声明）
+$script:VsInstallation = $null
+$script:BoostSource = 'unknown'
+
 # ---- 固定版本（改版本时必须同步 packaging/nsis-hooks.nsh 的 RIMESYNC_WEASEL_*）----
 $WeaselVersion   = '0.17.4'
 $WeaselBuild     = '0'
@@ -149,13 +153,19 @@ function Invoke-InDevShell {
         [Parameter(Mandatory = $true)][string]$WorkDir,
         [switch]$AllowFailure
     )
-    $vsDevCmd = Find-VsDevCmd
+    $vs = Get-VsInstallation
     $bat = Join-Path ([System.IO.Path]::GetTempPath()) ("rime-sync-weasel-{0}.cmd" -f ([guid]::NewGuid().ToString('N')))
     $lines = @(
         '@echo off',
         'setlocal',
-        ('call "' + $vsDevCmd + '" -arch=' + $Arch + ' -host_arch=amd64 -no_logo'),
+        ('call "' + $vs.VsDevCmd + '" -arch=' + $Arch + ' -host_arch=amd64 -no_logo'),
         'if errorlevel 1 exit /b 9001',
+        # boost 1.84 的 build.bat 靠这三个变量定位工具集（tools/build/src/engine/guess_toolset.bat、
+        # config_toolset.bat）。VsDevCmd 只保证 VSINSTALLDIR/VCINSTALLDIR 正确，VS170COMNTOOLS 它不设；
+        # 这里把 vswhere 已经解析好的安装路径显式喂进去，bootstrap/b2 就不必再自己猜。
+        ('set "VSINSTALLDIR=' + $vs.InstallPath + '"'),
+        ('set "VCINSTALLDIR=' + $vs.VcDir + '"'),
+        ('set "VS170COMNTOOLS=' + $vs.CommonTools + '"'),
         ('cd /d "' + $WorkDir + '"'),
         $CommandLine,
         'set "RIMESYNC_RC=%ERRORLEVEL%"',
@@ -174,34 +184,61 @@ function Invoke-InDevShell {
     return $code
 }
 
-function Find-VsDevCmd {
+function Get-VsInstallation {
+    if ($null -ne $script:VsInstallation) { return $script:VsInstallation }
+
+    $installPath = ''
     $pf86 = ${env:ProgramFiles(x86)}
     $vswhere = $null
     if ($pf86) { $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe' }
     if ($vswhere -and (Test-Path -LiteralPath $vswhere)) {
-        $installPath = & $vswhere -latest -products '*' -requires 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' -property installationPath
-        $code = Get-LastExitCode
-        if (($code -eq 0) -and $installPath) {
-            $first = @($installPath)[0]
-            $candidate = Join-Path $first.Trim() 'Common7\Tools\VsDevCmd.bat'
-            if (Test-Path -LiteralPath $candidate) { return $candidate }
+        Write-Host "[vs] vswhere: $vswhere"
+        $found = @(& $vswhere -latest -products '*' -requires 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' -property installationPath 2>$null)
+        foreach ($line in $found) {
+            $candidate = ([string]$line).Trim()
+            if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate 'Common7\Tools\VsDevCmd.bat'))) {
+                $installPath = $candidate
+                break
+            }
+        }
+        if (-not $installPath) {
+            Write-Warning '[vs] vswhere 没给出带 C++ 工作负载的安装，回退到目录扫描'
         }
     }
-    $roots = @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})
-    foreach ($root in $roots) {
-        if (-not $root) { continue }
-        $vsRoot = Join-Path $root 'Microsoft Visual Studio'
-        if (-not (Test-Path -LiteralPath $vsRoot)) { continue }
-        $versions = Get-ChildItem -LiteralPath $vsRoot -Directory -ErrorAction SilentlyContinue
-        foreach ($ver in $versions) {
-            $editions = Get-ChildItem -LiteralPath $ver.FullName -Directory -ErrorAction SilentlyContinue
-            foreach ($ed in $editions) {
-                $candidate = Join-Path $ed.FullName 'Common7\Tools\VsDevCmd.bat'
-                if (Test-Path -LiteralPath $candidate) { return $candidate }
+
+    if (-not $installPath) {
+        $roots = @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})
+        foreach ($root in $roots) {
+            if (-not $root) { continue }
+            $vsRoot = Join-Path $root 'Microsoft Visual Studio'
+            if (-not (Test-Path -LiteralPath $vsRoot)) { continue }
+            $versions = Get-ChildItem -LiteralPath $vsRoot -Directory -ErrorAction SilentlyContinue
+            foreach ($ver in $versions) {
+                $editions = Get-ChildItem -LiteralPath $ver.FullName -Directory -ErrorAction SilentlyContinue
+                foreach ($ed in $editions) {
+                    if (Test-Path -LiteralPath (Join-Path $ed.FullName 'Common7\Tools\VsDevCmd.bat')) {
+                        $installPath = $ed.FullName
+                        break
+                    }
+                }
             }
         }
     }
-    throw '找不到 Visual Studio 的 VsDevCmd.bat（需要 VS2022 + “使用 C++ 的桌面开发”）。'
+
+    if (-not $installPath) {
+        throw '找不到 Visual Studio 的 VsDevCmd.bat（需要 VS2022 + “使用 C++ 的桌面开发”）。'
+    }
+
+    # 带尾部分隔符：boost 的 msvc.jam / config_toolset.bat 会直接做字符串拼接。
+    $vcDir = (Join-Path $installPath 'VC') + '\'
+    $script:VsInstallation = [pscustomobject]@{
+        InstallPath = $installPath + '\'
+        VcDir       = $vcDir
+        VsDevCmd    = Join-Path $installPath 'Common7\Tools\VsDevCmd.bat'
+        VcVarsAll   = Join-Path $vcDir 'Auxiliary\Build\vcvarsall.bat'
+        CommonTools = (Join-Path $installPath 'Common7\Tools') + '\'
+    }
+    return $script:VsInstallation
 }
 
 function Get-SevenZip {
@@ -293,13 +330,95 @@ function Test-BoostReady {
     return ($null -ne $hit)
 }
 
+# dev shell 里到底有没有 cl.exe —— 没有的话 bootstrap/b2/msbuild 会以各种难懂的方式失败，
+# 所以先单独探一次，并把 VS 路径打出来。
+function Test-DevShellCompiler {
+    param([string]$WorkDir = '')
+    if (-not $WorkDir) { $WorkDir = $script:WeaselDir }
+    $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $WorkDir -CommandLine 'where cl.exe' -AllowFailure
+    return ($code -eq 0)
+}
+
+function Assert-DevShellCompiler {
+    # boost 还没解压时用 weasel 源码目录做 cwd，免得 cd 失败被误判成“没有 cl.exe”
+    $probeDir = $script:WeaselDir
+    if (Test-Path -LiteralPath $script:BoostDir) { $probeDir = $script:BoostDir }
+    if (Test-DevShellCompiler -WorkDir $probeDir) { return }
+    $vs = Get-VsInstallation
+    Write-Host '[vs] 诊断：'
+    Write-Host ("  VSINSTALLDIR  = " + $vs.InstallPath)
+    Write-Host ("  VCINSTALLDIR  = " + $vs.VcDir)
+    Write-Host ("  VsDevCmd      = " + $vs.VsDevCmd)
+    Invoke-InDevShell -Arch 'amd64' -WorkDir $probeDir -AllowFailure -CommandLine (
+        'echo VSINSTALLDIR=%VSINSTALLDIR%& echo VCINSTALLDIR=%VCINSTALLDIR%& ' +
+        'echo VCToolsVersion=%VCToolsVersion%& where cl.exe& where msbuild.exe') | Out-Null
+    throw ('开发者环境（VsDevCmd）里拿不到 cl.exe。' + [Environment]::NewLine +
+           '需要 runner 装 VS2022 + “使用 C++ 的桌面开发”工作负载；若已安装，检查 vswhere 是否指向了另一份安装。')
+}
+
+# boost 1.84 的 bootstrap.bat 没拿到显式 toolset 时会走 guess_toolset.bat：它只认 VS2017 的
+# 硬编码路径（外加一层 vswhere 包装），在「只有 VS2022」的 runner 上会打印
+# "### unable to detect your toolset installation" 并让 bootstrap 以 1 退出 —— v0.6.1 就死在这里
+# （build.bat 自己都提示 "You can specify the toolset as the argument, i.e. .\build.bat msvc"）。
+# 显式传 vc143 会直接进 config_toolset.bat 的 Config_VC143，跳过 guess。
+function Initialize-B2 {
+    $b2 = Join-Path $script:BoostDir 'b2.exe'
+    if (Test-Path -LiteralPath $b2) {
+        $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -AllowFailure -CommandLine ('call "' + $b2 + '" --version')
+        if ($code -eq 0) {
+            $script:BoostSource = 'reused-b2'
+            Write-Host "[boost] 复用已存在的 b2.exe：$b2"
+            return
+        }
+        Write-Warning "[boost] 已存在的 b2.exe 跑不起来（exit $code），重新 bootstrap"
+        Remove-Item -LiteralPath $b2 -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Step "bootstrap boost（$script:BoostDir，显式 toolset vc143）"
+    $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -CommandLine 'call bootstrap.bat vc143' -AllowFailure
+    if (($code -eq 0) -and (Test-Path -LiteralPath $b2)) {
+        $script:BoostSource = 'bootstrap-vc143'
+    } else {
+        # bootstrap.bat 本身只做三件事：cd tools\build\src\engine、build.bat <toolset>、把 b2.exe
+        # 拷回根目录。直接复刻这一步，绕开 bootstrap.bat 自己的路径处理。
+        Write-Warning "[boost] bootstrap.bat vc143 失败（exit $code），改走 tools\build\src\engine\build.bat vc143"
+        $engineDir = Join-Path $script:BoostDir 'tools\build\src\engine'
+        Assert-File (Join-Path $engineDir 'build.bat') 'boost 源码树不完整：缺 tools\build\src\engine\build.bat（7z 解压失败？）'
+        $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $engineDir -CommandLine 'call build.bat vc143' -AllowFailure
+        $engineB2 = Join-Path $engineDir 'b2.exe'
+        if (($code -ne 0) -or (-not (Test-Path -LiteralPath $engineB2))) {
+            throw ('boost 的 b2 引擎构建失败（bootstrap 与 build.bat 都不是 0）：b2.exe 没生成。' + [Environment]::NewLine +
+                   '排查：① runner 是否缺 VS2022 C++ 工作负载（上面 "where cl.exe" 的结果）；' + [Environment]::NewLine +
+                   '      ② 在 VS2022 x64 Native Tools 提示符里 cd ' + $script:BoostDir + ' 后手动执行 bootstrap.bat vc143；' + [Environment]::NewLine +
+                   '      ③ 若只能离线构建，把一份 /MT（-mt-s- 名字）的自建 boost 放到 -BoostRoot 指向的目录。')
+        }
+        Copy-Item -LiteralPath $engineB2 -Destination $b2 -Force
+        Set-Content -LiteralPath (Join-Path $script:BoostDir 'project-config.jam') -Value @(
+            '# generated by scripts/ime/build-weasel.ps1 (bootstrap fallback)',
+            'import option ;',
+            'using msvc ;',
+            'option.set keep-going : false ;'
+        ) -Encoding (Get-TextEncodingName)
+        $script:BoostSource = 'engine-build-vc143'
+    }
+
+    $code = Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -AllowFailure -CommandLine ('call "' + $b2 + '" --version')
+    if ($code -ne 0) { throw "b2.exe 生成了但无法执行（exit $code）：$b2" }
+    Write-Host "[boost] b2 就绪：$b2（来源 $script:BoostSource）"
+}
+
 function Ensure-Boost {
     $needX64 = (-not (Test-BoostReady -Bits '64')) -or $RebuildBoost
     $needX86 = (-not $SkipWin32) -and (((-not (Test-BoostReady -Bits '32'))) -or $RebuildBoost)
     if ((-not $needX64) -and (-not $needX86)) {
-        Write-Host "[boost] 已就绪：$script:BoostDir"
+        $script:BoostSource = 'cache'
+        Write-Host "[boost] 已就绪（缓存命中，跳过下载/bootstrap/b2）：$script:BoostDir"
+        Write-Host ("[boost] 来源=cache；x64={0}；x86={1}" -f (Test-BoostReady -Bits '64'), (Test-BoostReady -Bits '32'))
         return
     }
+
+    # 真正要编译 boost 时先确认 dev shell 里真有 cl.exe：比等 120 MB 下载 + b2 报错快得多
+    Assert-DevShellCompiler
 
     $boostTag = $BoostVersion -replace '\.', '_'
     $depsDir = Join-Path $script:WeaselDir 'deps'
@@ -319,10 +438,13 @@ function Ensure-Boost {
         Invoke-Native -FilePath $sevenZip -Arguments @('x', $archive, "-o$depsDir", '-y') | Out-Null
     }
 
-    Assert-File (Join-Path $script:BoostDir 'bootstrap.bat') 'BOOST_ROOT 必须指向 boost 源码树（含 bootstrap.bat）；预编译 boost 请放到 <root>\boost 与 <root>\stage\lib。'
+    # 注意：不能用 Boost 官方的预编译二进制包（boost_1_84_0-msvc-14.3-*.exe）顶替。
+    # 那套 .lib 是 /MD 运行时（名字里没有 -s），而 Weasel 全树是 /MT
+    # （weasel.vcxproj: RuntimeLibrary=MultiThreaded），boost 的自动链接只会去找
+    # libboost_*-mt-s-*；/MD 的 .lib 会被 MSVC 直接拒掉（LNK1104 / LNK2038）。
+    Assert-File (Join-Path $script:BoostDir 'bootstrap.bat') 'BOOST_ROOT 必须指向 boost 源码树（含 bootstrap.bat）；自建的 /MT boost（-mt-s- 名字）请放到 <root>\boost 与 <root>\stage\lib。'
     if ($needX64 -or $needX86) {
-        Write-Step "bootstrap boost（$script:BoostDir）"
-        Invoke-InDevShell -Arch 'amd64' -WorkDir $script:BoostDir -CommandLine 'call bootstrap.bat' | Out-Null
+        Initialize-B2
     }
 
     $b2 = Join-Path $script:BoostDir 'b2.exe'
@@ -356,6 +478,9 @@ function Ensure-Boost {
     if ((-not $SkipWin32) -and (-not (Test-BoostReady -Bits '32'))) {
         throw 'boost x86 构建后仍找不到 stage\lib\libboost_filesystem-vc*-mt-s-x86-*.lib'
     }
+    $x86Text = 'skipped'
+    if (-not $SkipWin32) { $x86Text = [string](Test-BoostReady -Bits '32') }
+    Write-Host ("[boost] 来源={0}；x64={1}；x86={2}；root={3}" -f $script:BoostSource, (Test-BoostReady -Bits '64'), $x86Text, $script:BoostDir)
 }
 
 # ---------------------------------------------------------------------------
@@ -632,7 +757,21 @@ function Invoke-Preflight {
     $sevenZip = Get-SevenZip -WeaselDir $script:WeaselDir
     $makensis = Find-Makensis
     $vsText = 'missing'
-    try { $vsText = Find-VsDevCmd } catch { $vsText = 'missing: ' + $_.Exception.Message }
+    $vsPathText = 'missing'
+    try {
+        $vs = Get-VsInstallation
+        $vsText = $vs.VsDevCmd
+        $vsPathText = $vs.InstallPath
+    } catch { $vsText = 'missing: ' + $_.Exception.Message }
+    $clText = 'unknown'
+    if ($vsText -notlike 'missing*') {
+        try {
+            if (Test-DevShellCompiler -WorkDir $script:WeaselDir) { $clText = 'ok' }
+            else { $clText = 'missing（VS 缺 C++ 工作负载？）' }
+        } catch { $clText = 'error: ' + $_.Exception.Message }
+    }
+    $b2Text = '缺失（会 bootstrap vc143）'
+    if (Test-Path -LiteralPath (Join-Path $script:BoostDir 'b2.exe')) { $b2Text = '已存在（复用）' }
     $sevenZipText = '缺失'
     if ($sevenZip) { $sevenZipText = $sevenZip }
     $makensisText = '缺失（会自动安装 3.08）'
@@ -646,7 +785,10 @@ function Invoke-Preflight {
         [pscustomobject]@{ Name = 'boost x86 ready';  Value = (Test-BoostReady -Bits '32') },
         [pscustomobject]@{ Name = 'librime ready';    Value = (Test-LibrimeReady) },
         [pscustomobject]@{ Name = '7z';               Value = $sevenZipText },
+        [pscustomobject]@{ Name = 'VS 安装';          Value = $vsPathText },
         [pscustomobject]@{ Name = 'VsDevCmd';         Value = $vsText },
+        [pscustomobject]@{ Name = 'cl.exe (devshell)'; Value = $clText },
+        [pscustomobject]@{ Name = 'b2.exe';           Value = $b2Text },
         [pscustomobject]@{ Name = 'makensis';         Value = $makensisText }
     )
     $rows | Format-Table -AutoSize | Out-String | Write-Host

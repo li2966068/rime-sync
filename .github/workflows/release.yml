@@ -137,6 +137,7 @@ jobs:
       - name: upload sync deb
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: sync-deb
           if-no-files-found: error
           path: src-tauri/target/release/bundle/deb/*.deb
@@ -144,6 +145,7 @@ jobs:
       - name: upload sync appimage
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: sync-appimage
           if-no-files-found: error
           path: |
@@ -295,6 +297,7 @@ jobs:
       - name: upload ime artifacts (${{ matrix.distro }})
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ime-${{ matrix.distro }}
           if-no-files-found: error
           # 注意：不要上传 rime-smoke（四个发行版同名，merge-multiple 后会撞名，
@@ -361,13 +364,16 @@ jobs:
       - name: upload linux bundles
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: linux-bundles
           if-no-files-found: error
           path: dist/**
 
   windows:
     name: windows · nsis + portable zip
-    runs-on: windows-latest
+    # 固定 2022：脚本的前提是 VS2022 + v143 + boost 1.84（windows-latest 会跟着微软迁移，
+    # 迁移当天工具集/boost 探测会一起漂移）。要换 runner 请先跑一遍 build-weasel.ps1 -Check。
+    runs-on: windows-2022
     outputs:
       weasel_mode: ${{ steps.weasel_mode.outputs.mode }}
       weasel_source: ${{ steps.weasel_verify.outputs.source }}
@@ -440,6 +446,12 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # 缓存四件套：
+      #   boost/ + stage/   命中就直接跳过下载/bootstrap/b2（日志会打印「来源=cache」）
+      #   b2.exe            源码/头文件在、但 b2 丢了时不用重跑 bootstrap
+      #   boost_1_84_0.7z   失败重跑时不必再从 archives.boost.io 拉 120 MB
+      # key 含 build-weasel.ps1 的哈希：脚本一改就换 key，但 restore-keys 会捞上一次的同名缓存，
+      # 所以调试期间不会每次都从零编译。
       - name: cache weasel build deps (boost 1.84.0)
         if: steps.weasel_mode.outputs.mode != 'fetch'
         uses: actions/cache@v4
@@ -447,13 +459,37 @@ jobs:
           path: |
             third_party/weasel/deps/boost_1_84_0/boost
             third_party/weasel/deps/boost_1_84_0/stage
+            third_party/weasel/deps/boost_1_84_0/b2.exe
+            third_party/weasel/deps/boost_1_84_0/project-config.jam
+            third_party/weasel/deps/boost_1_84_0.7z
           key: ${{ runner.os }}-weasel-boost-1.84.0-${{ hashFiles('scripts/ime/build-weasel.ps1', 'third_party/weasel/weasel.sln') }}
           restore-keys: |
             ${{ runner.os }}-weasel-boost-1.84.0-
 
+      # 先在 1 分钟内把工具链看清楚，再进 90 分钟的自编译。
+      # -Check 不下载、不编译，只打印 repo root/VS/cl.exe/b2/boost 状态；
+      # v0.6.1 的失败点（bootstrap 探测不到工具集）在这里就会以「cl.exe = ok」+ VS 路径暴露。
+      - name: preflight · weasel toolchain（VS2022 / v143 / boost 缓存）
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -Check
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::build-weasel.ps1 -Check 失败（exit $LASTEXITCODE）：VS 工具链或 vendored 源码不完整"
+            exit $LASTEXITCODE
+          }
+
       # 从 vendored 源码（third_party/weasel = rime/weasel 0.17.4）编译 Weasel 安装包。
       # 依赖：VS2022/v143 + boost 1.84.0（脚本自建/缓存）+ librime 预编译包（get-rime.ps1）
       #       + NSIS 3.08（脚本自动安装）。脚本内部会做产物断言。
+      #
+      # boost 的取法（v0.6.1 就死在这一步）：
+      #   脚本现在固定 `call bootstrap.bat vc143`，并把 VSINSTALLDIR/VCINSTALLDIR/VS170COMNTOOLS
+      #   显式喂进 dev shell。原因：boost 1.84 的 bootstrap 不带 toolset 时会走 guess_toolset.bat，
+      #   那里只认 VS2017 路径，VS2022-only 的 runner 上必然报
+      #   "### unable to detect your toolset installation" 然后 exit 1。
+      #   不要改用 SourceForge 的预编译包：它是 /MD，Weasel 是 /MT，链接会硬失败（LNK1104/LNK2038）。
       # require（tag 发布）：失败即本 job 失败，**不回退**（v0.6.0 事故的根因就是这里静默回退了）。
       # build/fetch（手动）：失败只让本步骤红，下一步回退上游官方包，但会在 summary / 发布说明红字标注。
       - name: build weasel installer from vendored source
@@ -473,6 +509,35 @@ jobs:
           }
           $exe = Get-Item -LiteralPath 'packaging/windows/vendor/weasel-0.17.4.0-installer.exe'
           Write-Host ("self-built weasel: {0:N1} MiB" -f ($exe.Length / 1MB))
+
+      # 只有自编译失败时才跑：把 VS 安装 / cl.exe / boost 目录状态一次性打到日志里。
+      # v0.6.1 的日志里只有 "unable to detect your toolset installation" 这一句猜谜；
+      # 下一次失败应该能从日志直接读出「哪份 VS、有没有 cl、b2 在不在、boost 源码树齐不齐」。
+      - name: dump toolchain diagnostics (self-build failed)
+        if: steps.weasel_selfbuild.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host '==== vswhere installations ===='
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path -LiteralPath $vswhere) {
+            & $vswhere -all -products '*' -property installationPath
+            & $vswhere -all -products '*' -property installationVersion
+          } else {
+            Write-Host "vswhere 不存在：$vswhere"
+          }
+          Write-Host '==== boost tree ===='
+          $root = 'third_party/weasel/deps/boost_1_84_0'
+          Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue |
+            Select-Object Mode, Length, Name | Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host ('b2.exe = ' + (Test-Path -LiteralPath (Join-Path $root 'b2.exe')))
+          Write-Host ('bootstrap.bat = ' + (Test-Path -LiteralPath (Join-Path $root 'bootstrap.bat')))
+          $lib = Join-Path $root 'stage/lib'
+          if (Test-Path -LiteralPath $lib) {
+            Get-ChildItem -LiteralPath $lib -Filter 'libboost_filesystem-*.lib' | Select-Object -ExpandProperty Name
+          }
+          Write-Host '==== preflight (-Check) ===='
+          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -Check
+          exit 0
 
       # 离线兜底：fetch-weasel.ps1 仍然保留，下载并校验上游官方安装包（大小 + SHA-256）。
       # 触发条件：显式 mode=fetch（或手动选了 build 且自编译失败）。
@@ -598,6 +663,7 @@ jobs:
       - name: upload windows artifacts
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: windows-bundles
           if-no-files-found: error
           path: |
@@ -740,3 +806,31 @@ jobs:
           fi
           # download-artifact 保留 deb/appimage/nsis 子目录，dist/* 会把目录当文件上传。
           find dist -type f -print0 | xargs -0 gh release upload "$TAG" --clobber
+
+      # Artifact 配额很小，发布完立刻删掉本次运行的中间产物；
+      # 配合 upload-artifact 的 retention-days: 1，避免再次撑爆配额。
+      - name: prune run artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          ids=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' 2>/dev/null || true)
+          for id in $ids; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
+          done
+          echo "pruned artifacts"
+
+      # Artifact 配额很小，发布完立刻删掉本次运行的中间产物；
+      # 配合 upload-artifact 的 retention-days: 1，避免再次撑爆配额。
+      - name: prune run artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          ids=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' 2>/dev/null || true)
+          for id in $ids; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
+          done
+          echo "pruned artifacts"
