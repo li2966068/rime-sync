@@ -82,10 +82,10 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
 
 ### 已知差异与离线兜底
 
-- 自编译安装包不含 OpenCC 转换数据（`data\opencc`）：librime 的预编译包不提供该数据。
-  构建期把上游 `install.nsi` 里两行 `File data\opencc\*` 改成 `/nonfatal`
-  （生成 `output/install.rime-sync.nsi`，**不改 vendored 源码**），否则 NSIS 会因
-  “通配符没有匹配文件”直接中止编译。简繁转换等依赖 OpenCC 的特性因此不可用。
+- 自编译安装包的 NSIS 载荷按「文件实际存在」生成宏：ARM/ARM64 组件、OpenCC 数据、data/*.txt、data/*.gram
+  各自用 !ifdef 包住，构建期生成 output/install.rime-sync.nsi（宏前言 + 原样 install.nsi，不改 vendored 源码）。
+  缺哪个可选组件都不会让 makensis 中止；data/*.yaml 仍是硬性 File，缺了会红。
+  （早期版本用把 OpenCC 两行改成 /nonfatal 的做法，现已废弃。）
 - 自编译安装包内置 `third_party/rime-data` 里的全部方案（见第 2 节）：安装器把
   `*.yaml` 平铺进 `C:\Program Files\Rime\weasel-0.17.4\data\`，`essay.txt` 一并放入。
   `-WithRimeData` 仍可用 plum 追加更多方案（plum 在 vendored 树里为空，默认关闭）。

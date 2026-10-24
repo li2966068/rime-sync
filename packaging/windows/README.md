@@ -44,19 +44,16 @@ pnpm tauri build --bundles nsis
 6. **MSBuild**：`weasel.sln`，`Release|x64` + `Release|Win32`（32 位 TSF 组件，
    64 位系统上的 32 位程序要用；`install.nsi` 在编译期就 `File` 它们）。
 7. **NSIS 3.08**：找不到 `makensis` 时先试 `choco install nsis`，再退回 SourceForge 静默安装；
-   先把 `output/install.nsi` 生成一份 `output/install.rime-sync.nsi`（只把两行 OpenCC 数据的
-   `File` 改成 `/nonfatal`，见下），再编译它
-   （`/DWEASEL_VERSION=0.17.4 /DWEASEL_BUILD=0 /DPRODUCT_VERSION=0.17.4.0`）。
+   先把 output/install.nsi 生成一份 output/install.rime-sync.nsi：脚本按 output/ 下实际存在的文件
+   写入 !ifdef 宏（ARM 组件、OpenCC、data 的 txt/gram），再把原样 install.nsi 附在宏之后编译
+   （/DWEASEL_VERSION=0.17.4 /DWEASEL_BUILD=0 /DPRODUCT_VERSION=0.17.4.0）。
 8. **产物断言**：复制到 `vendor/weasel-0.17.4.0-installer.exe`，打印大小与 SHA-256，
    低于 `-MinInstallerMB`（默认 8 MiB）直接失败；写了 `GITHUB_STEP_SUMMARY`（CI 摘要）。
 
-> **OpenCC 数据（构建期改脚本的原因）**
-> librime 的 Windows 预编译包不含 `share/opencc`（那是 librime 构建时生成的），
-> vendored 树里 `librime/` 又是空子模块。上游 `install.nsi` 对
-> `File "data\opencc\*.json"` / `*.ocd*` 用的是**硬性** File（通配符没匹配到就中止编译），
-> 所以构建期生成一份只把这两行改成 `/nonfatal` 的 `install.rime-sync.nsi` 再编译，
-> **不改 vendored 源码**。后果：自编译安装包没有 OpenCC 转换数据（简繁转换等特性不可用），
-> 与「不含输入方案」同属已知差异，见 `docs/THIRD-PARTY.md`。
+> **可选载荷（为什么构建期生成脚本）**
+> 上游 install.nsi 对 ARM/ARM64 二进制、data 的 txt/gram、OpenCC 数据用硬性 File，通配符没匹配到就中止。
+> 我们按文件实际存在与否生成 !ifdef 宏，再原样附上上游脚本：不改 vendored 源码，也不会因缺组件失败。
+> 随包方案数据来自 third_party/rime-data（9 个 recipe、16 个方案），见 docs/THIRD-PARTY.md 第 2 节。
 
 ### 依赖版本
 
@@ -179,8 +176,8 @@ File ...resources...
 - 自编译安装包不含输入方案（plum 为空子模块）；需要方案时用 `-WithRimeData`
   或走官方安装包，见 `docs/THIRD-PARTY.md`。
 
-## 7. 卸载顺序（实现与证据点）
-
+- 自编译安装包内置 third_party/rime-data 的 16 个方案（拼音/五笔/仓颉/笔画/地球/注音）；
+  需要更多方案时用 -WithRimeData 走 plum，见 docs/THIRD-PARTY.md。
 `NSIS_HOOK_PREUNINSTALL` 是 Tauri `Section Uninstall` 的第一条语句（此时 `$INSTDIR` 还在），
 顺序是「先问是否删本地用户数据（默认否）→ 卸小狼毫（仅当是我们装的）→ 删 rime-sync 自己的
 快捷方式/日志 → 最后按选择删 `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app`」。
