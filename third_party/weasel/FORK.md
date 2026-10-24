@@ -103,6 +103,36 @@ button labels live in the UTF-16 .rc files, one copy per LANGUAGE block.
   while NSIS installs Weasel, before rime-sync is finalized; an entry point there has no
   value. The real settings window is the WeaselDeployer one above.
 
+### 2. output/install.nsi: optional payload behind !ifdef (2026-10-24)
+
+Our Windows job builds **x64 + Win32 only** (no ARM toolchain, no ARM boost/librime) and
+fills `output\data` from the vendored `third_party/rime-data`. Upstream's install.nsi
+unconditionally `File`s three groups that may therefore be absent. NSIS treats a `File`
+whose wildcard matches nothing as a hard error; `/nonfatal` downgrades it to a warning,
+but the two OpenCC lines carry no flag, so a missing `share\opencc` aborts the compile
+outright. Even the warning-only remainder (no ARM binaries, no `data\*.txt`) shipped an
+installer below our size floor, i.e. a package without any scheme data.
+
+Each group is now wrapped in `!ifdef`. scripts/ime/build-weasel.ps1 prepends the matching
+`!define`s to the generated `output\install.rime-sync.nsi` **based on the files actually
+present in output\**, and the same switches work as makensis `/D` arguments:
+
+| Macro | Guards | Defined when |
+| --- | --- | --- |
+| `RIMESYNC_WEASEL_ARM` | weaselARM/ARM64/ARM64X `.dll` and `.ime` (3 + 3 `File` lines) | `output\weaselARM64.dll` exists |
+| `RIMESYNC_HAVE_OPENCC` | `SetOutPath $INSTDIR\data\opencc` + `data\opencc\*.json` / `*.ocd*` | `output\data\opencc` holds json/ocd files |
+| `RIMESYNC_HAVE_DATA_TXT` | `data\*.txt` (essay.txt) | `output\data\*.txt` exists |
+| `RIMESYNC_HAVE_DATA_GRAM` | `data\*.gram` | `output\data\*.gram` exists |
+
+Deliberately unchanged: `File "data\*.yaml"`, `File "data\preview\*.png"`, every x64/Win32
+binary line and the existing `/nonfatal` flags — a missing required file still aborts the
+build, so a broken package can never come out green. `-SkipWin32` still throws before
+makensis because upstream compiles the 32-bit TSF files unconditionally.
+
+The generated script keeps the upstream UTF-8 BOM (`Unicode true` + Chinese LangStrings);
+the vendored `install.nsi` stays the single source of truth and is copied byte-for-byte
+behind a 244-byte macro preamble.
+
 ## Verification
 
 Done locally (Linux, no Windows toolchain):

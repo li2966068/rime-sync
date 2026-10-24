@@ -261,10 +261,11 @@ jobs:
           done
           # deb 必须先下载到 packaging/out/ 再抓依赖闭包
           awk '/^  ime:/{f=1} /^  collect:/{f=0} f' "$wf" > /tmp/ime_job.yml
-          dl=$(grep -n 'download-artifact' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
+          # 产物来源已经从 workflow artifact 换成草稿 Release（gh release download）。
+          dl=$(grep -n 'gh release download' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
           fv=$(grep -n 'fetch-vendor-deps.sh "$DISTRO"' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
           if [ -z "$dl" ] || [ -z "$fv" ] || [ "$dl" -ge "$fv" ]; then
-            echo "::error::ime job 里 download-artifact（第 ${dl:-?} 行）必须先于 fetch-vendor-deps（第 ${fv:-?} 行）"
+            echo "::error::ime job 里 gh release download（第 ${dl:-?} 行）必须先于 fetch-vendor-deps（第 ${fv:-?} 行）"
             exit 1
           fi
       - name: legacy flat vendor fetch stays out of release.yml

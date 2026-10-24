@@ -18,6 +18,18 @@ Unicode true
 !define WEASEL_BUILD 0
 !endif
 
+; ---- rime-sync: optional payload switches --------------------------------
+; NSIS treats a "File" wildcard with no matching file as a hard error; /nonfatal
+; downgrades it to a warning, but upstream only flags some of these lines (the
+; OpenCC pair carries no flag, so a missing share\opencc aborts the compile).
+; Everything this fork may not produce is therefore wrapped in !ifdef. The macros
+; are defined by the header scripts/ime/build-weasel.ps1 prepends to
+; install.rime-sync.nsi; they can also be passed as makensis /D switches.
+;   RIMESYNC_WEASEL_ARM      weaselARM/ARM64/ARM64X .dll/.ime (this repo builds x64+Win32 only)
+;   RIMESYNC_HAVE_OPENCC     data\opencc\*.json / *.ocd* (present when librime ships share\opencc)
+;   RIMESYNC_HAVE_DATA_TXT   data\*.txt (essay.txt ...)
+;   RIMESYNC_HAVE_DATA_GRAM  data\*.gram (grammar models)
+
 !define WEASEL_ROOT $INSTDIR\weasel-${WEASEL_VERSION}
 !define REG_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Weasel"
 
@@ -240,20 +252,24 @@ program_files:
   ${If} ${RunningX64}
     File "weaselx64.dll"
   ${EndIf}
+!ifdef RIMESYNC_WEASEL_ARM
   ${If} ${IsNativeARM64}
     File /nonfatal "weaselARM.dll"
     File /nonfatal "weaselARM64.dll"
     File /nonfatal "weaselARM64X.dll"
   ${EndIf}
+!endif
   File "weasel.ime"
   ${If} ${RunningX64}
     File "weaselx64.ime"
   ${EndIf}
+!ifdef RIMESYNC_WEASEL_ARM
   ${If} ${IsNativeARM64}
     File /nonfatal "weaselARM.ime"
     File /nonfatal "weaselARM64.ime"
     File /nonfatal "weaselARM64X.ime"
   ${EndIf}
+!endif
   ; install x64 build for NativeARM64_WINDOWS11 and NativeAMD64_WINDOWS11
   ${If} ${AtLeastWin11} ; Windows 11 and above
     ${If} ${IsNativeARM64}
@@ -291,12 +307,18 @@ program_files:
   ; shared data files
   SetOutPath $INSTDIR\data
   File "data\*.yaml"
+!ifdef RIMESYNC_HAVE_DATA_TXT
   File /nonfatal "data\*.txt"
+!endif
+!ifdef RIMESYNC_HAVE_DATA_GRAM
   File /nonfatal "data\*.gram"
+!endif
   ; opencc data files
+!ifdef RIMESYNC_HAVE_OPENCC
   SetOutPath $INSTDIR\data\opencc
-  File "data\opencc\*.json"
-  File "data\opencc\*.ocd*"
+  File /nonfatal "data\opencc\*.json"
+  File /nonfatal "data\opencc\*.ocd*"
+!endif
   ; images
   SetOutPath $INSTDIR\data\preview
   File "data\preview\*.png"

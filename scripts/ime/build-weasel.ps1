@@ -38,9 +38,9 @@
   （32 位 TSF 组件，64 位系统上的 32 位程序要用），跳过 Win32 会导致 makensis 失败。
 
 .PARAMETER WithRimeData
-  额外用 plum 拉取 Rime 方案数据（prelude：essay + luna_pinyin 等）写入 output\data。
-  默认关闭：vendored 树里 plum/ 为空，且这一步要联网、依赖 bash；关闭时安装包只含
-  上游自带的 weasel.yaml + preview 配色 + librime 的 opencc 数据，不含输入方案。
+  额外用 plum 再拉一批 Rime 方案写入 output\data（要联网 + bash，vendored 树里 plum/ 为空）。
+  默认关闭：安装包内置的 prelude / luna_pinyin / essay 数据来自入库的 third_party/rime-data
+  （离线、可复现），这个开关只用于追加更多方案。
 
 .PARAMETER Check
   只做前置检查与打印计划，不下载、不编译。用于本地/CI 的依赖自检。
@@ -589,6 +589,45 @@ function Ensure-Librime {
 # ---------------------------------------------------------------------------
 # data / props
 # ---------------------------------------------------------------------------
+function Install-RimeDataSource {
+    # 方案数据来源：third_party/rime-data（入库的 rime-prelude / rime-luna-pinyin / rime-essay）。
+    # 上游 build.bat 的 :build_data 用 bash plum/rime-install 把同样的文件写进 output\data；
+    # 这里改用入库副本：离线、可复现，CI 不必联网拉方案。
+    # 布局与 Rime 的 shared data 一致：所有 *.yaml 平铺在 data\ 下，essay.txt 放 data\ 根。
+    $rimeData = Join-Path $script:RepoRoot 'third_party\rime-data'
+    $dataDir = Join-Path (Join-Path $script:WeaselDir 'output') 'data'
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+    Assert-File (Join-Path $rimeData 'rime-prelude\default.yaml') 'third_party/rime-data 未入库：安装包会没有离线方案数据。'
+    Assert-File (Join-Path $rimeData 'rime-essay\essay.txt')
+
+    foreach ($recipe in @('rime-prelude', 'rime-luna-pinyin')) {
+        $srcDir = Join-Path $rimeData $recipe
+        if (-not (Test-Path -LiteralPath $srcDir)) { throw "缺少方案数据目录：third_party/rime-data/$recipe" }
+        $yamls = @(Get-ChildItem -LiteralPath $srcDir -Filter '*.yaml' -File)
+        if ($yamls.Count -eq 0) { throw "third_party/rime-data/$recipe 里没有 *.yaml" }
+        foreach ($file in $yamls) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $dataDir $file.Name) -Force
+        }
+    }
+    Copy-Item -LiteralPath (Join-Path $rimeData 'rime-essay\essay.txt') -Destination (Join-Path $dataDir 'essay.txt') -Force
+
+    # default.yaml 的 schema_list 只能列随包的 schema：librime 部署时每个缺失 schema 都记一次
+    # failure，整次部署会失败（Linux deb 的离线包踩过同一个坑，见 packaging/linux）。
+    $defaultYaml = Join-Path $dataDir 'default.yaml'
+    $raw = Get-Content -LiteralPath $defaultYaml -Raw -Encoding UTF8
+    $schemas = @([regex]::Matches($raw, '(?m)^\s*-\s*schema:\s*([A-Za-z0-9_]+)\s*$') |
+                 ForEach-Object { $_.Groups[1].Value })
+    if ($schemas.Count -eq 0) { throw 'third_party/rime-data/rime-prelude/default.yaml 里没解析出 schema_list（格式变了？）' }
+    foreach ($schema in $schemas) {
+        Assert-File (Join-Path $dataDir ($schema + '.schema.yaml')) "default.yaml 的 schema_list 列了 $schema，但包里没有 $schema.schema.yaml：部署会失败。"
+    }
+
+    Assert-File (Join-Path $dataDir 'weasel.yaml') '上游 output\data\weasel.yaml 丢了：install.nsi 的 File data\*.yaml 需要它。'
+    $yamlCount = @(Get-ChildItem -LiteralPath $dataDir -Filter '*.yaml' -File).Count
+    Write-Host "[data] 方案数据：$yamlCount 个 yaml + essay.txt（来源 third_party/rime-data；schema_list: $($schemas -join ', ')）"
+}
+
 function Prepare-Data {
     $output = Join-Path $script:WeaselDir 'output'
     New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -614,11 +653,14 @@ function Prepare-Data {
         }
     }
 
+    # get-rime.ps1 -use dev 会把 librime 预编译包的 share\opencc 放进 data\opencc；
+    # 拿不到时 install.nsi 里那两行 File 由 !ifdef RIMESYNC_HAVE_OPENCC 关掉（见 Get-OptionalPayloadDefines）。
     $opencc = Join-Path $output 'data\opencc'
     if (-not (Test-Path -LiteralPath $opencc)) {
         New-Item -ItemType Directory -Force -Path $opencc | Out-Null
-        Write-Warning "[data] $opencc 为空：install.nsi 的 File data\opencc\*.json 会给出 warning。"
     }
+
+    Install-RimeDataSource
 
     if ($WithRimeData) {
         $plumDir = Join-Path $script:WeaselDir 'plum'
@@ -727,28 +769,83 @@ function Ensure-Nsis {
     return $found
 }
 
+function Get-OptionalPayloadDefines {
+    # install.nsi 里的可选组件用 !ifdef 包住：NSIS 对“File 通配符没有匹配文件”是硬错误
+    # （/nonfatal 能降级成 warning，但上游只有部分行带这个 flag），缺哪个组件就不定义哪个宏。
+    # 这里按 output\ 里**实际存在的文件**决定，不猜。
+    param([Parameter(Mandatory = $true)][string]$OutputDir)
+
+    $dataDir = Join-Path $OutputDir 'data'
+    $defines = @()
+
+    if (Test-Path -LiteralPath (Join-Path $OutputDir 'weaselARM64.dll')) {
+        $defines += 'RIMESYNC_WEASEL_ARM'
+        Write-Host '[nsis] ARM/ARM64 组件：打包（检测到 weaselARM64.dll）'
+    } else {
+        Write-Host '[nsis] ARM/ARM64 组件：跳过（本仓库只构建 x64 + Win32；需要时加 /DRIMESYNC_WEASEL_ARM）'
+    }
+
+    $opencc = @()
+    $openccDir = Join-Path $dataDir 'opencc'
+    if (Test-Path -LiteralPath $openccDir) {
+        $opencc = @(Get-ChildItem -LiteralPath $openccDir -File |
+                    Where-Object { $_.Name -like '*.json' -or $_.Name -like '*.ocd*' })
+    }
+    if ($opencc.Count -gt 0) {
+        $defines += 'RIMESYNC_HAVE_OPENCC'
+        Write-Host "[nsis] OpenCC 数据：打包（$($opencc.Count) 个文件）"
+    } else {
+        Write-Warning "[nsis] $openccDir 为空：安装包不含简繁/异体转换数据（librime 预编译包的 share\opencc 没取到）。"
+    }
+
+    $txt = @()
+    if (Test-Path -LiteralPath $dataDir) {
+        $txt = @(Get-ChildItem -LiteralPath $dataDir -File | Where-Object { $_.Name -like '*.txt' })
+    }
+    if ($txt.Count -gt 0) {
+        $defines += 'RIMESYNC_HAVE_DATA_TXT'
+        Write-Host "[nsis] data\*.txt：打包（$($txt.Count) 个文件）"
+    } else {
+        Write-Warning '[nsis] data\*.txt 为空：安装包不含 essay.txt 等词库数据。'
+    }
+
+    $gram = @()
+    if (Test-Path -LiteralPath $dataDir) {
+        $gram = @(Get-ChildItem -LiteralPath $dataDir -File | Where-Object { $_.Name -like '*.gram' })
+    }
+    if ($gram.Count -gt 0) {
+        $defines += 'RIMESYNC_HAVE_DATA_GRAM'
+        Write-Host "[nsis] data\*.gram：打包（$($gram.Count) 个文件）"
+    } else {
+        Write-Host '[nsis] data\*.gram：无（语法模型不是必需，跳过）'
+    }
+
+    return $defines
+}
+
 function New-InstallerScript {
-    param([string]$OutputDir)
-    # 上游 install.nsi 用 File "data\opencc\*.json" / "*.ocd*" 强制要求 OpenCC 数据；
-    # 但 librime 的 Windows 预编译包不含 share/opencc（那是 librime 构建时生成的），
-    # vendored 树里 librime/ 又是空子模块。NSIS 对“通配符没有匹配文件”是**硬错误**，
-    # 所以这里在构建期生成一份把这两行改成 /nonfatal 的脚本（不改 vendored 源码）。
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDir,
+        [string[]]$Defines = @()
+    )
+    # 生成副本 = 宏前言 + 未改动的 vendored install.nsi。宏的作用等同 makensis /D：
+    # 未定义 = install.nsi 里对应的 !ifdef 组不参与打包（ARM、OpenCC、data\*.txt|*.gram）。
     $src = Join-Path $OutputDir 'install.nsi'
     $dst = Join-Path $OutputDir 'install.rime-sync.nsi'
     $text = Get-Content -LiteralPath $src -Raw -Encoding UTF8
-    foreach ($glob in @('data\opencc\*.json', 'data\opencc\*.ocd*')) {
-        $needle = 'File "' + $glob + '"'
-        $replacement = 'File /nonfatal "' + $glob + '"'
-        if ($text.Contains($needle)) {
-            $text = $text.Replace($needle, $replacement)
-        } else {
-            Write-Warning "[nsis] install.nsi 里没找到预期的行：$needle（上游脚本可能已改版）"
-        }
-    }
+    $preamble = @(
+        '; 由 scripts/ime/build-weasel.ps1 生成，勿手工编辑（源文件 output\install.nsi）',
+        '; 可选组件开关：未定义的组不参与打包（install.nsi 里用 !ifdef 包住）'
+    )
+    foreach ($define in $Defines) { $preamble += ('!define ' + $define) }
+    $preamble += ''
+    $combined = ($preamble -join [Environment]::NewLine) + [Environment]::NewLine + $text
     # install.nsi 带 UTF-8 BOM（里面有中文 LangString），必须原样保留
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-    [System.IO.File]::WriteAllText($dst, $text, $utf8Bom)
-    Write-Host "[nsis] 已生成 $dst（OpenCC 数据缺失时不再中断打包）"
+    [System.IO.File]::WriteAllText($dst, $combined, $utf8Bom)
+    $macroText = '（无可选组件宏）'
+    if ($Defines.Count -gt 0) { $macroText = '（宏：' + ($Defines -join ', ') + '）' }
+    Write-Host "[nsis] 已生成 $dst $macroText"
     return $dst
 }
 
@@ -758,13 +855,29 @@ function Invoke-Makensis {
         throw '-SkipWin32 只适合调试编译：上游 install.nsi 在编译期就 File Win32\* 与 32 位 TSF 组件，缺了无法产出安装包。'
     }
     $output = Join-Path $script:WeaselDir 'output'
-    Write-Step 'makensis output/install.rime-sync.nsi'
+
+    # makensis 之前先确认“无条件 File”的输入都在：这些缺了 makensis 也可能“成功”，
+    # 但产出的安装包是残缺的（上一轮 CI 就是包体只有 x64 + Win32 二进制、没有方案数据）。
+    foreach ($rel in @(
+        'WeaselServer.exe', 'WeaselDeployer.exe', 'WeaselSetup.exe', 'rime.dll', 'WinSparkle.dll',
+        'weasel.dll', 'weasel.ime', 'weaselx64.dll', 'weaselx64.ime',
+        'Win32\WeaselServer.exe', 'Win32\WeaselDeployer.exe', 'Win32\rime.dll', 'Win32\WinSparkle.dll',
+        'data\weasel.yaml', 'data\default.yaml', 'data\essay.txt'
+    )) {
+        Assert-File (Join-Path $output $rel) "install.nsi 会打包 $rel，但它不存在（先跑完 msbuild / Prepare-Data）。"
+    }
+    $preview = @(Get-ChildItem -LiteralPath (Join-Path $output 'data\preview') -Filter '*.png' -File -ErrorAction SilentlyContinue)
+    if ($preview.Count -eq 0) { throw 'install.nsi 的 File data\preview\*.png 需要至少一张预览图。' }
+
+    $defines = @(Get-OptionalPayloadDefines -OutputDir $output)
+    $nsisScript = New-InstallerScript -OutputDir $output -Defines $defines
+    Write-Step ('makensis output/' + (Split-Path -Leaf $nsisScript))
     $nsisArgs = @(
         '/V2',
         "/DWEASEL_VERSION=$WeaselVersion",
         "/DWEASEL_BUILD=$WeaselBuild",
         "/DPRODUCT_VERSION=$ProductVersion",
-        (Split-Path -Leaf (New-InstallerScript -OutputDir $output))
+        (Split-Path -Leaf $nsisScript)
     )
     Invoke-Native -FilePath $Makensis -Arguments $nsisArgs -WorkDir $output | Out-Null
     $installer = Join-Path $output ("archives\$InstallerName")

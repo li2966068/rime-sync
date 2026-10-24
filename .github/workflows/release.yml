@@ -4,6 +4,12 @@ name: release
 # 产物：
 #   linux   → deb + AppImage（+ 更新包 .AppImage.tar.gz 与 .sig）
 #   windows → NSIS 安装包 + 便携版 zip（+ 更新包 .sig）
+#
+# 发布通道：草稿 Release 直传（v0.6.1 起）。
+#   构建产物一律 gh release upload 到 tag 对应的 draft release，不再用
+#   actions/upload-artifact：Actions Artifacts 有账户级配额，配额一满 upload-artifact
+#   就直接失败（v0.6.1 的 linux-app 就死在这里）；release 资产不受该配额限制。
+#   下游 job 用 gh release download --pattern ... 取输入，publish 最后把草稿转正。
 # 必需的仓库 secrets（Settings → Secrets and variables → Actions）：
 #   TAURI_SIGNING_PRIVATE_KEY           更新签名私钥（minisign/tauri signer 生成）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  私钥口令（无口令可留空）
@@ -30,7 +36,8 @@ on:
           - fetch
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  # 手动触发时的 tag 来自 inputs.tag，用 ref_name 会让不同 tag 共用同一个 group。
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -39,18 +46,72 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "22"
+  # 所有 gh 调用都锁定本仓库：即使某步没 checkout，gh 也不会因为找不到 remote 而失败。
+  GH_REPO: ${{ github.repository }}
 
 jobs:
-# 触发：推送 v* tag，或手动指定一个 tag。
-# 产物：
-#   linux   → deb + AppImage（+ 更新包 .AppImage.tar.gz 与 .sig）
-#             + 四发行版离线安装器（self-extracting .run：IME deb + 依赖闭包）
-#   windows → NSIS 安装包 + 便携版 zip（+ 更新包 .sig）
+  # 草稿 Release 直传的唯一入口：建草稿（已存在就复用）并把 tag 传给下游。
+  # 必须最早跑：下面每个 job 都要 needs 它才能拿到 tag 并写 release 资产。
+  # 幂等：tag 推送失败重跑时草稿通常已经在了，直接复用；下游一律 --clobber 覆盖同名资产。
+  prepare-draft:
+    name: prepare-draft · 草稿 Release
+    # 根 job（无 needs）：草稿必须在任何构建开始前就存在。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$REF_NAME}"
+          case "$tag" in
+            v*) : ;;
+            *) echo "::error::tag 必须形如 v0.6.1，收到：$tag"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release tag: $tag"
+
+      - name: create or reuse draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          : > /tmp/empty-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+            echo "复用已存在的 release：$TAG（draft=$is_draft）"
+            if [ "$is_draft" != "true" ]; then
+              echo "::warning title=发布目标已转正::$TAG 已经是正式 release，本次会直接覆盖它的同名资产"
+            fi
+          else
+            # --verify-tag：tag 不存在就立刻失败（多半是 workflow_dispatch 的 tag 写错）。
+            gh release create "$TAG" --draft --verify-tag \
+              --title "rime-sync $TAG" --notes-file /tmp/empty-notes.md
+            echo "已创建草稿 release：$TAG"
+          fi
+          {
+            echo "### 草稿 Release"
+            echo ""
+            echo "- tag：$TAG"
+            echo "- 构建产物直传到该草稿；publish 最后一步才 --draft=false 转正。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # 应用本体（deb + AppImage）。矩阵里的四个发行版 job 都复用这一个 rime-sync deb。
   linux-app:
     name: linux-app · deb + AppImage
+    needs: prepare-draft
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    permissions:
+      contents: write
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -133,33 +194,36 @@ jobs:
           esac
           echo "$deb ($(( $(stat -c %s "${debs[0]}") / 1024 / 1024 )) MiB)"
 
-      # 单独成 artifact：矩阵的四个 job 只需要这几 MB 的 deb，不必拖 AppImage。
-      - name: upload sync deb
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: sync-deb
-          if-no-files-found: error
-          path: src-tauri/target/release/bundle/deb/*.deb
-
-      - name: upload sync appimage
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: sync-appimage
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
-            src-tauri/target/release/bundle/appimage/*.sig
+      # 直接进草稿 Release：四个 ime job 用 `gh release download --pattern 'rime-sync_*.deb'` 取它。
+      # 资产名只保留 basename，所以这里的 deb 名（rime-sync_<ver>_amd64.deb）就是下游看到的名字。
+      - name: upload bundles to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          tarballs=(src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz)
+          sigs=(src-tauri/target/release/bundle/appimage/*.sig)
+          if [ "${#debs[@]}" -eq 0 ]; then echo "::error::没有 rime-sync deb"; exit 1; fi
+          if [ "${#appimages[@]}" -eq 0 ]; then echo "::error::没有 AppImage"; exit 1; fi
+          if [ "${#tarballs[@]}" -eq 0 ]; then echo "::error::没有 AppImage.tar.gz（updater 更新包）"; exit 1; fi
+          if [ "${#sigs[@]}" -eq 0 ]; then echo "::error::没有 .sig（updater 签名）"; exit 1; fi
+          printf '  %s\n' "${debs[@]}" "${appimages[@]}" "${tarballs[@]}" "${sigs[@]}"
+          gh release upload "$TAG" "${debs[@]}" "${appimages[@]}" "${tarballs[@]}" "${sigs[@]}" --clobber
 
   # 四发行版各占一个 runner：镜像/闭包/.run 全部按发行版隔离，互不踩磁盘。
   # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，组装 1-2 min。
   ime:
     name: ime · ${{ matrix.distro }}
-    needs: linux-app
+    # linux-app 提供 rime-sync deb；prepare-draft 提供 tag（从草稿 Release 取/放资产都要它）。
+    needs: [linux-app, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 40
+    permissions:
+      contents: write
     strategy:
       # 单个发行版失败不取消其它三个：一次跑完就能看出是哪几套坏了。
       fail-fast: false
@@ -213,12 +277,23 @@ jobs:
           fi
 
       # fetch-vendor-deps.sh / build-offline-installer.sh 的默认输入
-      - name: download rime-sync deb
-        uses: actions/download-artifact@v4
-        with:
-          name: sync-deb
-          path: packaging/out
-          merge-multiple: true
+      # 从草稿 Release 取 linux-app 上传的 deb（原来走 download-artifact sync-deb）。
+      - name: download rime-sync deb from draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf packaging/out
+          mkdir -p packaging/out
+          gh release download "$TAG" --dir packaging/out --pattern 'rime-sync_*.deb'
+          ls -l packaging/out/
+          shopt -s nullglob
+          debs=(packaging/out/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::期望恰好 1 个 rime-sync deb，实际 ${#debs[@]} 个"
+            exit 1
+          fi
 
       - name: build input-method deb (${{ matrix.distro }})
         timeout-minutes: 20
@@ -294,86 +369,117 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: upload ime artifacts (${{ matrix.distro }})
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: ime-${{ matrix.distro }}
-          if-no-files-found: error
-          # 注意：不要上传 rime-smoke（四个发行版同名，merge-multiple 后会撞名，
-          # gh release upload 报 HTTP 422 Validation Failed）。
-          path: |
-            packaging/linux/out/*.run
-            build/deb/${{ matrix.distro }}/*.deb
+      # 直传草稿 Release。资产名 = basename，四套矩阵不会撞名：
+      #   rime-sync-installer_<ver>~<suite>.run
+      #   rime-inputmethod_<ver>~<suite>_amd64.deb
+      # 注意：不要上传 rime-smoke（四个发行版同名，--clobber 会互相覆盖，只剩最后一个）。
+      - name: upload ime artifacts to draft release (${{ matrix.distro }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          runs=(packaging/linux/out/*.run)
+          if [ "${#runs[@]}" -ne 1 ]; then
+            echo "::error::$DISTRO: 期望恰好 1 个 .run，实际 ${#runs[@]} 个"
+            exit 1
+          fi
+          # 与 build-linux.sh 的产物名一致；取最新一个，避免容器里残留的旧 deb 被一起上传。
+          deb=$(ls -1t "build/deb/$DISTRO"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
+          if [ -z "$deb" ]; then
+            echo "::error::$DISTRO: 没有 rime-inputmethod deb 可上传"
+            exit 1
+          fi
+          printf '  %s\n  %s\n' "${runs[@]}" "$deb"
+          gh release upload "$TAG" "${runs[@]}" "$deb" --clobber
 
   # 汇总 + 验收：只有四套 .run 与四个 IME deb 都在，publish 才会被触发。
   collect:
     name: collect · 汇总并断言离线安装器
-    needs: [linux-app, ime]
+    # 四套 ime 全部成功才会跑（fail-fast: false，任一发行版失败 = collect 不跑 = 不发布）。
+    needs: [linux-app, ime, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: list artifacts
-        run: du -sh dist && find dist -type f -printf '%P  %s bytes\n' | sort
+      # 不再下载产物（几百 MiB 的 .run 没必要重复搬一次）：直接读草稿 Release 的资产清单。
+      # GitHub 返回的 name+size 就是上传完成时的实际值，用来断言「四套安装器都在且体积够」。
+      - name: list draft release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft,assets \
+            --jq '"draft=\(.isDraft), assets=\(.assets | length)"'
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)"' | sort
 
       - name: assert 4 installers + 4 input-method debs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
         run: |
           set -euo pipefail
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > /tmp/assets.txt
+          # 只按「资产名 + 字节数」比对：这就是 publish 之后用户能下载到的东西。
+          asset_size() { awk -v n="$1" '$1==n {print $2; exit}' /tmp/assets.txt; }
           status=0
           for pair in ubuntu-22.04:jammy ubuntu-24.04:noble debian-12:bookworm debian-13:trixie; do
             d=${pair%%:*}
             suite=${pair##*:}
-            run_file=dist/packaging/linux/out/rime-sync-installer_${ver}~${suite}.run
-            if [ ! -f "$run_file" ]; then
-              echo "::error::缺少 $d 的离线安装器（$run_file）"
+            run_asset=rime-sync-installer_${ver}~${suite}.run
+            size=$(asset_size "$run_asset")
+            if [ -z "$size" ]; then
+              echo "::error::缺少 $d 的离线安装器（$run_asset）"
               status=1
             else
-              size=$(stat -c %s "$run_file")
               mib=$(( size / 1024 / 1024 ))
-              echo "$run_file: ${mib} MiB"
+              echo "  $run_asset: ${mib} MiB"
               if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
-                echo "::error file=$run_file::${d} 安装器仅 ${mib} MiB（< 100 MiB）"
+                echo "::error::$d 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
                 status=1
               fi
             fi
-            ime=$(ls -1 dist/build/deb/"$d"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
-            if [ -n "$ime" ]; then
-              echo "$ime: $(( $(stat -c %s "$ime") / 1024 / 1024 )) MiB"
+            ime_asset=rime-inputmethod_${ver}~${suite}_amd64.deb
+            if [ -z "$(asset_size "$ime_asset")" ]; then
+              echo "::error::缺少 $d 的 rime-inputmethod deb（$ime_asset）"
+              status=1
             else
-              echo "::error::缺少 $d 的 rime-inputmethod deb"
+              echo "  $ime_asset: $(( $(asset_size "$ime_asset") / 1024 / 1024 )) MiB"
+            fi
+          done
+          # 四套 deb 必须都在：同名资产会被 --clobber 互相覆盖，这里能立刻抓出来。
+          ime_count=$(awk '$1 ~ /^rime-inputmethod_/ {c++} END {print c+0}' /tmp/assets.txt)
+          echo "  rime-inputmethod 资产数：$ime_count"
+          if [ "$ime_count" -ne 4 ]; then
+            echo "::error::草稿 Release 里 rime-inputmethod deb 有 $ime_count 个（期望 4）：资产名撞名会互相覆盖"
+            status=1
+          fi
+          for name in "rime-sync_${ver}_amd64.deb" "rime-sync_${ver}_amd64.AppImage"; do
+            if [ -z "$(asset_size "$name")" ]; then
+              echo "::error::缺少 $name"
               status=1
             fi
           done
-          for f in "dist/rime-sync_${ver}_amd64.deb" "dist/rime-sync_${ver}_amd64.AppImage"; do
-            [ -f "$f" ] || { echo "::error::缺少 $f"; status=1; }
-          done
           exit $status
-
-      - name: upload linux bundles
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: linux-bundles
-          if-no-files-found: error
-          path: dist/**
 
   windows:
     name: windows · nsis + portable zip
+    needs: prepare-draft
     # 固定 2022：脚本的前提是 VS2022 + v143 + boost 1.84（windows-latest 会跟着微软迁移，
     # 迁移当天工具集/boost 探测会一起漂移）。要换 runner 请先跑一遍 build-weasel.ps1 -Check。
     runs-on: windows-2022
+    permissions:
+      contents: write
     outputs:
       weasel_mode: ${{ steps.weasel_mode.outputs.mode }}
       weasel_source: ${{ steps.weasel_verify.outputs.source }}
@@ -587,8 +693,8 @@ jobs:
           }
           $mib = [math]::Round($exe.Length / 1MB, 1)
           Write-Host "vendor: $($exe.Name) $mib MiB"
-          if ($exe.Length -lt 10MB) {
-            Write-Host "::error::weasel 安装包只有 $mib MiB（< 10 MiB），疑似下载/构建不完整"
+          if ($exe.Length -lt 8MB) {
+            Write-Host "::error::weasel 安装包只有 $mib MiB（< 8 MiB），疑似下载/构建不完整"
             exit 1
           }
 
@@ -660,38 +766,55 @@ jobs:
         shell: pwsh
         run: ./packaging/portable-zip.ps1 -TargetDir src-tauri/target/release -OutDir packaging/out
 
-      - name: upload windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          retention-days: 1
-          name: windows-bundles
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/nsis/*-setup.exe
-            src-tauri/target/release/bundle/nsis/*.sig
-            packaging/out/*.zip
-            # Weasel 来源标记：publish 据此写红字发布说明，verify-artifacts 据此放行/拒绝回退产物。
-            packaging/out/WEASEL-SOURCE.json
+      # 直传草稿 Release（用 bash 而不是 pwsh：让 shell 真正展开通配符，缺文件能当场断言）。
+      # Weasel 来源标记 WEASEL-SOURCE.json 也一起上传：publish 据此写红字发布说明。
+      - name: upload windows artifacts to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          setups=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          sigs=(src-tauri/target/release/bundle/nsis/*.sig)
+          zips=(packaging/out/*.zip)
+          marker=packaging/out/WEASEL-SOURCE.json
+          if [ "${#setups[@]}" -eq 0 ]; then echo "::error::没有 NSIS 安装包（*-setup.exe）"; exit 1; fi
+          if [ "${#sigs[@]}" -eq 0 ]; then echo "::error::没有 setup.exe 的 .sig（updater 签名）"; exit 1; fi
+          if [ "${#zips[@]}" -eq 0 ]; then echo "::error::没有便携版 zip"; exit 1; fi
+          if [ ! -f "$marker" ]; then echo "::error::缺少 $marker"; exit 1; fi
+          printf '  %s\n' "${setups[@]}" "${sigs[@]}" "${zips[@]}" "$marker"
+          gh release upload "$TAG" "${setups[@]}" "${sigs[@]}" "${zips[@]}" "$marker" --clobber
 
   # 产物验收：把"用户能看见的功能入口"变成断言（v0.6.0 事故的直接防线）。
   # 失败就不发布：publish 依赖本 job。
   verify-artifacts:
     name: verify-artifacts · 功能入口断言
-    needs: [collect, windows]
+    needs: [collect, windows, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: download built artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-bundles"
-          path: dist
-          merge-multiple: true
+      # 草稿 Release 是唯一产物来源（不再有 workflow artifact）。
+      # 只下断言要用的：4 个 IME deb + 1 个 rime-sync deb + setup.exe。
+      # 资产名是扁平的，全部落在 dist/ 根下；脚本用 find 递归找，不依赖目录布局。
+      - name: download built artifacts from draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          gh release download "$TAG" --dir dist --pattern '*.deb' --pattern '*-setup.exe'
+          find dist -maxdepth 2 -type f -printf '%P  %s bytes\n' | sort
 
       - name: install extraction tools
         run: |
@@ -712,29 +835,41 @@ jobs:
 
   publish:
     name: publish · 汇总产物并生成 latest.json
-    needs: [collect, windows, verify-artifacts]
+    # verify-artifacts 通过才允许发布；collect/windows 再兜一层（任一发行版缺失都不发布）。
+    needs: [verify-artifacts, collect, windows, prepare-draft]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          # 只取 collect / windows 的最终产物：sync-deb、sync-appimage、ime-<distro>
-          # 是构建期的中间 artifact（不匹配 *-bundles），不必在这里重复下载。
-          pattern: "*-bundles"
-          path: dist
-          merge-multiple: true
-
-      - name: list artifacts
-        run: find dist -type f -printf '%P  %s bytes\n' | sort
+      # 只下 publish 真正需要的：updater 的 .sig + 对应产物（make-latest-json.py 要成对读）
+      # 和 Weasel 来源标记。大件（.run / 各 deb / AppImage / setup.exe）已经在草稿 Release 里，
+      # 不必再下载一遍——这正是「草稿直传」省下来的带宽。
+      - name: download updater inputs from draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          gh release download "$TAG" --dir dist \
+            --pattern '*.AppImage.tar.gz' \
+            --pattern '*.AppImage.tar.gz.sig' \
+            --pattern '*-setup.exe' \
+            --pattern '*-setup.exe.sig' \
+            --pattern 'WEASEL-SOURCE.json'
+          find dist -type f -printf '%P  %s bytes\n' | sort
 
       - name: generate release notes
+        env:
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
+          set -euo pipefail
           VERSION="${TAG#v}"
           # 更新提示直接用 CHANGELOG 的中文段落（用户要求：提示里显示本版更新内容）。
           python3 .github/scripts/changelog-notes.py --version "$VERSION" --out dist/notes.md
@@ -744,7 +879,7 @@ jobs:
       - name: disclose weasel fallback
         run: |
           set -euo pipefail
-          # upload-artifact 保留相对仓库根的子目录（例如 packaging/out/），所以不能假定它在 dist 根下。
+          # gh release download 只保留 basename，标记会落在 dist 根下；仍然用 find 兜住布局变化。
           marker=$(find dist -name 'WEASEL-SOURCE.json' -type f | sort | sed -n '1p')
           if [ -z "$marker" ] || [ ! -f "$marker" ]; then
             echo "::error title=Weasel 来源未知::dist 里没有 WEASEL-SOURCE.json，无法确认本版是否带「Rime 同步」入口"
@@ -783,8 +918,10 @@ jobs:
           fi
 
       - name: generate latest.json
+        env:
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
+          set -euo pipefail
           VERSION="${TAG#v}"
           python3 .github/scripts/make-latest-json.py \
             --dir dist \
@@ -794,43 +931,21 @@ jobs:
             --notes-file dist/notes.md \
             --out dist/latest.json
 
-      - name: publish release
+      # 草稿 → 正式：资产在上一步之前就全部到位了，这里只补 latest.json 再转正。
+      # 顺序刻意是「先传 latest.json，后 --draft=false」：反过来的话会有几秒钟
+      # 正式 release 可见但 latest.json 还是旧版（updater 会读到上一版的包）。
+      - name: publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file dist/notes.md
-          else
-            gh release create "$TAG" --title "rime-sync $TAG" --notes-file dist/notes.md --verify-tag
-          fi
-          # download-artifact 保留 deb/appimage/nsis 子目录，dist/* 会把目录当文件上传。
-          find dist -type f -print0 | xargs -0 gh release upload "$TAG" --clobber
-
-      # Artifact 配额很小，发布完立刻删掉本次运行的中间产物；
-      # 配合 upload-artifact 的 retention-days: 1，避免再次撑爆配额。
-      - name: prune run artifacts
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -u
-          ids=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' 2>/dev/null || true)
-          for id in $ids; do
-            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
-          done
-          echo "pruned artifacts"
-
-      # Artifact 配额很小，发布完立刻删掉本次运行的中间产物；
-      # 配合 upload-artifact 的 retention-days: 1，避免再次撑爆配额。
-      - name: prune run artifacts
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -u
-          ids=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[].id' 2>/dev/null || true)
-          for id in $ids; do
-            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
-          done
-          echo "pruned artifacts"
+          set -euo pipefail
+          gh release upload "$TAG" dist/latest.json --clobber
+          gh release edit "$TAG" --draft=false --notes-file dist/notes.md
+          gh release view "$TAG" --json isDraft,url --jq '"draft=\(.isDraft)  \(.url)"'
+          {
+            echo "### 发布完成"
+            echo ""
+            echo "- tag：$TAG（已从草稿转正）"
+            echo "- 更新清单：latest.json 与安装包在同一个 release 资产里"
+          } >> "$GITHUB_STEP_SUMMARY"
