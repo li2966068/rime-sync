@@ -434,7 +434,7 @@ jobs:
           for pair in ubuntu-22.04:jammy ubuntu-24.04:noble debian-12:bookworm debian-13:trixie; do
             d=${pair%%:*}
             suite=${pair##*:}
-            run_asset=rime-sync-installer_${ver}~${suite}.run
+            run_asset=rime-sync-installer_${ver}.${suite}.run
             size=$(asset_size "$run_asset")
             if [ -z "$size" ]; then
               echo "::error::缺少 $d 的离线安装器（$run_asset）"
@@ -447,7 +447,7 @@ jobs:
                 status=1
               fi
             fi
-            ime_asset=rime-inputmethod_${ver}~${suite}_amd64.deb
+            ime_asset=rime-inputmethod_${ver}.${suite}_amd64.deb
             if [ -z "$(asset_size "$ime_asset")" ]; then
               echo "::error::缺少 $d 的 rime-inputmethod deb（$ime_asset）"
               status=1
