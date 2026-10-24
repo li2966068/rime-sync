@@ -85,8 +85,8 @@ impl DedupeGroup {
     }
 }
 
-/// 按 owner.json 的 hostname+os 分组：组内保留本机 device_id，否则保留
-/// heartbeat_ts 最新的一份；缺失 owner.json 的目录单独成组。
+/// 按 owner.json 的 hostname+os 分组：组内保留本机目录 self_id（installation_id），
+/// 否则保留 heartbeat_ts 最新的一份；缺失 owner.json 的目录单独成组。
 pub fn group_device_dirs(dirs: &[DeviceDirEntry], self_id: &str) -> Vec<DedupeGroup> {
     let mut groups: Vec<DedupeGroup> = Vec::new();
     let mut known: BTreeMap<(String, String), Vec<&DeviceDirEntry>> = BTreeMap::new();
@@ -332,7 +332,7 @@ fn short(value: &str) -> &str {
 }
 
 /// 远端删除闸门：必须落在 sync/ 下、不得指向 shared/ 内容，
-/// 删除整个设备目录时不得指向本机 device_id。
+/// 删除整个设备目录时不得指向本机目录 self_id（installation_id）。
 pub fn validate_remote_delete_path(rel: &str, self_id: &str) -> Result<()> {
     plan::validate_rel_path(rel)?;
     ensure!(
@@ -562,5 +562,84 @@ mod tests {
         assert!(validate_snapshot_delete_path("sync/other-dev/a.userdb.txt", "self-dev").is_ok());
         assert!(validate_snapshot_delete_path("sync/other-dev/a.txt", "self-dev").is_err());
         assert!(validate_snapshot_delete_path("sync/other-dev", "self-dev").is_err());
+    }
+
+    /// installation_id ≠ device_id：本机目录按 installation_id 保留，旧标签目录
+    /// 才会进入 suggested。
+    #[test]
+    fn self_dir_is_installation_id_not_device_label() {
+        let dirs = vec![
+            dir("e6169df8-uuid", "pc", "linux", 10, 10),
+            dir("5095", "pc", "linux", 999, 20),
+        ];
+        let groups = group_device_dirs(&dirs, "e6169df8-uuid");
+        let pc = groups
+            .iter()
+            .find(|group| group.tag == TAG_DEVICE)
+            .expect("pc group");
+        let kept: Vec<&str> = pc
+            .items
+            .iter()
+            .filter(|item| item.is_keep)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["e6169df8-uuid"], "本机目录心跳更旧也必须保留");
+        assert_eq!(
+            pc.suggested_ids(),
+            vec!["5095"],
+            "旧 device_id 目录才可建议删除"
+        );
+    }
+
+    /// 自删闸门必须认 installation_id：旧 device_id 目录是普通设备，可以删。
+    #[test]
+    fn delete_gate_protects_installation_id_directory() {
+        let self_id = "e6169df8-uuid";
+        assert!(
+            validate_remote_delete_path(&format!("sync/{self_id}"), self_id).is_err(),
+            "整目录删除必须被拒绝"
+        );
+        assert!(validate_remote_delete_path("sync/5095", self_id).is_ok());
+        assert!(validate_remote_delete_path("sync/5095/main.userdb.txt", self_id).is_ok());
+        assert!(
+            validate_snapshot_delete_path(&format!("sync/{self_id}/main.userdb.txt"), self_id)
+                .is_ok()
+        );
+    }
+
+    /// 本机目录下的快照即使全部 sha 重复，同目录分组也至少保留一份。
+    #[test]
+    fn self_directory_snapshots_keep_at_least_one() {
+        let self_id = "e6169df8-uuid";
+        let files = vec![
+            snapshot(&format!("sync/{self_id}/old.userdb.txt"), "same", 10, 100),
+            snapshot(&format!("sync/{self_id}/new.userdb.txt"), "same", 10, 200),
+            snapshot("sync/5095/main.userdb.txt", "same", 10, 300),
+        ];
+        let groups = group_snapshots(&files);
+        let same_dir = groups
+            .iter()
+            .find(|group| group.tag == TAG_SAME_DIR)
+            .expect("same-dir group");
+        let kept: Vec<&str> = same_dir
+            .items
+            .iter()
+            .filter(|item| item.is_keep)
+            .map(|item| item.id.as_str())
+            .collect();
+        let expected_keep = format!("sync/{self_id}/new.userdb.txt");
+        assert_eq!(kept, vec![expected_keep.as_str()], "本机目录内至少保留一份");
+        let expected_suggested = format!("sync/{self_id}/old.userdb.txt");
+        assert_eq!(same_dir.suggested_ids(), vec![expected_suggested]);
+        // 跨目录组只提示、不默认勾选。
+        let cross = groups
+            .iter()
+            .find(|group| group.tag == TAG_CROSS_DIR)
+            .expect("cross-dir group");
+        assert!(cross.suggested_ids().is_empty());
+        assert!(cross
+            .items
+            .iter()
+            .any(|item| item.id == "sync/5095/main.userdb.txt" && item.is_keep));
     }
 }

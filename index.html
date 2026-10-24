@@ -236,7 +236,7 @@
             <table class="table" id="device-table">
               <thead>
                 <tr>
-                  <th data-i18n="devices.id">设备 ID</th>
+                  <th data-i18n="devices.id">远端目录</th>
                   <th data-i18n="devices.hostname">主机名</th>
                   <th data-i18n="devices.os">系统</th>
                   <th data-i18n="devices.heartbeat">最后心跳</th>
@@ -265,7 +265,7 @@
                 <p class="hint" data-i18n="settings.intervalHint"></p>
               </div>
               <div class="field">
-                <label for="device-id" data-i18n="settings.deviceId">设备 ID</label>
+                <label for="device-id" data-i18n="settings.deviceId">设备名称（label）</label>
                 <div class="input-with-action">
                   <input id="device-id" type="text" spellcheck="false" maxlength="64" autocomplete="off" />
                   <button class="ghost small" id="btn-regen-device" type="button" data-i18n="settings.regen">重新生成</button>
@@ -332,6 +332,19 @@
           </div>
 
           <div class="card">
+            <!-- 离线依赖安装告警：packaging/linux/postinst 的 worker 失败时写
+                 ~/.config/com.rimesync.app/install-warning.json，这里读出来显示红条。 -->
+            <div class="install-warning" id="install-warning" role="alert" hidden>
+              <div class="install-warning-copy">
+                <strong data-i18n="settings.installWarningTitle">离线依赖未安装完成，点击查看日志/重试</strong>
+                <p id="install-warning-detail"></p>
+                <p class="install-warning-error" id="install-warning-error" hidden></p>
+              </div>
+              <div class="install-warning-actions">
+                <button class="ghost small" id="btn-install-warning-log" type="button" data-i18n="settings.installWarningLog">查看日志</button>
+                <button class="small" id="btn-install-warning-retry" type="button" data-i18n="settings.installWarningRetry">重试</button>
+              </div>
+            </div>
             <div class="card-head">
               <h3 data-i18n="settings.diag">诊断包</h3>
               <button class="ghost small" id="btn-diag" type="button" data-i18n="settings.diagExport">导出诊断包</button>

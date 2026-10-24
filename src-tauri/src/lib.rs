@@ -136,7 +136,7 @@ pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, Stri
     Ok(config)
 }
 
-fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
+pub(crate) fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
     rime_dir::detect(config.rime_dir.as_deref().map(Path::new))
         .or_else(|_| rime_dir::detect(None))
         .map_err(|error| {
@@ -957,6 +957,7 @@ pub fn run() {
             device_cmds::cmd_revoke_device,
             device_cmds::cmd_check_device_id,
             device_cmds::cmd_migrate_device,
+            device_cmds::cmd_publish_identity,
             dedupe_cmds::cmd_dedupe_preview,
             dedupe_cmds::cmd_dedupe_apply,
             backup_cmds::cmd_list_backups,
@@ -968,6 +969,9 @@ pub fn run() {
             preset_cmds::cmd_apply_preset,
             preset_cmds::cmd_probe_write,
             diagnostics::cmd_export_diagnostics,
+            // 离线依赖安装告警（packaging/linux/postinst 写 install-warning.json）
+            diagnostics::cmd_install_warning,
+            diagnostics::cmd_retry_install_deps,
             watch_cmds::cmd_watch_start,
             watch_cmds::cmd_watch_stop,
             watch_cmds::cmd_watch_status,

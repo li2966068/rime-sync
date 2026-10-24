@@ -54,8 +54,15 @@ sudo packaging/linux/out/offline/install.sh --uninstall
 1. 检查 root（否则提示 sudo）。
 2. 读 /etc/os-release 选对应目录；找不到时列出支持的发行版并询问是否改用联网 apt。
 3. 移除与自带 librime/数据冲突的发行版包（fcitx5-rime / librime1 / librime1t64 / librime-data）。
-4. 校验 SHA256SUMS 后以 dpkg --unpack + dpkg --configure -a 安装离线依赖闭包。
+4. 记录 dpkg 快照（/var/log/rime-sync/dpkg-before-install.txt + dpkg-l-before-install.txt），
+   校验 SHA256SUMS 后只解包"状态非 ii"的依赖：
+   * 已配置（ii）的包**不升级**（多架构系统上同名包任一架构版本不同时连缺失架构也不补）；
+   * 只配置本次解包的包（`dpkg --configure <pkg:arch>...`），不再 `dpkg --configure -a`，
+     系统里无关的半配置包不会被判成安装失败；
+   * 需要升级系统库时显式加 `--upgrade-vendor`。
+   失败时打印 dpkg 原文尾部、多架构版本不一致清单与修复命令（apt --fix-broken / dpkg --remove-architecture）。
 5. 严格顺序：先 dpkg -i rime-inputmethod_*.deb，再 dpkg -i rime-sync_*.deb；任一步失败立即停止。
+   旧版已装时直接覆盖升级，不需要先卸载。
 6. 不启动应用、不写 autostart；结束提示「安装完成，输入法设置或应用菜单里打开同步设置」。
 7. 日志：/var/log/rime-sync/install.log，安装顺序时间戳：/var/log/rime-sync/install-steps.log。
 
@@ -65,6 +72,9 @@ sudo packaging/linux/out/offline/install.sh --uninstall
 
 ~~~bash
 APT_MIRROR=http://mirrors.aliyun.com packaging/linux/verify-offline.sh
+# 安装器行为矩阵（每个用例一个全新容器，--network none 真离线）
+packaging/linux/test/install-matrix.sh        # normal / broken-unrelated / multiarch /
+                                              # prebroken-multiarch / upgrade / single-arch
 ~~~
 
 对每个发行版在 docker run --network none 下用 .run 安装，然后断言：

@@ -17,6 +17,17 @@ on:
         description: "要发布的 tag（形如 v0.2.0，必须是已存在的 tag）"
         required: true
         type: string
+      # 见 docs/FALLBACK-POLICY.md：回退必须显式、可见、可关闭。
+      weasel_mode:
+        description: "Windows 内置小狼毫的来源：auto=tag 推送强制 require；手动时取仓库变量或 build"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - require
+          - build
+          - fetch
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -87,6 +98,16 @@ jobs:
       # 这里刻意不抓 vendor 闭包：tauri deb 的 bundle.linux.deb.files 会把
       # packaging/linux/vendor/ 整个拷进 /usr/share/rime-sync/vendor/，四份发行版闭包
       # 会互相冲突且撑到 ~700 MiB。闭包只在 ime-<distro> 里按发行版单份使用。
+      # fcitx5 配置页的「立即同步」按钮调用 /usr/bin/rime-sync-cli；CLI 不在 tauri 产物里，
+      # 必须在打包前编译好并放到 deb.files 指定的位置，否则该按钮会静默 no-op。
+      - name: build CLI for the deb
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo build -p rime-sync-cli --release --locked
+          install -Dm755 target/release/rime-sync-cli packaging/linux/rime-sync-cli
+          file packaging/linux/rime-sync-cli
+
       - name: build bundles (deb + AppImage)
         timeout-minutes: 45
         env:
@@ -347,13 +368,57 @@ jobs:
   windows:
     name: windows · nsis + portable zip
     runs-on: windows-latest
-    env:
-      RIMESYNC_WEASEL_MODE: ${{ vars.RIMESYNC_WEASEL_MODE || 'build' }}
+    outputs:
+      weasel_mode: ${{ steps.weasel_mode.outputs.mode }}
+      weasel_source: ${{ steps.weasel_verify.outputs.source }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      # 模式解析（唯一真源）：
+      #   tag 推送              → require：自编译失败直接让 job 失败，绝不用上游包顶替
+      #   手动 workflow_dispatch → inputs.weasel_mode（auto 时取仓库变量 vars.RIMESYNC_WEASEL_MODE，缺省 build）
+      # build 允许回退，但产物里带 WEASEL-SOURCE.json 标记，publish 用它写红字发布说明。
+      - name: resolve weasel mode
+        id: weasel_mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.weasel_mode }}
+          REPO_VAR: ${{ vars.RIMESYNC_WEASEL_MODE }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            mode=require
+            source_note="tag 推送强制 require"
+          else
+            case "$INPUT_MODE" in
+              "" | auto) mode="${REPO_VAR:-build}" ;;
+              *) mode="$INPUT_MODE" ;;
+            esac
+            source_note="手动触发 inputs.weasel_mode=$INPUT_MODE"
+          fi
+          case "$mode" in
+            require | build | fetch) : ;;
+            *)
+              echo "::error::未知的 Weasel 模式：$mode（只接受 require|build|fetch）"
+              exit 1
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "RIMESYNC_WEASEL_MODE=$mode" >> "$GITHUB_ENV"
+          echo "weasel mode: $mode（$source_note）"
+          {
+            echo "### Weasel 模式：$mode"
+            echo ""
+            case "$mode" in
+              require) echo "- 自编译失败 = 本 job 失败，不允许回退上游官方安装包。" ;;
+              build) echo "- 自编译失败会回退上游官方安装包：**本版将不带「Rime 同步」入口**，发布说明与 summary 会红字标注。" ;;
+              fetch) echo "- 直接使用上游官方安装包：**本版不带「Rime 同步」入口**（显式选择，仍会红字标注）。" ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: setup pnpm
         uses: pnpm/action-setup@v4
@@ -376,7 +441,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: cache weasel build deps (boost 1.84.0)
-        if: env.RIMESYNC_WEASEL_MODE != 'fetch'
+        if: steps.weasel_mode.outputs.mode != 'fetch'
         uses: actions/cache@v4
         with:
           path: |
@@ -389,35 +454,45 @@ jobs:
       # 从 vendored 源码（third_party/weasel = rime/weasel 0.17.4）编译 Weasel 安装包。
       # 依赖：VS2022/v143 + boost 1.84.0（脚本自建/缓存）+ librime 预编译包（get-rime.ps1）
       #       + NSIS 3.08（脚本自动安装）。脚本内部会做产物断言。
-      # 失败不直接红：下一步用上游官方安装包兜底，保证发布不中断（见 packaging/windows/README.md）。
+      # require（tag 发布）：失败即本 job 失败，**不回退**（v0.6.0 事故的根因就是这里静默回退了）。
+      # build/fetch（手动）：失败只让本步骤红，下一步回退上游官方包，但会在 summary / 发布说明红字标注。
       - name: build weasel installer from vendored source
         id: weasel_selfbuild
-        if: env.RIMESYNC_WEASEL_MODE != 'fetch'
-        continue-on-error: true
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        continue-on-error: ${{ steps.weasel_mode.outputs.mode != 'require' }}
         timeout-minutes: 90
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
         run: |
           pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -LibrimeTag 1.13.1
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::build-weasel.ps1 失败（exit $LASTEXITCODE）；下一步回退上游安装包"
+            Write-Host "::error::build-weasel.ps1 失败（exit $LASTEXITCODE；模式 $env:WEASEL_MODE）：require=本 job 失败，build/fetch=回退上游安装包"
             exit $LASTEXITCODE
           }
           $exe = Get-Item -LiteralPath 'packaging/windows/vendor/weasel-0.17.4.0-installer.exe'
           Write-Host ("self-built weasel: {0:N1} MiB" -f ($exe.Length / 1MB))
 
       # 离线兜底：fetch-weasel.ps1 仍然保留，下载并校验上游官方安装包（大小 + SHA-256）。
-      # 触发条件：显式 RIMESYNC_WEASEL_MODE=fetch，或上一步自编译失败。
+      # 触发条件：显式 mode=fetch（或手动选了 build 且自编译失败）。
+      # require 模式下这一步永远不跑：上一步失败已经让 job 红了。
       - name: fetch upstream weasel installer (fallback / offline mode)
-        if: env.RIMESYNC_WEASEL_MODE == 'fetch' || steps.weasel_selfbuild.outcome == 'failure'
+        if: steps.weasel_mode.outputs.mode != 'require' && (steps.weasel_mode.outputs.mode == 'fetch' || steps.weasel_selfbuild.outcome == 'failure')
         timeout-minutes: 15
         shell: pwsh
         run: |
           if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'failure') {
-            Write-Host '::warning::自编译 Weasel 失败，回退到上游官方安装包（packaging/windows/fetch-weasel.ps1）'
+            Write-Host '::error title=Weasel 回退::自编译 Weasel 失败，回退上游官方安装包：本版 Windows 版将没有「Rime 同步…」入口（已写进 summary 与发布说明）'
           } else {
-            Write-Host '::notice::RIMESYNC_WEASEL_MODE=fetch：直接使用上游官方安装包'
+            Write-Host '::error title=Weasel 回退::RIMESYNC_WEASEL_MODE=fetch：直接使用上游官方安装包，本版没有「Rime 同步…」入口'
+          }
+          if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @(
+              '> [!CAUTION]',
+              '> **本版未包含 Weasel 入口**（上游官方 Weasel 回退）。',
+              '> 规则见 docs/FALLBACK-POLICY.md。'
+            )
           }
           if (-not (Test-Path -LiteralPath 'packaging/windows/fetch-weasel.ps1')) {
             Write-Host '::error::缺少 packaging/windows/fetch-weasel.ps1（兜底路径不可用）'
@@ -429,8 +504,15 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # 验收：内嵌的 Weasel 必须真的来自我们自己编译的源码。
+      # require 模式下自编译失败 = 本 job 失败（绝不静默回退）。
+      # 回退时写 packaging/out/WEASEL-SOURCE.json：publish 用它写红字发布说明，
+      # verify-artifacts 用它决定是否放行「WeaselServer.exe 里没有 Rime 同步」。
       - name: verify weasel vendor payload
+        id: weasel_verify
         shell: pwsh
+        env:
+          WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
         run: |
           $exe = Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*.exe' -File -ErrorAction SilentlyContinue |
             Sort-Object Length -Descending | Select-Object -First 1
@@ -444,13 +526,44 @@ jobs:
             Write-Host "::error::weasel 安装包只有 $mib MiB（< 10 MiB），疑似下载/构建不完整"
             exit 1
           }
-          $source = 'upstream official installer (fetch-weasel.ps1 fallback)'
-          if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'success') {
-            $source = 'self-built from third_party/weasel @ 0.17.4'
+
+          $mode = $env:WEASEL_MODE
+          $selfbuilt = '${{ steps.weasel_selfbuild.outcome }}'
+          $source = 'upstream'
+          if ($selfbuilt -eq 'success') { $source = 'self-built' }
+
+          if ($mode -eq 'require' -and $source -ne 'self-built') {
+            Write-Host "::error title=Weasel 自编译失败::RIMESYNC_WEASEL_MODE=require：自编译 Weasel 失败（outcome=$selfbuilt），本版不允许回退上游官方安装包；请修 scripts/ime/build-weasel.ps1"
+            exit 1
           }
-          Write-Host "weasel source: $source"
+
+          $marker = 'packaging/out/WEASEL-SOURCE.json'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marker) | Out-Null
+          $payload = [ordered]@{
+            mode              = $mode
+            source            = $source
+            selfbuild_outcome = $selfbuilt
+            installer         = $exe.Name
+            installer_bytes   = $exe.Length
+            caption           = 'Rime 同步'
+            written_at        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+          $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $marker -Encoding utf8
+          Write-Host "weasel source: $source（mode=$mode）"
+          Write-Host "marker: $marker"
+          "source=$source" >> $env:GITHUB_OUTPUT
+
           if ($env:GITHUB_STEP_SUMMARY) {
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- Weasel 安装器：{0}（{1} MiB，来源：{2}）" -f $exe.Name, $mib, $source)
+            if ($source -eq 'self-built') {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (
+                "- Weasel 安装器：{0}（{1} MiB，来源：自编译 third_party/weasel @ 0.17.4，模式 {2}）" -f $exe.Name, $mib, $mode)
+            } else {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @(
+                '> [!CAUTION]',
+                ('> **本版未包含 Weasel 入口**：Windows 安装包用的是上游官方 Weasel（自编译 outcome=' + $selfbuilt + '，模式 ' + $mode + '）。'),
+                '> 「Rime 同步…」菜单项不存在；规则见 docs/FALLBACK-POLICY.md。'
+              )
+            }
           }
 
       - name: build nsis
@@ -491,10 +604,49 @@ jobs:
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/*.sig
             packaging/out/*.zip
+            # Weasel 来源标记：publish 据此写红字发布说明，verify-artifacts 据此放行/拒绝回退产物。
+            packaging/out/WEASEL-SOURCE.json
+
+  # 产物验收：把"用户能看见的功能入口"变成断言（v0.6.0 事故的直接防线）。
+  # 失败就不发布：publish 依赖本 job。
+  verify-artifacts:
+    name: verify-artifacts · 功能入口断言
+    needs: [collect, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-bundles"
+          path: dist
+          merge-multiple: true
+
+      - name: install extraction tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      # Weasel 严格程度由 windows job 解析出的模式决定：
+      # require → WeaselServer.exe 里必须有「Rime 同步」，否则失败；
+      # build/fetch → 允许上游回退，但 summary/发布说明红字标注。
+      - name: verify artifacts
+        env:
+          WEASEL_MODE: ${{ needs.windows.outputs.weasel_mode }}
+        run: |
+          set -euo pipefail
+          echo "Weasel 模式：${WEASEL_MODE:-require}"
+          find dist -maxdepth 5 -type f -printf '%P  %s bytes\n' | sort | sed -n '1,60p'
+          bash .github/scripts/verify-artifacts.sh --dir dist --weasel-mode "${WEASEL_MODE:-require}"
 
   publish:
     name: publish · 汇总产物并生成 latest.json
-    needs: [collect, windows]
+    needs: [collect, windows, verify-artifacts]
     runs-on: ubuntu-latest
     steps:
       - name: checkout
@@ -514,12 +666,60 @@ jobs:
       - name: list artifacts
         run: find dist -type f -printf '%P  %s bytes\n' | sort
 
-      - name: generate latest.json
+      - name: generate release notes
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
           # 更新提示直接用 CHANGELOG 的中文段落（用户要求：提示里显示本版更新内容）。
           python3 .github/scripts/changelog-notes.py --version "$VERSION" --out dist/notes.md
+
+      # docs/FALLBACK-POLICY.md：任何回退必须在发布说明里可见。
+      # WEASEL-SOURCE.json 由 windows job 写出并随 windows-bundles 上传。
+      - name: disclose weasel fallback
+        run: |
+          set -euo pipefail
+          # upload-artifact 保留相对仓库根的子目录（例如 packaging/out/），所以不能假定它在 dist 根下。
+          marker=$(find dist -name 'WEASEL-SOURCE.json' -type f | sort | sed -n '1p')
+          if [ -z "$marker" ] || [ ! -f "$marker" ]; then
+            echo "::error title=Weasel 来源未知::dist 里没有 WEASEL-SOURCE.json，无法确认本版是否带「Rime 同步」入口"
+            exit 1
+          fi
+          echo "weasel marker: $marker"
+          python3 - "$marker" > dist/weasel-warning.md <<'PY'
+          import json
+          import sys
+
+          # Windows 侧 Set-Content 可能带 BOM，utf-8-sig 两种情况都能读。
+          data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+          if data.get("source") == "self-built":
+              sys.exit(0)
+          print("> [!CAUTION]")
+          print("> **本版未包含 Weasel 入口**（Windows 安装包里没有「Rime 同步…」菜单项）。")
+          print(">")
+          print(f"> Weasel 安装器来源：{data.get('installer', '?')}"
+                f"（self-build outcome={data.get('selfbuild_outcome', '?')}，"
+                f"模式 {data.get('mode', '?')}）。")
+          print(">")
+          print("> 规则见 docs/FALLBACK-POLICY.md；修复后重跑构建即恢复入口。")
+          PY
+          if [ -s dist/weasel-warning.md ]; then
+            cat dist/weasel-warning.md dist/notes.md > dist/notes.new
+            mv dist/notes.new dist/notes.md
+            {
+              echo "## Weasel 回退（发布说明已红字标注）"
+              echo ""
+              cat dist/weasel-warning.md
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Weasel 回退::本版未包含 Weasel 入口，已在发布说明顶部标注"
+          else
+            echo "Weasel 来源：自编译（发布说明无需告警）"
+            echo "- Weasel：自编译，入口完整" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: generate latest.json
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
           python3 .github/scripts/make-latest-json.py \
             --dir dist \
             --version "$VERSION" \

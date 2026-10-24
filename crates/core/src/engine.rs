@@ -24,6 +24,27 @@ use crate::retry::RetryState;
 use crate::rime_dir;
 use crate::webdav::{DavClient, PutOutcome};
 
+pub fn local_hostname() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// 本机 owner.json 的内容：transport 写远端与设备页的「未上传」占位共用，
+/// 避免两处字段定义漂移。
+pub fn owner_json(config: &Config) -> Result<serde_json::Value> {
+    let now = now_secs();
+    Ok(serde_json::json!({
+        "device_id": config.device_id,
+        "hostname": local_hostname(),
+        "os": std::env::consts::OS,
+        "session": format!("{}-{now}", config.device_id),
+        "heartbeat_ts": now,
+    }))
+}
+
+pub fn owner_bytes(config: &Config) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&owner_json(config)?)?)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
     pub pulled: usize,
@@ -628,7 +649,7 @@ impl Engine {
 
     /// sync/ 下本机目录名：优先 installation.yaml 的 installation_id，缺失时回退 device_id。
     fn local_sync_id(&self) -> String {
-        rime_dir::local_sync_id_in(&self.rime_dir, &self.config.device_id)
+        rime_dir::local_sync_id(&self.rime_dir, &self.config.device_id)
     }
 
     /// 导出本地词库并统计条目数（rime_dict_manager -e，要求输入法已停止）。
@@ -786,15 +807,7 @@ impl Engine {
     }
 
     fn write_owner(&self, remote_sync: &str) -> Result<()> {
-        let now = now_secs();
-        let owner = serde_json::json!({
-            "device_id": self.config.device_id,
-            "hostname": std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
-            "os": std::env::consts::OS,
-            "session": format!("{}-{now}", self.config.device_id),
-            "heartbeat_ts": now,
-        });
-        let bytes = serde_json::to_vec_pretty(&owner)?;
+        let bytes = owner_bytes(&self.config)?;
         self.dav
             .put(&format!("{remote_sync}/owner.json"), &bytes, None)?;
         Ok(())

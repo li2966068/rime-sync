@@ -184,7 +184,7 @@ pub fn installation_id(rime_dir: &Path) -> Option<String> {
 ///
 /// librime / 小狼毫按 installation_id 建快照目录；取不到、空值或不是合法单段
 /// 目录名时回退 device_id。
-pub fn local_sync_id(installation_yaml: Option<&str>, device_id: &str) -> String {
+pub fn local_sync_id_from_text(installation_yaml: Option<&str>, device_id: &str) -> String {
     let candidate = installation_yaml
         .and_then(|text| parse_installation(text).installation_id)
         .map(|value| value.trim().to_string())
@@ -192,10 +192,116 @@ pub fn local_sync_id(installation_yaml: Option<&str>, device_id: &str) -> String
     candidate.unwrap_or_else(|| device_id.to_string())
 }
 
-/// 读 <rime_dir>/installation.yaml 后解析（缺失文件按 None 处理）。
-pub fn local_sync_id_in(rime_dir: &Path, device_id: &str) -> String {
+/// 远端目录名的唯一来源：读 <rime_dir>/installation.yaml（缺失时回退 device_id）。
+pub fn local_sync_id(rime_dir: &Path, device_id: &str) -> String {
     let text = fs::read_to_string(rime_dir.join("installation.yaml")).ok();
-    local_sync_id(text.as_deref(), device_id)
+    local_sync_id_from_text(text.as_deref(), device_id)
+}
+
+/// 改 installation.yaml 的 installation_id：其它字段、注释与行顺序原样保留；
+/// 文件不存在时按 librime 的默认字段创建。写入走临时文件 + rename。
+///
+/// 幂等：值已经一致时不重写文件。
+pub fn set_installation_id(rime_dir: &Path, id: &str) -> Result<()> {
+    let id = id.trim();
+    if !is_valid_segment(id) {
+        bail!("installation_id 不是合法的单段目录名：{id:?}");
+    }
+    let path = rime_dir.join("installation.yaml");
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取 {} 失败", path.display()));
+        }
+    };
+    let next = match existing.as_deref() {
+        Some(text) => replace_installation_id(text, id),
+        None => default_installation_yaml(id),
+    };
+    if existing.as_deref() == Some(next.as_str()) {
+        return Ok(());
+    }
+    write_atomic(&path, &next)
+}
+
+/// 逐行替换 installation_id（保留尾随换行风格），没有该键就追加。
+fn replace_installation_id(text: &str, id: &str) -> String {
+    let line = format!("installation_id: \"{id}\"");
+    let mut out = String::with_capacity(text.len() + line.len() + 2);
+    let mut replaced = false;
+    for chunk in text.split_inclusive('\n') {
+        let body = chunk.trim_end_matches('\n').trim_end_matches('\r');
+        let key = body
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split_once(':')
+            .map(|(key, _)| key.trim());
+        if !replaced && key == Some("installation_id") {
+            let newline = if chunk.ends_with("\r\n") {
+                "\r\n"
+            } else if chunk.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            out.push_str(&line);
+            out.push_str(newline);
+            replaced = true;
+            continue;
+        }
+        out.push_str(chunk);
+    }
+    if replaced {
+        return out;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&line);
+    out.push('\n');
+    out
+}
+
+/// librime 首次生成 installation.yaml 时的默认字段（distribution_* 随平台）。
+fn default_installation_yaml(id: &str) -> String {
+    let (code_name, name) = distribution_defaults();
+    format!(
+        "distribution_code_name: {code_name}\ndistribution_name: {name}\ndistribution_version: \"0.0\"\ninstallation_id: \"{id}\"\n"
+    )
+}
+
+fn distribution_defaults() -> (&'static str, &'static str) {
+    match std::env::consts::OS {
+        "windows" => ("weasel", "Weasel"),
+        "macos" => ("squirrel", "Squirrel"),
+        _ => ("fcitx-rime", "Rime"),
+    }
+}
+
+/// 同目录临时文件 + rename：半途失败不会留下被截断的 installation.yaml。
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("yaml.tmp");
+    fs::write(&tmp, contents).with_context(|| format!("写入 {} 失败", tmp.display()))?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => replace_over(&tmp, path, error),
+    }
+}
+
+/// rename 失败后的收尾：Unix 直接删临时文件；Windows 的 rename 不覆盖已存在的
+/// 目标文件，所以删目标后重试一次。
+#[cfg(not(windows))]
+fn replace_over(tmp: &Path, path: &Path, error: std::io::Error) -> Result<()> {
+    fs::remove_file(tmp).ok();
+    Err(error).with_context(|| format!("替换 {} 失败", path.display()))
+}
+
+#[cfg(windows)]
+fn replace_over(tmp: &Path, path: &Path, _error: std::io::Error) -> Result<()> {
+    fs::remove_file(path).ok();
+    fs::rename(tmp, path).with_context(|| format!("替换 {} 失败", path.display()))
 }
 
 /// 目录名必须是单段、非隐藏、无空白：installation.yaml 是外部输入，不能让它逃出 sync/。
@@ -255,7 +361,7 @@ mod tests {
     #[test]
     fn local_sync_id_falls_back_when_file_missing() {
         assert_eq!(
-            local_sync_id(None, "debian-528996"),
+            local_sync_id_from_text(None, "debian-528996"),
             "debian-528996",
             "缺失 installation.yaml 时必须回退 device_id"
         );
@@ -265,7 +371,7 @@ mod tests {
     fn local_sync_id_prefers_quoted_installation_id() {
         let text = "distribution_code_name: fcitx-rime\ninstallation_id: \"5d0d8b1e-0f7a-4c2a-9a3f-1f2e\"\n";
         assert_eq!(
-            local_sync_id(Some(text), "debian-528996"),
+            local_sync_id_from_text(Some(text), "debian-528996"),
             "5d0d8b1e-0f7a-4c2a-9a3f-1f2e"
         );
     }
@@ -273,7 +379,10 @@ mod tests {
     #[test]
     fn local_sync_id_tolerates_single_quotes_and_whitespace() {
         let text = "installation_id:   'abc-123'   \n";
-        assert_eq!(local_sync_id(Some(text), "debian-528996"), "abc-123");
+        assert_eq!(
+            local_sync_id_from_text(Some(text), "debian-528996"),
+            "abc-123"
+        );
     }
 
     #[test]
@@ -284,7 +393,7 @@ mod tests {
             "other: value\n",
         ] {
             assert_eq!(
-                local_sync_id(Some(text), "debian-528996"),
+                local_sync_id_from_text(Some(text), "debian-528996"),
                 "debian-528996",
                 "空值或缺失键必须回退 device_id: {text:?}"
             );
@@ -300,7 +409,7 @@ mod tests {
             "installation_id: a b\n",
         ] {
             assert_eq!(
-                local_sync_id(Some(text), "debian-528996"),
+                local_sync_id_from_text(Some(text), "debian-528996"),
                 "debian-528996",
                 "非法目录名必须回退 device_id: {text:?}"
             );
@@ -308,20 +417,130 @@ mod tests {
     }
 
     #[test]
-    fn local_sync_id_in_reads_real_file() {
+    fn local_sync_id_reads_real_file() {
         let dir = std::env::temp_dir().join(format!(
             "rime-sync-install-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         fs::create_dir_all(&dir).expect("mkdir");
-        assert_eq!(local_sync_id_in(&dir, "debian-528996"), "debian-528996");
+        assert_eq!(local_sync_id(&dir, "debian-528996"), "debian-528996");
         fs::write(
             dir.join("installation.yaml"),
             "installation_id: \"uuid-from-disk\"\n",
         )
         .expect("write");
-        assert_eq!(local_sync_id_in(&dir, "debian-528996"), "uuid-from-disk");
+        assert_eq!(local_sync_id(&dir, "debian-528996"), "uuid-from-disk");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn install_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-setid-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn set_installation_id_preserves_other_fields_and_comments() {
+        let dir = install_dir("keep");
+        let before = concat!(
+            "# generated by rime\n",
+            "distribution_code_name: fcitx-rime\n",
+            "distribution_name: Rime\n",
+            "sync_dir: \"/tmp/my-sync\"\n",
+            "installation_id: \"old-uuid\"\n",
+            "rime_version: 1.8.5\n",
+        );
+        fs::write(dir.join("installation.yaml"), before).expect("write");
+
+        set_installation_id(&dir, "new-uuid").expect("set");
+
+        let after = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        assert_eq!(
+            after,
+            before.replace("\"old-uuid\"", "\"new-uuid\""),
+            "只替换 installation_id 一行"
+        );
+        assert_eq!(local_sync_id(&dir, "fallback"), "new-uuid");
+        assert_eq!(
+            parse_installation(&after).sync_dir,
+            Some(PathBuf::from("/tmp/my-sync"))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_installation_id_creates_missing_file_with_distribution_defaults() {
+        let dir = install_dir("create");
+        set_installation_id(&dir, "fresh-id").expect("set");
+
+        let text = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        let parsed = parse_installation(&text);
+        assert_eq!(parsed.installation_id.as_deref(), Some("fresh-id"));
+        assert!(
+            text.contains("distribution_code_name:"),
+            "缺失文件必须补 distribution_* 默认字段: {text}"
+        );
+        assert!(text.contains("distribution_name:"));
+        assert!(text.contains("distribution_version:"));
+        assert_eq!(local_sync_id(&dir, "fallback"), "fresh-id");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_installation_id_is_idempotent() {
+        let dir = install_dir("idem");
+        set_installation_id(&dir, "same-id").expect("first");
+        let first = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        set_installation_id(&dir, "same-id").expect("second");
+        let second = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        assert_eq!(first, second, "重复设置同一 ID 不得改动文件");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_installation_id_keeps_crlf_and_appends_missing_key() {
+        let dir = install_dir("crlf");
+        fs::write(
+            dir.join("installation.yaml"),
+            "distribution_name: Rime\r\ninstallation_id: \"old\"\r\n",
+        )
+        .expect("write");
+        set_installation_id(&dir, "new").expect("set");
+        let text = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        assert_eq!(
+            text,
+            "distribution_name: Rime\r\ninstallation_id: \"new\"\r\n"
+        );
+
+        fs::write(dir.join("installation.yaml"), "distribution_name: Rime\n").expect("write");
+        set_installation_id(&dir, "appended").expect("append");
+        let text = fs::read_to_string(dir.join("installation.yaml")).expect("read");
+        assert_eq!(
+            text,
+            "distribution_name: Rime\ninstallation_id: \"appended\"\n"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_installation_id_rejects_path_escape() {
+        let dir = install_dir("reject");
+        for bad in ["", "../evil", "a/b", "a b", ".hidden"] {
+            assert!(
+                set_installation_id(&dir, bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        assert!(
+            !dir.join("installation.yaml").exists(),
+            "拒绝时不得创建文件"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

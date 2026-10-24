@@ -1,4 +1,4 @@
-import { api } from "../api";
+import { api, type InstallWarning } from "../api";
 import { t } from "../i18n";
 import { el } from "./dom";
 import { errorText } from "./format";
@@ -28,6 +28,75 @@ export async function copyText(value: string): Promise<boolean> {
     return ok;
   } catch {
     return false;
+  }
+}
+
+/* ---------- 离线依赖安装告警（Linux postinst 写 install-warning.json） ---------- */
+
+let installWarning: InstallWarning | null = null;
+
+export async function refreshInstallWarning(): Promise<void> {
+  try {
+    installWarning = await api.installWarning();
+  } catch {
+    // 后端读不到就当作没有告警：诊断页本身必须始终可用。
+    installWarning = null;
+  }
+  renderInstallWarning();
+}
+
+export function renderInstallWarning(): void {
+  const present = installWarning?.present === true;
+  el.installWarning.hidden = !present;
+  el.installWarningRetry.disabled = !present;
+  if (!present) {
+    el.installWarningDetail.textContent = "";
+    el.installWarningError.hidden = true;
+    el.installWarningError.textContent = "";
+    return;
+  }
+  const parts: string[] = [];
+  if (installWarning?.package) {
+    parts.push(t("settings.installWarningPackage", { package: installWarning.package }));
+  }
+  if (installWarning?.reason) {
+    parts.push(installWarning.reason);
+  }
+  if (installWarning?.written_at) {
+    parts.push(t("settings.installWarningTime", { time: installWarning.written_at }));
+  }
+  if (installWarning?.log_path) {
+    parts.push(t("settings.installWarningLogPath", { path: installWarning.log_path }));
+  }
+  el.installWarningDetail.textContent = parts.join(" · ");
+}
+
+/** 「查看日志」：/var/log 下的文件普通用户不一定能直接打开，先复制路径。 */
+export async function copyInstallWarningLog(): Promise<void> {
+  const path = installWarning?.log_path ?? "";
+  if (!path) {
+    return;
+  }
+  const ok = await copyText(path);
+  toast(
+    ok
+      ? t("settings.installWarningLogCopied", { path })
+      : t("settings.installWarningLogCopyFail", { path }),
+  );
+}
+
+/** 「重试」：pkexec 重跑 postinst 生成的 wrapper（幂等，成功后 wrapper 自己删告警）。 */
+export async function retryInstallDeps(): Promise<void> {
+  el.installWarningRetry.disabled = true;
+  el.installWarningError.hidden = true;
+  el.installWarningError.textContent = "";
+  try {
+    toast(await api.retryInstallDeps());
+  } catch (error) {
+    el.installWarningError.hidden = false;
+    el.installWarningError.textContent = errorText(error);
+  } finally {
+    el.installWarningRetry.disabled = false;
   }
 }
 

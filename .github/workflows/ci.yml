@@ -70,6 +70,24 @@ jobs:
       - name: type check
         run: pnpm exec tsc --noEmit
 
+  # 断言脚本自检：用合成产物证明"少一个功能入口就会红"。
+  # 真实产物验收在 release.yml 的 verify-artifacts job（那里才有 deb / setup.exe）；
+  # 这里每次 push/PR 都跑，成本约 20 秒（无需编译）。
+  verify-artifacts:
+    name: verify-artifacts · 断言脚本自检
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install extraction tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: verifier selftest
+        run: bash .github/scripts/verify-artifacts.sh --selftest
+
   e2e:
     name: e2e · rclone webdav transport
     runs-on: ubuntu-22.04
@@ -269,6 +287,98 @@ jobs:
             grep -qE "^  ${trigger}:" "$wf" || { echo "::error::ci.yml 的 on: 缺少 ${trigger}（该 e2e 必须在 push/PR 都跑）"; exit 1; }
           done
           echo "dav e2e 接线 OK"
+
+      # v0.6.0 事故防线（docs/FALLBACK-POLICY.md）：Weasel 回退必须显式、可见、可关闭。
+      - name: guard · weasel fallback is explicit and visible
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          test -f docs/FALLBACK-POLICY.md || { echo "::error::缺少 docs/FALLBACK-POLICY.md"; exit 1; }
+          grep -qF 'FALLBACK-POLICY.md' packaging/README.md || {
+            echo "::error::packaging/README.md 没有引用 docs/FALLBACK-POLICY.md"
+            exit 1
+          }
+          grep -qE '^  verify-artifacts:' "$wf" || { echo "::error::$wf 缺少 verify-artifacts job"; exit 1; }
+          grep -qE '^  verify-artifacts:' .github/workflows/ci.yml || {
+            echo "::error::ci.yml 缺少 verify-artifacts job（断言脚本自检必须在 push/PR 就跑）"
+            exit 1
+          }
+          grep -qF 'verify-artifacts.sh --selftest' .github/workflows/ci.yml || {
+            echo "::error::ci.yml 没有跑 verify-artifacts.sh --selftest"
+            exit 1
+          }
+          grep -qF 'verify-artifacts.sh' "$wf" || {
+            echo "::error::$wf 没有调用 .github/scripts/verify-artifacts.sh"
+            exit 1
+          }
+          pub_needs=$(awk '/^  publish:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
+          case "$pub_needs" in
+            *verify-artifacts*) : ;;
+            *) echo "::error::publish 必须 needs verify-artifacts（断言失败就不许发布）"; exit 1 ;;
+          esac
+          grep -qF 'weasel_mode:' "$wf" || {
+            echo "::error::$wf 的 workflow_dispatch 没有 weasel_mode 选项（回退必须可显式选择）"
+            exit 1
+          }
+          grep -qF 'mode=require' "$wf" || {
+            echo "::error::$wf 没有把 tag 推送解析成 require（自编译失败必须让 job 失败）"
+            exit 1
+          }
+          grep -qF 'continue-on-error: ${{ steps.weasel_mode.outputs.mode != '"'"'require'"'"' }}' "$wf" || {
+            echo "::error::$wf 的 Weasel 自编译步骤必须按模式决定 continue-on-error（不能写死 true）"
+            exit 1
+          }
+          if grep -nE '^ *continue-on-error: true' "$wf" | grep -qv 'weasel_mode'; then
+            echo "::error::$wf 里还有写死 continue-on-error: true 的步骤（会静默吞掉失败）"
+            exit 1
+          fi
+          grep -qF '本版未包含 Weasel 入口' "$wf" || {
+            echo "::error::$wf 没有在回退时红字标注「本版未包含 Weasel 入口」"
+            exit 1
+          }
+          echo "weasel fallback 接线 OK"
+
+      # 开发机没有 pwsh 时，release.yml 里的内联 PowerShell 只能靠这里兜住：
+      # 把每个 shell: pwsh 的 run 块抽出来，用 runner 自带的 pwsh 逐个做语法解析。
+      - name: parse inline PowerShell in release.yml
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import os
+          import yaml
+
+          for stale in glob.glob('/tmp/inline-*.ps1'):
+              os.remove(stale)
+          doc = yaml.safe_load(open('.github/workflows/release.yml'))
+          index = 0
+          for job in doc['jobs'].values():
+              for step in job.get('steps', []):
+                  if step.get('shell') == 'pwsh' and 'run' in step:
+                      index += 1
+                      with open(f'/tmp/inline-{index}.ps1', 'w') as handle:
+                          handle.write(step['run'])
+          print(f'extracted {index} inline pwsh steps')
+          PY
+          cat >/tmp/parse-pwsh.ps1 <<'PS1'
+          param([string]$Path)
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error file=$Path::$($_.Message)" }
+            exit 1
+          }
+          PS1
+          shopt -s nullglob
+          files=(/tmp/inline-*.ps1)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::release.yml 里没有抽到任何 shell: pwsh 步骤（守卫失效）"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            pwsh -NoProfile -File /tmp/parse-pwsh.ps1 "$f"
+            echo "pwsh syntax ok: $f"
+          done
 
       - name: parse packaging/windows/fetch-weasel.ps1
         run: |

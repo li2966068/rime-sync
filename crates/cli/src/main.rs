@@ -138,6 +138,9 @@ struct StatusReport {
     lock_held: bool,
     lock_stale: bool,
     lock_holder: Option<String>,
+    /// 离线依赖安装告警（<config 目录>/install-warning.json）。
+    /// None = 没有告警；文件存在但坏了也会是 Some（带 present/parse_error），不许静默。
+    install_warning: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -345,6 +348,7 @@ fn run(cli: Cli) -> Result<()> {
             let network = NetworkPolicy::system();
             let retry =
                 RetryState::load(&state_dir(&config_path).join("retry.json")).unwrap_or_default();
+            let install_warning = read_install_warning(&state_dir(&config_path));
             let report = StatusReport {
                 config_path: config_path.display().to_string(),
                 rime_dir: detection.display().to_string(),
@@ -369,6 +373,7 @@ fn run(cli: Cli) -> Result<()> {
                 lock_holder: lock_status
                     .info
                     .map(|info| format!("pid={} host={}", info.pid, info.hostname)),
+                install_warning,
             };
             if cli.json {
                 print_json(&report)
@@ -406,6 +411,8 @@ fn run(cli: Cli) -> Result<()> {
                     report.lock_stale,
                     report.lock_holder.as_deref().unwrap_or("-")
                 );
+                // 离线依赖没装完时这一行是 JSON；没有告警时是 "-"，脚本可稳定解析。
+                println!("{}", install_warning_line(&report.install_warning));
                 if let Some(error) = report.remote_error {
                     eprintln!("remote_error: {error}");
                 }
@@ -676,6 +683,55 @@ fn state_dir(config_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 读 <config 目录>/install-warning.json（packaging/linux/postinst 的 wrapper 写）。
+///
+/// 返回 None 表示没有告警。文件存在但读不动 / 不是合法 JSON 时也要返回
+/// present=true + parse_error：这条链路的目的就是"别静默"，解析失败同样要可见。
+fn read_install_warning(dir: &Path) -> Option<serde_json::Value> {
+    let path = dir.join("install-warning.json");
+    if !path.exists() {
+        return None;
+    }
+    let path_text = path.display().to_string();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Some(serde_json::json!({
+                "present": true,
+                "path": path_text,
+                "parse_error": format!("读取 install-warning.json 失败：{error}"),
+            }))
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            let _ = map.insert("present".to_string(), serde_json::Value::Bool(true));
+            if !map.contains_key("path") {
+                let _ = map.insert("path".to_string(), serde_json::Value::String(path_text));
+            }
+            Some(serde_json::Value::Object(map))
+        }
+        Ok(other) => Some(serde_json::json!({
+            "present": true,
+            "path": path_text,
+            "parse_error": format!("install-warning.json 不是 JSON 对象：{other}"),
+        })),
+        Err(error) => Some(serde_json::json!({
+            "present": true,
+            "path": path_text,
+            "parse_error": format!("install-warning.json 无法解析：{error}"),
+        })),
+    }
+}
+
+/// 文本模式的一行输出；没有告警也打印 "-"，脚本能稳定解析这个字段。
+fn install_warning_line(warning: &Option<serde_json::Value>) -> String {
+    match warning {
+        Some(value) => format!("install_warning: {value}"),
+        None => "install_warning: -".to_string(),
+    }
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -791,4 +847,74 @@ fn count_local(root: &Path) -> Result<(usize, usize)> {
         }
     }
     Ok((shared, snapshots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-cli-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("创建临时目录");
+        dir
+    }
+
+    /// status 的 install_warning 必须在 JSON 与文本两条路径上都能看到；
+    /// 坏 JSON 也要 present=true + parse_error（不许静默、不许 panic）。
+    #[test]
+    fn install_warning_reaches_json_and_text_output() {
+        let dir = temp_dir("warning");
+        let warning_path = dir.join("install-warning.json");
+        fs::write(
+            &warning_path,
+            r#"{"written_at":"2026-10-24T09:00:00Z","package":"fcitx5-rime","reason":"离线依赖未安装完成","log_path":"/var/log/rime-sync/vendor-install.log"}"#,
+        )
+        .expect("写 warning");
+
+        let warning = read_install_warning(&dir).expect("应当读到告警");
+        assert_eq!(warning["present"], serde_json::Value::Bool(true));
+        assert_eq!(warning["package"].as_str(), Some("fcitx5-rime"));
+        assert_eq!(
+            warning["log_path"].as_str(),
+            Some("/var/log/rime-sync/vendor-install.log")
+        );
+
+        // JSON 模式：StatusReport 直接序列化这个字段。
+        let json = serde_json::to_string(&warning).expect("序列化");
+        assert!(json.contains("\"present\":true"), "json={json}");
+        assert!(json.contains("fcitx5-rime"), "json={json}");
+
+        // 文本模式：一行 install_warning: {...}
+        let line = install_warning_line(&Some(warning));
+        assert!(line.starts_with("install_warning: {"), "line={line}");
+        assert!(line.contains("fcitx5-rime"), "line={line}");
+
+        // 坏 JSON 也必须可见，且不 panic。
+        fs::write(&warning_path, "{not json").expect("写坏 JSON");
+        let broken = read_install_warning(&dir).expect("坏 JSON 也要可见");
+        assert_eq!(broken["present"], serde_json::Value::Bool(true));
+        assert!(
+            broken["parse_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("无法解析"),
+            "broken={broken}"
+        );
+        assert!(install_warning_line(&Some(broken)).contains("parse_error"));
+
+        // 没有文件时是 None，文本模式打印 "-"。
+        let empty = temp_dir("empty");
+        assert!(read_install_warning(&empty).is_none());
+        assert_eq!(install_warning_line(&None), "install_warning: -");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty);
+    }
 }

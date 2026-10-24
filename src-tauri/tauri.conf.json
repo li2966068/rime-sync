@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rime-sync",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "identifier": "com.rimesync.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -77,7 +77,8 @@
           "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh",
           "/usr/lib/rime-sync/uninstall.sh": "../packaging/linux/uninstall.sh",
           "/usr/share/applications/rime-sync-uninstall.desktop": "../packaging/linux/rime-sync-uninstall.desktop",
-          "/usr/bin/rime-sync-status": "../packaging/linux/rime-sync-status"
+          "/usr/bin/rime-sync-status": "../packaging/linux/rime-sync-status",
+          "/usr/bin/rime-sync-cli": "../packaging/linux/rime-sync-cli"
         },
         "postInstallScript": "../packaging/linux/postinst",
         "preRemoveScript": "../packaging/linux/prerm",

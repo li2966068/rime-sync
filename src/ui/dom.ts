@@ -123,6 +123,12 @@ export const el = {
   diagPath: byId<HTMLElement>("diag-path"),
   diagCopy: byId<HTMLButtonElement>("btn-diag-copy"),
 
+  installWarning: byId<HTMLDivElement>("install-warning"),
+  installWarningDetail: byId<HTMLParagraphElement>("install-warning-detail"),
+  installWarningError: byId<HTMLParagraphElement>("install-warning-error"),
+  installWarningLog: byId<HTMLButtonElement>("btn-install-warning-log"),
+  installWarningRetry: byId<HTMLButtonElement>("btn-install-warning-retry"),
+
   language: byId<HTMLSelectElement>("language"),
   updateStatus: byId<HTMLElement>("update-status"),
   updateVersion: byId<HTMLParagraphElement>("update-version"),

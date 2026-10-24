@@ -269,6 +269,31 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
   .first-sync-banner { flex-direction: column; align-items: stretch; }
 }
 
+/* ---------- 离线依赖安装告警（postinst → install-warning.json） ---------- */
+.install-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+}
+.install-warning-copy { min-width: 0; }
+.install-warning-copy strong { display: block; font-size: 13px; }
+.install-warning-copy p { margin: 3px 0 0; line-height: 1.5; word-break: break-all; }
+.install-warning-error { font-weight: 600; }
+.install-warning-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+@media (max-width: 620px) {
+  .install-warning { flex-direction: column; align-items: stretch; }
+  .install-warning-actions { justify-content: flex-end; }
+}
+
 .remote-list {
   margin-top: 12px;
   border: 1px solid var(--border);

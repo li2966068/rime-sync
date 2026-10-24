@@ -13,7 +13,13 @@ import { previewSync } from "./ui/plan";
 import { conflicts, activeConflict, renderDiff, loadConflicts, resolveOne, confirmResolve, resolveFromList, resolveAll } from "./ui/conflicts";
 import { loadDevices, revokeDevice } from "./ui/devices";
 import { updateDedupeApply, loadDedupe, applyDedupe } from "./ui/dedupe";
-import { copyDiagPath, exportDiagnostics } from "./ui/diagnostics";
+import {
+  copyDiagPath,
+  copyInstallWarningLog,
+  exportDiagnostics,
+  refreshInstallWarning,
+  retryInstallDeps,
+} from "./ui/diagnostics";
 import { applyAppVersion, renderUpdate, checkUpdate, installUpdate } from "./ui/update";
 import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui/watch";
 import { loadPresets, applyPresetTo } from "./ui/presets";
@@ -309,6 +315,12 @@ export function bindEvents(): void {
   el.diagCopy.addEventListener("click", () => {
     void copyDiagPath();
   });
+  el.installWarningLog.addEventListener("click", () => {
+    void copyInstallWarningLog();
+  });
+  el.installWarningRetry.addEventListener("click", () => {
+    void retryInstallDeps();
+  });
 
   el.language.addEventListener("change", () => {
     setLang(el.language.value === "en" ? "en" : "zh");
@@ -427,6 +439,7 @@ export async function init(): Promise<void> {
     await refreshNetwork();
     await loadWatchStatus();
     await loadBackups();
+    await refreshInstallWarning();
     localLog("界面已就绪");
     setFooter(t("footer.ready"));
     if (needsSetup) {

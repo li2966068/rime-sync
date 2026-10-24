@@ -7,8 +7,9 @@ import { localLog } from "./logs";
 import { config, busy, setConfig, requireConfig } from "./state";
 import { clampBackupKeep, renderBackupKeep } from "./backups";
 import { refreshSecretStatus } from "./secret";
+import { loadDevices } from "./devices";
 
-// 设置页：配置回填、草稿与保存、Rime 目录、设备 ID。
+// 设置页：配置回填、草稿与保存、Rime 目录、设备名称（label）。
 
 type DeviceChoice = "migrate" | "local" | "cancel";
 let deviceChoiceResolve: ((choice: DeviceChoice) => void) | null = null;
@@ -159,7 +160,7 @@ export async function detectRimeDir(
   }
 }
 
-/* ---------- 设备 ID 与去重 ---------- */
+/* ---------- 设备名称（label）与去重 ---------- */
 
 export const DEVICE_ID_MAX = 64;
 
@@ -206,6 +207,18 @@ export function settleDeviceChoice(choice: DeviceChoice): void {
   resolve?.(choice);
 }
 
+/// 设备名称变更后：先把本机身份登记到远端（目录名 = installation_id，幂等，只写 owner.json），
+/// 再刷新设备页。远端登记失败不影响本地已保存的名称：同步时会再写一次 owner.json。
+async function refreshAfterIdentityChange(): Promise<void> {
+  try {
+    await api.publishIdentity();
+    toast(t("settings.devicePublishOk"));
+  } catch (error) {
+    toast(t("settings.devicePublishFail", { error: errorText(error) }));
+  }
+  await loadDevices();
+}
+
 export async function saveSettings(): Promise<void> {
   if (!config || busy) {
     return;
@@ -250,10 +263,21 @@ export async function saveSettings(): Promise<void> {
     return;
   }
   if (choice === "migrate") {
+    // 后端把 installation.yaml、本地与远端 sync 目录一起改名，并保存 device_id 标签；
+    // 失败时后端已回滚，这里只需保留旧配置。
     el.settingsHint.textContent = t("settings.deviceChecking");
     try {
       const result = await api.migrateDevice(previousId, nextId);
-      toast(t("settings.deviceMigrateOk", { files: result.copied_files }));
+      // 后端按结构化结果说明到底做了什么：无需迁移 / 只改本地目录 / 复制了远端目录。
+      const message = result.skipped
+        ? t("settings.deviceMigrateSkipped")
+        : result.remote_renamed
+          ? t("settings.deviceMigrateOk", { files: result.copied_files })
+          : t("settings.deviceMigrateLocalRenamed");
+      toast(message);
+      if (result.warnings.length > 0) {
+        localLog(result.warnings.join("；"));
+      }
     } catch (error) {
       const text = t("settings.deviceMigrateFail", { error: errorText(error) });
       el.settingsHint.textContent = text;
@@ -271,5 +295,8 @@ export async function saveSettings(): Promise<void> {
     const text = t("conn.saveFail", { error: errorText(error) });
     el.settingsHint.textContent = text;
     toast(text);
+    return;
   }
+  // 迁移 / 仅本地修改都要登记新身份并刷新设备页，否则设备页会停留在旧 ID。
+  await refreshAfterIdentityChange();
 }

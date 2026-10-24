@@ -171,6 +171,17 @@ export interface ConflictResolve {
   bytes: number | null;
 }
 
+/** 离线依赖安装告警（Linux；来源 ~/.config/com.rimesync.app/install-warning.json）。 */
+export interface InstallWarning {
+  present: boolean;
+  path: string;
+  written_at?: string | null;
+  package?: string | null;
+  reason?: string | null;
+  log_path?: string | null;
+  retry_command?: string | null;
+}
+
 export interface DeviceInfo {
   id: string;
   hostname: string;
@@ -209,6 +220,19 @@ export interface MigrateResult {
   removed: number;
   freed_bytes: number;
   steps: MigrateStep[];
+  /** 远端旧目录存在并已复制（false = 只改了本地目录与名称）。 */
+  remote_renamed: boolean;
+  /** 本地与远端都没有旧目录：无需搬运，只改了 installation_id 与标签。 */
+  skipped: boolean;
+  /** 迁移已完成但旧目录清理失败等非致命问题。 */
+  warnings: string[];
+}
+
+/** 本机身份登记结果（只写 sync/<id>/owner.json，不搬快照）。 */
+export interface PublishIdentityResult {
+  device_id: string;
+  remote_path: string;
+  wrote: boolean;
 }
 
 export interface DedupeItem {
@@ -377,6 +401,7 @@ export const api = {
   checkDeviceId: (id: string) => invoke<DeviceIdCheck>("cmd_check_device_id", { id }),
   migrateDevice: (oldId: string, newId: string) =>
     invoke<MigrateResult>("cmd_migrate_device", { old: oldId, new: newId }),
+  publishIdentity: () => invoke<PublishIdentityResult>("cmd_publish_identity"),
 
   dedupePreview: () => invoke<DedupePreview>("cmd_dedupe_preview"),
   dedupeApply: (kind: DedupeKind, ids: string[]) =>
@@ -396,6 +421,9 @@ export const api = {
   pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
 
   exportDiagnostics: () => invoke<{ path: string }>("cmd_export_diagnostics"),
+
+  installWarning: () => invoke<InstallWarning>("cmd_install_warning"),
+  retryInstallDeps: () => invoke<string>("cmd_retry_install_deps"),
 
   watchStart: () => invoke<WatchStatus>("cmd_watch_start"),
   watchStop: () => invoke<WatchStatus>("cmd_watch_stop"),

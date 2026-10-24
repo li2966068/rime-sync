@@ -45,6 +45,14 @@ release 的两个构建 job：
 `publish` job 下载两边 artifact，用 `.github/scripts/make-latest-json.py` 从 `*.sig` 生成
 `latest.json`，再 `gh release upload` 上传（含 `--clobber`，可重复跑）。
 
+发布前还有两个"功能入口断言"，任一失败 publish 都不会跑：
+
+- `verify-artifacts` job：`.github/scripts/verify-artifacts.sh`——解 deb 检查
+  `rime.so` 里的 `/usr/bin/rime-sync-status`、`zh_CN` 译文、可执行位；解 `*-setup.exe` 检查
+  `WeaselServer.exe` 里有没有「Rime 同步」。`ci.yml` 每次 push/PR 跑它的 `--selftest`。
+- `windows` job 的 `verify weasel vendor payload`：来源必须是自编译（`require` 模式），
+  否则写 `WEASEL-SOURCE.json` 并在 summary / 发布说明红字标注。
+
 ### 必需的 secrets
 
 | Secret | 用途 | 缺失后果 |
@@ -156,3 +164,80 @@ pnpm tauri icon packaging/assets/source-icon.png   # 需要自备 1024x1024 源�
 ```
 
 许可与来源要求见 `packaging/assets/README.md`。
+
+## 11. 回退策略
+
+打包链路里所有"失败后自动降级"的行为（Weasel 自编译失败回退上游官方包、离线依赖
+安装失败回退自带 .deb……）都受 [`../docs/FALLBACK-POLICY.md`](../docs/FALLBACK-POLICY.md) 约束：
+
+> 任何 fallback 必须同时做到：**写日志、在 UI 或发布说明可见、可用参数关闭。**
+
+落到本目录的具体位置：
+
+| 位置 | 说明 |
+|---|---|
+| `windows/README.md` §5 | `RIMESYNC_WEASEL_MODE=require/build/fetch` 的行为表 |
+| `linux/postinst` | 依赖安装最终失败 → `~/.config/com.rimesync.app/install-warning.json`（应用诊断页红条 + 重试） |
+| `.github/scripts/verify-artifacts.sh` | 把"入口必须存在"变成断言；`--selftest` 证明缺少入口时会红 |
+| `.github/workflows/release.yml` | tag 发布强制 `require`；回退时 summary 与发布说明红字 |
+
+## 12. Linux 离线安装器：判定逻辑与故障排查
+
+`packaging/linux/install.sh` 负责 `.run` 自解压包里的
+「vendor 依赖 → rime-inputmethod → rime-sync」三段安装。0.6.0 起它只对
+**自己解包的包**负责：
+
+| 行为 | 实现 |
+|---|---|
+| 只补缺失、不升级系统库 | dpkg 状态为 `ii` 的包直接跳过；只有 `iU/iF/rc/未安装` 才解包 |
+| 多架构系统更保守 | `dpkg --print-foreign-architectures` 非空时，同名包任一架构已装且版本不同就不碰（避免 `libbrotli1:amd64` 与 `libbrotli1:i386` 版本不一致） |
+| 只配置自己解包的包 | `dpkg --configure <pkg:arch>...`，不再 `dpkg --configure -a`；无关的半配置包不影响判定 |
+| 失败判定 | 只看「安装前是 ii 或本来不存在、现在却不是 ii」的包；安装前就坏的包只提示 |
+| 可重复执行 | 旧版已装时直接 `dpkg -i --force-confdef --force-confold` 覆盖升级，不需要先卸载 |
+| 需要升级系统库时 | `sudo ./install.sh --upgrade-vendor`（默认关闭） |
+
+失败时安装器会打印：未配置的包名与 dpkg 原文尾部、`dpkg --audit` 的系统范围
+清单、本次改动过的包（安装前 → 现在）以及可执行的修复命令。安装前的 dpkg
+快照写在 `/var/log/rime-sync/dpkg-before-install.txt`，完整日志在
+`/var/log/rime-sync/install.log`。
+
+多架构版本冲突的处置（用户现场：`libbrotli1:amd64` 被升到 `deb13u1`、`i386`
+还停在 `b7`，dpkg 报 `cannot be configured because libbrotli1:i386 is at a
+different version`）：
+
+```bash
+sudo apt --fix-broken install          # 有网络：让 apt 统一各架构版本
+sudo apt purge '.*:i386'               # 不需要 32 位兼容时
+sudo dpkg --remove-architecture i386
+sudo dpkg --configure libbrotli1:amd64 # 只修被点名的那一个
+sudo dpkg --audit                      # 确认系统整体状态
+```
+
+修好后重跑安装器即可（已配好的依赖不会重复解包）。
+
+### 容器验收矩阵
+
+```bash
+packaging/linux/test/install-matrix.sh                # 全部用例
+packaging/linux/test/install-matrix.sh upgrade        # 只跑升级用例
+```
+
+每个用例都是全新容器、`--network none` 真离线：
+
+| 用例 | 场景 | 断言 |
+|---|---|---|
+| `normal` | debian-13 干净系统 | 两个包都装上、rime_deployer 能构建、dpkg.log 0 次 upgrade |
+| `broken-unrelated` | 预置一个无关的半配置包（postinst 返回 1） | 安装仍成功；那个包保持原状且不出现在 install.log |
+| `multiarch` | 启用 i386 + libbrotli1 两架构同版本，离线库里该包更高 | 不升级 `libbrotli1:amd64`、安装成功、0 次 upgrade |
+| `prebroken-multiarch` | 已处于"上次安装把 amd64 解包成新版、i386 仍是旧版"的坏状态 | 退出码 3 但措辞明确，输出 dpkg 原文 + 多架构说明 + 修复命令 + 责任归属 |
+| `upgrade` | 先装旧版（0.4.0 IME + 0.3.0 sync），再装当前产物 | 版本原地升级、旧版独有路径已清理、用户数据哈希不变 |
+| `single-arch` | debian-12（无任何外部架构） | 安装成功且不触发多架构分支 |
+
+产物默认取本地已有的 `.deb`（`build/deb/debian-*/`、`packaging/out/`），可用
+`IME_DEB_NEW` / `SYNC_DEB_NEW` 等环境变量指向 CI 新产物。仓库里的
+`packaging/linux/vendor/` 是历史快照（对应 IME 0.4.x）；IME 0.5.x 新增的
+`libqt5core5t64` / `libpcre2-16-0` / `libdouble-conversion3` 由
+`EXTRA_DEBS`（默认 `packaging/linux/out/test-extra-debs/<distro>/`）补入，
+正式离线包由 `fetch-vendor-debs.sh` 现算闭包不会缺；缺任何依赖时脚本会在预检
+阶段直接点名。
+

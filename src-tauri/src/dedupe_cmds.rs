@@ -5,12 +5,14 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::path::Path;
 
 use rime_sync_core::backup::{now_secs, BackupManifest};
 use rime_sync_core::config::Config;
 use rime_sync_core::dedupe::{self, BackupFingerprint, DedupeGroup, DeviceDirEntry, SnapshotFile};
 use rime_sync_core::index::sha256_hex;
 use rime_sync_core::plan;
+use rime_sync_core::rime_dir;
 use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -21,6 +23,61 @@ use crate::{backup_manager, dav_client, ensure_config, push_log, AppState};
 /// 与备份一致：sync/ 树最多扫描 6 层。
 const SNAPSHOT_DEPTH: usize = 6;
 const SNAPSHOT_MAX_FILES: usize = 512;
+
+/// 本机目录名：installation_id 优先（缺 installation.yaml 才回退 device_id）。
+/// 回退时返回 warning，避免 UI 静默按错误标识判定「本机」。
+pub(crate) fn resolve_self_id(config: &Config) -> (String, Option<String>) {
+    let detection = crate::detect_rime(config).ok();
+    resolve_self_id_at(
+        detection.as_ref().map(|detection| detection.path.as_path()),
+        config,
+    )
+}
+
+/// 纯函数版本（单测直接喂 rime 目录）：None 表示 rime 目录不可用。
+pub(crate) fn resolve_self_id_at(rime: Option<&Path>, config: &Config) -> (String, Option<String>) {
+    let Some(rime) = rime else {
+        return (
+            config.device_id.clone(),
+            Some("未能定位 Rime 用户目录，去重按 device_id 判定本机目录".to_string()),
+        );
+    };
+    let id = rime_dir::local_sync_id(rime, &config.device_id);
+    if id == config.device_id && rime_dir::installation_id(rime).is_none() {
+        return (
+            id,
+            Some(format!(
+                "installation.yaml 缺少 installation_id，去重按 device_id（{}）判定本机目录",
+                config.device_id
+            )),
+        );
+    }
+    (id, None)
+}
+
+/// 单个设备目录的删除闸门（纯函数）：名字合法 + 不得指向本机目录。
+pub(crate) fn check_device_delete(id: &str, self_id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id == "."
+        || id == ".."
+        || id.starts_with('.')
+        || id == "shared"
+    {
+        return Err("设备目录名无效".to_string());
+    }
+    dedupe::validate_remote_delete_path(&format!("sync/{id}"), self_id)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// 同一内容的远端副本不得一次删光：至少留一份（含本机目录下的快照）。
+pub(crate) fn ensure_one_copy_left(total: usize, chosen: usize) -> Result<(), String> {
+    if total > 0 && chosen >= total {
+        return Err("不能删除同一内容的全部副本".to_string());
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 pub struct DedupeSection {
@@ -111,11 +168,17 @@ pub fn cmd_dedupe_preview(
     state: State<'_, AppState>,
 ) -> Result<DedupePreview, String> {
     let config = ensure_config(&app, &state.0)?;
+    let (self_id, self_warning) = resolve_self_id(&config);
+    let self_warnings: Vec<String> = self_warning.into_iter().collect();
     let (devices, snapshots) = match dav_client(&app, &state.0) {
-        Ok((config, client)) => (
-            preview_devices(&client, &config),
-            preview_snapshots(&client),
-        ),
+        // 本机目录名与传输一致：installation_id（不是 device_id 标签）。
+        Ok((_, client)) => {
+            let mut devices = preview_devices(&client, &self_id);
+            let mut snapshots = preview_snapshots(&client);
+            devices.warnings.extend(self_warnings.iter().cloned());
+            snapshots.warnings.extend(self_warnings);
+            (devices, snapshots)
+        }
         Err(error) => (
             DedupeSection::error(error.clone()),
             DedupeSection::error(error),
@@ -123,7 +186,7 @@ pub fn cmd_dedupe_preview(
     };
     let backups = preview_backups(&app, &state.0)?;
     Ok(DedupePreview {
-        self_id: config.device_id,
+        self_id,
         generated_at: now_secs(),
         devices,
         snapshots,
@@ -172,7 +235,7 @@ fn scan_sync_dirs(client: &DavClient) -> Result<Vec<String>, String> {
     Ok(dirs)
 }
 
-fn preview_devices(client: &DavClient, config: &Config) -> DedupeSection {
+fn preview_devices(client: &DavClient, self_id: &str) -> DedupeSection {
     let dirs = match scan_sync_dirs(client) {
         Ok(dirs) => dirs,
         Err(error) => return DedupeSection::error(error),
@@ -217,7 +280,7 @@ fn preview_devices(client: &DavClient, config: &Config) -> DedupeSection {
             size_bytes: size,
         });
     }
-    let groups = dedupe::group_device_dirs(&entries, &config.device_id)
+    let groups = dedupe::group_device_dirs(&entries, self_id)
         .into_iter()
         .filter(|group| group.tag == dedupe::TAG_UNKNOWN || group.items.len() > 1)
         .collect();
@@ -350,6 +413,10 @@ fn apply_devices(
     ids: &[String],
 ) -> Result<DedupeResult, String> {
     let (config, client) = dav_client(app, inner)?;
+    let (self_id, warning) = resolve_self_id(&config);
+    if let Some(warning) = warning {
+        push_log(inner, warning);
+    }
     let mut acc = ApplyAccumulator::default();
     let mut seen = HashSet::new();
     for id in ids {
@@ -358,19 +425,9 @@ fn apply_devices(
             continue;
         }
         let result: Result<u64, String> = (|| {
-            if id.is_empty()
-                || id.contains('/')
-                || id.contains('\\')
-                || id == "."
-                || id == ".."
-                || id.starts_with('.')
-                || id == "shared"
-            {
-                return Err("设备目录名无效".to_string());
-            }
+            // 闸门按 installation_id 认本机目录；旧 device_id 目录可以删。
+            check_device_delete(id, &self_id)?;
             let rel = format!("sync/{id}");
-            dedupe::validate_remote_delete_path(&rel, &config.device_id)
-                .map_err(|error| format!("{error:#}"))?;
             let report =
                 remote_tree::delete_tree(&client, &rel).map_err(|error| format!("{error:#}"))?;
             Ok(report.freed_bytes)
@@ -398,6 +455,10 @@ fn apply_snapshots(
     ids: &[String],
 ) -> Result<DedupeResult, String> {
     let (config, client) = dav_client(app, inner)?;
+    let (self_id, warning) = resolve_self_id(&config);
+    if let Some(warning) = warning {
+        push_log(inner, warning);
+    }
     let scan = scan_snapshots(&client)?;
     let by_path: BTreeMap<String, SnapshotFile> = scan
         .files
@@ -429,10 +490,9 @@ fn apply_snapshots(
             };
             let total = totals.get(&file.sha256).copied().unwrap_or(0);
             let chosen = selected.get(&file.sha256).copied().unwrap_or(0);
-            if total > 0 && chosen >= total {
-                return Err("不能删除同一内容的全部副本".to_string());
-            }
-            dedupe::validate_snapshot_delete_path(id, &config.device_id)
+            // 同一内容至少留一份（本机目录下的快照同样受保护）。
+            ensure_one_copy_left(total, chosen)?;
+            dedupe::validate_snapshot_delete_path(id, &self_id)
                 .map_err(|error| format!("{error:#}"))?;
             client.delete(id).map_err(|error| format!("{error:#}"))?;
             Ok(file.size)
@@ -521,5 +581,101 @@ mod tests {
         assert!(result.removed.is_empty());
         assert_eq!(result.freed_bytes, 0);
         assert!(result.failed.is_empty());
+    }
+
+    fn config_with(device_id: &str) -> Config {
+        Config {
+            device_id: device_id.to_string(),
+            ..Config::default()
+        }
+    }
+
+    fn temp_rime(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rime-sync-dedupe-{tag}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn self_id_prefers_installation_id_over_device_label() {
+        let dir = temp_rime("self-id");
+        fs::write(
+            dir.join("installation.yaml"),
+            "installation_id: \"e6169df8-uuid\"\n",
+        )
+        .expect("write");
+        let (self_id, warning) = resolve_self_id_at(Some(&dir), &config_with("5095"));
+        assert_eq!(
+            self_id, "e6169df8-uuid",
+            "去重必须按 installation_id 认本机目录"
+        );
+        assert!(warning.is_none(), "读得到 installation_id 时不应告警");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn self_id_falls_back_to_device_label_with_warning() {
+        let (self_id, warning) = resolve_self_id_at(None, &config_with("5095"));
+        assert_eq!(self_id, "5095");
+        assert!(warning.expect("warning").contains("device_id"));
+
+        let dir = temp_rime("fallback");
+        let (self_id, warning) = resolve_self_id_at(Some(&dir), &config_with("5095"));
+        assert_eq!(self_id, "5095");
+        let warning = warning.expect("warning");
+        assert!(warning.contains("installation_id"), "{warning}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 模拟 apply_devices 对单个 id 的处理：闸门失败必须计入 failed。
+    fn apply_one_device(acc: &mut ApplyAccumulator, id: &str, self_id: &str) {
+        match check_device_delete(id, self_id) {
+            Ok(()) => acc.ok(id, 0),
+            Err(error) => acc.fail(id, error),
+        }
+    }
+
+    #[test]
+    fn self_installation_id_dir_is_refused_and_counted_as_failed() {
+        let self_id = "e6169df8-uuid";
+        let mut acc = ApplyAccumulator::default();
+        apply_one_device(&mut acc, self_id, self_id);
+        apply_one_device(&mut acc, "5095", self_id);
+        let result = acc.finish();
+        assert_eq!(
+            result.removed,
+            vec!["5095"],
+            "旧 device_id 目录是普通设备，可以删除"
+        );
+        assert_eq!(result.failed.len(), 1, "删除本机目录必须失败而不是静默跳过");
+        assert_eq!(result.failed[0].id, self_id);
+        assert!(
+            result.failed[0]
+                .error
+                .contains("refusing to delete the local device directory"),
+            "{}",
+            result.failed[0].error
+        );
+    }
+
+    #[test]
+    fn snapshot_guard_keeps_at_least_one_copy_including_own_dir() {
+        assert!(ensure_one_copy_left(0, 0).is_ok(), "没有副本时不必拦截");
+        assert!(ensure_one_copy_left(3, 2).is_ok());
+        let error = ensure_one_copy_left(3, 3).expect_err("must keep one copy");
+        assert!(error.contains("全部副本"), "{error}");
+
+        // 本机 sync/<installation_id>/ 下的快照：路径闸门允许删除单个文件，
+        // 但同一内容被全选时仍必须至少保留一份。
+        let self_id = "e6169df8-uuid";
+        let own = format!("sync/{self_id}/main.userdb.txt");
+        assert!(dedupe::validate_snapshot_delete_path(&own, self_id).is_ok());
+        assert!(
+            ensure_one_copy_left(2, 2).is_err(),
+            "本机目录的快照也不能删光"
+        );
+        assert!(ensure_one_copy_left(2, 1).is_ok());
     }
 }

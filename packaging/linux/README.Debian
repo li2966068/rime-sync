@@ -77,7 +77,77 @@ postinst 本身立即返回，绝不会卡住或让安装失败。日志在
     packaging/linux/fetch-vendor-debs.sh                            # ubuntu:22.04
     IMAGE=ubuntu:24.04 VERSION_ID=24.04 packaging/linux/fetch-vendor-debs.sh
 
-四、卸载
+离线包对"系统已有包"的处理（0.6.0 起，install.sh）：
+
+* **只解包缺失的包**：dpkg 里已经是 ii（install ok installed）的包一律跳过，
+  不会把系统自带的安全更新版本覆盖成离线包里的版本；
+* **多架构系统更保守**（`dpkg --print-foreign-architectures` 非空）：同名包只要
+  在任一架构已装、且版本与离线包不同，连缺失的那个架构也不补。原因是 dpkg 要求
+  同一包的各架构版本一致，硬装会得到
+  `libbrotli1:amd64 (1.1.0-2+deb13u1) cannot be configured because
+  libbrotli1:i386 is at a different version (1.1.0-2+b7)`，随后整条依赖链
+  全部 "leaving unconfigured"（0.6.0 用户现场就是这样把安装卡死的）；
+* **只配置自己解包的包**：`dpkg --configure <pkg:arch>...`，不再对全系统跑
+  `dpkg --configure -a`；系统里与本安装无关的半配置包不会再被判成安装失败；
+* 确实需要把系统库升到离线包版本时才加 `--upgrade-vendor`（默认关闭）。
+
+四、故障排查：半配置包与多架构冲突
+----------------------------------
+安装失败时先看安装器自己打出来的三段信息（也在 /var/log/rime-sync/install.log）：
+
+1. 未配置的包名 + `dpkg` 原文尾部（真正的错误行在这里）；
+2. `dpkg --audit` 的系统范围未配置清单（区分"我们解包的"与"系统本来就坏的"）；
+3. 本次离线包改动过的包（安装前 → 现在）与原始版本；安装前的完整 dpkg 快照写在
+   /var/log/rime-sync/dpkg-before-install.txt。
+
+常见情形与处置：
+
+A. 多架构版本不一致（libbrotli1 / libssl3 / libpcre2 这类 Multi-Arch: same 的库）
+
+    # 有网络：让 apt 把各架构统一到同一版本
+    sudo apt --fix-broken install
+
+    # 不需要 32 位兼容：彻底退出 i386 多架构
+    sudo apt purge '.*:i386'
+    sudo dpkg --remove-architecture i386
+
+    # 只把卡住的那个包配好（安装器输出里会点名，例如 libbrotli1:amd64）
+    sudo dpkg --configure libbrotli1:amd64
+
+B. 系统里有一个与本安装无关的半配置包（iU / iF）
+
+    新版安装器不会碰它，也不会因它中止；装完后它仍然是原来的状态，可以用
+    `sudo dpkg --configure -a` 或 `sudo apt --fix-broken install` 单独收拾。
+
+C. 想把失败的依赖退回安装前的状态
+
+    # 本次新增的包（安装器会列出具体名字）
+    sudo dpkg -r <包>:<架构>
+    # 本次被升级的包（只有显式 --upgrade-vendor 才会发生）
+    sudo apt-get install --reinstall <包>:<架构>=<原版本>
+
+D. 只想确认系统当前还有什么没配好
+
+    dpkg --audit
+    dpkg -l | awk '$1 ~ /^.U|^.F/ {print $1, $2, $3}'
+
+修好后重新执行安装器即可：已经配置好的依赖不会重复处理，rime-inputmethod 与
+rime-sync 直接 `dpkg -i` 覆盖升级。
+
+升级语义（重复执行）：本安装器可以直接在旧版上重跑，不需要先卸载。0.6.0 起用
+`dpkg -i --force-confdef --force-confold` 覆盖安装，dpkg.log 里是 upgrade
+记录；用户数据（~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
+~/.config/rime-sync）不会被触碰。
+
+容器化自测（离线、无需真机）：
+
+    packaging/linux/test/install-matrix.sh                    # 全部 6 个用例
+    packaging/linux/test/install-matrix.sh upgrade            # 只跑升级用例
+
+覆盖：正常离线安装 / 无关半配置包不中止 / 多架构版本不一致不升级已有库 /
+已处于半配置多架构状态时的诊断输出 / 旧版覆盖升级 / 纯单架构系统。
+
+五、卸载
 --------
 应用菜单里的「卸载 Rime 同步与输入法」会经 pkexec 调用
 /usr/lib/rime-sync/uninstall.sh，一次卸掉 rime-sync 与 rime-inputmethod。

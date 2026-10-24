@@ -114,12 +114,20 @@ main() {
 
     # 只装"本机没有或版本更旧"的包：dpkg 不允许降级，硬装整份闭包
     # 会在已经打全安全更新的 22.04 上失败（例如 libc6 已比自带的新）。
-    local -a debs=()
-    local d pkg ver inst
+    # 多架构系统上更保守：dpkg 里已有这个包（任一架构）就不碰。否则把 amd64 的
+    # libbrotli1 升到离线包版本、i386 还停在旧版时，dpkg 会拒绝配置整条依赖链
+    # （cannot be configured because libbrotli1:i386 is at a different version）。
+    local -a debs=() foreign=()
+    local d pkg ver inst any
+    mapfile -t foreign < <(dpkg --print-foreign-architectures 2>/dev/null || true)
     for d in "$VENDOR"/*.deb; do
         pkg=$(dpkg-deb -f "$d" Package 2>/dev/null) || continue
         ver=$(dpkg-deb -f "$d" Version 2>/dev/null) || continue
-        inst=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+        any=$(dpkg-query -W -f='${Package}' "$pkg" 2>/dev/null | head -1 || true)
+        inst=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null | head -1 || true)
+        if [ "${#foreign[@]}" -gt 0 ] && [ -n "$any" ]; then
+            continue
+        fi
         if [ -n "$inst" ] && dpkg --compare-versions "$inst" ge "$ver" 2>/dev/null; then
             continue
         fi

@@ -130,9 +130,11 @@ File ...resources...
 | 步骤 | 作用 |
 |---|---|
 | `cache weasel build deps (boost 1.84.0)` | 缓存 `third_party/weasel/deps/boost_1_84_0/{boost,stage}` |
-| `build weasel installer from vendored source` | 调 `build-weasel.ps1`，`continue-on-error`（失败不直接红） |
-| `fetch upstream weasel installer (fallback / offline mode)` | 自编译失败或 `RIMESYNC_WEASEL_MODE=fetch` 时走官方安装包 |
-| `verify weasel vendor payload` | 必须有 `weasel-*.exe` 且 ≥ 10 MiB；摘要记录来源 |
+| `resolve weasel mode` | 解析 `RIMESYNC_WEASEL_MODE`：tag 推送强制 `require`；手动按 `workflow_dispatch.weasel_mode` |
+| `build weasel installer from vendored source` | 调 `build-weasel.ps1`；`continue-on-error` 只在 `build`/`fetch` 模式为真，`require` 下失败即 job 失败 |
+| `fetch upstream weasel installer (fallback / offline mode)` | `build` 模式自编译失败、或 `fetch` 模式时走官方安装包；**绝不**在 `require` 下运行 |
+| `verify weasel vendor payload` | 必须有 `weasel-*.exe` 且 ≥ 10 MiB；`require` 下来源必须是自编译；写 `packaging/out/WEASEL-SOURCE.json` 并红字标注回退 |
+| `verify-artifacts`（独立 job） | 解 `*-setup.exe` → `WeaselServer.exe`，搜 UTF-16LE「Rime 同步」；`require` 下缺失即失败，publish 不会跑 |
 | `assert nsis setup embeds weasel` | 最终 setup ≥ 15 MiB |
 
 在 CI 上确认自编译成功的检查项：
@@ -147,15 +149,24 @@ File ...resources...
 
 ## 5. 回退方案（自编译失败）
 
-任选其一：
+规则见 [`../../docs/FALLBACK-POLICY.md`](../../docs/FALLBACK-POLICY.md)：回退必须
+**写日志 + 对外可见 + 可用参数关闭**。v0.6.0 就是在这里静默回退到上游官方包，
+结果 Windows 版没有「Rime 同步…」入口却照样发布。
 
-- **让 CI 自动兜底**：什么都不用做。自编译步骤失败时下一步自动跑
-  `fetch-weasel.ps1`，摘要里注明 `upstream official installer`。
-- **强制走官方安装包**：把仓库变量 `RIMESYNC_WEASEL_MODE` 设为 `fetch`
-  （Settings → Secrets and variables → Actions → Variables），或本地
-  `pwsh -File packaging/windows/fetch-weasel.ps1` 后再 `pnpm tauri build --bundles nsis`。
-- 两条路径产出的文件名一致（`weasel-0.17.4.0-installer.exe`），
-  钩子与 resources 布局不用改。
+`RIMESYNC_WEASEL_MODE`（`release.yml` 的 `windows` job）：
+
+| 模式 | 何时 | 自编译失败时 | 可见性 |
+|---|---|---|---|
+| `require` | **tag 推送默认**；手动显式选择 | **job 失败，不回退，不发布** | — |
+| `build` | 手动默认（仓库变量 `RIMESYNC_WEASEL_MODE` 缺省值） | 回退上游官方包 | job summary `> [!CAUTION]` + 发布说明顶部红字 + `WEASEL-SOURCE.json` |
+| `fetch` | 手动显式选择（离线/应急） | 直接用上游官方包 | 同上 |
+
+- 手动触发：Actions → release → Run workflow → `weasel_mode` 选 `require` / `build` / `fetch`。
+- 本地等价：`pwsh -File packaging/windows/fetch-weasel.ps1` 后再 `pnpm tauri build --bundles nsis`
+  （本地构建没有 summary，必须自己记得这一版没有入口）。
+- 两条路径产出的文件名一致（`weasel-0.17.4.0-installer.exe`），钩子与 resources 布局不用改。
+- 产物验收：`bash .github/scripts/verify-artifacts.sh --dir dist`（严格）或
+  `--weasel-mode build`（放行回退但红字告警）。
 
 ## 6. 无法在本机验证的点（必须靠 CI / 真机）
 

@@ -1,15 +1,23 @@
 #!/bin/bash
 # rime-sync postinst
-# 原则：任何失败都不许让安装中断；不在 root 下弹窗；不碰用户数据目录。
+# 原则：安装失败都不许让 postinst 自己中断安装；不在 root 下弹窗；不碰用户数据目录。
 #
 # 为什么依赖安装是"后台排队"而不是同步执行：
 #   dpkg 在运行 postinst 期间持有 /var/lib/dpkg/lock-frontend 与数据库锁，
 #   postinst 里直接调 dpkg -i / apt-get install 会被锁拒掉
 #   （实测：dpkg: error: dpkg frontend lock was locked by another process）。
 #   所以这里只做检测 + 起一个脱离的后台 worker，由它等锁释放后再装。
+#
+# 失败可见（docs/FALLBACK-POLICY.md）：
+#   worker 的失败以前只有 /var/log/rime-sync/vendor-install.log 里的一行字，用户看不到。
+#   现在由 /var/lib/rime-sync/install-vendor-deps-wrapper.sh 在失败时写
+#     ~/.config/com.rimesync.app/install-warning.json
+#   （含时间、包名、日志路径），应用诊断页据此显示红条并提供「查看日志 / 重试」；
+#   成功则删掉该文件。重试 = pkexec bash /var/lib/rime-sync/install-vendor-deps-wrapper.sh
 set -u
 
 WORKER=/usr/lib/rime-sync/install-vendor-deps.sh
+WRAPPER=/var/lib/rime-sync/install-vendor-deps-wrapper.sh
 LOGDIR=/var/log/rime-sync
 
 # 桌面入口用 pkexec 直接执行卸载脚本；dpkg-deb 打包自定义文件时不一定保留执行位
@@ -19,6 +27,9 @@ UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
 # fcitx5-rime 配置页的「查看同步状态」按钮调用它，同样需要执行位。
 STATUS_HELPER=/usr/bin/rime-sync-status
 [ -f "$STATUS_HELPER" ] && chmod 0755 "$STATUS_HELPER" 2>/dev/null
+# fcitx5 配置页的「立即同步」按钮调用它（CLI 由 release.yml 在打包前编译）。
+CLI_HELPER=/usr/bin/rime-sync-cli
+[ -f "$CLI_HELPER" ] && chmod 0755 "$CLI_HELPER" 2>/dev/null
 LOG=$LOGDIR/vendor-install.log
 
 say() { printf '[rime-sync] %s\n' "$*"; }
@@ -33,21 +44,172 @@ rime_im_installed() {
         [ "$(dpkg-query -W -f='${Status}' fcitx5-rime 2>/dev/null || true)" = "install ok installed" ]
 }
 
+# ---------------------------------------------------------------- 目标用户
+# postinst 以 root 运行，但 install-warning.json 必须落到"用桌面的那个人"的
+# ~/.config/com.rimesync.app/ 下，否则应用永远读不到。
+pick_target_user() {
+    local user="${RIMESYNC_TARGET_USER:-}"
+    if [ -n "$user" ]; then printf '%s' "$user"; return; fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then printf '%s' "$SUDO_USER"; return; fi
+    if [ -n "${PKEXEC_UID:-}" ]; then
+        user=$(id -nu "$PKEXEC_UID" 2>/dev/null || true)
+        if [ -n "$user" ] && [ "$user" != root ]; then printf '%s' "$user"; return; fi
+    fi
+    user=$(logname 2>/dev/null || true)
+    if [ -n "$user" ] && [ "$user" != root ]; then printf '%s' "$user"; return; fi
+    # 只有一个普通用户时兜底（离线安装器 / 首次配置最常见的场景）
+    local cand
+    for cand in /home/*; do
+        [ -d "$cand" ] || continue
+        user=$(basename "$cand")
+        if id -u "$user" >/dev/null 2>&1; then printf '%s' "$user"; return; fi
+    done
+    printf ''
+}
+
+target_home() {
+    local user=$1 home=""
+    if [ -n "${RIMESYNC_TARGET_HOME:-}" ] && [ -d "${RIMESYNC_TARGET_HOME}" ]; then
+        printf '%s' "$RIMESYNC_TARGET_HOME"
+        return
+    fi
+    if [ -n "$user" ]; then
+        home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    fi
+    if [ -n "$home" ] && [ -d "$home" ]; then printf '%s' "$home"; return; fi
+    printf ''
+}
+
+TARGET_USER=$(pick_target_user)
+TARGET_HOME=$(target_home "$TARGET_USER")
+WARN_DIR=""
+WARN_FILE=""
+if [ -n "$TARGET_HOME" ]; then
+    WARN_DIR=$TARGET_HOME/.config/com.rimesync.app
+    WARN_FILE=$WARN_DIR/install-warning.json
+fi
+
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+write_install_warning() { # $1=package $2=reason
+    local package=$1 reason=$2
+    if [ -z "$WARN_FILE" ]; then
+        say "找不到桌面用户的 HOME，无法写 install-warning.json；请转告用户：依赖安装未完成，日志 $LOG"
+        return 0
+    fi
+    mkdir -p "$WARN_DIR" 2>/dev/null || {
+        say "无法创建 $WARN_DIR，跳过 install-warning.json"
+        return 0
+    }
+    cat >"$WARN_FILE" <<JSON
+{
+  "schema": 1,
+  "written_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "package": "$(json_escape "$package")",
+  "reason": "$(json_escape "$reason")",
+  "log_path": "$(json_escape "$LOG")",
+  "retry_command": "pkexec bash $WRAPPER $WARN_FILE"
+}
+JSON
+    chmod 0644 "$WARN_FILE" 2>/dev/null || true
+    if [ -n "$TARGET_USER" ]; then
+        chown -R "$TARGET_USER":"$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+            "$WARN_DIR" 2>/dev/null || true
+    fi
+    say "已写安装告警：$WARN_FILE（应用诊断页会显示红条）"
+}
+
+# ---------------------------------------------------------------- worker 包装
+# worker 自己永远 exit 0（它把失败吞成一行日志），所以包装脚本按"目标包是否真的
+# 装上"判定成败：失败写告警、成功清告警。retry 也复用它（幂等、可重复执行）。
+install_worker_wrapper() {
+    mkdir -p "$(dirname "$WRAPPER")" 2>/dev/null || return 1
+    cat >"$WRAPPER" <<'WRAPPER_EOF'
+#!/bin/bash
+# 由 rime-sync 的 postinst 生成（每次安装/升级重写），不要手改。
+# 用法：install-vendor-deps-wrapper.sh [install-warning.json 路径]
+# 退出码：0 = 依赖已就绪（并清掉告警）；1 = 仍未就绪（已写告警）；2 = 缺 worker。
+set -u
+WORKER=/usr/lib/rime-sync/install-vendor-deps.sh
+LOG=/var/log/rime-sync/vendor-install.log
+WARN=${1:-}
+STATUS_FMT='${Status}'
+
+log() { printf '%s [rime-sync/wrapper] %s\n' "$(date '+%F %T')" "$*"; }
+
+im_ready() {
+    [ "$(dpkg-query -W -f="$STATUS_FMT" rime-inputmethod 2>/dev/null || true)" = "install ok installed" ] ||
+        [ "$(dpkg-query -W -f="$STATUS_FMT" fcitx5-rime 2>/dev/null || true)" = "install ok installed" ]
+}
+
+write_warning() {
+    [ -n "$WARN" ] || return 0
+    mkdir -p "$(dirname "$WARN")" 2>/dev/null || return 0
+    local reason
+    reason=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    cat >"$WARN" <<JSON
+{
+  "schema": 1,
+  "written_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "package": "fcitx5-rime",
+  "reason": "$reason",
+  "log_path": "$LOG",
+  "retry_command": "pkexec bash /var/lib/rime-sync/install-vendor-deps-wrapper.sh $WARN"
+}
+JSON
+    chmod 0644 "$WARN" 2>/dev/null || true
+}
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+if [ ! -r "$WORKER" ]; then
+    log "缺少 $WORKER，无法安装依赖"
+    write_warning "缺少 /usr/lib/rime-sync/install-vendor-deps.sh，离线依赖没有开始安装"
+    exit 2
+fi
+
+if im_ready; then
+    log "依赖已就绪，跳过"
+    [ -n "$WARN" ] && rm -f "$WARN" 2>/dev/null
+    exit 0
+fi
+
+log "开始安装依赖（worker=$WORKER）"
+bash "$WORKER" >>"$LOG" 2>&1
+
+if im_ready; then
+    log "依赖已就绪，清除 install-warning.json"
+    [ -n "$WARN" ] && rm -f "$WARN" 2>/dev/null
+    exit 0
+fi
+
+log "依赖仍未就绪，写安装告警：${WARN:-（未指定路径）}"
+write_warning "离线依赖未安装完成：worker 已退出，但 fcitx5-rime / rime-inputmethod 仍未就绪"
+exit 1
+WRAPPER_EOF
+    chmod 0755 "$WRAPPER" 2>/dev/null
+    chown root:root "$WRAPPER" 2>/dev/null || true
+    [ -x "$WRAPPER" ]
+}
+
 mkdir -p "$LOGDIR" 2>/dev/null && chmod 755 "$LOGDIR" 2>/dev/null
 
 if rime_im_installed; then
     say "已检测到 fcitx5-rime，跳过输入法依赖安装。"
+    rm -f "$WARN_FILE" 2>/dev/null
 else
-    if [ -r "$WORKER" ]; then
+    if install_worker_wrapper; then
         say "未检测到 fcitx5-rime：已排入后台安装队列（有网走 apt，无网用自带 .deb）。"
         if command -v setsid >/dev/null 2>&1; then
-            setsid nohup bash "$WORKER" >>"$LOG" 2>&1 </dev/null &
+            setsid nohup bash "$WRAPPER" "$WARN_FILE" >>"$LOG" 2>&1 </dev/null &
         else
-            nohup bash "$WORKER" >>"$LOG" 2>&1 </dev/null &
+            nohup bash "$WRAPPER" "$WARN_FILE" >>"$LOG" 2>&1 </dev/null &
         fi
         say "安装日志：$LOG（另开终端 tail -f 可看进度）"
+        say "若最终失败，会写 $WARN_FILE，应用「设置 → 诊断包」里会显示红条"
     else
-        say "未检测到 fcitx5-rime，且缺少 $WORKER，请手工安装输入法（见下方提示）。"
+        say "未检测到 fcitx5-rime，且无法生成 $WRAPPER，请手工安装输入法（见下方提示）。"
+        write_install_warning "fcitx5-rime" "无法生成 $WRAPPER，依赖安装没有开始"
     fi
 fi
 
@@ -71,6 +233,7 @@ cat <<'EOM'
             ~/.local/share/fcitx5/rime/default.custom.yaml
         fcitx5-remote -r
 
+ 依赖若没装上：打开应用「设置 → 诊断包」，红条里有日志路径与「重试」按钮。
  安装不会自动启动程序，也不会写入开机自启项；需要设置时从应用菜单手动打开。
  详细说明（含离线安装失败的手工补救）：/usr/share/doc/rime-sync/README.Debian
 ----------------------------------------------------------------

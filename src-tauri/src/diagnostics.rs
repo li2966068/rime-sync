@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::{data_dir, ensure_config, log_tail, state_dir, AppState};
 
@@ -170,6 +170,150 @@ fn config_diagnostics(
     })
 }
 
+/// 离线依赖安装告警（由 packaging/linux/postinst 生成的 wrapper 写出）。
+///
+/// 链路：postinst → /var/lib/rime-sync/install-vendor-deps-wrapper.sh →
+/// worker 结束后仍拿不到 fcitx5-rime/rime-inputmethod →
+/// ~/.config/com.rimesync.app/install-warning.json（含时间、包名、日志路径）。
+/// 诊断页读它显示红条；重试按钮用 pkexec 重跑同一个 wrapper（幂等）。
+const INSTALL_WARNING_FILE: &str = "install-warning.json";
+/// fcitx5-rime / rime-inputmethod 安装成功后都会落下这个文件（离线包与发行版包都一样）。
+#[cfg(target_os = "linux")]
+const RIME_ADDON_CONF: &str = "/usr/share/fcitx5/addon/rime.conf";
+const RETRY_WRAPPER: &str = "/var/lib/rime-sync/install-vendor-deps-wrapper.sh";
+
+#[derive(Serialize, Default)]
+pub struct InstallWarning {
+    /// 是否需要在前端显示红条。
+    pub present: bool,
+    /// 告警文件路径（无论是否存在都返回，便于用户手工检查）。
+    pub path: String,
+    pub written_at: Option<String>,
+    pub package: Option<String>,
+    pub reason: Option<String>,
+    pub log_path: Option<String>,
+    pub retry_command: Option<String>,
+}
+
+fn parse_install_warning(path: String, raw: &str) -> InstallWarning {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        // 文件坏了也要可见：红条退化成"告警文件无法解析"，不要静默吞掉。
+        Err(error) => {
+            return InstallWarning {
+                present: true,
+                path,
+                reason: Some(format!("{INSTALL_WARNING_FILE} 无法解析：{error}")),
+                ..Default::default()
+            }
+        }
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(|entry| entry.as_str())
+            .map(str::to_string)
+    };
+    InstallWarning {
+        present: true,
+        path,
+        written_at: text("written_at"),
+        package: text("package"),
+        reason: text("reason"),
+        log_path: text("log_path"),
+        retry_command: text("retry_command"),
+    }
+}
+
+/// 依赖已经装好时告警就过期了（例如用户后来手动 apt install），顺手清掉，
+/// 免得红条永远消不掉。
+#[cfg(target_os = "linux")]
+fn install_deps_present() -> bool {
+    std::path::Path::new(RIME_ADDON_CONF).exists()
+}
+#[cfg(not(target_os = "linux"))]
+fn install_deps_present() -> bool {
+    false
+}
+
+fn read_install_warning(app: &AppHandle) -> InstallWarning {
+    let Ok(dir) = state_dir(app) else {
+        return InstallWarning::default();
+    };
+    let path = dir.join(INSTALL_WARNING_FILE);
+    let path_text = path.display().to_string();
+    if !path.exists() {
+        return InstallWarning {
+            path: path_text,
+            ..Default::default()
+        };
+    }
+    if install_deps_present() {
+        let _ = fs::remove_file(&path);
+        crate::push_log(
+            &app.state::<AppState>().0,
+            "依赖已就绪，清除 install-warning.json",
+        );
+        return InstallWarning {
+            path: path_text,
+            ..Default::default()
+        };
+    }
+    match fs::read_to_string(&path) {
+        Ok(raw) => parse_install_warning(path_text, &raw),
+        Err(error) => InstallWarning {
+            present: true,
+            path: path_text,
+            reason: Some(format!("读取 {INSTALL_WARNING_FILE} 失败：{error}")),
+            ..Default::default()
+        },
+    }
+}
+
+/// 诊断页读取：离线依赖是否装完（Linux 之外永远是 present=false）。
+#[tauri::command]
+pub fn cmd_install_warning(app: AppHandle) -> InstallWarning {
+    read_install_warning(&app)
+}
+
+/// 诊断页「重试」：用 pkexec 重跑 postinst 生成的 wrapper（它会重新 apt/dpkg 安装，
+/// 成功后自己删掉 install-warning.json）。脱离进程，不等结果：pkexec 要弹密码框。
+#[tauri::command]
+pub fn cmd_retry_install_deps(app: AppHandle) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &app;
+        return Err("离线依赖安装告警只在 Linux 版存在".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !std::path::Path::new(RETRY_WRAPPER).exists() {
+            return Err(format!(
+                "缺少 {RETRY_WRAPPER}：请重新安装 rime-sync（postinst 会生成该脚本）"
+            ));
+        }
+        let warning = read_install_warning(&app);
+        let mut command = std::process::Command::new("pkexec");
+        command
+            .arg("bash")
+            .arg(RETRY_WRAPPER)
+            .arg(&warning.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+            .spawn()
+            .map_err(|error| format!("启动 pkexec 失败：{error}"))?;
+        crate::push_log(&app.state::<AppState>().0, "已通过 pkexec 重试离线依赖安装");
+        Ok(format!(
+            "已启动依赖重试（会弹授权窗口）。完成后刷新本页；日志：{}",
+            warning
+                .log_path
+                .unwrap_or_else(|| "/var/log/rime-sync/vendor-install.log".to_string())
+        ))
+    }
+}
+
 #[tauri::command]
 pub fn cmd_export_diagnostics(
     app: AppHandle,
@@ -226,6 +370,16 @@ pub fn cmd_export_diagnostics(
     });
 
     let log = log_tail(&state.0, LOG_LINES).join("\n");
+    let install_warning = read_install_warning(&app);
+    let install_warning_json = serde_json::json!({
+        "present": install_warning.present,
+        "path": install_warning.path,
+        "written_at": install_warning.written_at,
+        "package": install_warning.package,
+        "reason": install_warning.reason,
+        "log_path": install_warning.log_path,
+        "retry_command": install_warning.retry_command,
+    });
     let entries = vec![
         (
             "config.json".to_string(),
@@ -239,6 +393,10 @@ pub fn cmd_export_diagnostics(
         (
             "system.json".to_string(),
             serde_json::to_vec_pretty(&system).map_err(|error| error.to_string())?,
+        ),
+        (
+            "install-warning.json".to_string(),
+            serde_json::to_vec_pretty(&install_warning_json).map_err(|error| error.to_string())?,
         ),
     ];
 
@@ -287,6 +445,31 @@ mod tests {
         assert!(!text.contains("alice:"), "config view leaked URL userinfo");
         assert!(text.contains("example.com"));
         assert!(text.contains("a***"));
+    }
+
+    #[test]
+    fn install_warning_parses_metadata() {
+        let raw = r#"{"schema":1,"written_at":"2026-10-24T09:00:00Z","package":"fcitx5-rime",
+            "reason":"离线依赖未安装完成","log_path":"/var/log/rime-sync/vendor-install.log",
+            "retry_command":"pkexec bash /var/lib/rime-sync/install-vendor-deps-wrapper.sh"}"#;
+        let warning = parse_install_warning(
+            "/home/alice/.config/com.rimesync.app/install-warning.json".to_string(),
+            raw,
+        );
+        assert!(warning.present);
+        assert_eq!(warning.package.as_deref(), Some("fcitx5-rime"));
+        assert_eq!(
+            warning.log_path.as_deref(),
+            Some("/var/log/rime-sync/vendor-install.log")
+        );
+        assert!(warning.reason.unwrap().contains("离线依赖"));
+    }
+
+    #[test]
+    fn install_warning_survives_broken_json() {
+        let warning = parse_install_warning("/tmp/install-warning.json".to_string(), "{not json");
+        assert!(warning.present, "解析失败也必须可见");
+        assert!(warning.reason.unwrap_or_default().contains("无法解析"));
     }
 
     #[test]

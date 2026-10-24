@@ -19,8 +19,11 @@ export function renderDevices(): void {
       const state = device.reachable
         ? '<span class="dot ok"></span>' + escapeHtml(t("devices.reachable"))
         : '<span class="dot"></span>' + escapeHtml(t("devices.offline"));
+      // 本机但远端还没有 sync/<id>/owner.json：用独立文案区分「未上传」占位行。
       const self = device.is_self
-        ? ' <span class="badge">' + escapeHtml(t("devices.self")) + "</span>"
+        ? ' <span class="badge">' +
+          escapeHtml(device.reachable ? t("devices.self") : t("devices.selfNotUploaded")) +
+          "</span>"
         : "";
       return (
         "<tr" +
