@@ -324,7 +324,8 @@ jobs:
             echo "::error::$wf 没有把 tag 推送解析成 require（自编译失败必须让 job 失败）"
             exit 1
           }
-          grep -qF 'continue-on-error: ${{ steps.weasel_mode.outputs.mode != '"'"'require'"'"' }}' "$wf" || {
+          # 这里刻意不写完整的表达式字面量：run 块里的表达式会被 GitHub 求值。
+          grep -qF 'steps.weasel_mode.outputs.mode' "$wf" || {
             echo "::error::$wf 的 Weasel 自编译步骤必须按模式决定 continue-on-error（不能写死 true）"
             exit 1
           }
