@@ -2,7 +2,7 @@ name: release
 
 # 触发：推送 v* tag，或手动指定一个 tag。
 # 产物：
-#   linux   → deb + AppImage（+ 更新包 .AppImage.tar.gz 与 .sig）
+#   linux   → deb + AppImage（+ .sig）
 #   windows → NSIS 安装包 + 便携版 zip（+ 更新包 .sig）
 #
 # 发布通道：草稿 Release 直传（v0.6.1 起）。
@@ -205,14 +205,12 @@ jobs:
           shopt -s nullglob
           debs=(src-tauri/target/release/bundle/deb/*.deb)
           appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
-          tarballs=(src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz)
           sigs=(src-tauri/target/release/bundle/appimage/*.sig)
           if [ "${#debs[@]}" -eq 0 ]; then echo "::error::没有 rime-sync deb"; exit 1; fi
           if [ "${#appimages[@]}" -eq 0 ]; then echo "::error::没有 AppImage"; exit 1; fi
-          if [ "${#tarballs[@]}" -eq 0 ]; then echo "::error::没有 AppImage.tar.gz（updater 更新包）"; exit 1; fi
           if [ "${#sigs[@]}" -eq 0 ]; then echo "::error::没有 .sig（updater 签名）"; exit 1; fi
-          printf '  %s\n' "${debs[@]}" "${appimages[@]}" "${tarballs[@]}" "${sigs[@]}"
-          gh release upload "$TAG" "${debs[@]}" "${appimages[@]}" "${tarballs[@]}" "${sigs[@]}" --clobber
+          printf '  %s\n' "${debs[@]}" "${appimages[@]}" "${sigs[@]}"
+          gh release upload "$TAG" "${debs[@]}" "${appimages[@]}" "${sigs[@]}" --clobber
 
   # 四发行版各占一个 runner：镜像/闭包/.run 全部按发行版隔离，互不踩磁盘。
   # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，组装 1-2 min。
@@ -743,7 +741,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
 
-      # 验收断言：最终 setup.exe ≥ 15 MiB（内嵌的 Weasel 安装器约 12 MiB，未被 LZMA 压没）。
+      # 验收断言：最终 setup.exe ≥ 12 MiB（内嵌的 Weasel 安装器约 10 MiB，未被 LZMA 压没）。
       - name: assert nsis setup embeds weasel
         shell: pwsh
         run: |
@@ -755,8 +753,8 @@ jobs:
           }
           $mib = [math]::Round($setup.Length / 1MB, 1)
           Write-Host "NSIS setup: $($setup.Name) $mib MiB"
-          if ($setup.Length -lt 15MB) {
-            Write-Host "::error::NSIS 安装包只有 $mib MiB（< 15 MiB）：内置 Weasel 很可能没打进去。"
+          if ($setup.Length -lt 12MB) {
+            Write-Host "::error::NSIS 安装包只有 $mib MiB（< 12 MiB）：内置 Weasel 很可能没打进去。"
             Write-Host "检查 packaging/windows/vendor/weasel-*.exe 是否存在，以及 makensis 日志里"
             Write-Host "是否有 'NSIS_HOOK_PREINSTALL' 相关告警（packaging/nsis-hooks.nsh 的 !warning）。"
             exit 1
@@ -858,8 +856,8 @@ jobs:
           rm -rf dist
           mkdir -p dist
           gh release download "$TAG" --dir dist \
-            --pattern '*.AppImage.tar.gz' \
-            --pattern '*.AppImage.tar.gz.sig' \
+            --pattern '*.AppImage' \
+            --pattern '*.AppImage.sig' \
             --pattern '*-setup.exe' \
             --pattern '*-setup.exe.sig' \
             --pattern 'WEASEL-SOURCE.json'
