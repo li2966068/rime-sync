@@ -180,10 +180,16 @@ ldconfig
 # (fcitx5-rime is configured with -DRIME_DATA_DIR=$RIME_DATA_DIR).
 # Without it the addon loads but cannot deploy, so the image is not usable.
 install -d "$RIME_DATA_DIR"
-cp -f "$SRC/third_party/rime-data/rime-prelude/"*.yaml "$RIME_DATA_DIR"/
-cp -f "$SRC/third_party/rime-data/rime-essay/essay.txt" "$RIME_DATA_DIR"/
-cp -f "$SRC/third_party/rime-data/rime-luna-pinyin/"*.yaml "$RIME_DATA_DIR"/
-echo "rime data: $(find "$RIME_DATA_DIR" -maxdepth 1 -type f | wc -l) files"
+# Flatten every vendored recipe (any third_party/rime-data/* directory holding
+# *.yaml / *.txt) into RIME_DATA_DIR, exactly like the Weasel installer and the deb do.
+for recipe_dir in "$SRC"/third_party/rime-data/*/; do
+  # *.yaml and *.txt both matter: rime-essay ships only essay.txt and would be
+  # skipped by a yaml-only filter.
+  find "$recipe_dir" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.txt' \) \
+    -exec cp -f {} "$RIME_DATA_DIR"/ \;
+done
+[ -f "$RIME_DATA_DIR/essay.txt" ] || { echo "!! essay.txt missing from $RIME_DATA_DIR"; exit 1; }
+echo "rime data: $(find "$RIME_DATA_DIR" -maxdepth 1 -type f | wc -l) files from $(find "$SRC/third_party/rime-data" -mindepth 1 -maxdepth 1 -type d | wc -l) recipes"
 export DISPLAY=:99
 Xvfb :99 -screen 0 640x480x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
 XVFB_PID=$!

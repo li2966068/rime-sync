@@ -3490,6 +3490,7 @@ dependencies = [
  "rime-sync-core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

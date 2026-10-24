@@ -23,6 +23,7 @@ import {
 import { applyAppVersion, renderUpdate, checkUpdate, installUpdate } from "./ui/update";
 import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui/watch";
 import { loadPresets, applyPresetTo } from "./ui/presets";
+import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
 import { refreshLanguageDependent } from "./ui/language";
 import { api, type Report, type Progress, type ConflictChoice, type WatchEvent } from "./api";
@@ -49,6 +50,7 @@ export function switchPanel(name: string): void {
   }
   if (name === "settings") {
     void loadBackups();
+    void ensureSchemasLoaded();
   }
 }
 
@@ -115,6 +117,28 @@ export function bindEvents(): void {
   el.planClose.addEventListener("click", () => {
     el.planCard.hidden = true;
   });
+  el.schemaRefresh.addEventListener("click", () => {
+    void loadSchemas(true);
+  });
+  el.schemaSave.addEventListener("click", () => {
+    void saveSchemas();
+  });
+  el.schemaList.addEventListener("change", (event) => {
+    const input = event.target as HTMLInputElement;
+    const id = input.dataset.schemaToggle;
+    if (id) {
+      toggleSchema(id, input.checked);
+    }
+  });
+  el.schemaList.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-schema-move]");
+    const id = button?.dataset.schemaId;
+    if (!id) {
+      return;
+    }
+    moveSchema(id, button?.dataset.schemaMove === "up" ? -1 : 1);
+  });
+
   el.transport.addEventListener("click", () => {
     void run("transport");
   });
@@ -439,6 +463,7 @@ export async function init(): Promise<void> {
     await refreshNetwork();
     await loadWatchStatus();
     await loadBackups();
+    await loadSchemas();
     await refreshInstallWarning();
     localLog("界面已就绪");
     setFooter(t("footer.ready"));

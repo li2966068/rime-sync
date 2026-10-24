@@ -316,3 +316,97 @@ fn differing_custom_yaml_patch_conflicts_with_file_and_keys() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---- schema_list 三向合并取并集：两台机器各自装的方案都不能丢 ----
+
+const SCHEMA_BASE: &[u8] = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+const SCHEMA_LOCAL: &[u8] =
+    b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+const SCHEMA_REMOTE: &[u8] =
+    b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: cangjie\n";
+
+fn schema_names(bytes: &[u8]) -> Vec<String> {
+    let doc: serde_yaml::Value = serde_yaml::from_slice(bytes).expect("yaml");
+    let list = doc
+        .get("patch")
+        .and_then(|patch| patch.get("schema_list"))
+        .and_then(|value| value.as_sequence())
+        .expect("schema_list");
+    list.iter()
+        .map(|item| {
+            item.get("schema")
+                .and_then(|name| name.as_str())
+                .expect("schema name")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn schema_list_union_is_written_locally_and_pushed_back() {
+    let manifest = manifest_for(&[(SHARED_REL, SCHEMA_BASE)]);
+    let mock = MockDav::start(vec![
+        ("shared/manifest.json", manifest),
+        ("shared/files/default.custom.yaml", SCHEMA_BASE.to_vec()),
+    ]);
+    let root = temp_dir("schema-union");
+    let rime = root.join("rime");
+    fs::create_dir_all(&rime).expect("rime");
+    let state = root.join("state");
+    fs::create_dir_all(&state).expect("state");
+
+    // 先同步一轮，拿到 base=[luna_pinyin]。
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let first = engine.transport();
+    assert!(first.ok, "baseline transport failed: {first:?}");
+    assert_eq!(
+        fs::read(rime.join(SHARED_REL)).expect("baseline local"),
+        SCHEMA_BASE
+    );
+
+    // 两台机器各加一个方案：本地 [luna, wubi]，远端 [luna, cangjie]。
+    fs::write(rime.join(SHARED_REL), SCHEMA_LOCAL).expect("local schema list");
+    mock.set("shared/files/default.custom.yaml", SCHEMA_REMOTE.to_vec());
+    mock.set(
+        "shared/manifest.json",
+        manifest_for(&[(SHARED_REL, SCHEMA_REMOTE)]),
+    );
+
+    let report = engine.transport();
+    assert!(report.ok, "union transport failed: {report:?}");
+    assert!(
+        report.conflicts.is_empty(),
+        "schema_list union must not conflict: {report:?}"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains(SHARED_REL) && note.contains("set union")),
+        "the union must be recorded in the report: {report:?}"
+    );
+
+    let expected = ["luna_pinyin", "wubi86", "cangjie"];
+    assert_eq!(
+        schema_names(&fs::read(rime.join(SHARED_REL)).expect("local")),
+        expected,
+        "local file must keep both machines' schemas"
+    );
+    let remote = mock.snapshot();
+    assert_eq!(
+        schema_names(
+            remote
+                .get("shared/files/default.custom.yaml")
+                .expect("remote custom yaml")
+        ),
+        expected,
+        "the union must be pushed back to the remote"
+    );
+    assert!(report.pushed >= 1, "union must be pushed: {report:?}");
+    assert!(
+        report.config_changed,
+        "a merged custom yaml needs a redeploy: {report:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

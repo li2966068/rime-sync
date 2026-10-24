@@ -105,6 +105,11 @@ export const el = {
   kindDict: byId<HTMLInputElement>("kind-dict"),
   excludes: byId<HTMLTextAreaElement>("excludes"),
   stopFcitx5: byId<HTMLInputElement>("stop-fcitx5"),
+  schemaList: byId<HTMLDivElement>("schema-list"),
+  schemaEmpty: byId<HTMLParagraphElement>("schema-empty"),
+  schemaStatus: byId<HTMLParagraphElement>("schema-status"),
+  schemaRefresh: byId<HTMLButtonElement>("btn-schema-refresh"),
+  schemaSave: byId<HTMLButtonElement>("btn-schema-save"),
   saveSettings: byId<HTMLButtonElement>("btn-save-settings"),
   settingsHint: byId<HTMLSpanElement>("settings-hint"),
 

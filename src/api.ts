@@ -371,6 +371,23 @@ export interface FirstRunResult {
   note: string | null;
 }
 
+/// 一个可用的 Rime 输入方案（*.schema.yaml）。
+/// source：local = 用户 rime 目录，shared = 随包 / 发行版 shared data 目录。
+export interface SchemaEntry {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source: "local" | "shared";
+}
+
+export interface SetSchemasResult {
+  schemas: SchemaEntry[];
+  backup: string | null;
+  deployed: boolean;
+  /// 配置已写入但部署失败时的可读原因。
+  deploy_error: string | null;
+}
+
 export const api = {
   getConfig: () => invoke<Config>("cmd_get_config"),
   setConfig: (config: Config) => invoke<Config>("cmd_set_config", { config }),
@@ -417,6 +434,9 @@ export const api = {
   applyPreset: (presetId: string, rawUrl: string) =>
     invoke<PresetApply>("cmd_apply_preset", { presetId, rawUrl }),
   probeWrite: () => invoke<WriteProbe>("cmd_probe_write"),
+
+  listSchemas: () => invoke<SchemaEntry[]>("cmd_list_schemas"),
+  setSchemas: (ids: string[]) => invoke<SetSchemasResult>("cmd_set_schemas", { ids }),
 
   pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
 

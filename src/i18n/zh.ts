@@ -425,6 +425,21 @@ export const zh = {
   "wizard.passwordHint": "密码不会写入配置文件",
   "wizard.skipTest": "跳过测试",
 
+  "schemas.title": "输入方案",
+  "schemas.desc": "勾选要启用的方案；顺序即候选切换顺序（第一项为默认方案）。保存后自动重新部署，只改写 default.custom.yaml 的 schema_list。",
+  "schemas.save": "保存并重新部署",
+  "schemas.saved": "方案已保存并重新部署",
+  "schemas.saving": "正在保存并部署…",
+  "schemas.deployFail": "方案已保存，但重新部署失败：{error}（修正后可再点「保存并重新部署」重试）",
+  "schemas.saveFail": "保存方案失败：{error}",
+  "schemas.loadFail": "读取方案列表失败：{error}",
+  "schemas.empty": "没有找到任何 *.schema.yaml 方案文件。请先安装输入方案，或在「同步」页确认 Rime 目录。",
+  "schemas.source.local": "本地",
+  "schemas.source.shared": "随包",
+  "schemas.up": "上移",
+  "schemas.down": "下移",
+  "schemas.needOne": "至少保留一个启用的输入方案",
+
   "modal.confirmTitle": "请确认",
 } as const;
 

@@ -669,6 +669,24 @@ button.ghost.danger-text:hover:not(:disabled) { background: var(--danger-soft); 
 .dedupe-item em { display: block; }
 .device-choice-actions { flex-wrap: wrap; }
 
+/* 输入方案卡片：启用复选框 + 上移/下移 */
+.schema-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.schema-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.schema-row.is-enabled { border-color: var(--accent); background: var(--accent-soft); }
+.schema-row .check { flex: 1; min-width: 0; }
+.schema-name { font-size: 13px; word-break: break-all; }
+.schema-order { display: flex; gap: 4px; flex-shrink: 0; }
+.schema-order button:disabled { opacity: 0.35; cursor: default; }
+
 @media (max-width: 820px) {
   .conflict-layout { grid-template-columns: 1fr; }
   .conflict-list { max-height: 180px; }

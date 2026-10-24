@@ -32,6 +32,7 @@ mod diagnostics;
 mod platform_prefs;
 mod preset_cmds;
 mod remote_tree;
+mod schema_cmds;
 mod tray;
 mod update_cmds;
 mod watch_cmds;
@@ -967,6 +968,8 @@ pub fn run() {
             backup_cmds::cmd_prune_backups,
             preset_cmds::cmd_list_presets,
             preset_cmds::cmd_apply_preset,
+            schema_cmds::cmd_list_schemas,
+            schema_cmds::cmd_set_schemas,
             preset_cmds::cmd_probe_write,
             diagnostics::cmd_export_diagnostics,
             // 离线依赖安装告警（packaging/linux/postinst 写 install-warning.json）

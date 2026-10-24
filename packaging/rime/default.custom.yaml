@@ -1,9 +1,23 @@
-# rime-sync 随包默认：每页 8 个候选词 + 朙月拼音系方案。
+# rime-sync 随包默认：每页 8 个候选词 + 随包方案（拼音/五笔/仓颉/笔画/地球拼音/注音）。
 # 安装器只在用户 Rime 目录里没有同名文件时写入，绝不覆盖用户已有配置。
+# 这里的方案必须都在 /usr/share/rime-data（Windows: data\）里随包提供，
+# 否则 librime 部署会因缺失 schema 失败（见 scripts/ime 的 schema_list 守卫）。
 patch:
   "menu/page_size": 8
   schema_list:
-    - {schema: luna_pinyin_simp}
     - {schema: luna_pinyin}
+    - {schema: luna_pinyin_simp}
     - {schema: luna_pinyin_fluency}
+    - {schema: luna_pinyin_tw}
     - {schema: luna_quanpin}
+    - {schema: wubi86}
+    - {schema: wubi_pinyin}
+    - {schema: wubi_trad}
+    - {schema: cangjie5}
+    - {schema: cangjie5_express}
+    - {schema: stroke}
+    - {schema: terra_pinyin}
+    - {schema: terra_pinyin_12345}
+    - {schema: bopomofo}
+    - {schema: bopomofo_tw}
+    - {schema: bopomofo_express}

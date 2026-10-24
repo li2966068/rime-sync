@@ -3,12 +3,27 @@
 
 config_version: '0.50'
 
-# Vendored for rime-sync: only the schemas shipped in this tree are listed.
+# Vendored for rime-sync: every schema in this list ships in third_party/rime-data.
 # librime's deployer counts every missing schema as a failure and reports the
-# whole deployment as failed, so upstream's bopomofo/cangjie5/quick5/stroke/
-# terra_pinyin entries must not stay here unless those repos are vendored too.
+# whole deployment as failed, so this list must stay in sync with the vendored
+# recipe repos (guarded by scripts/ime/build-weasel.ps1 and package-ime-deb.sh).
 schema_list:
   - schema: luna_pinyin
+  - schema: luna_pinyin_simp
+  - schema: luna_pinyin_fluency
+  - schema: luna_pinyin_tw
+  - schema: luna_quanpin
+  - schema: wubi86
+  - schema: wubi_pinyin
+  - schema: wubi_trad
+  - schema: cangjie5
+  - schema: cangjie5_express
+  - schema: stroke
+  - schema: terra_pinyin
+  - schema: terra_pinyin_12345
+  - schema: bopomofo
+  - schema: bopomofo_tw
+  - schema: bopomofo_express
 
 switcher:
   caption: 〔方案選單〕

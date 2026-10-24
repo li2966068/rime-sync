@@ -51,6 +51,9 @@ pub struct Report {
     pub pushed: usize,
     pub merged: usize,
     pub conflicts: Vec<String>,
+    /// 非冲突的合并说明（如 schema_list 取并集），解释本地为什么多了一项。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub skipped: Vec<String>,
     pub duration_ms: u64,
     pub ok: bool,
@@ -1335,8 +1338,12 @@ impl Engine {
         }
         let base_bytes = self.load_base(base.map(|item| item.sha256.as_str()));
         let outcome = merge_yaml_patch(base_bytes.as_deref(), local_bytes, Some(&remote_bytes))?;
-        let (bytes, conflicts) = match outcome {
-            MergeOutcome::Patch { bytes, conflicts } => (bytes, conflicts),
+        let (bytes, conflicts, notes) = match outcome {
+            MergeOutcome::Patch {
+                bytes,
+                conflicts,
+                notes,
+            } => (bytes, conflicts, notes),
             MergeOutcome::Fallback { reason } => {
                 tracing::debug!("patch merge not applicable for {rel}: {reason}");
                 return Ok(false);
@@ -1368,6 +1375,9 @@ impl Engine {
                     return Ok(true);
                 }
             }
+        }
+        for note in notes {
+            report.notes.push(format!("{rel}: {note}"));
         }
         report.merged += 1;
         if conflicts.is_empty() {
@@ -1607,6 +1617,7 @@ mod tests {
             pushed: 2,
             merged: 3,
             conflicts: vec!["a".into()],
+            notes: vec!["default.custom.yaml: schema_list union".into()],
             skipped: vec![],
             duration_ms: 9,
             ok: true,
@@ -1636,6 +1647,7 @@ mod tests {
         assert_eq!(json["first_sync"], true);
         assert_eq!(json["mode"], "pull-only");
         assert_eq!(json["conflict_details"][0]["both_changed"], 3);
+        assert_eq!(json["notes"][0], "default.custom.yaml: schema_list union");
     }
 
     #[test]

@@ -4,6 +4,7 @@ import { config, lastReport } from "./state";
 import { conflicts, activeConflict, renderConflictList, renderDiff } from "./conflicts";
 import { renderDevices } from "./devices";
 import { renderBackups } from "./backups";
+import { renderSchemas } from "./schemas";
 import { renderDedupe } from "./dedupe";
 import { renderUpdate } from "./update";
 import { renderWatch } from "./watch";
@@ -35,6 +36,7 @@ export function refreshLanguageDependent(): void {
   }
   renderDevices();
   renderBackups();
+  renderSchemas();
   renderDedupe();
   renderUpdate();
   if (lastReport) {

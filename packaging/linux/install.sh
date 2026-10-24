@@ -477,10 +477,14 @@ if [ -n "$TARGET_USER" ] && [ -f /usr/share/rime-sync/defaults/default.custom.ya
     RIME_USER_DIR="$TARGET_HOME/.local/share/fcitx5/rime"
     install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
     chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
-    if [ ! -f "$RIME_USER_DIR/default.custom.yaml" ]; then
+    if [ ! -f /usr/share/rime-data/wubi86.schema.yaml ]; then
+      # 模板列了 16 个随包方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
+      # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。
+      say "跳过推荐输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 16 个方案会导致部署失败"
+    elif [ ! -f "$RIME_USER_DIR/default.custom.yaml" ]; then
       install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null &&
         chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
-      say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 4 个方案）"
+      say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
     else
       say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
     fi

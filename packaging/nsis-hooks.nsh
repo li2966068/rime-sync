@@ -170,10 +170,22 @@ Function RimeSyncSeedRimeConfig
     Return
   rimesync_seed_dir_ready:
   IfFileExists "$APPDATA\Rime\default.custom.yaml" rimesync_seed_skip_default
-    CopyFiles /SILENT "$INSTDIR\resources\default.custom.yaml" "$APPDATA\Rime\default.custom.yaml"
-    DetailPrint "[rime-sync] 写入推荐 default.custom.yaml（每页 8 个候选 / 4 个方案）"
-    StrCpy $R3 "[rime-sync] $R2 seed default.custom.yaml"
-    Call RimeSyncLog
+    ; 推荐配置列了 16 个随包方案（含五笔）。官方 Weasel 安装包的 data 没有五笔，
+    ; schema_list 里列一个缺失方案会让 librime 整次部署失败（exit 1），所以先确认
+    ; 已装小狼毫的 data 里真有 wubi86.schema.yaml；没有就跳过，保留 Weasel 自己的方案表。
+    Call RimeSyncFindWeaselRoot
+    StrCmp $R8 "" rimesync_seed_default_gate
+    IfFileExists "$R8\data\wubi86.schema.yaml" rimesync_seed_default_ok rimesync_seed_default_gate
+    rimesync_seed_default_gate:
+      DetailPrint "[rime-sync] 小狼毫 data 没有 wubi86（官方安装包不含五笔），跳过推荐 default.custom.yaml，避免部署失败"
+      StrCpy $R3 "[rime-sync] $R2 seed skipped default.custom.yaml: no wubi86 in $R8\data"
+      Call RimeSyncLog
+      Goto rimesync_seed_skip_default
+    rimesync_seed_default_ok:
+      CopyFiles /SILENT "$INSTDIR\resources\default.custom.yaml" "$APPDATA\Rime\default.custom.yaml"
+      DetailPrint "[rime-sync] 写入推荐 default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
+      StrCpy $R3 "[rime-sync] $R2 seed default.custom.yaml"
+      Call RimeSyncLog
   rimesync_seed_skip_default:
   IfFileExists "$APPDATA\Rime\weasel.custom.yaml" rimesync_seed_skip_weasel
     CopyFiles /SILENT "$INSTDIR\resources\weasel.custom.yaml" "$APPDATA\Rime\weasel.custom.yaml"

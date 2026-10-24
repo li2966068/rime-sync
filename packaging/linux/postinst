@@ -232,6 +232,9 @@ cat <<'EOM'
         install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
             ~/.local/share/fcitx5/rime/default.custom.yaml
         fcitx5-remote -r
+      注意：模板列了 16 个随包方案（拼音/五笔/仓颉/笔画/注音）。只有 /usr/share/rime-data
+      来自随包 rime-inputmethod 时才有这些数据；若用的是发行版 librime-data（没有五笔等），
+      照抄模板会让 rime 部署失败，请改列 /usr/share/rime-data 里实际存在的方案。
 
  依赖若没装上：打开应用「设置 → 诊断包」，红条里有日志路径与「重试」按钮。
  安装不会自动启动程序，也不会写入开机自启项；需要设置时从应用菜单手动打开。

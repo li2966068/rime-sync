@@ -296,6 +296,22 @@
             </label>
           </div>
 
+          <!-- 输入方案：列出用户目录与 shared data 里的 *.schema.yaml。
+               顺序即候选切换顺序，保存后自动重新部署。 -->
+          <div class="card" id="schema-card">
+            <div class="card-head">
+              <h3 data-i18n="schemas.title">输入方案</h3>
+              <div class="card-actions">
+                <button class="ghost small" id="btn-schema-refresh" type="button" data-i18n="common.refresh">刷新</button>
+                <button class="small" id="btn-schema-save" type="button" data-i18n="schemas.save">保存并重新部署</button>
+              </div>
+            </div>
+            <p class="hint" data-i18n="schemas.desc"></p>
+            <div class="schema-list" id="schema-list"></div>
+            <p class="hint" id="schema-empty" hidden data-i18n="schemas.empty"></p>
+            <p class="hint" id="schema-status"></p>
+          </div>
+
           <div class="card">
             <div class="card-head">
               <h3 data-i18n="settings.backups">备份区</h3>

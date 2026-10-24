@@ -77,10 +77,11 @@ DEPS=$(printf '%s' "$DEPS" | sed -E \
 # librime1t64; list both unconditionally (Conflicts with a package that does
 # not exist is harmless) so a package built for jammy can never coexist with a
 # t64 librime by accident.
-# Debian 12/13 split the distro rime data into rime-data/rime-prelude/rime-essay/
-# rime-luna-pinyin; we ship the same files under /usr/share/rime-data, so apt
-# (unlike plain dpkg -i) would fail with "trying to overwrite ... default.yaml".
-CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data, rime-data, rime-prelude, rime-essay, rime-luna-pinyin"}
+# Debian 12/13 split the distro rime data into per-recipe packages; we ship the
+# same files under /usr/share/rime-data, so apt (unlike plain dpkg -i) would
+# fail with "trying to overwrite ... default.yaml". Keep this list in sync with
+# the recipes vendored under third_party/rime-data.
+CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data, rime-data, rime-prelude, rime-essay, rime-luna-pinyin, rime-cangjie, rime-stroke, rime-terra-pinyin, rime-bopomofo, rime-wubi"}
 if [ -f "$STAGING/conflicts-extra.txt" ]; then
   while read -r extra; do
     [ -n "$extra" ] || continue
@@ -111,13 +112,29 @@ rm -rf "$PKGROOT/usr/include" "$PKGROOT/usr/lib/x86_64-linux-gnu/pkgconfig" \
 DATA_SRC=$REPO_ROOT/third_party/rime-data
 DATA_DST=$PKGROOT/usr/share/rime-data
 install -d "$DATA_DST"
-cp -f "$DATA_SRC/rime-prelude/"*.yaml "$DATA_DST"/
-cp -f "$DATA_SRC/rime-essay/essay.txt" "$DATA_DST"/
-cp -f "$DATA_SRC/rime-luna-pinyin/"*.yaml "$DATA_DST"/
 install -d "$PKGROOT/usr/share/doc/$PKG"
-for d in rime-prelude rime-essay rime-luna-pinyin; do
-  cp -f "$DATA_SRC/$d/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.$d" 2>/dev/null || true
+# Every vendored recipe (any third_party/rime-data/* dir holding *.yaml / *.txt)
+# is flattened, so adding a schema upstream only means vendoring its repo.
+for recipe_dir in "$DATA_SRC"/*/; do
+  recipe=$(basename "$recipe_dir")
+  # *.yaml and *.txt both matter: rime-essay ships only essay.txt and would be
+  # skipped by a yaml-only filter.
+  find "$recipe_dir" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.txt' \) \
+    -exec cp -f {} "$DATA_DST"/ \;
+  cp -f "$recipe_dir/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.$recipe" 2>/dev/null || true
 done
+[ -f "$DATA_DST/essay.txt" ] || { echo "!! third_party/rime-data/rime-essay/essay.txt missing" >&2; exit 1; }
+# Every schema named in default.yaml must ship here: librime's deployer treats a
+# missing schema as a deployment failure (exit 1), so fail the build instead.
+# Pure shell on purpose: this script has no other runtime dependency besides dpkg.
+schema_ids=$(sed -n 's/^[[:space:]]*-[[:space:]]*schema:[[:space:]]*\([A-Za-z0-9_][A-Za-z0-9_]*\)[[:space:]]*$/\1/p' "$DATA_DST/default.yaml")
+[ -n "$schema_ids" ] || { echo "!! default.yaml has no schema_list" >&2; exit 1; }
+missing=""
+for schema in $schema_ids; do
+  [ -f "$DATA_DST/$schema.schema.yaml" ] || missing="$missing $schema"
+done
+[ -z "$missing" ] || { echo "!! schema_list names schemas that are not packaged:$missing" >&2; exit 1; }
+echo "schema_list: $(printf '%s\n' "$schema_ids" | wc -l) schemas, all packaged"
 cp "$REPO_ROOT/third_party/librime/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.librime" 2>/dev/null || true
 cp "$REPO_ROOT/third_party/fcitx5-rime/LICENSES/LGPL-2.1-or-later.txt" \
    "$PKGROOT/usr/share/doc/$PKG/copyright.fcitx5-rime" 2>/dev/null || true
@@ -128,7 +145,9 @@ cp "$REPO_ROOT/third_party/fcitx5-rime/LICENSES/LGPL-2.1-or-later.txt" \
   echo "Upstream:"
   echo "  librime      https://github.com/rime/librime (tag 1.17.0, BSD-3-Clause)"
   echo "  fcitx5-rime  https://github.com/fcitx/fcitx5-rime (tag 5.0.16, LGPL-2.1-or-later)"
-  echo "  rime data    https://github.com/rime/rime-prelude, rime-essay, rime-luna-pinyin (LGPL-3.0)"
+  echo "  rime data    https://github.com/rime/rime-prelude, rime-essay, rime-luna-pinyin,"
+  echo "               rime-cangjie, rime-stroke, rime-terra-pinyin, rime-bopomofo, rime-wubi (LGPL-3.0)"
+  echo "               rime-pinyin-simp (Apache-2.0)"
   echo
   echo "Schema data is installed to /usr/share/rime-data so the input method can"
   echo "deploy and type Chinese immediately after installation, without network."

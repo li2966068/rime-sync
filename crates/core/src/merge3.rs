@@ -3,6 +3,8 @@
 //! PLAN 第 9 节选择的是整文件取舍而不是行级合并：Rime 的 YAML 配置
 //! 行级合并后仍可能语义冲突，整文件取舍 + 冲突副本更可预测。
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use serde_yaml::{Mapping, Value};
 
@@ -145,6 +147,9 @@ fn canonical_key(key: &Value) -> String {
     }
 }
 
+/// 只做集合合并的 patch 键：多台机器各自安装的输入方案不能互相冲掉。
+const SCHEMA_LIST_KEY: &str = "schema_list";
+
 /// YAML 段落级合并结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -152,6 +157,8 @@ pub enum MergeOutcome {
     Patch {
         bytes: Vec<u8>,
         conflicts: Vec<String>,
+        /// 非冲突的合并说明（如 schema_list 取并集），由调用方写进 Report。
+        notes: Vec<String>,
     },
     /// 结构不符合预期 / 解析失败 → 调用方回落文件级合并，绝不中断。
     Fallback { reason: String },
@@ -219,6 +226,7 @@ pub fn merge_yaml_patch(
 
     let mut merged = Mapping::new();
     let mut conflicts = Vec::new();
+    let mut notes = Vec::new();
     let mut keys: Vec<&Value> = local_patch.keys().collect();
     for key in remote_patch.keys() {
         if !local_patch.contains_key(key) {
@@ -229,10 +237,16 @@ pub fn merge_yaml_patch(
         let local_value = local_patch.get(key);
         let remote_value = remote_patch.get(key);
         let base_value = base_patch.get(key);
+        // schema_list 视为集合：两边都是合法列表就取并集，不看 base。
+        // 一台机器新增的方案不能因为「另一边没动」而按单值取舍丢掉。
+        let schema_union = schema_list_union(key, local_value, remote_value);
         if local_value == remote_value {
             if let Some(value) = local_value {
                 merged.insert(key.clone(), value.clone());
             }
+        } else if let Some((value, note)) = schema_union {
+            merged.insert(key.clone(), value);
+            notes.push(note);
         } else if local_value == base_value {
             // 本地没动，跟远端（None 表示远端删除该 key）。
             if let Some(value) = remote_value {
@@ -270,7 +284,82 @@ pub fn merge_yaml_patch(
     Ok(MergeOutcome::Patch {
         bytes: text.into_bytes(),
         conflicts,
+        notes,
     })
+}
+
+/// schema_list 的集合合并入口。
+///
+/// 键名不匹配、缺一边、或任一边不是「元素都带非空字符串 schema 字段的序列」时
+/// 返回 None，调用方回落到原来的三向冲突逻辑（绝不猜结构）。
+fn schema_list_union(
+    key: &Value,
+    local: Option<&Value>,
+    remote: Option<&Value>,
+) -> Option<(Value, String)> {
+    if !matches!(key, Value::String(name) if name == SCHEMA_LIST_KEY) {
+        return None;
+    }
+    let (local, remote) = (local?, remote?);
+    let local_items = valid_schema_list(local)?;
+    let remote_items = valid_schema_list(remote)?;
+    Some(union_schema_list(local_items, remote_items))
+}
+
+/// 合法输入方案列表：序列且每一项都能取出 schema 名。空序列也算合法。
+fn valid_schema_list(value: &Value) -> Option<&[Value]> {
+    let Value::Sequence(items) = value else {
+        return None;
+    };
+    if items.iter().all(|item| schema_name(item).is_some()) {
+        Some(items)
+    } else {
+        None
+    }
+}
+
+/// 去重键：元素映射里的非空字符串 `schema` 字段。
+fn schema_name(item: &Value) -> Option<&str> {
+    let Value::Mapping(map) = item else {
+        return None;
+    };
+    match map.get("schema") {
+        Some(Value::String(name)) if !name.is_empty() => Some(name),
+        _ => None,
+    }
+}
+
+/// 并集：先本机顺序，再按远端顺序追加本机没有的方案。
+///
+/// 同一 schema 只保留第一次出现（本机优先），两侧的重复项都被折叠。
+fn union_schema_list(local: &[Value], remote: &[Value]) -> (Value, String) {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    let mut names = Vec::new();
+    for item in local.iter().chain(remote.iter()) {
+        let Some(name) = schema_name(item) else {
+            continue;
+        };
+        if seen.insert(name.to_string()) {
+            names.push(name.to_string());
+            items.push(item.clone());
+        }
+    }
+    let note = format!(
+        "patch.{SCHEMA_LIST_KEY} merged as set union: local=[{}] remote=[{}] result=[{}]",
+        schema_names(local),
+        schema_names(remote),
+        names.join(", "),
+    );
+    (Value::Sequence(items), note)
+}
+
+fn schema_names(items: &[Value]) -> String {
+    items
+        .iter()
+        .filter_map(schema_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_yaml(bytes: &[u8]) -> Option<Value> {
@@ -419,7 +508,9 @@ mod patch_tests {
         let remote = b"patch:\n  a: 3\n";
         let outcome = merge_yaml_patch(Some(base), local, Some(remote)).expect("merge");
         match outcome {
-            MergeOutcome::Patch { bytes, conflicts } => {
+            MergeOutcome::Patch {
+                bytes, conflicts, ..
+            } => {
                 assert_eq!(conflicts, vec!["patch.a".to_string()]);
                 let text = String::from_utf8(bytes).expect("utf8");
                 assert!(text.contains("a: 2"), "{text}");
@@ -480,7 +571,9 @@ mod patch_tests {
         let remote = b"patch:\n  a: 2\n  b: 3\n";
         let outcome = merge_yaml_patch(None, local, Some(remote)).expect("merge");
         match outcome {
-            MergeOutcome::Patch { bytes, conflicts } => {
+            MergeOutcome::Patch {
+                bytes, conflicts, ..
+            } => {
                 assert_eq!(conflicts, vec!["patch.a".to_string()]);
                 let text = String::from_utf8(bytes).expect("utf8");
                 assert!(text.contains("a: 1"));
@@ -488,6 +581,163 @@ mod patch_tests {
             }
             MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_list_tests {
+    use super::*;
+
+    fn merge(
+        base: Option<&[u8]>,
+        local: &[u8],
+        remote: &[u8],
+    ) -> (String, Vec<String>, Vec<String>) {
+        match merge_yaml_patch(base, local, Some(remote)).expect("merge") {
+            MergeOutcome::Patch {
+                bytes,
+                conflicts,
+                notes,
+            } => (String::from_utf8(bytes).expect("utf8"), conflicts, notes),
+            MergeOutcome::Fallback { reason } => panic!("unexpected fallback: {reason}"),
+        }
+    }
+
+    /// 按文件里的顺序读出 schema 名，顺带验证结构合法。
+    fn names(text: &str) -> Vec<String> {
+        let doc: Value = serde_yaml::from_str(text).expect("yaml");
+        let patch = patch_mapping(&doc).expect("patch");
+        let list = patch.get("schema_list").expect("schema_list");
+        valid_schema_list(list)
+            .expect("valid schema list")
+            .iter()
+            .map(|item| schema_name(item).expect("schema name").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn same_set_in_different_order_has_no_conflict() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: wubi86\n    - schema: luna_pinyin\n";
+        let (text, conflicts, notes) = merge(Some(base), local, remote);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        // 本机顺序优先。
+        assert_eq!(names(&text), ["luna_pinyin", "wubi86"]);
+        assert!(
+            notes.iter().any(|note| note.contains("set union")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn local_only_schema_is_preserved() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let (text, conflicts, _) = merge(Some(base), local, remote);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(names(&text), ["luna_pinyin", "wubi86"]);
+    }
+
+    #[test]
+    fn remote_only_schema_is_appended_in_remote_order() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: cangjie\n";
+        let (text, conflicts, _) = merge(Some(base), local, remote);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(names(&text), ["luna_pinyin", "cangjie"]);
+    }
+
+    #[test]
+    fn list_versus_scalar_falls_back_to_conflict() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local_list =
+            b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote_scalar = b"patch:\n  schema_list: luna_pinyin\n";
+        let (text, conflicts, notes) = merge(Some(base), local_list, remote_scalar);
+        assert_eq!(conflicts, ["patch.schema_list"]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(text.contains("wubi86"), "local value must win: {text}");
+
+        let local_scalar = b"patch:\n  schema_list: luna_pinyin\n";
+        let remote_list =
+            b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: cangjie\n";
+        let (text, conflicts, notes) = merge(Some(base), local_scalar, remote_list);
+        assert_eq!(conflicts, ["patch.schema_list"]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(text.contains("schema_list: luna_pinyin"), "{text}");
+    }
+
+    #[test]
+    fn invalid_items_fall_back_to_conflict() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: cangjie\n";
+        // 元素不是映射：拿不到去重键。
+        let local_string_item =
+            b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - wubi86\n";
+        let (_, conflicts, notes) = merge(Some(base), local_string_item, remote);
+        assert_eq!(conflicts, ["patch.schema_list"]);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // 映射里没有 schema 字段。
+        let local_no_field =
+            b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - name: wubi86\n";
+        let (_, conflicts, notes) = merge(Some(base), local_no_field, remote);
+        assert_eq!(conflicts, ["patch.schema_list"]);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn empty_lists_are_valid_collections() {
+        // 本机清空、远端新增 → 并集保留远端的方案。
+        let (text, conflicts, _) = merge(
+            Some(b"patch:\n  schema_list:\n    - schema: luna_pinyin\n"),
+            b"patch:\n  schema_list: []\n",
+            b"patch:\n  schema_list:\n    - schema: cangjie\n",
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(names(&text), ["cangjie"]);
+
+        // 远端清空不得抹掉本机方案。
+        let (text, conflicts, _) = merge(
+            None,
+            b"patch:\n  schema_list:\n    - schema: luna_pinyin\n",
+            b"patch:\n  schema_list: []\n",
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(names(&text), ["luna_pinyin"]);
+
+        // 两边都是空列表：合法，结果仍是空列表。
+        let (text, conflicts, _) = merge(
+            Some(b"patch:\n  schema_list:\n    - schema: luna_pinyin\n"),
+            b"patch:\n  schema_list: []\n",
+            b"patch:\n  schema_list: []\n",
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(names(&text).is_empty(), "{text}");
+        assert!(text.contains("schema_list: []"), "{text}");
+    }
+
+    #[test]
+    fn duplicate_schemas_are_collapsed_local_first() {
+        let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: wubi86\n    - schema: cangjie\n";
+        let (text, conflicts, _) = merge(None, local, remote);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(names(&text), ["luna_pinyin", "wubi86", "cangjie"]);
+    }
+
+    #[test]
+    fn other_patch_keys_keep_three_way_rules() {
+        let base = b"patch:\n  menu/page_size: 9\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local = b"patch:\n  menu/page_size: 10\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote = b"patch:\n  menu/page_size: 12\n  schema_list:\n    - schema: luna_pinyin\n    - schema: cangjie\n";
+        let (text, conflicts, _) = merge(Some(base), local, remote);
+        assert_eq!(conflicts, ["patch.menu/page_size"]);
+        assert_eq!(names(&text), ["luna_pinyin", "wubi86", "cangjie"]);
+        assert!(text.contains("menu/page_size: 10"), "{text}");
     }
 }
 

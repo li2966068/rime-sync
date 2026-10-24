@@ -39,8 +39,8 @@
 
 .PARAMETER WithRimeData
   额外用 plum 再拉一批 Rime 方案写入 output\data（要联网 + bash，vendored 树里 plum/ 为空）。
-  默认关闭：安装包内置的 prelude / luna_pinyin / essay 数据来自入库的 third_party/rime-data
-  （离线、可复现），这个开关只用于追加更多方案。
+  默认关闭：安装包内置的方案数据（prelude / luna_pinyin / cangjie / stroke / terra_pinyin /
+  bopomofo / wubi / essay）来自入库的 third_party/rime-data（离线、可复现），这个开关只用于追加更多方案。
 
 .PARAMETER Check
   只做前置检查与打印计划，不下载、不编译。用于本地/CI 的依赖自检。
@@ -590,27 +590,45 @@ function Ensure-Librime {
 # data / props
 # ---------------------------------------------------------------------------
 function Install-RimeDataSource {
-    # 方案数据来源：third_party/rime-data（入库的 rime-prelude / rime-luna-pinyin / rime-essay）。
-    # 上游 build.bat 的 :build_data 用 bash plum/rime-install 把同样的文件写进 output\data；
-    # 这里改用入库副本：离线、可复现，CI 不必联网拉方案。
-    # 布局与 Rime 的 shared data 一致：所有 *.yaml 平铺在 data\ 下，essay.txt 放 data\ 根。
+    # 方案数据来源：third_party/rime-data 下每个含 *.yaml / *.txt 的 recipe 目录
+    # （rime-prelude / rime-luna-pinyin / rime-essay / rime-cangjie / rime-stroke /
+    #  rime-terra-pinyin / rime-bopomofo / rime-wubi）。上游 build.bat 的 :build_data
+    # 用 bash plum/rime-install 把同样的文件写进 output\data；这里改用入库副本：
+    # 离线、可复现，CI 不必联网拉方案。新增方案 = 往 third_party/rime-data 里加一个目录，
+    # 本函数不用改。
+    # 布局与 Rime 的 shared data 一致：所有 *.yaml 平铺在 data\ 下，*.txt（essay.txt）
+    # 也放 data\ 根。
     $rimeData = Join-Path $script:RepoRoot 'third_party\rime-data'
     $dataDir = Join-Path (Join-Path $script:WeaselDir 'output') 'data'
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
     Assert-File (Join-Path $rimeData 'rime-prelude\default.yaml') 'third_party/rime-data 未入库：安装包会没有离线方案数据。'
-    Assert-File (Join-Path $rimeData 'rime-essay\essay.txt')
 
-    foreach ($recipe in @('rime-prelude', 'rime-luna-pinyin')) {
-        $srcDir = Join-Path $rimeData $recipe
-        if (-not (Test-Path -LiteralPath $srcDir)) { throw "缺少方案数据目录：third_party/rime-data/$recipe" }
-        $yamls = @(Get-ChildItem -LiteralPath $srcDir -Filter '*.yaml' -File)
-        if ($yamls.Count -eq 0) { throw "third_party/rime-data/$recipe 里没有 *.yaml" }
-        foreach ($file in $yamls) {
-            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $dataDir $file.Name) -Force
+    # recipe 目录 = third_party\rime-data 下任何含 *.yaml 或 *.txt 的直接子目录
+    # （rime-essay 只有 essay.txt，没有 yaml，不能按 yaml 过滤掉）。
+    $recipes = @(Get-ChildItem -LiteralPath $rimeData -Directory | Where-Object {
+        @(Get-ChildItem -LiteralPath $_.FullName -File |
+          Where-Object { $_.Extension -eq '.yaml' -or $_.Extension -eq '.txt' }).Count -gt 0
+    })
+    if ($recipes.Count -eq 0) { throw 'third_party\rime-data 下没有含 *.yaml / *.txt 的 recipe 目录' }
+
+    # 平铺到同一个 data\ 目录，同名文件会互相覆盖：先查重再拷。
+    $seen = @{}
+    $copiedYaml = 0
+    $copiedTxt = 0
+    foreach ($recipe in $recipes) {
+        foreach ($pattern in @('*.yaml', '*.txt')) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $recipe.FullName -Filter $pattern -File)) {
+                $key = $file.Name.ToLowerInvariant()
+                if ($seen.ContainsKey($key)) {
+                    throw "third_party/rime-data 里 $($seen[$key]) 与 $($recipe.Name) 都有 $($file.Name)：平铺到 output\data 会冲突。"
+                }
+                $seen[$key] = $recipe.Name
+                Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $dataDir $file.Name) -Force
+                if ($pattern -eq '*.yaml') { $copiedYaml++ } else { $copiedTxt++ }
+            }
         }
     }
-    Copy-Item -LiteralPath (Join-Path $rimeData 'rime-essay\essay.txt') -Destination (Join-Path $dataDir 'essay.txt') -Force
 
     # default.yaml 的 schema_list 只能列随包的 schema：librime 部署时每个缺失 schema 都记一次
     # failure，整次部署会失败（Linux deb 的离线包踩过同一个坑，见 packaging/linux）。
@@ -623,9 +641,12 @@ function Install-RimeDataSource {
         Assert-File (Join-Path $dataDir ($schema + '.schema.yaml')) "default.yaml 的 schema_list 列了 $schema，但包里没有 $schema.schema.yaml：部署会失败。"
     }
 
+    # 这几个是部署的硬依赖：default.yaml 来自 prelude，essay.txt 来自 rime-essay，
+    # weasel.yaml 由 Weasel 自己的构建产出。
+    Assert-File (Join-Path $dataDir 'essay.txt') 'third_party/rime-data/rime-essay/essay.txt 没拷进 data\：部署能过但候选词序会退化。'
     Assert-File (Join-Path $dataDir 'weasel.yaml') '上游 output\data\weasel.yaml 丢了：install.nsi 的 File data\*.yaml 需要它。'
     $yamlCount = @(Get-ChildItem -LiteralPath $dataDir -Filter '*.yaml' -File).Count
-    Write-Host "[data] 方案数据：$yamlCount 个 yaml + essay.txt（来源 third_party/rime-data；schema_list: $($schemas -join ', ')）"
+    Write-Host "[data] 方案数据：$yamlCount 个 yaml + $copiedTxt 个 txt，来自 $($recipes.Count) 个 recipe（$($recipes.Name -join ', ')）；schema_list: $($schemas -join ', ')"
 }
 
 function Prepare-Data {

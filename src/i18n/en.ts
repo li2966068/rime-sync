@@ -428,5 +428,20 @@ export const en: Record<keyof Dict, string> = {
   "wizard.passwordHint": "The password is never written to config.json",
   "wizard.skipTest": "Skip test",
 
+  "schemas.title": "Input schemas",
+  "schemas.desc": "Tick the schemas to enable; the order is the candidate-switch order (the first one is the default). Saving redeploys and only rewrites schema_list in default.custom.yaml.",
+  "schemas.save": "Save & redeploy",
+  "schemas.saved": "Schemas saved and redeployed",
+  "schemas.saving": "Saving and redeploying…",
+  "schemas.deployFail": "Schemas were saved, but redeploy failed: {error} (fix the cause and click Save & redeploy again)",
+  "schemas.saveFail": "Saving schemas failed: {error}",
+  "schemas.loadFail": "Loading schemas failed: {error}",
+  "schemas.empty": "No *.schema.yaml files found. Install some input schemas first, or check the Rime directory on the Sync tab.",
+  "schemas.source.local": "Local",
+  "schemas.source.shared": "Bundled",
+  "schemas.up": "Move up",
+  "schemas.down": "Move down",
+  "schemas.needOne": "Keep at least one input schema enabled",
+
   "modal.confirmTitle": "Please confirm",
 };
