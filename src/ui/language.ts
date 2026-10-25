@@ -9,6 +9,7 @@ import { renderDedupe } from "./dedupe";
 import { renderUpdate } from "./update";
 import { renderWatch } from "./watch";
 import { renderFirstSyncBanner } from "./settings";
+import { renderDeviceKeys } from "./device_keys";
 import { wizard, wizardTitleText } from "./wizard";
 import { renderReport } from "./sync";
 import { applySecretText, getSecretState } from "./secret";
@@ -37,6 +38,7 @@ export function refreshLanguageDependent(): void {
   renderDevices();
   renderBackups();
   renderSchemas();
+  renderDeviceKeys();
   renderDedupe();
   renderUpdate();
   if (lastReport) {

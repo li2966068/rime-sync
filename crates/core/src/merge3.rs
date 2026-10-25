@@ -101,6 +101,120 @@ pub fn custom_yaml_digest(bytes: &[u8]) -> String {
     }
 }
 
+/// 带设备本地作用域的规范化摘要：比较前先剔除 device_local 键。
+///
+/// device_local 为空时与 custom_yaml_digest 逐字节等价（回归保证）。
+pub fn custom_yaml_digest_scoped(bytes: &[u8], device_local: &[String]) -> String {
+    if device_local.is_empty() {
+        return custom_yaml_digest(bytes);
+    }
+    match normalize_custom_yaml_scoped(bytes, device_local) {
+        Some(normalized) => sha256_hex(&normalized),
+        None => sha256_hex(bytes),
+    }
+}
+
+/// normalize_custom_yaml 的设备本地作用域版本：剔除 device_local 键后再规范化。
+pub fn normalize_custom_yaml_scoped(bytes: &[u8], device_local: &[String]) -> Option<Vec<u8>> {
+    if device_local.is_empty() {
+        return normalize_custom_yaml(bytes);
+    }
+    let doc = parse_yaml(bytes)?;
+    let mut patch = patch_mapping(&doc)?.clone();
+    remove_device_keys(&mut patch, device_local);
+    let canonical = canonical_value(&Value::Mapping(patch));
+    serde_yaml::to_string(&canonical)
+        .ok()
+        .map(String::into_bytes)
+}
+
+/// 上传用的共享视图：从 patch 映射里删除设备本地键。
+///
+/// None 表示无法解析或没有 patch 映射——调用方回退原始字节（宁可多传，
+/// 也不能让文件因为解析问题卡住同步）。需要删的键不存在时原样返回字节。
+pub fn shared_view(bytes: &[u8], device_local: &[String]) -> Option<Vec<u8>> {
+    if device_local.is_empty() {
+        return Some(bytes.to_vec());
+    }
+    let mut doc = parse_yaml(bytes)?;
+    let mut patch = patch_mapping(&doc)?.clone();
+    let before = patch.len();
+    remove_device_keys(&mut patch, device_local);
+    if patch.len() == before {
+        return Some(bytes.to_vec());
+    }
+    let Value::Mapping(map) = &mut doc else {
+        return None;
+    };
+    map.insert(Value::String("patch".to_string()), Value::Mapping(patch));
+    serde_yaml::to_string(&doc).ok().map(String::into_bytes)
+}
+
+/// 写回本地时把本机原有的设备本地键原样放回：远端永远不提供这些键的值。
+///
+/// merged 或 local 不可解析时原样返回 merged（宁可不合并，也不丢本机设置）。
+pub fn restore_device_local(merged: &[u8], local: &[u8], device_local: &[String]) -> Vec<u8> {
+    if device_local.is_empty() {
+        return merged.to_vec();
+    }
+    let Some(local_patch) = parse_yaml(local).as_ref().and_then(patch_mapping).cloned() else {
+        return merged.to_vec();
+    };
+    let mut local_values: Vec<(Value, Value)> = Vec::new();
+    for key in device_local {
+        let key = Value::String(key.clone());
+        if let Some(value) = local_patch.get(&key) {
+            local_values.push((key, value.clone()));
+        }
+    }
+    if local_values.is_empty() {
+        return merged.to_vec();
+    }
+    let Some(mut doc) = parse_yaml(merged) else {
+        return merged.to_vec();
+    };
+    let Value::Mapping(map) = &mut doc else {
+        return merged.to_vec();
+    };
+    let Some(Value::Mapping(patch)) = map.get_mut(Value::String("patch".to_string())) else {
+        return merged.to_vec();
+    };
+    for (key, value) in local_values {
+        patch.insert(key, value);
+    }
+    serde_yaml::to_string(&doc)
+        .map(String::into_bytes)
+        .unwrap_or_else(|_| merged.to_vec())
+}
+
+fn remove_device_keys(patch: &mut Mapping, device_local: &[String]) {
+    for key in device_local {
+        patch.remove(Value::String(key.clone()));
+    }
+}
+
+/// 这批文件里出现过的设备本地键数量（去重），用于「剥离 N 个」说明。
+pub fn count_device_local_keys_in(bytes_list: &[&[u8]], device_local: &[String]) -> usize {
+    let patches: Vec<Mapping> = bytes_list
+        .iter()
+        .filter_map(|bytes| parse_yaml(bytes))
+        .filter_map(|doc| patch_mapping(&doc).cloned())
+        .collect();
+    let refs: Vec<&Mapping> = patches.iter().collect();
+    count_device_local_keys(&refs, device_local)
+}
+
+/// 三个版本里出现过的设备本地键数量（去重），用于「剥离 N 个」说明。
+fn count_device_local_keys(patches: &[&Mapping], device_local: &[String]) -> usize {
+    device_local
+        .iter()
+        .filter(|key| {
+            let key = Value::String((*key).clone());
+            patches.iter().any(|patch| patch.contains_key(&key))
+        })
+        .count()
+}
+
 /// 只保留 `patch:` 段并做确定性序列化（映射键排序、递归），用于比较而非写盘。
 ///
 /// 返回 None 表示「无法规范化」：解析失败、顶层不是映射、patch 不是映射。
@@ -153,11 +267,14 @@ const SCHEMA_LIST_KEY: &str = "schema_list";
 /// YAML 段落级合并结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
-    /// 段落级（patch: key 级）合并成功，bytes 是写回本地的新内容。
+    /// 段落级（patch: key 级）合并成功。
     Patch {
+        /// 写回本地的新内容：已把本机原有的设备本地键原样放回。
         bytes: Vec<u8>,
+        /// 上传用的共享视图：不含 device_local 键；device_local 为空时等于 bytes。
+        shared_bytes: Vec<u8>,
         conflicts: Vec<String>,
-        /// 非冲突的合并说明（如 schema_list 取并集），由调用方写进 Report。
+        /// 非冲突的合并说明（如 schema_list 取并集、剥离设备本地键），由调用方写进 Report。
         notes: Vec<String>,
     },
     /// 结构不符合预期 / 解析失败 → 调用方回落文件级合并，绝不中断。
@@ -168,10 +285,14 @@ pub enum MergeOutcome {
 ///
 /// 一侧相对基线未变的 key 直接取另一侧；两侧都变且不同 → 保留本地并记录冲突。
 /// base / remote 为 None 表示该侧不存在（远端删除交给文件级处理）。
+///
+/// device_local 里的 patch 键在参与比较与合并之前就被剔除，合并结果里再按本机
+/// 原值放回；shared_bytes 是剔除后的共享视图，只用于上传。
 pub fn merge_yaml_patch(
     base: Option<&[u8]>,
     local: &[u8],
     remote: Option<&[u8]>,
+    device_local: &[String],
 ) -> Result<MergeOutcome> {
     let local_doc = match parse_yaml(local) {
         Some(doc) => doc,
@@ -181,7 +302,7 @@ pub fn merge_yaml_patch(
             })
         }
     };
-    let Some(local_patch) = patch_mapping(&local_doc) else {
+    let Some(local_patch) = patch_mapping(&local_doc).cloned() else {
         return Ok(MergeOutcome::Fallback {
             reason: "local file has no patch mapping".to_string(),
         });
@@ -199,7 +320,7 @@ pub fn merge_yaml_patch(
             })
         }
     };
-    let Some(remote_patch) = patch_mapping(&remote_doc) else {
+    let Some(remote_patch) = patch_mapping(&remote_doc).cloned() else {
         return Ok(MergeOutcome::Fallback {
             reason: "remote file has no patch mapping".to_string(),
         });
@@ -223,6 +344,16 @@ pub fn merge_yaml_patch(
         },
         None => Mapping::new(),
     };
+
+    // 设备本地键在比较/合并之前剔除：它们既不参与三向判定，也不会互相冲突。
+    let stripped =
+        count_device_local_keys(&[&local_patch, &remote_patch, &base_patch], device_local);
+    let mut local_patch = local_patch;
+    let mut remote_patch = remote_patch;
+    let mut base_patch = base_patch;
+    remove_device_keys(&mut local_patch, device_local);
+    remove_device_keys(&mut remote_patch, device_local);
+    remove_device_keys(&mut base_patch, device_local);
 
     let mut merged = Mapping::new();
     let mut conflicts = Vec::new();
@@ -281,8 +412,15 @@ pub fn merge_yaml_patch(
             })
         }
     };
+    if stripped > 0 {
+        notes.push(format!("stripped {stripped} device-local key(s)"));
+    }
+    let shared_bytes = text.into_bytes();
+    // 写回本地的那份要把本机原有的设备本地值放回去。
+    let bytes = restore_device_local(&shared_bytes, local, device_local);
     Ok(MergeOutcome::Patch {
-        bytes: text.into_bytes(),
+        bytes,
+        shared_bytes,
         conflicts,
         notes,
     })
@@ -487,7 +625,7 @@ mod patch_tests {
 
     #[test]
     fn disjoint_patch_keys_merge_without_conflict() {
-        let outcome = merge_yaml_patch(Some(BASE), LOCAL, Some(REMOTE)).expect("merge");
+        let outcome = merge_yaml_patch(Some(BASE), LOCAL, Some(REMOTE), &[]).expect("merge");
         match &outcome {
             MergeOutcome::Patch { conflicts, .. } => assert!(conflicts.is_empty()),
             MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
@@ -506,7 +644,7 @@ mod patch_tests {
         let base = b"patch:\n  a: 1\n";
         let local = b"patch:\n  a: 2\n";
         let remote = b"patch:\n  a: 3\n";
-        let outcome = merge_yaml_patch(Some(base), local, Some(remote)).expect("merge");
+        let outcome = merge_yaml_patch(Some(base), local, Some(remote), &[]).expect("merge");
         match outcome {
             MergeOutcome::Patch {
                 bytes, conflicts, ..
@@ -522,24 +660,30 @@ mod patch_tests {
     #[test]
     fn invalid_yaml_falls_back_instead_of_failing() {
         let outcome =
-            merge_yaml_patch(Some(BASE), b"patch: [unclosed", Some(REMOTE)).expect("no error");
+            merge_yaml_patch(Some(BASE), b"patch: [unclosed", Some(REMOTE), &[]).expect("no error");
         assert!(matches!(outcome, MergeOutcome::Fallback { .. }));
-        let outcome = merge_yaml_patch(Some(BASE), b"patch:\n  a: 1\n", Some(b"\tbad: yaml"))
+        let outcome = merge_yaml_patch(Some(BASE), b"patch:\n  a: 1\n", Some(b"\tbad: yaml"), &[])
             .expect("no error");
         assert!(matches!(outcome, MergeOutcome::Fallback { .. }));
-        let outcome = merge_yaml_patch(Some(BASE), b"patch:\n  a: 1\n", None).expect("no error");
+        let outcome =
+            merge_yaml_patch(Some(BASE), b"patch:\n  a: 1\n", None, &[]).expect("no error");
         assert!(matches!(outcome, MergeOutcome::Fallback { .. }));
     }
 
     #[test]
     fn missing_patch_mapping_falls_back() {
-        let outcome = merge_yaml_patch(None, b"not_patch:\n  a: 1\n", Some(b"patch:\n  a: 2\n"))
-            .expect("no error");
+        let outcome = merge_yaml_patch(
+            None,
+            b"not_patch:\n  a: 1\n",
+            Some(b"patch:\n  a: 2\n"),
+            &[],
+        )
+        .expect("no error");
         match outcome {
             MergeOutcome::Fallback { reason } => assert!(reason.contains("patch")),
             MergeOutcome::Patch { .. } => panic!("should fall back"),
         }
-        let outcome = merge_yaml_patch(None, b"patch: scalar\n", Some(b"patch:\n  a: 2\n"))
+        let outcome = merge_yaml_patch(None, b"patch: scalar\n", Some(b"patch:\n  a: 2\n"), &[])
             .expect("no error");
         assert!(matches!(outcome, MergeOutcome::Fallback { .. }));
     }
@@ -549,7 +693,7 @@ mod patch_tests {
         let base = b"patch:\n  a: 1\n  b: 2\n";
         let local = b"patch:\n  a: 1\n  b: 2\n";
         let remote = b"patch:\n  a: 1\n";
-        let outcome = merge_yaml_patch(Some(base), local, Some(remote)).expect("merge");
+        let outcome = merge_yaml_patch(Some(base), local, Some(remote), &[]).expect("merge");
         let text = merged_text(outcome);
         assert!(text.contains("a: 1"));
         assert!(!text.contains("b:"), "{text}");
@@ -560,7 +704,7 @@ mod patch_tests {
         let base = b"patch:\n  a: 1\n  b: 2\n";
         let local = b"patch:\n  a: 1\n";
         let remote = b"patch:\n  a: 1\n  b: 2\n";
-        let outcome = merge_yaml_patch(Some(base), local, Some(remote)).expect("merge");
+        let outcome = merge_yaml_patch(Some(base), local, Some(remote), &[]).expect("merge");
         let text = merged_text(outcome);
         assert!(!text.contains("b:"), "{text}");
     }
@@ -569,7 +713,7 @@ mod patch_tests {
     fn absent_base_is_conservative() {
         let local = b"patch:\n  a: 1\n";
         let remote = b"patch:\n  a: 2\n  b: 3\n";
-        let outcome = merge_yaml_patch(None, local, Some(remote)).expect("merge");
+        let outcome = merge_yaml_patch(None, local, Some(remote), &[]).expect("merge");
         match outcome {
             MergeOutcome::Patch {
                 bytes, conflicts, ..
@@ -593,11 +737,12 @@ mod schema_list_tests {
         local: &[u8],
         remote: &[u8],
     ) -> (String, Vec<String>, Vec<String>) {
-        match merge_yaml_patch(base, local, Some(remote)).expect("merge") {
+        match merge_yaml_patch(base, local, Some(remote), &[]).expect("merge") {
             MergeOutcome::Patch {
                 bytes,
                 conflicts,
                 notes,
+                ..
             } => (String::from_utf8(bytes).expect("utf8"), conflicts, notes),
             MergeOutcome::Fallback { reason } => panic!("unexpected fallback: {reason}"),
         }
@@ -823,5 +968,171 @@ mod normalize_tests {
         let sequence = b"- patch: 1\n";
         assert!(normalize_custom_yaml(sequence).is_none());
         assert_eq!(custom_yaml_digest(sequence), sha256_hex(sequence));
+    }
+}
+
+#[cfg(test)]
+mod device_local_tests {
+    use super::*;
+
+    const LOCAL: &[u8] = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n  menu/page_size: 8\n";
+    const REMOTE: &[u8] =
+        b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  menu/page_size: 7\n";
+
+    fn keys() -> Vec<String> {
+        vec!["schema_list".to_string()]
+    }
+
+    fn parsed(text: &str) -> Value {
+        serde_yaml::from_str(text).expect("yaml")
+    }
+
+    fn schema_names(text: &str) -> Vec<String> {
+        let doc = parsed(text);
+        let list = patch_mapping(&doc)
+            .expect("patch")
+            .get("schema_list")
+            .expect("schema_list");
+        valid_schema_list(list)
+            .expect("valid schema list")
+            .iter()
+            .map(|item| schema_name(item).expect("schema name").to_string())
+            .collect()
+    }
+
+    fn has_schema_list(text: &str) -> bool {
+        let doc = parsed(text);
+        patch_mapping(&doc)
+            .expect("patch")
+            .contains_key(Value::String("schema_list".to_string()))
+    }
+
+    fn page_size(text: &str) -> u64 {
+        let doc = parsed(text);
+        patch_mapping(&doc)
+            .expect("patch")
+            .get("menu/page_size")
+            .and_then(Value::as_u64)
+            .expect("menu/page_size")
+    }
+
+    #[test]
+    fn device_keys_are_stripped_before_comparison() {
+        // 只有设备私有键不同 → 作用域摘要相同；整文件摘要仍然不同。
+        let local = b"patch:\n  schema_list:\n    - schema: a\n  menu/page_size: 8\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: b\n  menu/page_size: 8\n";
+        assert_eq!(
+            custom_yaml_digest_scoped(local, &keys()),
+            custom_yaml_digest_scoped(remote, &keys())
+        );
+        assert_ne!(custom_yaml_digest(local), custom_yaml_digest(remote));
+        // 空作用域 = 旧行为（回归）。
+        assert_eq!(
+            custom_yaml_digest_scoped(local, &[]),
+            custom_yaml_digest(local)
+        );
+    }
+
+    #[test]
+    fn merge_keeps_local_device_values_and_shares_the_rest() {
+        let base = b"patch:\n  menu/page_size: 8\n";
+        let outcome = merge_yaml_patch(Some(base), LOCAL, Some(REMOTE), &keys()).expect("merge");
+        match outcome {
+            MergeOutcome::Patch {
+                bytes,
+                shared_bytes,
+                conflicts,
+                notes,
+            } => {
+                assert!(conflicts.is_empty(), "{conflicts:?}");
+                let local = String::from_utf8(bytes).expect("utf8");
+                let shared = String::from_utf8(shared_bytes).expect("utf8");
+                // 本机保留自己的 schema_list，菜单分页跟远端（本地相对基线没改）。
+                assert_eq!(
+                    schema_names(&local),
+                    vec!["luna_pinyin".to_string(), "wubi86".to_string()]
+                );
+                assert_eq!(page_size(&local), 7);
+                // 共享视图里没有设备私有键。
+                assert!(!has_schema_list(&shared), "{shared}");
+                assert_eq!(page_size(&shared), 7);
+                assert!(
+                    notes.iter().any(|note| note.contains("stripped 1")),
+                    "{notes:?}"
+                );
+            }
+            MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
+        }
+    }
+
+    #[test]
+    fn device_keys_never_become_conflicts() {
+        // 两侧对设备私有键做了相反的改动，也不该算冲突。
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  menu/page_size: 8\n";
+        let local = b"patch:\n  schema_list:\n    - schema: wubi86\n  menu/page_size: 8\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  menu/page_size: 9\n";
+        match merge_yaml_patch(Some(base), local, Some(remote), &keys()).expect("merge") {
+            MergeOutcome::Patch {
+                bytes, conflicts, ..
+            } => {
+                assert!(conflicts.is_empty(), "{conflicts:?}");
+                let text = String::from_utf8(bytes).expect("utf8");
+                assert_eq!(schema_names(&text), vec!["wubi86".to_string()]);
+                assert_eq!(page_size(&text), 9);
+            }
+            MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
+        }
+    }
+
+    #[test]
+    fn empty_scope_keeps_previous_schema_list_union() {
+        let base = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n";
+        let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n";
+        let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: rime_ice\n";
+        match merge_yaml_patch(Some(base), local, Some(remote), &[]).expect("merge") {
+            MergeOutcome::Patch {
+                bytes,
+                shared_bytes,
+                conflicts,
+                notes,
+            } => {
+                assert_eq!(bytes, shared_bytes, "empty scope must not fork the output");
+                assert!(conflicts.is_empty(), "{conflicts:?}");
+                assert!(
+                    notes.iter().any(|note| note.contains("set union")),
+                    "{notes:?}"
+                );
+                assert!(
+                    !notes.iter().any(|note| note.contains("device-local")),
+                    "{notes:?}"
+                );
+            }
+            MergeOutcome::Fallback { reason } => panic!("fallback: {reason}"),
+        }
+    }
+
+    #[test]
+    fn shared_view_and_restore_round_trip() {
+        let view = shared_view(LOCAL, &keys()).expect("view");
+        let view_text = String::from_utf8(view).expect("utf8");
+        assert!(!has_schema_list(&view_text), "{view_text}");
+        let restored = restore_device_local(view_text.as_bytes(), LOCAL, &keys());
+        let restored_text = String::from_utf8(restored).expect("utf8");
+        assert_eq!(
+            schema_names(&restored_text),
+            vec!["luna_pinyin".to_string(), "wubi86".to_string()]
+        );
+
+        // 空作用域完全原样通过。
+        assert_eq!(shared_view(LOCAL, &[]).expect("view"), LOCAL);
+        assert_eq!(restore_device_local(REMOTE, LOCAL, &[]), REMOTE);
+
+        // 解析不了就不猜：上传方回退原始字节，本地写回保持合并结果。
+        assert!(shared_view(b"patch: [unclosed", &keys()).is_none());
+        assert_eq!(
+            restore_device_local(b"patch: [unclosed", LOCAL, &keys()).as_slice(),
+            b"patch: [unclosed"
+        );
+        assert_eq!(count_device_local_keys_in(&[LOCAL, REMOTE], &keys()), 1);
     }
 }

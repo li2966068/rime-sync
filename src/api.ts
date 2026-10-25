@@ -28,6 +28,8 @@ export interface Config {
   stop_fcitx5_during_apply: boolean;
   schema_version: number;
   first_sync_policy: FirstSyncPolicy;
+  // 只存本机、不上传的 patch 键（默认 ["schema_list"]）；后端缺失时按默认值展示。
+  device_local_keys: string[];
 }
 
 export interface Report {

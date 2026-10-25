@@ -312,6 +312,32 @@
             <p class="hint" id="schema-status"></p>
           </div>
 
+          <!-- 设备本地键：这些 patch 键只存本机、不上传（默认 schema_list），
+               这样各设备能保留自己的默认方案，同时共享 page_size 这类键。 -->
+          <div class="card" id="device-local-card">
+            <div class="card-head">
+              <h3 data-i18n="deviceLocal.title">设备本地键</h3>
+            </div>
+            <p class="hint" data-i18n="deviceLocal.desc"></p>
+            <div class="key-list" id="device-local-list"></div>
+            <p class="hint" id="device-local-empty" hidden data-i18n="deviceLocal.empty"></p>
+            <div class="field">
+              <label for="device-local-input" data-i18n="deviceLocal.addLabel">新增键名</label>
+              <div class="input-with-action">
+                <input
+                  id="device-local-input"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="menu/page_size"
+                  data-i18n-placeholder="deviceLocal.placeholder"
+                />
+                <button class="small" id="btn-device-local-add" type="button" data-i18n="deviceLocal.add">添加</button>
+              </div>
+              <p class="hint" id="device-local-status" role="status"></p>
+            </div>
+          </div>
+
           <div class="card">
             <div class="card-head">
               <h3 data-i18n="settings.backups">备份区</h3>

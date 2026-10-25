@@ -429,7 +429,7 @@ export const en: Record<keyof Dict, string> = {
   "wizard.skipTest": "Skip test",
 
   "schemas.title": "Input schemas",
-  "schemas.desc": "Tick the schemas to enable; the order is the candidate-switch order (the first one is the default). Saving redeploys and only rewrites schema_list in default.custom.yaml.",
+  "schemas.desc": "Tick the schemas to enable; the order is the candidate-switch order (the first one is the default). Saving redeploys and only rewrites schema_list (输入方案列表 / Schema list) in default.custom.yaml.",
   "schemas.save": "Save & redeploy",
   "schemas.saved": "Schemas saved and redeployed",
   "schemas.saving": "Saving and redeploying…",
@@ -442,6 +442,21 @@ export const en: Record<keyof Dict, string> = {
   "schemas.up": "Move up",
   "schemas.down": "Move down",
   "schemas.needOne": "Keep at least one input schema enabled",
+
+  "deviceLocal.title": "Device-local keys",
+  "deviceLocal.desc": "These keys stay on this device during sync: never uploaded, never overwritten by other devices. Only schema_list (输入方案列表 / Schema list) by default, so each device keeps its own default schemas while keys such as menu/page_size are still shared.",
+  "deviceLocal.empty": "No device-local keys: every patch key takes part in sync.",
+  "deviceLocal.addLabel": "Add a key",
+  "deviceLocal.placeholder": "e.g. menu/page_size",
+  "deviceLocal.add": "Add",
+  "deviceLocal.remove": "Remove",
+  "deviceLocal.emptyInput": "Enter a key name",
+  "deviceLocal.invalid": "Use a/b or a single segment; letters, digits, underscore and hyphen only",
+  "deviceLocal.tooLong": "Key name too long (128 characters max)",
+  "deviceLocal.duplicate": "“{key}” is already in the list",
+  "deviceLocal.added": "Added device-local key: {key}",
+  "deviceLocal.removed": "Removed device-local key: {key}",
+  "deviceLocal.saveFail": "Saving device-local keys failed: {error}",
 
   "modal.confirmTitle": "Please confirm",
 };

@@ -10,7 +10,9 @@ use rime_sync_core::engine::Report;
 
 mod support;
 
-use support::{engine_for, manifest_for, temp_dir, write_methods, MockDav};
+use support::{
+    engine_for, engine_for_with_device_local, manifest_for, temp_dir, write_methods, MockDav,
+};
 
 const SNAPSHOT: &[u8] = b"a\t1\nb\t2\n";
 const SHARED_REL: &str = "default.custom.yaml";
@@ -356,7 +358,9 @@ fn schema_list_union_is_written_locally_and_pushed_back() {
     fs::create_dir_all(&state).expect("state");
 
     // 先同步一轮，拿到 base=[luna_pinyin]。
-    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    // device_local_keys=[] 是 0.6.3 之前的映射：schema_list 仍按集合并集处理。
+    let mut engine =
+        engine_for_with_device_local(&mock, &rime, &state, FirstSyncPolicy::Normal, &[]);
     let first = engine.transport();
     assert!(first.ok, "baseline transport failed: {first:?}");
     assert_eq!(

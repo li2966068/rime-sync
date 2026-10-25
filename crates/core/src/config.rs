@@ -31,6 +31,32 @@ pub fn clamp_backup_keep(value: u32) -> u32 {
 /// 设备 ID 会直接成为远端 sync/<id> 目录名：64 字节内、只允许小写字母/数字/连字符。
 pub const DEVICE_ID_MAX_LEN: usize = 64;
 
+/// 设备本地键（*.custom.yaml 的 patch 键）长度上限。
+pub const DEVICE_LOCAL_KEY_MAX_LEN: usize = 128;
+
+/// 默认设备本地键：输入方案列表因机而异，绝不能被别的设备覆盖或上传。
+pub fn default_device_local_keys() -> Vec<String> {
+    vec!["schema_list".to_string()]
+}
+
+/// 校验并规范化设备本地键：去空白、去空项、丢弃含内部空白或过长的键、按首次出现去重。
+pub fn normalize_device_local_keys(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in keys {
+        let trimmed = key.trim();
+        if trimmed.is_empty() || trimmed.len() > DEVICE_LOCAL_KEY_MAX_LEN {
+            continue;
+        }
+        if trimmed.chars().any(char::is_whitespace) {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 pub fn validate_device_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("device id is empty");
@@ -158,6 +184,9 @@ pub struct Config {
     #[serde(default = "default_backup_keep")]
     pub backup_keep: u32,
     pub sync_kinds: SyncKinds,
+    /// *.custom.yaml 的 patch 键里只属于本机的键：不参与三向比较/合并，也不上传。
+    #[serde(default = "default_device_local_keys")]
+    pub device_local_keys: Vec<String>,
     pub exclude_globs: Vec<String>,
     pub stop_fcitx5_during_apply: bool,
     /// 配置 schema 版本（写入文件；缺失按 v1 处理）。
@@ -182,6 +211,7 @@ impl Default for Config {
             transport_interval_minutes: 10,
             backup_keep: BACKUP_KEEP_DEFAULT,
             sync_kinds: SyncKinds::default(),
+            device_local_keys: default_device_local_keys(),
             exclude_globs: Vec::new(),
             stop_fcitx5_during_apply: true,
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -201,8 +231,9 @@ impl Config {
                 config.legacy_password = has_plaintext_password(&text);
                 config.schema_detected = detected_schema_version(&text);
                 config.schema_version = config.schema_detected;
-                // 旧配置缺字段时 serde 已回落到默认值；此处再夹一次区间。
+                // 旧配置缺字段时 serde 已回落到默认值；此处再夹一次区间并校验。
                 config.backup_keep = clamp_backup_keep(config.backup_keep);
+                config.device_local_keys = normalize_device_local_keys(&config.device_local_keys);
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -317,6 +348,7 @@ impl Config {
         // save 拿的是 &self：序列化前夹一次，保证落盘值始终合法。
         let mut snapshot = self.clone();
         snapshot.backup_keep = clamp_backup_keep(snapshot.backup_keep);
+        snapshot.device_local_keys = normalize_device_local_keys(&snapshot.device_local_keys);
         let text = serde_json::to_string_pretty(&snapshot)?;
         let name = path
             .file_name()
@@ -779,6 +811,67 @@ mod tests {
         config.password_ref = PasswordRef::None;
         config.webdav.password.clear();
         assert_eq!(config.load_password(&store).expect("load"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn device_local_keys_default_named_scope() {
+        assert_eq!(default_device_local_keys(), vec!["schema_list".to_string()]);
+        assert_eq!(
+            Config::default().device_local_keys,
+            vec!["schema_list".to_string()]
+        );
+    }
+
+    #[test]
+    fn device_local_keys_are_normalized_on_load_and_save() {
+        let dir = std::env::temp_dir().join(format!("rime-sync-devkeys-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+
+        // 缺字段 → 默认；空数组 → 显式关闭（保持空，不回落到默认）。
+        fs::write(&path, r#"{"device_id":"devA"}"#).expect("write");
+        assert_eq!(
+            Config::load(&path).expect("load missing").device_local_keys,
+            vec!["schema_list".to_string()]
+        );
+        fs::write(&path, r#"{"device_local_keys":[]}"#).expect("write");
+        assert!(Config::load(&path)
+            .expect("load empty")
+            .device_local_keys
+            .is_empty());
+
+        // 空项/含空白/超长/重复都被丢弃，其余按首次出现去重。
+        let too_long = "k".repeat(DEVICE_LOCAL_KEY_MAX_LEN + 1);
+        let raw = serde_json::json!({
+            "device_local_keys": [
+                " schema_list ",
+                "",
+                "menu page_size",
+                too_long,
+                "schema_list",
+                "page_size",
+            ]
+        });
+        fs::write(&path, raw.to_string()).expect("write");
+        assert_eq!(
+            Config::load(&path).expect("load bad").device_local_keys,
+            vec!["schema_list".to_string(), "page_size".to_string()]
+        );
+
+        // save 也做同样的规范化，落盘值始终合法。
+        let config = Config {
+            device_local_keys: vec![
+                "schema_list".to_string(),
+                "schema_list".to_string(),
+                "bad key".to_string(),
+                String::new(),
+            ],
+            ..Config::default()
+        };
+        config.save(&path).expect("save");
+        let reloaded = Config::load(&path).expect("reload");
+        assert_eq!(reloaded.device_local_keys, vec!["schema_list".to_string()]);
         fs::remove_dir_all(&dir).ok();
     }
 

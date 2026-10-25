@@ -4,6 +4,7 @@ import { el } from "./dom";
 import { errorText, formatTimestamp, formatBytes, escapeHtml } from "./format";
 import { toast } from "./toast";
 import { confirmDialog } from "./modal";
+import { labelForKey } from "./config_keys";
 
 // 冲突页：列表、行级 diff 与逐条/批量解决。
 
@@ -131,9 +132,19 @@ export function remoteSizeText(entry: ConflictEntry): string {
   return entry.remote_size === null ? t("conflicts.remoteMissing") : formatBytes(entry.remote_size);
 }
 
+/// 键名显示为「中文（English）」；原始键（含 patch. 前缀）留在 title 里便于对照。
 export function keysHtml(keys: string[]): string {
   return keys.length > 0
-    ? keys.map((key) => "<code>" + escapeHtml(key) + "</code>").join(" ")
+    ? keys
+        .map(
+          (key) =>
+            '<code title="' +
+            escapeHtml(key) +
+            '">' +
+            escapeHtml(labelForKey(key)) +
+            "</code>",
+        )
+        .join(" ")
     : '<span class="muted">' + escapeHtml(t("conflicts.keysNone")) + "</span>";
 }
 

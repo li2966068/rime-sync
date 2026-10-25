@@ -426,7 +426,7 @@ export const zh = {
   "wizard.skipTest": "跳过测试",
 
   "schemas.title": "输入方案",
-  "schemas.desc": "勾选要启用的方案；顺序即候选切换顺序（第一项为默认方案）。保存后自动重新部署，只改写 default.custom.yaml 的 schema_list。",
+  "schemas.desc": "勾选要启用的方案；顺序即候选切换顺序（第一项为默认方案）。保存后自动重新部署，只改写 default.custom.yaml 的 schema_list（输入方案列表 / Schema list）。",
   "schemas.save": "保存并重新部署",
   "schemas.saved": "方案已保存并重新部署",
   "schemas.saving": "正在保存并部署…",
@@ -439,6 +439,21 @@ export const zh = {
   "schemas.up": "上移",
   "schemas.down": "下移",
   "schemas.needOne": "至少保留一个启用的输入方案",
+
+  "deviceLocal.title": "设备本地键",
+  "deviceLocal.desc": "这些键在同步时只保留在本机，不会上传，也不会被其它设备的修改覆盖。默认只有 schema_list（输入方案列表 / Schema list），这样每台设备都能保留自己的默认方案，而 menu/page_size 这类键仍然共享。",
+  "deviceLocal.empty": "当前没有任何设备本地键：所有 patch 键都会参与同步。",
+  "deviceLocal.addLabel": "新增键名",
+  "deviceLocal.placeholder": "例如 menu/page_size",
+  "deviceLocal.add": "添加",
+  "deviceLocal.remove": "移除",
+  "deviceLocal.emptyInput": "请输入键名",
+  "deviceLocal.invalid": "键名需为 a/b 或单段，只允许字母、数字、下划线与连字符",
+  "deviceLocal.tooLong": "键名过长（上限 128 字符）",
+  "deviceLocal.duplicate": "「{key}」已在列表中",
+  "deviceLocal.added": "已加入设备本地键：{key}",
+  "deviceLocal.removed": "已从设备本地键移除：{key}",
+  "deviceLocal.saveFail": "保存设备本地键失败：{error}",
 
   "modal.confirmTitle": "请确认",
 } as const;

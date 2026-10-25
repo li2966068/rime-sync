@@ -110,6 +110,11 @@ export const el = {
   schemaStatus: byId<HTMLParagraphElement>("schema-status"),
   schemaRefresh: byId<HTMLButtonElement>("btn-schema-refresh"),
   schemaSave: byId<HTMLButtonElement>("btn-schema-save"),
+  deviceLocalList: byId<HTMLDivElement>("device-local-list"),
+  deviceLocalEmpty: byId<HTMLParagraphElement>("device-local-empty"),
+  deviceLocalInput: byId<HTMLInputElement>("device-local-input"),
+  deviceLocalAdd: byId<HTMLButtonElement>("btn-device-local-add"),
+  deviceLocalStatus: byId<HTMLParagraphElement>("device-local-status"),
   saveSettings: byId<HTMLButtonElement>("btn-save-settings"),
   settingsHint: byId<HTMLSpanElement>("settings-hint"),
 

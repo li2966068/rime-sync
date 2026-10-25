@@ -16,7 +16,8 @@ use crate::history::{self, HistoryEntry};
 use crate::index::{sha256_hex, FileIndex, FileMeta};
 use crate::lock::{self, LockGuard};
 use crate::merge3::{
-    custom_yaml_digest, is_custom_yaml, merge3_digests, merge_yaml_patch, MergeOutcome, MergeResult,
+    count_device_local_keys_in, custom_yaml_digest_scoped, is_custom_yaml, merge3_digests,
+    merge_yaml_patch, restore_device_local, shared_view, MergeOutcome, MergeResult,
 };
 use crate::plan;
 use crate::platform::RimeTrigger;
@@ -1012,6 +1013,8 @@ impl Engine {
         }
 
         let local_files = self.scan_local_shared()?;
+        // 设备本地键：只在 *.custom.yaml 上生效；克隆一份避免与 &mut self 借用冲突。
+        let device_local = self.config.device_local_keys.clone();
         let mut keys: BTreeSet<String> = BTreeSet::new();
         keys.extend(manifest.files.keys().cloned());
         keys.extend(self.index.files.keys().cloned());
@@ -1043,43 +1046,58 @@ impl Engine {
             let custom = is_custom_yaml(rel);
             let mut remote_bytes: Option<Vec<u8>> = None;
             let mut metadata_only = false;
+            // 本机共享视图的整份摘要：远端文件（新格式）就是共享视图，两者相等说明
+            // 只剩设备私有键的差异，连 GET 都不用发。
+            let local_view_hash = if custom && !device_local.is_empty() {
+                local_bytes
+                    .as_deref()
+                    .and_then(|bytes| shared_view(bytes, &device_local))
+                    .map(|bytes| sha256_hex(&bytes))
+            } else {
+                None
+            };
             let decision = if custom
                 && local_hash.is_some()
                 && remote_hash.is_some()
                 && local_hash != remote_hash
             {
-                let Some(bytes) = self.fetch_shared_remote(rel, remote_meta.as_ref(), report)?
-                else {
-                    continue;
-                };
-                let local = local_bytes.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "local hash present but file unreadable: {rel} ({})",
-                        local_path.display()
-                    )
-                })?;
-                let normalized_local = custom_yaml_digest(local);
-                let normalized_remote = custom_yaml_digest(&bytes);
-                let normalized_base = self
-                    .load_base(base_hash.as_deref())
-                    .as_deref()
-                    .map(custom_yaml_digest);
-                remote_bytes = Some(bytes);
-                if normalized_local == normalized_remote {
-                    // patch 完全一致，只有文件头不同：不是冲突，采用远端字节让本地彻底对齐。
-                    metadata_only = true;
+                if local_view_hash.as_deref() == remote_hash.as_deref() {
                     MergeResult::Unchanged
                 } else {
-                    match normalized_base {
-                        Some(digest) if digest == normalized_local => MergeResult::TakeRemote,
-                        Some(digest) if digest == normalized_remote => MergeResult::TakeLocal,
-                        Some(_) => MergeResult::Conflict,
-                        // 基线内容不可用（升级后首轮）：退回原始摘要，结论只会更保守。
-                        None => merge3_digests(
-                            base_hash.as_deref(),
-                            local_hash.as_deref(),
-                            remote_hash.as_deref(),
-                        ),
+                    let Some(bytes) =
+                        self.fetch_shared_remote(rel, remote_meta.as_ref(), report)?
+                    else {
+                        continue;
+                    };
+                    let local = local_bytes.as_deref().ok_or_else(|| {
+                        anyhow!(
+                            "local hash present but file unreadable: {rel} ({})",
+                            local_path.display()
+                        )
+                    })?;
+                    let normalized_local = custom_yaml_digest_scoped(local, &device_local);
+                    let normalized_remote = custom_yaml_digest_scoped(&bytes, &device_local);
+                    let normalized_base = self
+                        .load_base(base_hash.as_deref())
+                        .as_deref()
+                        .map(|base| custom_yaml_digest_scoped(base, &device_local));
+                    remote_bytes = Some(bytes);
+                    if normalized_local == normalized_remote {
+                        // patch 完全一致，只有文件头不同：不是冲突，采用远端字节让本地彻底对齐。
+                        metadata_only = true;
+                        MergeResult::Unchanged
+                    } else {
+                        match normalized_base {
+                            Some(digest) if digest == normalized_local => MergeResult::TakeRemote,
+                            Some(digest) if digest == normalized_remote => MergeResult::TakeLocal,
+                            Some(_) => MergeResult::Conflict,
+                            // 基线内容不可用（升级后首轮）：退回原始摘要，结论只会更保守。
+                            None => merge3_digests(
+                                base_hash.as_deref(),
+                                local_hash.as_deref(),
+                                remote_hash.as_deref(),
+                            ),
+                        }
                     }
                 }
             } else {
@@ -1099,23 +1117,73 @@ impl Engine {
             match decision {
                 MergeResult::Unchanged => {
                     if metadata_only {
-                        // 纯 metadata 差异：把远端字节写成本地文件并更新 index/基线，
-                        // 下一轮本地与远端整文件一致，不再反复进入这条路径。
+                        // patch 等价：只有 customization 头（或设备私有键）不同。
+                        // 落盘用远端共享视图 + 本机设备私有键原值。
                         let bytes = remote_bytes.ok_or_else(|| {
                             anyhow!("metadata-only merge without fetched bytes: {rel}")
                         })?;
-                        let meta = remote_meta.clone().ok_or_else(|| {
+                        let mut meta = remote_meta.clone().ok_or_else(|| {
                             anyhow!("metadata-only merge without remote metadata: {rel}")
                         })?;
-                        self.write_pulled(
-                            rel,
-                            &bytes,
-                            "shared merge: metadata-only, adopt remote",
-                        )?;
-                        self.remember_base(Some(&meta.sha256), Some(&bytes));
+                        let local = local_bytes.as_deref().unwrap_or_default();
+                        let shared = if custom {
+                            shared_view(&bytes, &device_local).unwrap_or_else(|| bytes.clone())
+                        } else {
+                            bytes.clone()
+                        };
+                        if custom {
+                            let stripped =
+                                count_device_local_keys_in(&[local, &bytes], &device_local);
+                            if stripped > 0 {
+                                report.notes.push(format!(
+                                    "{rel}: stripped {stripped} device-local key(s)"
+                                ));
+                            }
+                        }
+                        // 远端还是旧格式（带着设备私有键）：用共享视图把它清干净。
+                        if !read_only && sha256_hex(&shared) != meta.sha256 {
+                            match self.put(
+                                &format!("shared/files/{rel}"),
+                                &shared,
+                                meta.etag.as_deref(),
+                                "shared upload: strip device-local keys",
+                            )? {
+                                PutOutcome::Written => {
+                                    meta = FileMeta::local(&shared);
+                                    manifest.files.insert(rel.clone(), meta.clone());
+                                    self.remember_base(Some(&meta.sha256), Some(&shared));
+                                    report.pushed += 1;
+                                }
+                                PutOutcome::PreconditionFailed => {
+                                    report
+                                        .conflicts
+                                        .push(format!("{rel}: remote changed during upload"));
+                                }
+                            }
+                        }
+                        let adopted = if custom {
+                            restore_device_local(&shared, local, &device_local)
+                        } else {
+                            shared.clone()
+                        };
+                        if adopted.as_slice() != local {
+                            self.write_pulled(
+                                rel,
+                                &adopted,
+                                "shared merge: metadata-only, adopt remote",
+                            )?;
+                            report.config_changed = true;
+                        }
+                        // 基线缓存按内容寻址：没清理远端时用远端原始字节，
+                        // 清理过（meta 已换成共享视图）时用共享视图。
+                        let base = if sha256_hex(&shared) == meta.sha256 {
+                            &shared
+                        } else {
+                            &bytes
+                        };
+                        self.remember_base(Some(&meta.sha256), Some(base));
                         self.index.files.insert(rel.clone(), meta);
                         report.merged += 1;
-                        report.config_changed = true;
                         tracing::info!(
                             "{rel}: only the customization header differs (metadata-only); adopting remote bytes"
                         );
@@ -1142,17 +1210,23 @@ impl Engine {
                     }
                     let bytes =
                         local_bytes.ok_or_else(|| anyhow!("local file disappeared: {rel}"))?;
+                    // 上传的永远只是共享视图：schema_list 等设备私有键不出本机。
+                    let upload = if custom {
+                        shared_view(&bytes, &device_local).unwrap_or_else(|| bytes.clone())
+                    } else {
+                        bytes.clone()
+                    };
                     let if_match = remote_meta.as_ref().and_then(|meta| meta.etag.as_deref());
                     let remote_path = format!("shared/files/{rel}");
                     match self.put(
                         &remote_path,
-                        &bytes,
+                        &upload,
                         if_match,
                         "shared upload: local changed",
                     )? {
                         PutOutcome::Written => {
-                            let meta = FileMeta::local(&bytes);
-                            self.remember_base(Some(&meta.sha256), Some(&bytes));
+                            let meta = FileMeta::local(&upload);
+                            self.remember_base(Some(&meta.sha256), Some(&upload));
                             manifest.files.insert(rel.clone(), meta.clone());
                             self.index.files.insert(rel.clone(), meta);
                             report.pushed += 1;
@@ -1166,7 +1240,7 @@ impl Engine {
                     }
                 }
                 MergeResult::TakeRemote => {
-                    let meta =
+                    let mut meta =
                         remote_meta.ok_or_else(|| anyhow!("missing remote metadata for {rel}"))?;
                     let remote_path = format!("shared/files/{rel}");
                     let bytes = match remote_bytes.take() {
@@ -1191,8 +1265,58 @@ impl Engine {
                     if custom {
                         report.config_changed = true;
                     }
-                    self.write_pulled(rel, &bytes, "shared merge: take remote")?;
-                    self.remember_base(Some(&meta.sha256), Some(&bytes));
+                    // 远端共享视图（旧版本可能还带着 schema_list）与拉取后要写的本地内容。
+                    let shared = if custom {
+                        shared_view(&bytes, &device_local).unwrap_or_else(|| bytes.clone())
+                    } else {
+                        bytes.clone()
+                    };
+                    // 拉取时保留本机设备私有键：远端即使带着 schema_list，
+                    // 也不能覆盖本机自己的方案列表。
+                    let local_write = if custom {
+                        match local_bytes.as_deref() {
+                            Some(local) => restore_device_local(&shared, local, &device_local),
+                            None => shared.clone(),
+                        }
+                    } else {
+                        shared.clone()
+                    };
+                    if custom {
+                        let stripped = count_device_local_keys_in(&[&bytes], &device_local);
+                        if stripped > 0 {
+                            report
+                                .notes
+                                .push(format!("{rel}: stripped {stripped} device-local key(s)"));
+                        }
+                    }
+                    // 远端还是旧格式：顺手把设备私有键从线上清掉（只读策略除外）。
+                    if !read_only && sha256_hex(&shared) != meta.sha256 {
+                        match self.put(
+                            &remote_path,
+                            &shared,
+                            meta.etag.as_deref(),
+                            "shared upload: strip device-local keys",
+                        )? {
+                            PutOutcome::Written => {
+                                meta = FileMeta::local(&shared);
+                                manifest.files.insert(rel.clone(), meta.clone());
+                                report.pushed += 1;
+                            }
+                            PutOutcome::PreconditionFailed => {
+                                report
+                                    .conflicts
+                                    .push(format!("{rel}: remote changed during upload"));
+                            }
+                        }
+                    }
+                    self.write_pulled(rel, &local_write, "shared merge: take remote")?;
+                    // base 缓存按内容寻址，不能把共享视图存到旧远端摘要下面。
+                    let base = if sha256_hex(&shared) == meta.sha256 {
+                        &shared
+                    } else {
+                        &bytes
+                    };
+                    self.remember_base(Some(&meta.sha256), Some(base));
                     self.index.files.insert(rel.clone(), meta);
                     report.pulled += 1;
                     report.merged += 1;
@@ -1337,13 +1461,20 @@ impl Engine {
             return Ok(false);
         }
         let base_bytes = self.load_base(base.map(|item| item.sha256.as_str()));
-        let outcome = merge_yaml_patch(base_bytes.as_deref(), local_bytes, Some(&remote_bytes))?;
-        let (bytes, conflicts, notes) = match outcome {
+        let device_local = self.config.device_local_keys.clone();
+        let outcome = merge_yaml_patch(
+            base_bytes.as_deref(),
+            local_bytes,
+            Some(&remote_bytes),
+            &device_local,
+        )?;
+        let (bytes, shared_bytes, conflicts, notes) = match outcome {
             MergeOutcome::Patch {
                 bytes,
+                shared_bytes,
                 conflicts,
                 notes,
-            } => (bytes, conflicts, notes),
+            } => (bytes, shared_bytes, conflicts, notes),
             MergeOutcome::Fallback { reason } => {
                 tracing::debug!("patch merge not applicable for {rel}: {reason}");
                 return Ok(false);
@@ -1354,16 +1485,18 @@ impl Engine {
             self.write_pulled(rel, &bytes, "patch merge result")?;
             report.config_changed = true;
         }
-        if hash != meta.sha256 {
+        // 上传的是共享视图：设备本地键永远不出现在远端。
+        let shared_hash = sha256_hex(&shared_bytes);
+        if shared_hash != meta.sha256 {
             match self.put(
                 &remote_path,
-                &bytes,
+                &shared_bytes,
                 meta.etag.as_deref(),
                 "patch merge upload",
             )? {
                 PutOutcome::Written => {
-                    let new_meta = FileMeta::local(&bytes);
-                    self.remember_base(Some(&hash), Some(&bytes));
+                    let new_meta = FileMeta::local(&shared_bytes);
+                    self.remember_base(Some(&shared_hash), Some(&shared_bytes));
                     manifest.files.insert(rel.to_string(), new_meta.clone());
                     self.index.files.insert(rel.to_string(), new_meta);
                     report.pushed += 1;

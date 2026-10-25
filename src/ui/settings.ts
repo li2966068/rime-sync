@@ -8,6 +8,7 @@ import { config, busy, setConfig, requireConfig } from "./state";
 import { clampBackupKeep, renderBackupKeep } from "./backups";
 import { refreshSecretStatus } from "./secret";
 import { loadDevices } from "./devices";
+import { renderDeviceKeys } from "./device_keys";
 
 // 设置页：配置回填、草稿与保存、Rime 目录、设备名称（label）。
 
@@ -31,6 +32,7 @@ export function renderConfig(next: Config): void {
   el.stopFcitx5.checked = next.stop_fcitx5_during_apply;
   renderBackupKeep(next.backup_keep);
   el.footerConfig.textContent = next.device_id ? t("footer.device", { id: next.device_id }) : "";
+  renderDeviceKeys();
   renderFirstSyncBanner();
 }
 

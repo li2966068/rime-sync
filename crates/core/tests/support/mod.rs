@@ -339,6 +339,34 @@ pub fn write_methods(methods: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 指定设备本地键的引擎；空切片 = 0.6.3 之前的行为（不剥离任何键）。
+pub fn engine_for_with_device_local(
+    mock: &MockDav,
+    rime: &Path,
+    state: &Path,
+    policy: FirstSyncPolicy,
+    device_local: &[&str],
+) -> Engine {
+    let config = Config {
+        webdav: rime_sync_core::config::WebDavConfig {
+            url: format!("http://{}/dav", mock.addr),
+            username: "u".to_string(),
+            ..Default::default()
+        },
+        device_id: "devA".to_string(),
+        first_sync_policy: policy,
+        device_local_keys: device_local.iter().map(|key| key.to_string()).collect(),
+        ..Config::default()
+    };
+    Engine::new(
+        config,
+        rime.to_path_buf(),
+        state.to_path_buf(),
+        Box::new(FakeTrigger::new()),
+    )
+    .expect("engine")
+}
+
 impl MockDav {
     /// 本 mock 的 WebDAV 根地址。
     pub fn url(&self) -> String {

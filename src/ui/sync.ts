@@ -7,6 +7,7 @@ import { appendLog, localLog } from "./logs";
 import { confirmDialog } from "./modal";
 import { refreshNetwork } from "./connection";
 import { config, busy, plannedActions, setBusyFlag, touchLastRun } from "./state";
+import { labelConflictLine } from "./config_keys";
 
 // 同步执行：忙碌态、进度与结果报告。
 
@@ -63,7 +64,7 @@ export function renderReport(report: Report): void {
     notes.push(t("sync.reportConflicts", { count: report.conflicts.length }));
     const shown = report.conflicts.slice(0, 5);
     for (const entry of shown) {
-      notes.push("· " + entry);
+      notes.push("· " + labelConflictLine(entry));
     }
     if (report.conflicts.length > shown.length) {
       notes.push(t("sync.reportConflictMore", { count: report.conflicts.length - shown.length }));

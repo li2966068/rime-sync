@@ -25,6 +25,7 @@ import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui
 import { loadPresets, applyPresetTo } from "./ui/presets";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
+import { addDeviceLocalKey, removeDeviceLocalKey } from "./ui/device_keys";
 import { refreshLanguageDependent } from "./ui/language";
 import { api, type Report, type Progress, type ConflictChoice, type WatchEvent } from "./api";
 import { getLang, setLang, t, applyI18n } from "./i18n";
@@ -137,6 +138,22 @@ export function bindEvents(): void {
       return;
     }
     moveSchema(id, button?.dataset.schemaMove === "up" ? -1 : 1);
+  });
+  el.deviceLocalAdd.addEventListener("click", () => {
+    void addDeviceLocalKey(el.deviceLocalInput.value);
+  });
+  el.deviceLocalInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void addDeviceLocalKey(el.deviceLocalInput.value);
+    }
+  });
+  el.deviceLocalList.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-remove-key]");
+    const key = button?.dataset.removeKey;
+    if (key) {
+      void removeDeviceLocalKey(key);
+    }
   });
 
   el.transport.addEventListener("click", () => {
