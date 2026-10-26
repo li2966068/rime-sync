@@ -269,7 +269,7 @@ check_windows_setup() { # $1=setup.exe $2=workdir
     return
   fi
 
-  local msg="WeaselServer.exe 里搜不到 UTF-16LE「$WEASEL_CAPTION」：本版 Windows 安装包不含「Rime 同步」入口（上游官方 Weasel 回退）"
+  local msg="WeaselServer.exe 里搜不到 UTF-16LE「$WEASEL_CAPTION」：本版 Windows 安装包不含「输入法自建同步」入口（上游官方 Weasel 回退）"
   if [ "$WEASEL_STRICT" -eq 1 ]; then
     bad "$msg（RIMESYNC_WEASEL_MODE=$WEASEL_MODE）"
   else
@@ -478,13 +478,13 @@ PY
   python3 - "$base/no-weasel-caption/weasel/WeaselServer.exe" <<'PY'
 import sys
 path = sys.argv[1]
-data = open(path, 'rb').read().replace('Rime 同步'.encode('utf-16-le'), 'Rime XXXX'.encode('utf-16-le'))
+data = open(path, 'rb').read().replace('输入法自建同步'.encode('utf-16-le'), 'Rime XXXX'.encode('utf-16-le'))
 open(path, 'wb').write(data)
 PY
   (cd "$base/no-weasel-caption/weasel" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/resources/weasel-0.17.4.0-installer.exe" WeaselServer.exe >/dev/null 2>&1)
   rm -f "$base/no-weasel-caption/dist/"*-setup.exe
   (cd "$base/no-weasel-caption" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
-  expect_fail "Weasel 里没有「Rime 同步」" "$base/no-weasel-caption" "搜不到 UTF-16LE"
+  expect_fail "Weasel 里没有「输入法自建同步」" "$base/no-weasel-caption" "搜不到 UTF-16LE"
 
   printf '\n自检失败 %d 项\n' "$failures"
   rm -rf "$base"

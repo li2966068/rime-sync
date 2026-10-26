@@ -128,8 +128,8 @@ MANIFEST1="$(remote_manifest)"
 [ -n "$MANIFEST1" ] || fail "首轮后远端为空"
 
 log "断言远端结构"
-grep -q "rime-sync/shared/files/default.custom.yaml" <<<"$MANIFEST1" \
-  || fail "远端缺少 shared/files/default.custom.yaml"
+grep -q "rime-sync/sync/$DEVICE/config/files/default.custom.yaml" <<<"$MANIFEST1" \
+  || fail "远端缺少 sync/$DEVICE/config/files/default.custom.yaml（每设备配置目录）"
 grep -q "rime-sync/sync/$DEVICE/luna_pinyin.userdb.txt" <<<"$MANIFEST1" \
   || fail "远端缺少 sync/$DEVICE/luna_pinyin.userdb.txt"
 grep -q "custom_phrase.txt" <<<"$MANIFEST1" || fail "远端缺少 custom_phrase.txt"
