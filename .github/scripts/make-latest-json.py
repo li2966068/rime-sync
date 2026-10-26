@@ -28,7 +28,14 @@ PLATFORM_SUFFIXES = [
 DEFAULT_REQUIRED = ("linux-x86_64", "windows-x86_64")
 
 
+# Windows 离线变体（-offline-setup.exe，内嵌 WebView2，0.6.5 起）不是 updater 目标：
+# 它只是给受限代理/内网首次安装用的独立包，体积 ~200MB，绝不能进 latest.json。
+OFFLINE_MARKERS = ("-offline-setup.exe", "-offline-setup.exe.sig")
+
+
 def classify(name: str) -> str | None:
+    if any(marker in name for marker in OFFLINE_MARKERS):
+        return None
     for suffix, platform in PLATFORM_SUFFIXES:
         if name.endswith(suffix):
             return platform
@@ -60,7 +67,10 @@ def main() -> int:
             continue
         platform = classify(artifact.name)
         if platform is None:
-            print(f"warn: 无法从文件名判断平台，跳过 {artifact.name}", file=sys.stderr)
+            if any(marker in artifact.name for marker in OFFLINE_MARKERS):
+                print(f"info: 离线变体不是更新目标，跳过 {artifact.name}", file=sys.stderr)
+            else:
+                print(f"warn: 无法从文件名判断平台，跳过 {artifact.name}", file=sys.stderr)
             continue
         signature = sig.read_text(encoding="utf-8").strip()
         if not signature:

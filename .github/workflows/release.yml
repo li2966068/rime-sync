@@ -468,6 +468,30 @@ jobs:
               status=1
             fi
           done
+          # Windows 两件套：在线包（≥ 12 MiB：内嵌 Weasel）与离线包（≥ 100 MiB：内嵌 WebView2）。
+          # 离线包是 0.6.5 为受限代理/内网新增的变体，缺了就等于本次发布没解决问题。
+          for pair in "rime-sync_${ver}_x64-setup.exe:12" "rime-sync_${ver}_x64-offline-setup.exe:100"; do
+            win_name=${pair%:*}
+            min_mib=${pair##*:}
+            size=$(asset_size "$win_name")
+            if [ -z "$size" ]; then
+              echo "::error::缺少 Windows 安装包（$win_name）"
+              status=1
+            else
+              mib=$(( size / 1024 / 1024 ))
+              echo "  $win_name: ${mib} MiB"
+              if [ "$size" -lt $(( min_mib * 1024 * 1024 )) ]; then
+                echo "::error::$win_name 仅 ${mib} MiB（< ${min_mib} MiB）：内嵌载荷没打进去"
+                status=1
+              fi
+            fi
+          done
+          for name in "rime-sync_${ver}_x64-setup.exe.sig" "rime-sync_${ver}_x64-offline-setup.exe.sig"; do
+            if [ -z "$(asset_size "$name")" ]; then
+              echo "::error::缺少 $name（updater / 离线包签名）"
+              status=1
+            fi
+          done
           exit $status
 
   windows:
@@ -476,6 +500,9 @@ jobs:
     # 固定 2022：脚本的前提是 VS2022 + v143 + boost 1.84（windows-latest 会跟着微软迁移，
     # 迁移当天工具集/boost 探测会一起漂移）。要换 runner 请先跑一遍 build-weasel.ps1 -Check。
     runs-on: windows-2022
+    # 0.6.5 起同一次 job 要打两遍 NSIS（在线包 + 内嵌 WebView2 的离线包），
+    # 离线包压缩一个 ~130 MiB 载荷很慢，超时给足。
+    timeout-minutes: 120
     permissions:
       contents: write
     outputs:
@@ -760,6 +787,76 @@ jobs:
             exit 1
           }
 
+      # ---- 离线包（0.6.5）：内嵌 WebView2 Standalone，受限代理/内网也能装 ----
+      # 1) 先把刚打好的在线包挪走：离线包会写回同一个文件名，不挪就被覆盖。
+      - name: stash online nsis artifacts
+        shell: pwsh
+        run: |
+          $src = 'src-tauri/target/release/bundle/nsis'
+          $dst = 'packaging/out/nsis-online'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $files = @(Get-ChildItem -LiteralPath $src -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*-setup.exe' -or $_.Name -like '*-setup.exe.sig' })
+          if ($files.Count -eq 0) {
+            Write-Host '::error::没有可留存的在线 NSIS 产物（*-setup.exe / *.sig）'
+            exit 1
+          }
+          $files | Copy-Item -Destination $dst -Force
+          Remove-Item -LiteralPath $src -Recurse -Force
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          Get-ChildItem -LiteralPath $dst | ForEach-Object {
+            Write-Host "  online: $($_.Name) $([math]::Round($_.Length / 1MB, 1)) MiB"
+          }
+
+      # 2) WebView2 Evergreen Standalone（x64，约 130 MiB）。脚本自带 3 次重试、
+      #    体积下限 100 MiB 与 MZ 头校验：抓回在线引导器/错误页会当场失败。
+      - name: fetch WebView2 standalone payload (offline variant)
+        timeout-minutes: 30
+        run: pwsh -NoProfile -File packaging/windows/fetch-webview2.ps1
+
+      # 3) 第二遍 NSIS：只覆盖 installerHooks（→ nsis-hooks-offline.nsh 定义
+      #    RIMESYNC_EMBED_WEBVIEW），其余配置沿用 tauri.conf.json。
+      - name: build nsis (offline variant, embeds WebView2)
+        timeout-minutes: 60
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json
+
+      # 4) 改名成 *-offline-setup.exe（+ .sig）并断言体积：< 100 MiB 说明 WebView2 没打进去。
+      #    updater 的 latest.json 只认在线包，offline 变体不得进入（见 make-latest-json.py）。
+      - name: rename and assert offline bundle
+        shell: pwsh
+        run: |
+          $nsis = 'src-tauri/target/release/bundle/nsis'
+          $exes = @(Get-ChildItem -LiteralPath $nsis -File -Filter '*-setup.exe' -ErrorAction SilentlyContinue)
+          if ($exes.Count -ne 1) {
+            Write-Host "::error::离线构建后应只有 1 个 *-setup.exe，实际 $($exes.Count) 个"
+            exit 1
+          }
+          $exe = $exes[0]
+          $newName = $exe.Name -replace '-setup\.exe$', '-offline-setup.exe'
+          Rename-Item -LiteralPath $exe.FullName -NewName $newName
+          $sigOld = "$($exe.FullName).sig"
+          if (-not (Test-Path -LiteralPath $sigOld)) {
+            Write-Host "::error::离线包没有 .sig（updater 签名缺失）：$sigOld"
+            exit 1
+          }
+          Rename-Item -LiteralPath $sigOld -NewName "$newName.sig"
+          $offline = Get-Item -LiteralPath (Join-Path $nsis $newName)
+          $mib = [math]::Round($offline.Length / 1MB, 1)
+          Write-Host "offline setup: $($offline.Name) $mib MiB"
+          if ($offline.Length -lt 100MB) {
+            Write-Host "::error::离线包只有 $mib MiB（< 100 MiB）：WebView2 Standalone 没打进去。"
+            Write-Host '检查 packaging/windows/vendor/MicrosoftEdgeWebView2RuntimeInstallerX64.exe 是否存在，'
+            Write-Host "以及 makensis 日志里的 'offline build ... without WebView2 payload' 告警。"
+            exit 1
+          }
+          if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (
+              "- Windows 离线包：{0}（{1} MiB，内嵌 WebView2 Standalone，不联网）" -f $offline.Name, $mib)
+          }
+
       - name: build portable zip
         shell: pwsh
         run: ./packaging/portable-zip.ps1 -TargetDir src-tauri/target/release -OutDir packaging/out
@@ -774,16 +871,35 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          setups=(src-tauri/target/release/bundle/nsis/*-setup.exe)
-          sigs=(src-tauri/target/release/bundle/nsis/*.sig)
+          # 在线包（stash 出来的）与离线包（*-offline-setup.exe）都要上传，各自带 .sig
+          online=(packaging/out/nsis-online/*-setup.exe)
+          online_sigs=(packaging/out/nsis-online/*-setup.exe.sig)
+          offline=(src-tauri/target/release/bundle/nsis/*-offline-setup.exe)
+          offline_sigs=(src-tauri/target/release/bundle/nsis/*-offline-setup.exe.sig)
           zips=(packaging/out/*.zip)
           marker=packaging/out/WEASEL-SOURCE.json
-          if [ "${#setups[@]}" -eq 0 ]; then echo "::error::没有 NSIS 安装包（*-setup.exe）"; exit 1; fi
-          if [ "${#sigs[@]}" -eq 0 ]; then echo "::error::没有 setup.exe 的 .sig（updater 签名）"; exit 1; fi
+          if [ "${#online[@]}" -ne 1 ]; then echo "::error::在线 NSIS 安装包应有 1 个，实际 ${#online[@]} 个"; exit 1; fi
+          if [ "${#online_sigs[@]}" -ne 1 ]; then echo "::error::在线包的 .sig（updater 签名）应有 1 个，实际 ${#online_sigs[@]} 个"; exit 1; fi
+          if [ "${#offline[@]}" -ne 1 ]; then echo "::error::离线 NSIS 安装包应有 1 个，实际 ${#offline[@]} 个"; exit 1; fi
+          if [ "${#offline_sigs[@]}" -ne 1 ]; then echo "::error::离线包的 .sig 应有 1 个，实际 ${#offline_sigs[@]} 个"; exit 1; fi
           if [ "${#zips[@]}" -eq 0 ]; then echo "::error::没有便携版 zip"; exit 1; fi
           if [ ! -f "$marker" ]; then echo "::error::缺少 $marker"; exit 1; fi
-          printf '  %s\n' "${setups[@]}" "${sigs[@]}" "${zips[@]}" "$marker"
-          gh release upload "$TAG" "${setups[@]}" "${sigs[@]}" "${zips[@]}" "$marker" --clobber
+          for f in "${online[@]}"; do
+            name=$(basename "$f")
+            case "$name" in *-offline-setup.exe) echo "::error::在线产物里混进了离线包：$name"; exit 1 ;; esac
+          done
+          offline_bytes=$(stat -c %s "${offline[0]}")
+          offline_mib=$(( offline_bytes / 1024 / 1024 ))
+          echo "  offline setup: ${offline_mib} MiB"
+          if [ "$offline_bytes" -lt $(( 100 * 1024 * 1024 )) ]; then
+            echo "::error::离线包仅 ${offline_mib} MiB（< 100 MiB）：WebView2 Standalone 没打进去"
+            exit 1
+          fi
+          printf '  %s\n' "${online[@]}" "${online_sigs[@]}" "${offline[@]}" "${offline_sigs[@]}" "${zips[@]}" "$marker"
+          gh release upload "$TAG" \
+            "${online[@]}" "${online_sigs[@]}" \
+            "${offline[@]}" "${offline_sigs[@]}" \
+            "${zips[@]}" "$marker" --clobber
 
   # 产物验收：把"用户能看见的功能入口"变成断言（v0.6.0 事故的直接防线）。
   # 失败就不发布：publish 依赖本 job。
@@ -829,7 +945,9 @@ jobs:
           set -euo pipefail
           echo "Weasel 模式：${WEASEL_MODE:-require}"
           find dist -maxdepth 5 -type f -printf '%P  %s bytes\n' | sort | sed -n '1,60p'
-          bash .github/scripts/verify-artifacts.sh --dir dist --weasel-mode "${WEASEL_MODE:-require}"
+          # 0.6.5 起多一个离线包（内嵌 WebView2）：存在性 + 体积 + 两个载荷都要断言
+          bash .github/scripts/verify-artifacts.sh --dir dist --require-offline-setup \
+            --weasel-mode "${WEASEL_MODE:-require}"
 
   publish:
     name: publish · 汇总产物并生成 latest.json
@@ -861,6 +979,9 @@ jobs:
             --pattern '*-setup.exe' \
             --pattern '*-setup.exe.sig' \
             --pattern 'WEASEL-SOURCE.json'
+          # 离线包（*-offline-setup.exe）是给受限代理/内网用的独立变体，
+          # **不能**进 latest.json：updater 只认在线包，否则会把离线包当更新下发给所有人。
+          rm -f dist/*-offline-setup.exe dist/*-offline-setup.exe.sig
           find dist -type f -printf '%P  %s bytes\n' | sort
 
       - name: generate release notes

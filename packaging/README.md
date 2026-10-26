@@ -67,8 +67,8 @@ release 的两个构建 job：
 
 | 产物 | 预期体积 | 说明 |
 |---|---|---|
-| NSIS（`embedBootstrapper`） | **约 5–10MB** | 安装包内嵌 WebView2 引导器，安装时仍可离线启动、联网补运行时；**未实测** |
-| NSIS（`offlineInstaller`） | 约 130–140MB | 完整离线运行时，官方文档称额外约 127MB；**未实测** |
+| NSIS 在线包（`webviewInstallMode = skip`） | **约 12–15MB** | 内嵌 Weasel 安装器；WebView2 由钩子检测，缺了只弹框给下载地址（**不联网**） |
+| NSIS 离线包（`*-offline-setup.exe`） | 约 140–160MB | 另内嵌 WebView2 Evergreen Standalone（≈130MB）+ Weasel（≈12MB）；断言下限 100MB |
 | 便携 zip | 与 NSIS 安装后的程序本体相当（约 10–20MB） | 不含 WebView2；**未实测** |
 | deb | 约 4–10MB | 估算，未实测（不含 WebKitGTK，走系统依赖） |
 | AppImage | 约 8–20MB | 估算，未实测；不开 `bundleMediaFramework` 可省 GStreamer |
@@ -80,8 +80,10 @@ release 的两个构建 job：
 
 ### Windows
 
-- WebView2 Runtime：Win10 1803+ / Win11 通常自带。`embedBootstrapper` 会把引导器放进安装包，
-  目标机联网时自动补齐；完全离线分发需改 `offlineInstaller` 或单独分发 Evergreen Standalone。
+- WebView2 Runtime：Win10 1803+ / Win11 通常自带。0.6.5 起 `webviewInstallMode = skip`，
+  安装器**不再联网下载**：在线包缺运行时会弹框给出官方地址（不下载），离线包内嵌
+  Evergreen Standalone 静默安装。参数 `/SKIPWEBVIEW` 可跳过检查（受限代理/域内已推送时用），
+  详见 `windows/README.md` 第 8 节；下载地址与分发说明见 `docs/THIRD-PARTY.md` 第 3 节。
 - 无额外 VC++ 运行库要求（Tauri 产物静态链接，**推断**，未逐一验证）。
 - 未签名安装包会触发 SmartScreen「未知发布者」：更多信息 → 仍要运行。
 

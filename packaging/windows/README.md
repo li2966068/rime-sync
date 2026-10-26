@@ -9,8 +9,11 @@
 | `../../scripts/ime/build-weasel.ps1` | **主路径**：用 MSVC 从 `third_party/weasel` 编译 Weasel，产出安装包 |
 | `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
 | `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
-| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 装输入法并记所有权、POSTINSTALL 建快捷方式、PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
-| `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine` |
+| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
+| `../nsis-hooks-offline.nsh` | 离线变体：`!define RIMESYNC_EMBED_WEBVIEW` 后 include 主钩子（内嵌 WebView2 Standalone） |
+| `fetch-webview2.ps1` | 下载 WebView2 Evergreen **Standalone**（x64，约 130 MB）供离线包内嵌；3 次重试 + 体积/文件头校验 |
+| `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine`；`webviewInstallMode = skip` |
+| `../../src-tauri/tauri.offline.conf.json` | 离线包覆盖项：只改 `bundle.windows.nsis.installerHooks` 指向离线钩子 |
 
 > 为什么 resources 里没有 `weasel-*.exe`：安装器用 NSIS 的 `File` 指令在**构建期**把
 > 它内嵌进 setup.exe（见第 3 节），再放进 resources 会让同一个 12MB 文件进包两次。
@@ -108,8 +111,9 @@ File ...resources...
 | 证据 | 位置 |
 |---|---|
 | 编译期：内嵌缺失告警 | makensis 输出里的 `rime-sync: vendored weasel installer not found`（`!warning`） |
-| 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（UTF-8/ANSI 单行记录，含 `phase=PREINSTALL`、`exit=0`、`phase=POSTINSTALL`） |
-| 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=PREINSTALL ...` |
+| 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（单行记录，含 `phase=IME-INSTALL`、`exit=0`、`phase=POSTINSTALL`） |
+| 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，同一份内容 + 阶段名 `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径也写） |
+| 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=...` |
 | 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；内嵌的 Weasel 安装器约 12 MiB） |
 
 静默安装看不到 DetailPrint，所以顺序日志写文件；卸载时删除该文件。
@@ -132,7 +136,13 @@ File ...resources...
 | `fetch upstream weasel installer (fallback / offline mode)` | `build` 模式自编译失败、或 `fetch` 模式时走官方安装包；**绝不**在 `require` 下运行 |
 | `verify weasel vendor payload` | 必须有 `weasel-*.exe` 且 ≥ 10 MiB；`require` 下来源必须是自编译；写 `packaging/out/WEASEL-SOURCE.json` 并红字标注回退 |
 | `verify-artifacts`（独立 job） | 解 `*-setup.exe` → `WeaselServer.exe`，搜 UTF-16LE「Rime 同步」；`require` 下缺失即失败，publish 不会跑 |
-| `assert nsis setup embeds weasel` | 最终 setup ≥ 15 MiB |
+| `assert nsis setup embeds weasel` | 在线 setup ≥ 12 MiB（内嵌 Weasel） |
+| `stash online nsis artifacts` | 在线包先挪到 `packaging/out/nsis-online/`（第二遍构建会写回同名文件） |
+| `fetch WebView2 standalone payload` | `fetch-webview2.ps1`：3 次重试；< 100 MiB 或非 `MZ` 直接失败 |
+| `build nsis (offline variant, embeds WebView2)` | `pnpm tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json` |
+| `rename and assert offline bundle` | 改名 `*-offline-setup.exe`（`.sig` 同步）+ 断言 ≥ 100 MiB |
+| `collect` 的 Windows 断言 | 在线包 ≥ 12 MiB、离线包 ≥ 100 MiB、两者 `.sig` 都在 |
+| `verify-artifacts` 的离线断言 | `--require-offline-setup`：存在性 + 体积 + 内嵌 WebView2/Weasel 两个载荷 |
 
 在 CI 上确认自编译成功的检查项：
 
@@ -178,6 +188,12 @@ File ...resources...
 
 - 自编译安装包内置 third_party/rime-data 的 16 个方案（拼音/五笔/仓颉/笔画/地球/注音）；
   需要更多方案时用 -WithRimeData 走 plum，见 docs/THIRD-PARTY.md。
+- 0.6.5 新增：WebView2 的真实探测/安装/弹框只做了 makensis 编译期验证，
+  受限代理真机、静默安装中止路径、`%TEMP%\rime-sync-setup.log` 的 UTF-16LE 追加
+  （BOM 只写一次）都要在真机复核，见第 8 节。
+
+## 7. 卸载
+
 `NSIS_HOOK_PREUNINSTALL` 是 Tauri `Section Uninstall` 的第一条语句（此时 `$INSTDIR` 还在），
 顺序是「先问是否删本地用户数据（默认否）→ 卸小狼毫（仅当是我们装的）→ 删 rime-sync 自己的
 快捷方式/日志 → 最后按选择删 `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app`」。
@@ -215,3 +231,115 @@ shell 变量可能被映射到「所有用户」上下文。读不到 `%APPDATA%
    `uninstall.exe /S /PURGEDATA` → 两条目录都被删（日志 `purge-userdata=yes source=/PURGEDATA`）。
 8. 把 `%APPDATA%\Rime` 里的文件用别的进程占住（或设只读）再 `/S /PURGEDATA` →
    日志出现 `purge-userdata failed <path>`，卸载本身仍正常结束（不 Abort）。
+
+## 8. 受限代理 / 内网安装（0.6.5）
+
+0.6.4 及以前 `bundle.windows.webviewInstallMode` 是
+`{ "type": "embedBootstrapper", "silent": true }`：机器上没有 WebView2 时，安装器会
+**静默联网**下载约 130 MB 运行时。走受限代理时装不上、反复重试，安装器就卡在
+`WebView2Setup`，没有提示也没有日志（0.6.4 用户实测）。
+
+0.6.5 的改动：
+
+| 项 | 0.6.4 | 0.6.5 |
+|---|---|---|
+| Tauri `webviewInstallMode` | `embedBootstrapper`（静默联网下载） | `skip`（Tauri 完全不碰 WebView2） |
+| WebView2 检测 | 无 | PREINSTALL 第一步：`HKLM`/`HKCU` × 64/32 位视图读 `EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\pv`，另用 `EdgeWebView\Application\*\msedgewebview2.exe` 兜底 |
+| 未安装时 | 静默联网下载，无提示 | ① 离线包 → 内嵌 Standalone 静默安装；② 带 `/SKIPWEBVIEW` → 只写日志继续；③ 在线包 → 弹框（中英按 `$LANGUAGE`）给下载地址，继续或退出（退出 = Abort） |
+| 安装日志 | `$INSTDIR\install-ime-order.log` | 另加 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名 `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径同样写） |
+| Windows 版本门槛 | 无 | 低于 Windows 10 1803（10.0.17134）：弹框说明并 Abort |
+
+**任何路径都不再联网下载**：在线包只把地址打印在弹框里，离线包用内嵌的 Standalone 安装器。
+
+### 8.1 两个变体
+
+```text
+rime-sync_<ver>_x64-setup.exe          在线包（默认）：缺 WebView2 时弹框给地址，不下载
+rime-sync_<ver>_x64-offline-setup.exe  离线包：内嵌 WebView2 Standalone + Weasel，全程不联网
+```
+
+离线包由 `src-tauri/tauri.offline.conf.json` 选用 `packaging/nsis-hooks-offline.nsh`：
+该文件第一行 `!define RIMESYNC_EMBED_WEBVIEW`，然后 include 主钩子 —— 其余逻辑完全相同。
+
+### 8.2 安装器参数
+
+| 参数 | 作用 |
+|---|---|
+| `/SKIPWEBVIEW` | 缺 WebView2 也不阻断：写日志后继续（应用可能起不来，用户自己装好再运行） |
+| `/SKIPIME` | 跳过内嵌小狼毫安装（已有输入法、或不想让安装器碰输入法）；比"已存在就跳过"更强制 |
+| `/S` | 静默安装。**静默 + 缺 WebView2 + 没给 `/SKIPWEBVIEW` → 直接中止**（不弹框、不联网），避免无人值守时装出跑不起来的程序 |
+| `/KEEPWEASEL` / `/PURGEDATA` | 卸载参数，见第 7 节 |
+
+```powershell
+# 内网机器：WebView2 已由域内软件分发推送过
+rime-sync_0.6.5_x64-setup.exe /S /SKIPWEBVIEW /SKIPIME
+```
+
+### 8.3 手动装 WebView2（受限代理）
+
+1. 在能上网的机器下载 **Evergreen Standalone**（约 130 MB）：
+   <https://go.microsoft.com/fwlink/?linkid=2124701>
+   （在线引导器 <https://go.microsoft.com/fwlink/?linkid=2124703> 只有 1.5 MB，但它自己还要联网，
+   受限代理下同样会卡 —— 内网请用 Standalone。）
+2. 拷到目标机器，管理员运行：`MicrosoftEdgeWebView2RuntimeInstallerX64.exe /silent /install`。
+3. 复查（有 `pv` 即已装）：
+   ```bat
+   reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv
+   ```
+4. 再运行 rime-sync 安装包（或直接用离线包）。
+
+### 8.4 离线包怎么打（CI）
+
+`release.yml` 的 windows job 现在打两遍 NSIS：
+
+1. `pnpm tauri build --bundles nsis` → 在线包；`stash online nsis artifacts` 把它挪到
+   `packaging/out/nsis-online/`（否则会被第二遍的同名产物覆盖）。
+2. `pwsh -File packaging/windows/fetch-webview2.ps1`：下载 Standalone 到
+   `packaging/windows/vendor/MicrosoftEdgeWebView2RuntimeInstallerX64.exe`
+   （3 次重试；< 100 MiB 或文件头不是 `MZ` 直接失败，防止拿到在线引导器/错误页）。
+3. `pnpm tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json`
+   → 第二遍只换 `installerHooks`。
+4. `rename and assert offline bundle`：改名 `*-offline-setup.exe`（`.sig` 同步改名），
+   断言 ≥ 100 MiB；随后 `collect`（资产名 + 体积）与 `verify-artifacts.sh
+   --require-offline-setup`（解包查 WebView2 + Weasel 两个载荷）各再兜一层。
+
+本机等价（Windows + NSIS）：
+
+```powershell
+pwsh -File packaging/windows/fetch-webview2.ps1
+pnpm tauri build --bundles nsis --config src-tauri/tauri.offline.conf.json
+```
+
+体积：在线包约 12–15 MiB（内嵌 Weasel）；离线包约 140–160 MiB
+（WebView2 Standalone ≈ 130 MiB + Weasel ≈ 12 MiB，NSIS LZMA 压缩后；断言下限取 100 MiB）。
+
+> 离线包**不进** `latest.json`：`.github/scripts/make-latest-json.py` 显式跳过
+> `-offline-setup.exe`，updater 只把在线包当更新目标。
+
+### 8.5 本机（Linux）能验到哪一步
+
+`packaging/windows/check-nsis-hooks.sh` 会现场生成一个最小 harness（桩掉 Tauri 模板的
+`PRODUCTNAME` / `MAINBINARYNAME` / `MAINBINARYSRCPATH` 与两个 `NSIS_HOOK_*` 插入点，
+`vendor/` 下放假载荷），用 `makensis -WX`（告警即错误）分别编译在线与离线钩子：
+
+```sh
+bash packaging/windows/check-nsis-hooks.sh            # 没有 makensis 时打印 SKIP
+bash packaging/windows/check-nsis-hooks.sh --strict   # 没有 makensis 视为失败
+```
+
+输出示例（0 warning 0 error；离线包体积比在线包正好大一个假载荷 = 确实内嵌了 Standalone）：
+
+```text
+ok   online     144568 bytes  warnings=0
+ok   offline   1193178 bytes  warnings=0
+delta     1048610 bytes（离线包 - 在线包；假载荷 1048576 字节，应≈它）
+check-nsis-hooks: 两套钩子均 0 warning 0 error
+```
+
+离线 harness 缺 payload 时，编译期应当出现
+`rime-sync: offline build ... without WebView2 payload` 告警（构建缺陷的编译期信号）。
+
+真机仍需复核（本机无法验证）：注册表 4 种视图组合在真实机器上的命中、
+Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默中止的退出码、
+`%TEMP%\rime-sync-setup.log` 的 UTF-16 BOM 只写一次。
+

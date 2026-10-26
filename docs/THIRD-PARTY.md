@@ -58,8 +58,12 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
   构建期用 NSIS `File` 把 Weasel 安装器内嵌进 rime-sync 的 setup.exe；运行时的
   `PREINSTALL` 钩子（在 Tauri 拷贝主程序与 resources **之前**）把它解到 `$PLUGINSDIR`，
   `ExecWait ... /S` 等安装结束，然后 Tauri 才拷贝 rime-sync 自己的程序文件。
-- 安装器把带时间戳的顺序写入 `$INSTDIR\install-ime-order.log`（静默安装的唯一可复核证据，
-  卸载时删除），同时 `DetailPrint` 一份到安装日志。
+- 安装器把带时间戳的顺序写入 `$INSTDIR\install-ime-order.log`（静默安装的可复核证据，
+  卸载时删除），并**同时**追加到 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名
+  `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`，
+  安装结束后仍在，失败路径也写）。
+- 安装前先检查系统版本（≥ Windows 10 1803）与 WebView2 运行时（见第 3 节），
+  再装小狼毫；三步都在 Tauri 拷贝主程序之前。
 - 只有检测不到小狼毫时才静默安装，已安装则跳过（不覆盖用户版本）。
 - **卸载 rime-sync 默认连小狼毫一起卸载，但只卸「rime-sync 装的」那个**：
   - 安装前先探测小狼毫是否已存在。原本不存在、由本次安装装上时，安装器在
@@ -144,13 +148,44 @@ deb 把每个 recipe 的 `LICENSE` 装到 `/usr/share/doc/rime-inputmethod/copyr
 Windows 安装包把数据装进 `C:' + chr(92) + 'Program Files' + chr(92) + 'Rime' + chr(92) + 'weasel-0.17.4' + chr(92) + 'data' + chr(92) + '`，不额外投放单独的
 许可证文件——对应源码、提交与许可证见上表及仓库内 `third_party/rime-data/<repo>/LICENSE`。
 
-## 3. Linux 侧的第三方 deb
+## 3. Microsoft Edge WebView2 运行时（Windows，0.6.5 起）
+
+rime-sync 的界面是 WebView（Tauri v2），Windows 上需要 Microsoft Edge WebView2 Evergreen
+运行时。它不是本仓库的代码，也不随仓库入库：
+
+| 项 | 值 |
+|---|---|
+| 组件 | Microsoft Edge WebView2 Runtime（Evergreen，x64） |
+| 提供方 | Microsoft Corporation |
+| 许可证 | 随安装器分发的 Microsoft 许可条款（安装器自带 EULA，本项目不再单独分发文本） |
+| 获取方式（用户手动） | <https://go.microsoft.com/fwlink/?linkid=2124703>（在线引导器，约 1.5 MB，安装时联网） |
+| 获取方式（内网/离线） | <https://go.microsoft.com/fwlink/?linkid=2124701>（**Standalone**，约 130 MB） |
+
+**分发策略（0.6.5 的变更）**
+
+- 0.6.4 及以前：`tauri.conf.json` 用 `webviewInstallMode = embedBootstrapper`，
+  安装器在缺运行时的机器上**静默联网**下载约 130 MB；受限代理下反复重试并卡死在
+  `WebView2Setup`，无提示、无日志。
+- 0.6.5 起：`webviewInstallMode = skip`，改由项目自己的 NSIS 钩子处理：
+  - 在线包（`rime-sync_<ver>_x64-setup.exe`）：**不下载**。缺运行时则弹框中英说明 +
+    官方下载地址，由用户选择"继续（我已装好）/ 退出安装"；
+  - 离线包（`rime-sync_<ver>_x64-offline-setup.exe`）：构建期用 `File` 内嵌
+    `MicrosoftEdgeWebView2RuntimeInstallerX64.exe`，运行期 `ExecWait '/silent /install'`，
+    全程不联网。该 Standalone 安装器由 CI 的 `packaging/windows/fetch-webview2.ps1`
+    从微软官方链接下载后打进包内，**不入库**（`packaging/windows/vendor/*.exe`）。
+- 检测方式：`HKLM`/`HKCU` × 64/32 位视图读
+  `SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\pv`，
+  另用程序文件 `Microsoft\EdgeWebView\Application\*\msedgewebview2.exe` 兜底。
+- 用户可跳过：`/SKIPWEBVIEW`（缺运行时也不再阻断）；`/SKIPIME` 跳过内嵌小狼毫安装。
+  详见 `packaging/windows/README.md` 第 8 节。
+
+## 4. Linux 侧的第三方 deb
 
 
 deb 安装时会从 `packaging/linux/vendor/` 安装 fcitx5 / librime 等发行版软件包，
 其版本、来源与许可证见 `packaging/linux/README.Debian` 与各包自带版权文件。
 
-## 4. 其他
+## 5. 其他
 
 - 图标：见 `packaging/assets/README.md`。
 - Rust / 前端依赖的许可证由 Cargo / pnpm 各自的元数据描述，未在此逐一列举。

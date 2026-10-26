@@ -19,6 +19,10 @@
 #   --strict-ime-bundle       额外要求 rime-sync-status / uninstall.sh 必须由
 #                             rime-inputmethod deb 自带（默认按安装后布局，
 #                             允许由 rime-sync deb 提供）
+#   --require-offline-setup   要求存在 Windows 离线包 *-offline-setup.exe
+#                             （0.6.5 起内嵌 WebView2 Standalone；release.yml 用）
+#   --min-offline-mib N       离线包体积下限，默认 100 MiB（也可用环境变量
+#                             RIMESYNC_MIN_OFFLINE_MIB；自检用 0 跳过体积断言）
 #   --selftest                构造合成产物自检（不需要真构建）
 #
 # 退出码：0 = 全部通过；1 = 有断言失败；2 = 用法/环境错误。
@@ -28,6 +32,8 @@ PROG=$(basename "$0")
 DIR=""
 SELFTEST=0
 STRICT_IME=0
+REQUIRE_OFFLINE=0
+MIN_OFFLINE_MIB=${RIMESYNC_MIN_OFFLINE_MIB:-100}
 WEASEL_MODE="require"
 WEASEL_STRICT=1
 
@@ -87,6 +93,18 @@ while [ $# -gt 0 ]; do
     --strict-ime-bundle)
       STRICT_IME=1
       shift
+      ;;
+    --require-offline-setup)
+      REQUIRE_OFFLINE=1
+      shift
+      ;;
+    --min-offline-mib)
+      [ $# -ge 2 ] || die "--min-offline-mib 需要数字（MiB）"
+      case "$2" in
+        '' | *[!0-9]*) die "--min-offline-mib 只接受非负整数，收到：$2" ;;
+      esac
+      MIN_OFFLINE_MIB=$2
+      shift 2
       ;;
     --selftest)
       SELFTEST=1
@@ -280,6 +298,47 @@ check_windows_setup() { # $1=setup.exe $2=workdir
   fi
 }
 
+# 0.6.5 离线包：内嵌 WebView2 Standalone + Weasel，全程不联网。
+# 体积下限防「忘了下载载荷」；两个内嵌文件防「载荷下错/被压没」。
+check_windows_offline_setup() { # $1=离线 setup.exe $2=workdir
+  local setup=$1 work=$2
+  say "[windows/offline] $(basename "$setup")"
+
+  if ! command -v 7z >/dev/null 2>&1 && ! command -v 7za >/dev/null 2>&1; then
+    bad "缺少 7z/7za，无法解包离线安装包（CI 用 p7zip-full）"
+    return
+  fi
+
+  local bytes mib
+  bytes=$(stat -c %s "$setup" 2>/dev/null || echo 0)
+  mib=$(( bytes / 1024 / 1024 ))
+  if [ "${bytes:-0}" -lt $(( MIN_OFFLINE_MIB * 1024 * 1024 )) ]; then
+    bad "离线包只有 ${mib} MiB（< ${MIN_OFFLINE_MIB} MiB）：WebView2 Standalone 或 Weasel 没打进去"
+  else
+    ok "离线包体积 ${mib} MiB（≥ ${MIN_OFFLINE_MIB} MiB）"
+  fi
+
+  if ! unpack_7z "$setup" "$work/l1"; then
+    bad "7z 解不开 $(basename "$setup")（离线 NSIS 安装包）"
+    return
+  fi
+
+  local wv weasel
+  wv=$(find "$work/l1" -type f -iname 'MicrosoftEdgeWebView2RuntimeInstaller*.exe' -print -quit 2>/dev/null)
+  if [ -n "$wv" ]; then
+    ok "离线包内嵌 $(basename "$wv")（WEBVIEW-INSTALL 阶段静默安装，不联网）"
+  else
+    bad "$(basename "$setup") 里没有内嵌 MicrosoftEdgeWebView2RuntimeInstallerX64.exe：离线包装在受限代理机器上仍然缺 WebView2"
+  fi
+
+  weasel=$(find "$work/l1" -type f -iname 'weasel-*-installer.exe' -print -quit 2>/dev/null)
+  if [ -n "$weasel" ]; then
+    ok "离线包内嵌 $(basename "$weasel")"
+  else
+    bad "$(basename "$setup") 里没有内嵌 weasel-*-installer.exe：离线包不带输入法"
+  fi
+}
+
 # ---------------------------------------------------------------- 主流程
 
 cleanup() {
@@ -296,19 +355,28 @@ verify_dir() {
   WORK_DIR=$work
   trap cleanup EXIT
 
-  local ime_debs=() sync_debs=() setups=()
+  local ime_debs=() sync_debs=() setups=() online_setups=() offline_setups=() s
   mapfile -t ime_debs < <(find "$dir" -type f -name 'rime-inputmethod_*.deb' | sort)
   mapfile -t sync_debs < <(find "$dir" -type f -name 'rime-sync_*.deb' | sort)
   mapfile -t setups < <(find "$dir" -type f -iname '*-setup.exe' | sort)
+  for s in "${setups[@]}"; do
+    case "$s" in
+      *-offline-setup.exe) offline_setups+=("$s") ;;
+      *) online_setups+=("$s") ;;
+    esac
+  done
 
   say "产物目录：$dir"
   say "  rime-inputmethod deb: ${#ime_debs[@]} 个"
   say "  rime-sync deb:        ${#sync_debs[@]} 个"
-  say "  windows setup.exe:    ${#setups[@]} 个"
+  say "  windows setup.exe:    ${#online_setups[@]} 个（在线） + ${#offline_setups[@]} 个（离线）"
 
   [ "${#ime_debs[@]}" -gt 0 ] || bad "没有找到 rime-inputmethod_*.deb"
   [ "${#sync_debs[@]}" -gt 0 ] || bad "没有找到 rime-sync_*.deb"
-  [ "${#setups[@]}" -gt 0 ] || bad "没有找到 *-setup.exe"
+  [ "${#online_setups[@]}" -gt 0 ] || bad "没有找到在线 *-setup.exe"
+  if [ "$REQUIRE_OFFLINE" -eq 1 ] && [ "${#offline_setups[@]}" -eq 0 ]; then
+    bad "没有找到离线包 *-offline-setup.exe（--require-offline-setup）：受限代理用户装不上"
+  fi
 
   local i=0 deb
   for deb in "${ime_debs[@]}"; do
@@ -329,9 +397,15 @@ verify_dir() {
   fi
 
   i=0
-  for deb in "${setups[@]}"; do
+  for deb in "${online_setups[@]}"; do
     i=$((i + 1))
     check_windows_setup "$deb" "$work/win-$i"
+  done
+
+  i=0
+  for deb in "${offline_setups[@]}"; do
+    i=$((i + 1))
+    check_windows_offline_setup "$deb" "$work/winoff-$i"
   done
 
   say ""
@@ -432,6 +506,63 @@ PY
   }
 
   expect_ok "完整产物应通过" "$base/good"
+
+  # ---- 离线包（0.6.5）：缺包 / 体积不足 / 缺 WebView2 载荷都必须红，齐了才通过 ----
+  expect_ok_with() { # $1=label $2=dir $3...=verify 参数
+    local label=$1 dir=$2
+    shift 2
+    if bash "$0" --dir "$dir" "$@" >"$dir.$$.log" 2>&1; then
+      printf '  ok   自检：%s\n' "$label"
+    else
+      printf '  FAIL 自检：%s 应当通过却失败（日志 %s.$$.log）\n' "$label" "$dir"
+      sed -n '1,40p' "$dir.$$.log"
+      failures=$((failures + 1))
+    fi
+  }
+  expect_fail_with() { # $1=label $2=dir $3=grep pattern $4...=verify 参数
+    local label=$1 dir=$2 pat=$3
+    shift 3
+    if bash "$0" --dir "$dir" "$@" >"$dir.$$.log" 2>&1; then
+      printf '  FAIL 自检：%s 应当失败却通过\n' "$label"
+      failures=$((failures + 1))
+      return
+    fi
+    if grep -qF "$pat" "$dir.$$.log"; then
+      printf '  ok   自检：%s（被断言抓住）\n' "$label"
+    else
+      printf '  FAIL 自检：%s 失败了，但报错里没有「%s」\n' "$label" "$pat"
+      sed -n '1,40p' "$dir.$$.log"
+      failures=$((failures + 1))
+    fi
+  }
+
+  # 完整离线包（两个载荷都在）
+  local off="$base/with-offline"
+  rm -rf "$off"
+  cp -a "$base/good" "$off"
+  mkdir -p "$off/webview2"
+  python3 - "$off/webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" <<'PY'
+import sys
+open(sys.argv[1], 'wb').write(b'MZ' + b'\0' * 64)
+PY
+  (cd "$off" && 7z a -bso0 -bsp0 "$off/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
+    resources/weasel-0.17.4.0-installer.exe webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe >/dev/null 2>&1)
+
+  expect_fail_with "缺离线包" "$base/good" "没有找到离线包" \
+    --strict-ime-bundle --require-offline-setup --min-offline-mib 0
+  expect_fail_with "离线包体积不足" "$off" "离线包只有" \
+    --strict-ime-bundle --require-offline-setup
+  expect_ok_with "离线包完整（min=0）" "$off" \
+    --strict-ime-bundle --require-offline-setup --min-offline-mib 0
+
+  # 离线包只有 Weasel、没有 WebView2 载荷
+  local offbad="$base/only-weasel-offline"
+  rm -rf "$offbad"
+  cp -a "$base/good" "$offbad"
+  (cd "$offbad" && 7z a -bso0 -bsp0 "$offbad/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
+    resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  expect_fail_with "离线包缺 WebView2 载荷" "$offbad" "没有内嵌 MicrosoftEdgeWebView2RuntimeInstallerX64.exe" \
+    --strict-ime-bundle --require-offline-setup --min-offline-mib 0
 
   # ---- 逐个功能入口：少一个就必须红 ----
   mutate() { # $1=name

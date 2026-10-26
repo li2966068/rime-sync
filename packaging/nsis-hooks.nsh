@@ -1,5 +1,7 @@
 ; rime-sync · NSIS 安装钩子
 ; 由 src-tauri/tauri.conf.json 的 bundle.windows.nsis.installerHooks 引用。
+; 离线变体：packaging/nsis-hooks-offline.nsh 先 !define RIMESYNC_EMBED_WEBVIEW
+; 再 !include 本文件（由 src-tauri/tauri.offline.conf.json 选用）。
 ; Tauri 在 installer.nsi / uninstaller.nsi 里以 !ifmacrodef 方式插入这些宏，
 ; 因此本文件只定义宏与私有函数，不覆盖 Tauri 自己的安装逻辑。
 ;
@@ -18,9 +20,28 @@
 ;        installerHooks 路径 canonicalize 成绝对路径再 !include，因此这里得到的是
 ;        <repo>\packaging\windows\vendor\weasel-<ver>-installer.exe。
 ;
-; 验收证据：除了 DetailPrint，安装过程还会把带时间戳的顺序日志追加到
-;   $INSTDIR\install-ime-order.log
-; （静默安装看不到 DetailPrint，这个文件是唯一可复核的证据；卸载时删除）
+; 验收证据：除了 DetailPrint，安装过程还会把带时间戳的日志追加到两个文件
+;   $INSTDIR\install-ime-order.log   （0.6.4 及以前的验收文件，保留）
+;   $TEMP\rime-sync-setup.log        （0.6.5 起统一安装日志，UTF-16LE）
+; 阶段名（phase=）：OS-CHECK / WEBVIEW-CHECK / WEBVIEW-INSTALL / IME-INSTALL /
+;                   POSTINSTALL / DONE；失败路径同样写日志。
+; （静默安装看不到 DetailPrint，这两个文件是唯一可复核的证据；前者卸载时删除）
+;
+; WebView2（0.6.5）：tauri.conf.json 的 webviewInstallMode 已改为 skip。
+; 安装器**不再**用 embedBootstrapper 静默联网下载（受限代理下会卡死在 WebView2Setup）。
+; 运行期在 PREINSTALL 第一步由 RimeSyncEnsureWebView2 处理：
+;   已装                         → 记日志继续
+;   未装 + /SKIPWEBVIEW          → 记日志继续（应用可能起不来，用户自己装）
+;   未装 + 离线包（EMBED_WEBVIEW）→ 内嵌 Standalone 安装器静默安装（/silent /install）
+;   未装 + 其它（在线包）         → 弹框说明下载地址：继续（我已装好）/ 退出（Abort）
+;   探测：HKLM/HKCU × 64/32 位视图读 EdgeUpdate Clients\{GUID}\pv，另用程序文件兜底。
+;
+; 安装器命令行参数：
+;   /SKIPWEBVIEW  缺 WebView2 也不阻断（不联网、不弹框、只写日志）
+;   /SKIPIME      跳过内嵌小狼毫安装（已有输入法时强制跳过）
+;
+; Windows 版本门槛：${AtLeastWin10} 且 CurrentBuildNumber >= 17134（Windows 10 1803），
+; 低于门槛弹框说明并 Abort。
 ;
 ; 所有权（卸载时才知道该不该连小狼毫一起卸）：
 ;   安装前先探测小狼毫是否已存在（RimeSyncFindWeaselRoot）。
@@ -65,9 +86,14 @@
 ; ${PRODUCTNAME} 要等 Tauri 模板在 include 之后才定义，所以这两个符号只在
 ; 宏体里使用，由宏在插入时展开后经 $R6 / $R7 传给函数。
 
-; /KEEPWEASEL 用 ${GetOptions} 解析（Tauri 模板也 include 了 FileFunc.nsh，
-; 该头文件自带 FILEFUNC_INCLUDED 保护，重复 include 安全）。
+; /KEEPWEASEL、/SKIPWEBVIEW、/SKIPIME 都用 ${GetOptions} 解析（Tauri 模板也
+; include 了 FileFunc.nsh，该头文件自带 FILEFUNC_INCLUDED 保护，重复 include 安全）。
 !include "FileFunc.nsh"
+; 系统版本判定：${AtLeastWin10}（Win10/Win11 都为真）+ CurrentBuildNumber 补 1803 门槛。
+; WinVer.nsh 自带 ___WINVER__NSH___ 保护，Tauri 模板若已 include 也不冲突。
+!include "WinVer.nsh"
+; WinVer.nsh 的 LogicLib 扩展需要 LogicLib.nsh（自带 LOGICLIB_INCLUDED 保护）。
+!include "LogicLib.nsh"
 
 !define RIMESYNC_NAME "Rime 同步"
 !define RIMESYNC_SETUP_NAME "同步设置"
@@ -75,6 +101,25 @@
 !define RIMESYNC_WEASEL_DIRVER "0.17.4"
 !define RIMESYNC_ORDER_LOG "$INSTDIR\install-ime-order.log"
 !define RIMESYNC_UNINSTALL_LOG "$TEMP\rime-sync-uninstall.log"
+
+; 0.6.5 统一安装日志（UTF-16LE）：$INSTDIR\install-ime-order.log 仍保留，两者都写；
+; %TEMP% 下这一份在安装结束后仍可复核，失败路径（Abort 前）也写。
+!define RIMESYNC_SETUP_LOG "$TEMP\rime-sync-setup.log"
+
+; WebView2 Evergreen 运行时：EdgeUpdate 客户端 GUID（没有这个键 = 没装）
+!define RIMESYNC_WEBVIEW_GUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+; 在线引导安装器地址：只打印给用户手动装，安装器自己绝不联网下载（受限代理会卡死）
+!define RIMESYNC_WEBVIEW_URL "https://go.microsoft.com/fwlink/?linkid=2124703"
+!define RIMESYNC_WEBVIEW_INSTALLER "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+; 仅离线包（nsis-hooks-offline.nsh 定义 RIMESYNC_EMBED_WEBVIEW）才内嵌这个 ~130MB 载荷
+!define RIMESYNC_WEBVIEW_EXE "${__FILEDIR__}\windows\vendor\${RIMESYNC_WEBVIEW_INSTALLER}"
+; Windows 10 1803 的构建号：WebView2 运行时官方最低要求，低于它直接拦下
+!define RIMESYNC_MIN_WIN10_BUILD "17134"
+
+; 缺 WebView2 / 安装失败时的说明正文（中英按运行时 $LANGUAGE 选）；
+; $R0（中文附加原因）/ $R1（英文附加原因）由调用方在 Call 前填好。
+!define RIMESYNC_WEBVIEW_MSG_ZH "缺少 Microsoft Edge WebView2 运行时，rime-sync 无法显示界面。$\r$\n$\r$\n请先手动安装 WebView2（在线安装器约 1.5 MB；内网/受限代理请用离线安装包，约 130 MB）：$\r$\n${RIMESYNC_WEBVIEW_URL}$\r$\n$\r$\n装好后重新运行本安装包。$\r$\n$\r$\n"
+!define RIMESYNC_WEBVIEW_MSG_EN "Microsoft Edge WebView2 Runtime is missing, so rime-sync cannot show its window.$\r$\n$\r$\nInstall WebView2 manually first (about 1.5 MB online bootstrapper; behind a restricted proxy use the offline installer, about 130 MB):$\r$\n${RIMESYNC_WEBVIEW_URL}$\r$\n$\r$\nThen run this installer again.$\r$\n$\r$\n"
 
 ; 所有权标记（卸载时读同一个键）；64 位视图，与 perMachine 安装上下文一致。
 !define RIMESYNC_REG_KEY "Software\rime-sync"
@@ -96,6 +141,17 @@
   !define RIMESYNC_WEASEL_EMBEDDED
 !else
   !warning "rime-sync: vendored weasel installer not found, IME will not be installed (run scripts/ime/build-weasel.ps1)"
+!endif
+
+; 离线包的 WebView2 载荷（packaging/windows/vendor/MicrosoftEdgeWebView2RuntimeInstallerX64.exe）。
+; 只在定义了 RIMESYNC_EMBED_WEBVIEW 的离线构建里检查；缺失时编译告警，
+; 运行时在 WEBVIEW-INSTALL 阶段显式失败（绝不回退成联网下载）。
+!ifdef RIMESYNC_EMBED_WEBVIEW
+  !if /FileExists "${RIMESYNC_WEBVIEW_EXE}"
+    !define RIMESYNC_WEBVIEW_PAYLOAD
+  !else
+    !warning "rime-sync: offline build (RIMESYNC_EMBED_WEBVIEW) without WebView2 payload; run packaging/windows/fetch-webview2.ps1"
+  !endif
 !endif
 
 ; 完成页「运行 rime-sync」复选框默认不勾选（不自动启动主程序）
@@ -130,11 +186,20 @@ FunctionEnd
 ; 追加到 $INSTDIR\install-ime-order.log
 ; ---------------------------------------------------------------------------
 Function RimeSyncLog
+  ; $R3 = 一行文本（调用方已写入 $R2 时间戳与 phase=）
+  ; 同时写两份：旧验收文件（0.6.4 及以前的路径）+ 0.6.5 统一 setup 日志（UTF-16LE）
   ClearErrors
   FileOpen $R4 "${RIMESYNC_ORDER_LOG}" a
+  IfErrors rimesync_log_setup
+    FileWrite $R4 "$R3$\r$\n"
+    FileClose $R4
+  rimesync_log_setup:
+  ClearErrors
+  FileOpen $R4 "${RIMESYNC_SETUP_LOG}" a
   IfErrors rimesync_log_done
-  FileWrite $R4 "$R3$\r$\n"
-  FileClose $R4
+    ; UTF-16LE：NSIS 只在文件为空时写 BOM，追加不会每行重复
+    FileWriteUTF16LE $R4 "$R3$\r$\n"
+    FileClose $R4
   rimesync_log_done:
 FunctionEnd
 
@@ -333,13 +398,300 @@ Function RimeSyncMarkBundledWeasel
   WriteRegStr HKLM "${RIMESYNC_REG_KEY}" "BundledAt" "$R2"
   IfErrors rimesync_mark_failed
     DetailPrint "[rime-sync] 已记录小狼毫所有权：卸载 rime-sync 时会连小狼毫一起卸载（用户数据保留）"
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL ownership marker written"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL ownership marker written"
     Call RimeSyncLog
     Return
   rimesync_mark_failed:
     DetailPrint "[rime-sync] 警告：写小狼毫所有权标记失败，卸载 rime-sync 时将保留小狼毫"
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL ownership marker write failed"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL ownership marker write failed"
     Call RimeSyncLog
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 系统版本门槛：Windows 10 1803（10.0.17134）及以上
+;   ${AtLeastWin10} 只看主版本号（Win10 / Win11 都为真），构建号再拦 1803 以下。
+;   低于门槛：写日志 → 弹框说明 → Abort（不写任何文件、不装输入法）。
+; ---------------------------------------------------------------------------
+Function RimeSyncCheckWindows
+  Push $0
+  Push $1
+  Push $R2
+  Push $R3
+
+  Call RimeSyncStamp
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
+  ; 只取前 5 位：个别系统/预览版写成 "17134.1"；Win10 1803+ 的构建号都是 5 位。
+  StrCpy $1 $0 5
+
+  ${If} ${AtLeastWin10}
+    ${If} $1 == ""
+      ; 读不到构建号但系统确实是 Windows 10+：放行（宁可装上，也不要误拦）
+      Goto rimesync_win_ok
+    ${EndIf}
+    ${If} $1 >= ${RIMESYNC_MIN_WIN10_BUILD}
+      Goto rimesync_win_ok
+    ${EndIf}
+  ${EndIf}
+
+  DetailPrint "[rime-sync] 系统版本过低（build=$0），要求 Windows 10 1803（10.0.17134）或更高"
+  StrCpy $R3 "[rime-sync] $R2 phase=OS-CHECK pass=no build=$0 min=${RIMESYNC_MIN_WIN10_BUILD} abort"
+  Call RimeSyncLog
+  IntCmp $LANGUAGE 2052 rimesync_win_zh rimesync_win_en rimesync_win_en
+  rimesync_win_zh:
+    MessageBox MB_OK|MB_ICONSTOP "本安装包需要 Windows 10 1803（10.0.17134）或更高版本。$\r$\n$\r$\n当前系统构建号：$0$\r$\n$\r$\n请先升级 Windows，再重新运行本安装包。安装已中止，未写入任何文件。"
+    Goto rimesync_win_abort
+  rimesync_win_en:
+    MessageBox MB_OK|MB_ICONSTOP "This installer requires Windows 10 version 1803 (10.0.17134) or later.$\r$\n$\r$\nCurrent build number: $0$\r$\n$\r$\nUpdate Windows first, then run this installer again. Setup was aborted; no files were written."
+  rimesync_win_abort:
+  SetErrorLevel 3
+  Abort
+
+  rimesync_win_ok:
+  StrCpy $R3 "[rime-sync] $R2 phase=OS-CHECK pass=yes build=$0"
+  Call RimeSyncLog
+  Pop $R3
+  Pop $R2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; WebView2 探测（0.6.5）
+;   $R1 = 注册表 pv 原始值 → 有效则 $R7=1
+;   pv 为空 / "0" / "0.0.0.0" 都算没装（卸载残键常见）
+; ---------------------------------------------------------------------------
+Function RimeSyncWebView2PvValid
+  StrCmp $R1 "" rimesync_wvpv_done
+  StrCmp $R1 "0" rimesync_wvpv_done
+  StrCmp $R1 "0.0.0.0" rimesync_wvpv_done
+  StrCpy $R7 "1"
+  rimesync_wvpv_done:
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 探测 WebView2 运行时：$R7=1 已装，$R5=版本号（或 "file-only"）
+;   1) HKLM / HKCU 的 EdgeUpdate Clients\{GUID}\pv，64 位与 32 位视图都读
+;      （32 位视图下 HKLM\Software 自动映射到 WOW6432Node，x64 运行时通常写那里）
+;   2) 注册表没写（精简/绿色安装）时，退回程序文件：EdgeWebView\Application\*\msedgewebview2.exe
+;   退出时把注册表视图恢复成 64 位（本工程只出 x64 安装包，与 Tauri 默认一致）
+; ---------------------------------------------------------------------------
+Function RimeSyncFindWebView2
+  Push $R1
+  StrCpy $R5 ""
+  StrCpy $R7 "0"
+
+  SetRegView 64
+  ReadRegStr $R1 HKLM "Software\Microsoft\EdgeUpdate\Clients\${RIMESYNC_WEBVIEW_GUID}" "pv"
+  Call RimeSyncWebView2PvValid
+  StrCmp $R7 "1" rimesync_wv_hit
+  ReadRegStr $R1 HKCU "Software\Microsoft\EdgeUpdate\Clients\${RIMESYNC_WEBVIEW_GUID}" "pv"
+  Call RimeSyncWebView2PvValid
+  StrCmp $R7 "1" rimesync_wv_hit
+
+  SetRegView 32
+  ReadRegStr $R1 HKLM "Software\Microsoft\EdgeUpdate\Clients\${RIMESYNC_WEBVIEW_GUID}" "pv"
+  Call RimeSyncWebView2PvValid
+  StrCmp $R7 "1" rimesync_wv_hit
+  ReadRegStr $R1 HKCU "Software\Microsoft\EdgeUpdate\Clients\${RIMESYNC_WEBVIEW_GUID}" "pv"
+  Call RimeSyncWebView2PvValid
+  StrCmp $R7 "1" rimesync_wv_hit
+  SetRegView 64
+
+  ; 注册表兜底：程序文件在就算已装
+  StrCmp $PROGRAMFILES64 "" rimesync_wv_file_pf32
+    IfFileExists "$PROGRAMFILES64\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" rimesync_wv_file
+  rimesync_wv_file_pf32:
+    IfFileExists "$PROGRAMFILES\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" rimesync_wv_file
+  Goto rimesync_wv_done
+
+  rimesync_wv_file:
+    StrCpy $R7 "1"
+    StrCpy $R5 "file-only"
+    Goto rimesync_wv_done
+
+  rimesync_wv_hit:
+    StrCpy $R5 $R1
+
+  rimesync_wv_done:
+  SetRegView 64
+  Pop $R1
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 中止（缺 WebView2 / 内嵌安装失败）：绝不回退成联网下载
+;   入参：$R0 = 中文附加原因，$R1 = 英文附加原因（正文常量见 RIMESYNC_WEBVIEW_MSG_*）
+;   调用方负责先写日志（说明为什么失败），这里只负责弹框与 Abort。
+;   只有离线包（内嵌安装器失败 / 载荷缺失）会用到它，所以按 !ifdef 编译，
+;   否则在线包里会触发「not referenced」告警（makensis -WX 下等于失败）。
+; ---------------------------------------------------------------------------
+!ifdef RIMESYNC_EMBED_WEBVIEW
+Function RimeSyncAbortNoWebView2
+  IntCmp $LANGUAGE 2052 rimesync_abort_zh rimesync_abort_en rimesync_abort_en
+  rimesync_abort_zh:
+    MessageBox MB_OK|MB_ICONSTOP "${RIMESYNC_WEBVIEW_MSG_ZH}$R0"
+    Goto rimesync_abort_end
+  rimesync_abort_en:
+    MessageBox MB_OK|MB_ICONSTOP "${RIMESYNC_WEBVIEW_MSG_EN}$R1"
+  rimesync_abort_end:
+  SetErrorLevel 4
+  Abort
+FunctionEnd
+!endif
+
+; ---------------------------------------------------------------------------
+; WebView2：已装就过；没装按「离线包 / /SKIPWEBVIEW / 弹框询问」三条路走
+;   - 这里绝不下载任何东西：在线包只给地址，离线包只用内嵌的 Standalone 安装器。
+;   - 每条路径（含失败）都写 phase=WEBVIEW-CHECK 或 phase=WEBVIEW-INSTALL 日志。
+; ---------------------------------------------------------------------------
+Function RimeSyncEnsureWebView2
+  Push $0
+  Push $1
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R5
+  Push $R7
+  Push $R8
+
+  Call RimeSyncFindWebView2
+  StrCmp $R7 "1" rimesync_wvc_present
+
+  ; ---- 未安装 ----
+  Call RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=no"
+  Call RimeSyncLog
+  DetailPrint "[rime-sync] 未检测到 Microsoft Edge WebView2 运行时"
+
+  ; /SKIPWEBVIEW：明确跳过（不联网、不弹框、不阻断）
+  ${GetOptions} $CMDLINE "/SKIPWEBVIEW" $R0
+  IfErrors rimesync_wvc_offline
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=no skip=1 switch=/SKIPWEBVIEW note=app-may-not-start"
+    Call RimeSyncLog
+    DetailPrint "[rime-sync] 收到 /SKIPWEBVIEW：跳过 WebView2，继续安装（应用可能无法启动）"
+    Goto rimesync_wvc_done
+
+  rimesync_wvc_offline:
+  !ifdef RIMESYNC_EMBED_WEBVIEW
+    !ifdef RIMESYNC_WEBVIEW_PAYLOAD
+      StrCmp $PLUGINSDIR "" 0 rimesync_wvc_have_plugins
+        InitPluginsDir
+      rimesync_wvc_have_plugins:
+      SetOutPath "$PLUGINSDIR\rime-sync-webview"
+      File "/oname=${RIMESYNC_WEBVIEW_INSTALLER}" "${RIMESYNC_WEBVIEW_EXE}"
+      StrCpy $0 "$PLUGINSDIR\rime-sync-webview\${RIMESYNC_WEBVIEW_INSTALLER}"
+      SetOutPath "$INSTDIR"
+
+      Call RimeSyncStamp
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL begin embedded=1 args=/silent /install"
+      Call RimeSyncLog
+      DetailPrint "[rime-sync] 正在静默安装内嵌的 WebView2 运行时（不联网）"
+      ClearErrors
+      ExecWait '"$0" /silent /install' $1
+      IfErrors rimesync_wvc_launch_failed
+      StrCpy $R8 $1
+      Call RimeSyncStamp
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL exit=$R8"
+      Call RimeSyncLog
+      Goto rimesync_wvc_recheck
+
+      rimesync_wvc_launch_failed:
+        StrCpy $R8 "exec-error"
+        Call RimeSyncStamp
+        StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL exit=exec-error"
+        Call RimeSyncLog
+
+      rimesync_wvc_recheck:
+      ; 退出码非 0 也可能已经装上（有的版本会返回「需要重启」）：一律复查一次
+      Call RimeSyncFindWebView2
+      StrCmp $R7 "1" rimesync_wvc_install_ok
+      ; 内嵌安装失败 → 弹框说明并 Abort（不回退联网）
+      DetailPrint "[rime-sync] 警告：内嵌 WebView2 安装失败（exit=$R8），安装中止"
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL installed=no exit=$R8 abort"
+      Call RimeSyncLog
+      StrCpy $R0 "内嵌安装器退出码：$R8。"
+      StrCpy $R1 "The bundled installer exited with code $R8."
+      Call RimeSyncAbortNoWebView2
+
+      rimesync_wvc_install_ok:
+        Call RimeSyncStamp
+        StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL installed=yes pv=$R5"
+        Call RimeSyncLog
+        DetailPrint "[rime-sync] WebView2 运行时安装完成（$R5）"
+        Delete "$PLUGINSDIR\rime-sync-webview\${RIMESYNC_WEBVIEW_INSTALLER}"
+        RMDir "$PLUGINSDIR\rime-sync-webview"
+        SetOutPath "$INSTDIR"
+        Goto rimesync_wvc_done
+    !else
+      ; 离线构建缺陷：编译期已 !warning；运行时显式失败，避免静默装出跑不起来的程序
+      DetailPrint "[rime-sync] 警告：离线包缺少内嵌 WebView2 安装器，安装中止"
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-INSTALL installed=no payload=missing abort"
+      Call RimeSyncLog
+      StrCpy $R0 "本离线安装包里没有内置 WebView2 安装器（构建缺陷），请改用在线安装包。"
+      StrCpy $R1 "This offline package has no bundled WebView2 installer (build error); use the online installer instead."
+      Call RimeSyncAbortNoWebView2
+    !endif
+  !else
+    ; 在线包：只给下载地址，绝不自动下载（0.6.4 的 embedBootstrapper 就是这么卡死的）
+    IfSilent rimesync_wvc_silent_abort
+    IntCmp $LANGUAGE 2052 rimesync_wvc_prompt_zh rimesync_wvc_prompt_en rimesync_wvc_prompt_en
+    rimesync_wvc_prompt_zh:
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "未检测到 Microsoft Edge WebView2 运行时。$\r$\n$\r$\nrime-sync 需要它才能显示界面。本安装包不会联网下载，请先手动安装（在线安装器约 1.5 MB；内网/受限代理请下载离线安装包，约 130 MB）：$\r$\n${RIMESYNC_WEBVIEW_URL}$\r$\n$\r$\n「是」= 我已装好，继续安装$\r$\n「否」= 退出安装（不写入任何文件）" IDYES rimesync_wvc_prompt_ok IDNO rimesync_wvc_prompt_quit
+      Goto rimesync_wvc_prompt_quit
+    rimesync_wvc_prompt_en:
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "Microsoft Edge WebView2 Runtime is not installed.$\r$\n$\r$\nrime-sync needs it to show its window. This installer never downloads anything; install WebView2 yourself first (about 1.5 MB online bootstrapper; behind a restricted proxy use the offline installer, about 130 MB):$\r$\n${RIMESYNC_WEBVIEW_URL}$\r$\n$\r$\nYes = I have installed it, continue$\r$\nNo  = Abort setup (no files written)" IDYES rimesync_wvc_prompt_ok IDNO rimesync_wvc_prompt_quit
+      Goto rimesync_wvc_prompt_quit
+
+    rimesync_wvc_prompt_ok:
+      ; 复查一次：用户可能刚装完（新装的可能还没写注册表，只记日志不拦）
+      Call RimeSyncFindWebView2
+      Call RimeSyncStamp
+      StrCmp $R7 "1" rimesync_wvc_prompt_ok_found
+        StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=no user=continue note=still-missing"
+        Call RimeSyncLog
+        DetailPrint "[rime-sync] 用户确认已装 WebView2，但复查仍未探测到；继续安装"
+        Goto rimesync_wvc_done
+      rimesync_wvc_prompt_ok_found:
+        StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=yes pv=$R5 user=continue"
+        Call RimeSyncLog
+        DetailPrint "[rime-sync] 复查到 WebView2（$R5），继续安装"
+        Goto rimesync_wvc_done
+
+    rimesync_wvc_prompt_quit:
+      Call RimeSyncStamp
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=no user=quit abort"
+      Call RimeSyncLog
+      SetErrorLevel 4
+      Abort
+
+    rimesync_wvc_silent_abort:
+      Call RimeSyncStamp
+      StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=no silent=1 abort note=use-/SKIPWEBVIEW"
+      Call RimeSyncLog
+      DetailPrint "[rime-sync] 静默安装且缺 WebView2：中止（如需继续请加 /SKIPWEBVIEW）"
+      SetErrorLevel 4
+      Abort
+  !endif
+
+  ; ---- 已安装 ----
+  rimesync_wvc_present:
+  Call RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=WEBVIEW-CHECK installed=yes pv=$R5"
+  Call RimeSyncLog
+  DetailPrint "[rime-sync] 已检测到 WebView2 运行时（$R5），跳过安装"
+
+  rimesync_wvc_done:
+  SetRegView 64
+  Pop $R8
+  Pop $R7
+  Pop $R5
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+  Pop $1
+  Pop $0
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
@@ -348,11 +700,22 @@ FunctionEnd
 ; 只有“原本没有、由本次安装装上”的情况才写所有权标记。
 ; ---------------------------------------------------------------------------
 Function RimeSyncInstallWeaselPre
+  ; /SKIPIME：已有输入法时强制跳过（当前逻辑本来就会跳过“已存在”，
+  ; 这个开关是给「已装但探测不到 / 用户不想动输入法」的场景用的显式出口）
+  ${GetOptions} $CMDLINE "/SKIPIME" $R1
+  IfErrors rimesync_pre_no_skipime
+    Call RimeSyncStamp
+    DetailPrint "[rime-sync] 收到 /SKIPIME：跳过内嵌小狼毫安装"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL skip=1 switch=/SKIPIME"
+    Call RimeSyncLog
+    Return
+  rimesync_pre_no_skipime:
+
   Call RimeSyncFindWeaselRoot
   StrCmp $R8 "" rimesync_pre_install
     DetailPrint "[rime-sync] 已检测到小狼毫（$R8），跳过内嵌安装包"
     Call RimeSyncStamp
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL skip existing weasel"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL skip existing weasel"
     Call RimeSyncLog
     Return
 
@@ -378,14 +741,14 @@ Function RimeSyncInstallWeaselPre
   StrCmp $R0 "" 0 rimesync_pre_run
     DetailPrint "[rime-sync] 警告：未找到内嵌的小狼毫安装包，跳过输入法安装"
     Call RimeSyncStamp
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL missing weasel installer"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL missing weasel installer"
     Call RimeSyncLog
     Return
 
   rimesync_pre_run:
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=PREINSTALL 开始静默安装小狼毫"
-  StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL begin weasel install"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL begin weasel install"
   Call RimeSyncLog
 
   ClearErrors
@@ -394,7 +757,7 @@ Function RimeSyncInstallWeaselPre
 
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=PREINSTALL 小狼毫安装器退出码 $0"
-  StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL weasel installer exit=$0"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL weasel installer exit=$0"
   Call RimeSyncLog
   StrCmp $0 "0" rimesync_pre_ok
     DetailPrint "[rime-sync] 警告：小狼毫安装器退出码 $0（不阻断 rime-sync 安装，也不写所有权标记）"
@@ -403,7 +766,7 @@ Function RimeSyncInstallWeaselPre
   rimesync_pre_launch_failed:
     Call RimeSyncStamp
     DetailPrint "[rime-sync] [$R2] 警告：无法启动小狼毫安装器（不阻断 rime-sync 安装）"
-    StrCpy $R3 "[rime-sync] $R2 phase=PREINSTALL exec failed"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL exec failed"
     Call RimeSyncLog
     Goto rimesync_pre_cleanup
 
@@ -770,8 +1133,11 @@ FunctionEnd
 ; 宏：Tauri 插入点
 ; ---------------------------------------------------------------------------
 !macro NSIS_HOOK_PREINSTALL
-  ; 先装满输入法，再让 Tauri 拷主程序（宏返回后 Tauri 才 File 主程序 / resources）
+  ; 0.6.5 顺序：系统版本 → WebView2 → 输入法 → 交还 Tauri 拷主程序。
+  ; 三步都在 Tauri File 主程序之前，任何一步 Abort 都不会留下半个安装。
+  Call RimeSyncCheckWindows
   CreateDirectory "$INSTDIR\resources"
+  Call RimeSyncEnsureWebView2
   Call RimeSyncInstallWeaselPre
 !macroend
 
@@ -795,6 +1161,12 @@ FunctionEnd
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=POSTINSTALL 完成"
   StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL done"
+  Call RimeSyncLog
+
+  ; 收尾标记：安装日志里必须有 phase=DONE（失败时不会有，便于区分「装完」与「中途退出」）
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；日志：$TEMP\rime-sync-setup.log"
+  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished"
   Call RimeSyncLog
 !macroend
 
