@@ -125,8 +125,11 @@ fn read_only_pulls_shared_files() {
 fn read_only_stores_conflict_copy_without_writing_remote() {
     let manifest = manifest_for(&[(SHARED_REL, SHARED_BODY)]);
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest),
-        ("shared/files/default.custom.yaml", SHARED_BODY.to_vec()),
+        ("sync/devA/config/manifest.json", manifest),
+        (
+            "sync/devA/config/files/default.custom.yaml",
+            SHARED_BODY.to_vec(),
+        ),
     ]);
     let before = mock.snapshot();
     let root = temp_dir("conflict");
@@ -230,8 +233,11 @@ fn conflict_copies(dir: &Path) -> Vec<String> {
 fn metadata_only_custom_yaml_is_adopted_without_conflict() {
     let manifest = manifest_for(&[(SHARED_REL, META_REMOTE)]);
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest),
-        ("shared/files/default.custom.yaml", META_REMOTE.to_vec()),
+        ("sync/devA/config/manifest.json", manifest),
+        (
+            "sync/devA/config/files/default.custom.yaml",
+            META_REMOTE.to_vec(),
+        ),
     ]);
     let root = temp_dir("meta-only");
     let rime = root.join("rime");
@@ -283,8 +289,11 @@ fn metadata_only_custom_yaml_is_adopted_without_conflict() {
 fn differing_custom_yaml_patch_conflicts_with_file_and_keys() {
     let manifest = manifest_for(&[(SHARED_REL, PATCH_REMOTE)]);
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest),
-        ("shared/files/default.custom.yaml", PATCH_REMOTE.to_vec()),
+        ("sync/devA/config/manifest.json", manifest),
+        (
+            "sync/devA/config/files/default.custom.yaml",
+            PATCH_REMOTE.to_vec(),
+        ),
     ]);
     let root = temp_dir("patch-conflict");
     let rime = root.join("rime");
@@ -348,8 +357,11 @@ fn schema_names(bytes: &[u8]) -> Vec<String> {
 fn schema_list_union_is_written_locally_and_pushed_back() {
     let manifest = manifest_for(&[(SHARED_REL, SCHEMA_BASE)]);
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest),
-        ("shared/files/default.custom.yaml", SCHEMA_BASE.to_vec()),
+        ("sync/devA/config/manifest.json", manifest),
+        (
+            "sync/devA/config/files/default.custom.yaml",
+            SCHEMA_BASE.to_vec(),
+        ),
     ]);
     let root = temp_dir("schema-union");
     let rime = root.join("rime");
@@ -370,9 +382,12 @@ fn schema_list_union_is_written_locally_and_pushed_back() {
 
     // 两台机器各加一个方案：本地 [luna, wubi]，远端 [luna, cangjie]。
     fs::write(rime.join(SHARED_REL), SCHEMA_LOCAL).expect("local schema list");
-    mock.set("shared/files/default.custom.yaml", SCHEMA_REMOTE.to_vec());
     mock.set(
-        "shared/manifest.json",
+        "sync/devA/config/files/default.custom.yaml",
+        SCHEMA_REMOTE.to_vec(),
+    );
+    mock.set(
+        "sync/devA/config/manifest.json",
         manifest_for(&[(SHARED_REL, SCHEMA_REMOTE)]),
     );
 
@@ -400,7 +415,7 @@ fn schema_list_union_is_written_locally_and_pushed_back() {
     assert_eq!(
         schema_names(
             remote
-                .get("shared/files/default.custom.yaml")
+                .get("sync/devA/config/files/default.custom.yaml")
                 .expect("remote custom yaml")
         ),
         expected,

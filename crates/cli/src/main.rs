@@ -21,6 +21,7 @@ use rime_sync_core::secret;
 use rime_sync_core::watch;
 use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
+use std::cell::OnceCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,6 +92,50 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+}
+
+impl Command {
+    /// 只有真正要访问 WebDAV 的子命令才解析密码——解析会探测钥匙串，
+    /// 而桌面会话里的 D-Bus 调用可能阻塞，detect/backup/history 不该为此买单。
+    fn needs_credentials(&self) -> bool {
+        matches!(
+            self,
+            Command::TestConn
+                | Command::Status
+                | Command::Transport
+                | Command::Apply
+                | Command::Probe
+                | Command::Watch { .. }
+        )
+    }
+}
+
+/// 密码后端的懒解析：第一次真正读写密码时才探测钥匙串（探测本身有超时）。
+struct Secrets {
+    app_data: PathBuf,
+    selection: OnceCell<secret::SecretSelection>,
+}
+
+impl Secrets {
+    fn new(app_data: PathBuf) -> Self {
+        Self {
+            app_data,
+            selection: OnceCell::new(),
+        }
+    }
+
+    fn selection(&self) -> &secret::SecretSelection {
+        self.selection
+            .get_or_init(|| secret::detect(&self.app_data))
+    }
+
+    fn store(&self) -> &dyn secret::SecretStore {
+        self.selection().store.as_ref()
+    }
+
+    fn describe(&self) -> String {
+        self.selection().describe()
+    }
 }
 
 #[derive(Serialize)]
@@ -218,28 +263,41 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let app_data = state_dir(&config_path);
-    let secrets = secret::detect(&app_data);
+    // 密码后端懒解析：没用到密码就不探测钥匙串（桌面会话里 D-Bus 调用可能永久阻塞）。
+    let secrets = Secrets::new(app_data.clone());
     if config.legacy_password || config.schema_version < config::CONFIG_SCHEMA_VERSION {
-        match config.migrate(secrets.store.as_ref(), &config_path) {
+        // 只有要把明文密码搬进后端时才需要解析后端。
+        let migration = if config.legacy_password {
+            config.migrate(secrets.store(), &config_path)
+        } else {
+            config.migrate_schema_only(&config_path)
+        };
+        match migration {
             Ok(report) if report.changed => {
                 stored.legacy_password = false;
                 stored.password_ref = config.password_ref;
                 stored.schema_version = config.schema_version;
                 if !cli.json {
-                    eprintln!(
-                        "config schema v{} -> v{} 迁移完成（密码后端 {}）",
-                        report.from,
-                        report.to,
-                        secrets.backend.as_str()
-                    );
+                    if report.password_migrated {
+                        eprintln!(
+                            "config schema v{} -> v{} 迁移完成（密码后端 {}）",
+                            report.from,
+                            report.to,
+                            secrets.describe()
+                        );
+                    } else {
+                        eprintln!("config schema v{} -> v{} 迁移完成", report.from, report.to);
+                    }
                 }
             }
             Ok(_) => {}
             Err(error) => eprintln!("warning: 配置迁移失败（原文件保留）: {error:#}"),
         }
     }
-    if let Err(error) = config.load_password(secrets.store.as_ref()) {
-        eprintln!("warning: 读取已保存密码失败: {error:#}");
+    if cli.command.needs_credentials() {
+        if let Err(error) = config.load_password(secrets.store()) {
+            eprintln!("warning: 读取已保存密码失败（继续，按无密码/环境变量处理）: {error:#}");
+        }
     }
 
     match cli.command {
@@ -916,5 +974,29 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&empty);
+    }
+
+    /// detect/backup/history 这类命令绝不能解析密码（= 不探测钥匙串）。
+    #[test]
+    fn only_webdav_commands_need_credentials() {
+        let command = |args: &[&str]| -> Command {
+            Cli::try_parse_from(args).expect("解析命令行").command
+        };
+        assert!(!command(&["rime-sync-cli", "detect"]).needs_credentials());
+        assert!(!command(&["rime-sync-cli", "backups"]).needs_credentials());
+        assert!(!command(&["rime-sync-cli", "history"]).needs_credentials());
+        assert!(!command(&["rime-sync-cli", "backup"]).needs_credentials());
+        assert!(!command(&["rime-sync-cli", "rollback", "id"]).needs_credentials());
+        let needing: [&[&str]; 6] = [
+            &["rime-sync-cli", "test-conn"],
+            &["rime-sync-cli", "status"],
+            &["rime-sync-cli", "transport"],
+            &["rime-sync-cli", "apply"],
+            &["rime-sync-cli", "probe"],
+            &["rime-sync-cli", "watch"],
+        ];
+        for args in needing {
+            assert!(command(args).needs_credentials(), "{args:?}");
+        }
     }
 }

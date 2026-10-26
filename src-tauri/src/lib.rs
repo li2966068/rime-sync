@@ -149,8 +149,22 @@ pub(crate) fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String
 
 /// 读取配置；device_id 为空时按 PLAN §6 生成并写回。
 pub(crate) fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
+    let config = load_config(app, inner)?;
+    ensure_device_id(app, inner, config)
+}
+
+/// 不解析密码的版本：只给不访问 WebDAV 的命令用。
+///
+/// 解析密码会探测钥匙串，而桌面会话里的 D-Bus 调用可能很慢（core 里有 2s 超时兜底），
+/// 读设置/探测目录这类操作没必要为此等待。
+pub(crate) fn ensure_config_meta(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
     let path = config_path(app)?;
-    let mut config = load_config(app, inner)?;
+    let config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    ensure_device_id(app, inner, config)
+}
+
+fn ensure_device_id(app: &AppHandle, inner: &Inner, mut config: Config) -> Result<Config, String> {
+    let path = config_path(app)?;
     if config.device_id.trim().is_empty() {
         let detected = detect_rime(&config).ok();
         config.device_id = match detected {
@@ -166,7 +180,8 @@ pub(crate) fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, St
 }
 
 pub(crate) fn rime_dir_for(app: &AppHandle, inner: &Inner) -> Result<PathBuf, String> {
-    let config = ensure_config(app, inner)?;
+    // 只要目录，不需要密码：不要为此探测钥匙串。
+    let config = ensure_config_meta(app, inner)?;
     Ok(detect_rime(&config)?.path)
 }
 
@@ -228,7 +243,8 @@ fn server_kind(server: Option<&str>, dav: &[String]) -> String {
 
 #[tauri::command]
 fn cmd_get_config(app: AppHandle, state: State<'_, AppState>) -> Result<Config, String> {
-    let mut config = ensure_config(&app, &state.0)?;
+    // 设置页要的是配置本身（密码字段序列化时已跳过），不必解析密码。
+    let mut config = ensure_config_meta(&app, &state.0)?;
     // 配置里的 Rime 目录可能已被删除（或来自旧机器/旧测试），启动时校验一次。
     if let Some(dir) = config.rime_dir.clone() {
         if !Path::new(&dir).is_dir() {
@@ -726,12 +742,13 @@ fn cmd_get_log(state: State<'_, AppState>, limit: Option<usize>) -> Result<Vec<S
 }
 
 #[tauri::command]
-fn cmd_needs_setup(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+fn cmd_needs_setup(app: AppHandle, _state: State<'_, AppState>) -> Result<bool, String> {
     let path = config_path(&app)?;
     if !path.exists() {
         return Ok(true);
     }
-    let config = load_config(&app, &state.0)?;
+    // 启动路径：只看 URL 是否为空，绝不探测钥匙串。
+    let config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
     Ok(config.webdav.url.trim().is_empty())
 }
 
@@ -956,6 +973,8 @@ pub fn run() {
             conflict_cmds::cmd_conflict_remote_sizes,
             device_cmds::cmd_list_devices,
             device_cmds::cmd_revoke_device,
+            device_cmds::cmd_reset_local_remote_dir,
+            device_cmds::cmd_local_identity,
             device_cmds::cmd_check_device_id,
             device_cmds::cmd_migrate_device,
             device_cmds::cmd_publish_identity,

@@ -156,6 +156,9 @@ fn serve(mut stream: TcpStream, requests: &Mutex<Vec<(String, String)>>) -> std:
     } else if method == "GET" && trimmed == shared_manifest_path {
         // 远端没有 shared/manifest.json：只读轮次必须当作"没有共享数据"继续。
         ("404 Not Found", Vec::new())
+    } else if method == "GET" && trimmed.ends_with("/manifest.json") {
+        // 本机还没有 profile：sync/<id>/config/manifest.json 不存在。
+        ("404 Not Found", Vec::new())
     } else {
         (
             "500 Internal Server Error",

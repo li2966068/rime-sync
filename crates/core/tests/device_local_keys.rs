@@ -17,7 +17,8 @@ mod support;
 use support::{manifest_for, temp_dir, write_methods, MockDav};
 
 const REL: &str = "default.custom.yaml";
-const REMOTE_PATH: &str = "shared/files/default.custom.yaml";
+const REMOTE_PATH: &str = "sync/devA/config/files/default.custom.yaml";
+const PROFILE_MANIFEST: &str = "sync/devA/config/manifest.json";
 
 const LOCAL: &[u8] = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n  menu/page_size: 8\n";
 /// 旧版本上传的远端文件：还带着 schema_list。
@@ -51,7 +52,7 @@ fn workspace(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::P
     (root, rime, state)
 }
 
-/// 写入「上一轮同步」的基线：index.json + base 缓存（base_dir/<sha256>）。
+/// 写入「上一轮同步」的基线：本地 profile manifest + base 缓存（base_dir/<sha256>）。
 fn seed_base(state: &Path, base: &[u8]) {
     let sha = sha256_hex(base);
     let mut index = FileIndex {
@@ -67,11 +68,17 @@ fn seed_base(state: &Path, base: &[u8]) {
             etag: None,
         },
     );
+    let manifest_path = state
+        .join("sync")
+        .join("devA")
+        .join("config")
+        .join("manifest.json");
+    fs::create_dir_all(manifest_path.parent().expect("parent")).expect("profile dir");
     fs::write(
-        state.join("index.json"),
+        &manifest_path,
         serde_json::to_vec_pretty(&index).expect("index json"),
     )
-    .expect("index");
+    .expect("profile manifest");
     fs::create_dir_all(state.join("base")).expect("base dir");
     fs::write(state.join("base").join(&sha), base).expect("base cache");
 }
@@ -111,7 +118,7 @@ fn remote_body(mock: &MockDav, rel: &str) -> String {
 #[test]
 fn device_local_keys_stay_local_and_are_never_uploaded() {
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest_for(&[(REL, REMOTE_OLD)])),
+        (PROFILE_MANIFEST, manifest_for(&[(REL, REMOTE_OLD)])),
         (REMOTE_PATH, REMOTE_OLD.to_vec()),
     ]);
     let (root, rime, state) = workspace("devkeys-shared");
@@ -171,7 +178,7 @@ fn pulling_an_old_remote_keeps_local_schema_list() {
     // 也不能在只读轮次里改写远端。
     let same_page = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  menu/page_size: 8\n";
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest_for(&[(REL, same_page)])),
+        (PROFILE_MANIFEST, manifest_for(&[(REL, same_page)])),
         (REMOTE_PATH, same_page.to_vec()),
     ]);
     let (root, rime, state) = workspace("devkeys-pull");
@@ -217,7 +224,7 @@ fn patch_merge_restores_local_keys_and_uploads_the_shared_view() {
     // 参与比较（不报冲突），也不会出现在上传内容里。
     let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  style/horizontal: true\n";
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest_for(&[(REL, remote)])),
+        (PROFILE_MANIFEST, manifest_for(&[(REL, remote)])),
         (REMOTE_PATH, remote.to_vec()),
     ]);
     let (root, rime, state) = workspace("devkeys-merge");
@@ -267,7 +274,7 @@ fn local_only_change_uploads_without_device_keys() {
     let remote = b"patch:\n  menu/page_size: 8\n";
     let local = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n    - schema: wubi86\n  menu/page_size: 9\n";
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest_for(&[(REL, remote)])),
+        (PROFILE_MANIFEST, manifest_for(&[(REL, remote)])),
         (REMOTE_PATH, remote.to_vec()),
     ]);
     let (root, rime, state) = workspace("devkeys-push");
@@ -296,7 +303,7 @@ fn empty_device_local_keys_behaves_exactly_like_before() {
     // 回归：device_local_keys=[] 时 schema_list 仍按并集合并，不做任何剥离。
     let remote = b"patch:\n  schema_list:\n    - schema: luna_pinyin\n  menu/page_size: 8\n";
     let mock = MockDav::start(vec![
-        ("shared/manifest.json", manifest_for(&[(REL, remote)])),
+        (PROFILE_MANIFEST, manifest_for(&[(REL, remote)])),
         (REMOTE_PATH, remote.to_vec()),
     ]);
     let (root, rime, state) = workspace("devkeys-empty");

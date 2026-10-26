@@ -6,12 +6,12 @@ import { clearLog, localLog, loadLog } from "./ui/logs";
 import { settleModal } from "./ui/modal";
 import { refreshSecretStatus } from "./ui/secret";
 import { beginSaveBackupKeep, loadBackups, createBackup, deleteBackup, pruneBackups, restoreBackup } from "./ui/backups";
-import { renderConfig, switchToTwoWay, saveRimeDir, pickRimeDir, detectRimeDir, randomDeviceId, settleDeviceChoice, saveSettings } from "./ui/settings";
+import { renderConfig, switchToTwoWay, saveRimeDir, pickRimeDir, detectRimeDir, randomDeviceId, settleDeviceChoice, settleMigrateChoice, saveSettings } from "./ui/settings";
 import { saveConnection, testConnection, probeWrite, listRemote, refreshNetwork } from "./ui/connection";
 import { renderProgress, renderReport, run } from "./ui/sync";
 import { previewSync } from "./ui/plan";
 import { conflicts, activeConflict, renderDiff, loadConflicts, resolveOne, confirmResolve, resolveFromList, resolveAll } from "./ui/conflicts";
-import { loadDevices, revokeDevice } from "./ui/devices";
+import { loadDevices, revokeDevice, resetLocalRemoteDir } from "./ui/devices";
 import { updateDedupeApply, loadDedupe, applyDedupe } from "./ui/dedupe";
 import {
   copyDiagPath,
@@ -285,6 +285,11 @@ export function bindEvents(): void {
     void loadDevices();
   });
   el.deviceBody.addEventListener("click", (event) => {
+    const reset = (event.target as HTMLElement).closest<HTMLElement>("[data-reset]");
+    if (reset?.dataset.reset) {
+      void resetLocalRemoteDir(reset.dataset.reset);
+      return;
+    }
     const target = (event.target as HTMLElement).closest<HTMLElement>("[data-revoke]");
     const id = target?.dataset.revoke;
     if (id) {
@@ -326,6 +331,15 @@ export function bindEvents(): void {
   el.deviceModal.addEventListener("click", (event) => {
     if (event.target === el.deviceModal) {
       settleDeviceChoice("cancel");
+    }
+  });
+
+  el.migrateMerge.addEventListener("click", () => settleMigrateChoice("merge"));
+  el.migrateReplace.addEventListener("click", () => settleMigrateChoice("replace"));
+  el.migrateCancel.addEventListener("click", () => settleMigrateChoice("cancel"));
+  el.migrateModal.addEventListener("click", (event) => {
+    if (event.target === el.migrateModal) {
+      settleMigrateChoice("cancel");
     }
   });
 
@@ -389,6 +403,9 @@ export function bindEvents(): void {
     }
     if (!el.deviceModal.hidden) {
       settleDeviceChoice("cancel");
+    }
+    if (!el.migrateModal.hidden) {
+      settleMigrateChoice("cancel");
     }
     if (!el.modal.hidden) {
       settleModal(false);

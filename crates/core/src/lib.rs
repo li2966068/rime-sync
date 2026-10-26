@@ -19,6 +19,7 @@ pub mod plan;
 pub mod platform;
 pub mod presets;
 pub mod process;
+pub mod profile;
 pub mod retry;
 pub mod rime_dir;
 pub mod secret;

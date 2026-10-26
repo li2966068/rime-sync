@@ -23,6 +23,10 @@ const NOTES: &str = "sync/devA/notes.txt";
 const SHARED: &str = "default.custom.yaml";
 const CONFLICT: &str = "conflict.custom.yaml";
 const DICT: &str = "custom.dict.yaml";
+/// 0.6.4：配置进本机 profile，词库源仍走 shared。
+const PROFILE_MANIFEST: &str = "sync/devA/config/manifest.json";
+const PROFILE_SHARED: &str = "sync/devA/config/files/default.custom.yaml";
+const PROFILE_CONFLICT: &str = "sync/devA/config/files/conflict.custom.yaml";
 
 const YAML_BASE: &[u8] = b"patch:\n  a: 1\n";
 const YAML_LOCAL: &[u8] = b"patch:\n  a: 2\n";
@@ -66,12 +70,10 @@ fn plan_engine(mock: &MockDav, rime: &Path, state: &Path) -> Engine {
 fn scene(tag: &str) -> Scene {
     let mock = MockDav::start(vec![
         (REMOTE_DEV, SNAPSHOT_REMOTE.to_vec()),
-        (
-            "shared/manifest.json",
-            manifest_for(&[(SHARED, YAML_BASE), (DICT, DICT_REMOTE)]),
-        ),
-        ("shared/files/default.custom.yaml", YAML_BASE.to_vec()),
+        ("shared/manifest.json", manifest_for(&[(DICT, DICT_REMOTE)])),
         ("shared/files/custom.dict.yaml", DICT_REMOTE.to_vec()),
+        (PROFILE_MANIFEST, manifest_for(&[(SHARED, YAML_BASE)])),
+        (PROFILE_SHARED, YAML_BASE.to_vec()),
     ]);
     let root = temp_dir(tag);
     let rime = root.join("rime");
@@ -108,17 +110,10 @@ fn prepare_changes(scene: &Scene) {
     fs::write(scene.rime.join(LOCAL_DEV), SNAPSHOT_LOCAL_NEW).expect("local snapshot");
     fs::write(scene.rime.join(CONFLICT), CONFLICT_LOCAL).expect("local conflict");
     scene.mock.set(REMOTE_EXTRA, SNAPSHOT_EXTRA.to_vec());
+    scene.mock.set(PROFILE_CONFLICT, CONFLICT_REMOTE.to_vec());
     scene.mock.set(
-        "shared/files/conflict.custom.yaml",
-        CONFLICT_REMOTE.to_vec(),
-    );
-    scene.mock.set(
-        "shared/manifest.json",
-        manifest_for(&[
-            (SHARED, YAML_BASE),
-            (DICT, DICT_REMOTE),
-            (CONFLICT, CONFLICT_REMOTE),
-        ]),
+        PROFILE_MANIFEST,
+        manifest_for(&[(SHARED, YAML_BASE), (CONFLICT, CONFLICT_REMOTE)]),
     );
 }
 
@@ -215,7 +210,7 @@ fn plan_has_zero_side_effects() {
         "changed local snapshot must be planned as push: {plan:?}"
     );
     assert!(
-        actions_of(&plan, PlanKind::Push).contains(&format!("shared/files/{SHARED}").as_str()),
+        actions_of(&plan, PlanKind::Push).contains(&PROFILE_SHARED),
         "local-only shared change must be planned as push: {plan:?}"
     );
     assert!(
@@ -341,7 +336,7 @@ fn plan_actions_match_real_transport() {
         scene
             .mock
             .snapshot()
-            .get("shared/files/conflict.custom.yaml")
+            .get(PROFILE_CONFLICT)
             .map(Vec::as_slice),
         Some(CONFLICT_REMOTE),
         "conflict must not be pushed over the remote copy"

@@ -286,7 +286,7 @@ assert_rc "$rc" "$DEVA transport 退出码 0"
 assert_json "$WORK/a1.json" 'r["ok"] is True and r["mode"] == "normal"' "$DEVA transport ok=true mode=normal"
 assert_json "$WORK/a1.json" 'r["pushed"] >= 3' "$DEVA 首次 pushed>=3（配置 + 词表 + 快照）"
 assert_json "$WORK/a1.json" 'not r["conflicts"]' "$DEVA 首次无冲突"
-assert_exists "$REMOTE/rime-sync/shared/files/default.custom.yaml" "远端出现 shared/files/default.custom.yaml"
+assert_exists "$REMOTE/rime-sync/sync/$DEVA/config/files/default.custom.yaml" "远端出现 sync/$DEVA/config/files/default.custom.yaml（每设备配置目录）"
 assert_exists "$REMOTE/rime-sync/shared/files/custom_phrase.txt" "远端出现 shared/files/custom_phrase.txt"
 assert_exists "$REMOTE/rime-sync/sync/$DEVA/luna_pinyin.userdb.txt" "远端出现 sync/$DEVA/luna_pinyin.userdb.txt"
 rc="$(run_json "$DEVA" "$WORK/conn-after-$DEVA.json" test-conn)"
@@ -308,7 +308,10 @@ assert_same "$DEV_ROOT_A/sync/$DEVA/luna_pinyin.userdb.txt" "$DEV_ROOT_B/sync/$D
 
 # --- 4. 双向增量 ----------------------------------------------------------
 
-step "4) 配置改动 A → 远端 → B（pushed / TakeRemote 路径）"
+cp "$DEV_ROOT_B/default.custom.yaml" "$WORK/before-b-config.yaml"
+BEFORE_B_CONFIG="$WORK/before-b-config.yaml"
+
+step "4) 配置改动 A 只进 A 的 profile（B 不受影响）"
 cat > "$DEV_ROOT_A/default.custom.yaml" <<'YAML'
 patch:
   style/horizontal: true
@@ -318,15 +321,15 @@ rc="$(run_json "$DEVA" "$WORK/a2.json" transport)"
 assert_rc "$rc" "$DEVA transport 退出码 0"
 assert_json "$WORK/a2.json" 'r["ok"] is True and r["pushed"] >= 1' "$DEVA 第 2 轮上传了配置改动"
 assert_json "$WORK/a2.json" 'not r["conflicts"]' "$DEVA 第 2 轮无冲突"
-assert_same "$DEV_ROOT_A/default.custom.yaml" "$REMOTE/rime-sync/shared/files/default.custom.yaml" "A 的配置改动已上传远端"
+assert_same "$DEV_ROOT_A/default.custom.yaml" "$REMOTE/rime-sync/sync/$DEVA/config/files/default.custom.yaml" "A 的配置改动已上传到自己的 profile"
 
 # B 同时写一份新快照（模拟 librime 导出），下一轮由 B 推送
 printf '# snapshot %s v2\n你好\tni hao\t100\n世界\tshi jie\t50\n' "$DEVB" > "$DEV_ROOT_B/sync/$DEVB/luna_pinyin.userdb.txt"
 rc="$(run_json "$DEVB" "$WORK/b2.json" transport)"
 assert_rc "$rc" "$DEVB transport 退出码 0"
-assert_json "$WORK/b2.json" 'r["ok"] is True and r["pulled"] >= 1 and r["pushed"] >= 1' "$DEVB 第 2 轮拉配置 + 推新快照"
+assert_json "$WORK/b2.json" 'r["ok"] is True and r["pushed"] >= 1 and r["pulled"] == 0' "$DEVB 第 2 轮只推自己的快照（不再拉 A 的配置）"
 assert_json "$WORK/b2.json" 'not r["conflicts"]' "$DEVB 第 2 轮无冲突"
-assert_same "$DEV_ROOT_A/default.custom.yaml" "$DEV_ROOT_B/default.custom.yaml" "配置改动已下发到 B（字节一致）"
+assert_same "$BEFORE_B_CONFIG" "$DEV_ROOT_B/default.custom.yaml" "B 的配置未被 A 的改动覆盖（每设备独立）"
 assert_same "$DEV_ROOT_B/sync/$DEVB/luna_pinyin.userdb.txt" "$REMOTE/rime-sync/sync/$DEVB/luna_pinyin.userdb.txt" "B 的新快照已上传远端"
 
 step "5) 快照回拉 A（sync/<devB>/ 路径 + 内容一致）"
@@ -335,7 +338,7 @@ assert_rc "$rc" "$DEVA transport 退出码 0"
 assert_json "$WORK/a3.json" 'r["ok"] is True and r["pulled"] >= 1' "$DEVA 第 3 轮拉到 B 的新快照"
 assert_json "$WORK/a3.json" 'not r["conflicts"]' "$DEVA 第 3 轮无冲突"
 assert_same "$DEV_ROOT_B/sync/$DEVB/luna_pinyin.userdb.txt" "$DEV_ROOT_A/sync/$DEVB/luna_pinyin.userdb.txt" "B 的快照已回拉到 A（内容一致）"
-assert_same "$DEV_ROOT_A/default.custom.yaml" "$REMOTE/rime-sync/shared/files/default.custom.yaml" "A 的配置在回拉后未被改动"
+assert_same "$DEV_ROOT_A/default.custom.yaml" "$REMOTE/rime-sync/sync/$DEVA/config/files/default.custom.yaml" "A 的配置在回拉后未被改动"
 
 # --- 5. apply -------------------------------------------------------------
 

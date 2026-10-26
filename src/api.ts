@@ -190,9 +190,49 @@ export interface DeviceInfo {
   os: string;
   session: string;
   heartbeat_ts: number;
+  /** 目录名 == 本机 installation_id。 */
   is_self: boolean;
+  /** 旧版目录：目录名 != 本机 ID，且没有 owner.json 或 owner.device_id 就是目录名。 */
+  legacy: boolean;
   reachable: boolean;
 }
+
+/** 重置远端身份（删除本机 sync/<installation_id>）的结果。 */
+export interface ResetRemoteDirResult {
+  id: string;
+  removed: number;
+  freed_bytes: number;
+}
+
+/** 设置页「显示名称 vs 本机目录名」提示用。 */
+export interface LocalIdentity {
+  device_id: string;
+  installation_id: string;
+  differs: boolean;
+}
+
+export interface MigrateOwner {
+  device_id: string | null;
+  hostname: string | null;
+  os: string | null;
+  session: string | null;
+  heartbeat_ts: number;
+}
+
+/** 迁移预检发现目标目录已存在时的结构化状态。 */
+export interface MigrateConflict {
+  target: string;
+  target_snapshot_count: number;
+  target_owner: MigrateOwner | null;
+  /** 目录名 = owner.device_id（0.6.0 及更早的命名）或没有 owner.json。 */
+  target_legacy: boolean;
+  target_in_use: boolean;
+  /** 允许「删除目标后迁移」：遗留目录且没有其他在线设备在用。 */
+  can_replace: boolean;
+  replace_blocked_reason: string | null;
+}
+
+export type MigrateMode = "cancel" | "merge" | "replace";
 
 export interface RevokeResult {
   id: string;
@@ -228,6 +268,12 @@ export interface MigrateResult {
   skipped: boolean;
   /** 迁移已完成但旧目录清理失败等非致命问题。 */
   warnings: string[];
+  /** 本次实际模式：direct（目标不存在）/ cancel / merge / replace。 */
+  mode: string;
+  /** 预检发现目标已存在且 mode=cancel 时的冲突状态；其余为 null。 */
+  conflict: MigrateConflict | null;
+  /** merge 模式从目标目录补进源目录的快照数。 */
+  merged_files: number;
 }
 
 /** 本机身份登记结果（只写 sync/<id>/owner.json，不搬快照）。 */
@@ -416,10 +462,15 @@ export const api = {
     invoke<ConflictResolve>("cmd_resolve_conflict", { targetPath, choice }),
 
   listDevices: () => invoke<DeviceInfo[]>("cmd_list_devices"),
-  revokeDevice: (id: string) => invoke<RevokeResult>("cmd_revoke_device", { id }),
+  // 本机目录（installation_id）必须带 confirm 才能注销；其它设备不需要。
+  revokeDevice: (id: string, confirm?: string) =>
+    invoke<RevokeResult>("cmd_revoke_device", { id, confirm: confirm ?? null }),
+  resetLocalRemoteDir: (confirm: string) =>
+    invoke<ResetRemoteDirResult>("cmd_reset_local_remote_dir", { confirm }),
+  localIdentity: () => invoke<LocalIdentity>("cmd_local_identity"),
   checkDeviceId: (id: string) => invoke<DeviceIdCheck>("cmd_check_device_id", { id }),
-  migrateDevice: (oldId: string, newId: string) =>
-    invoke<MigrateResult>("cmd_migrate_device", { old: oldId, new: newId }),
+  migrateDevice: (oldId: string, newId: string, mode: MigrateMode = "cancel") =>
+    invoke<MigrateResult>("cmd_migrate_device", { old: oldId, new: newId, mode }),
   publishIdentity: () => invoke<PublishIdentityResult>("cmd_publish_identity"),
 
   dedupePreview: () => invoke<DedupePreview>("cmd_dedupe_preview"),

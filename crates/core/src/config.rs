@@ -289,6 +289,21 @@ impl Config {
     /// 幂等：已是最新版本且无明文密码时不写盘。迁移失败时原文件保持不变，
     /// 错误信息里明确说明这一点（绝不静默丢配置）。
     pub fn migrate(&mut self, store: &dyn SecretStore, path: &Path) -> Result<MigrationReport> {
+        self.migrate_inner(Some(store), path)
+    }
+
+    /// 只升 schema 版本、不搬密码的迁移：绝不触碰密码后端（钥匙串可能阻塞）。
+    ///
+    /// 有明文密码却没给后端时直接报错——绝不静默丢密码。
+    pub fn migrate_schema_only(&mut self, path: &Path) -> Result<MigrationReport> {
+        self.migrate_inner(None, path)
+    }
+
+    fn migrate_inner(
+        &mut self,
+        store: Option<&dyn SecretStore>,
+        path: &Path,
+    ) -> Result<MigrationReport> {
         let from = self.schema_version;
         if from > CONFIG_SCHEMA_VERSION {
             bail!(
@@ -305,6 +320,12 @@ impl Config {
         if self.legacy_password {
             let password = self.webdav.password.clone();
             if !password.is_empty() {
+                let store = store.with_context(|| {
+                    format!(
+                        "migrate {} to schema v{CONFIG_SCHEMA_VERSION}: plaintext password present but no secret backend resolved",
+                        path.display()
+                    )
+                })?;
                 store
                     .set(&self.password_account(), &password)
                     .with_context(|| {
@@ -562,6 +583,63 @@ mod tests {
         fn delete(&self, _account: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// 不该碰后端时绝不能碰：桌面会话里的 keyring 调用可能永久阻塞。
+    struct PanicStore;
+
+    impl SecretStore for PanicStore {
+        fn backend(&self) -> SecretBackend {
+            SecretBackend::Keyring
+        }
+
+        fn get(&self, _account: &str) -> Result<Option<String>> {
+            panic!("secret backend must not be touched")
+        }
+
+        fn set(&self, _account: &str, _secret: &str) -> Result<()> {
+            panic!("secret backend must not be touched")
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            panic!("secret backend must not be touched")
+        }
+    }
+
+    #[test]
+    fn load_password_skips_backend_when_password_ref_is_none() {
+        let mut config = Config {
+            password_ref: PasswordRef::None,
+            ..Config::default()
+        };
+        assert!(config.webdav.password.is_empty());
+        assert_eq!(
+            config.load_password(&PanicStore).expect("no backend call"),
+            None
+        );
+    }
+
+    #[test]
+    fn schema_only_migration_does_not_touch_the_secret_backend() {
+        let dir =
+            std::env::temp_dir().join(format!("rime-sync-schema-only-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"webdav":{"url":"http://127.0.0.1:1","username":"alice"}}"#,
+        )
+        .expect("write");
+        let mut config = Config::load(&path).expect("load");
+        assert_eq!(config.schema_version, 1);
+        let report = config.migrate_schema_only(&path).expect("migrate");
+        assert!(report.changed);
+        assert!(!report.password_migrated);
+        assert_eq!(
+            Config::load(&path).expect("reload").schema_version,
+            CONFIG_SCHEMA_VERSION
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

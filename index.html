@@ -272,6 +272,8 @@
                 </div>
                 <p class="hint" data-i18n="settings.deviceHint"></p>
                 <p class="hint" data-i18n="settings.deviceIdRules"></p>
+                <!-- 显示名称（label）与本机远端目录名（installation_id）不同时的提示。 -->
+                <p class="hint warn-text" id="device-identity-hint" hidden></p>
               </div>
             </div>
 
@@ -455,6 +457,20 @@
           <button class="primary" id="device-migrate" type="button" data-i18n="settings.deviceMigrate"></button>
           <button class="secondary" id="device-local" type="button" data-i18n="settings.deviceLocalOnly"></button>
           <button class="ghost" id="device-cancel" type="button" data-i18n="common.cancel"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 迁移预检冲突：目标 sync/<new> 已存在时的三选一。 -->
+    <div class="modal" id="migrate-modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="migrate-modal-title">
+        <h3 id="migrate-modal-title" data-i18n="settings.migrateConflictTitle"></h3>
+        <p id="migrate-modal-body"></p>
+        <p class="hint" id="migrate-modal-target"></p>
+        <div class="modal-actions device-choice-actions">
+          <button class="primary" id="migrate-merge" type="button" data-i18n="settings.migrateMerge"></button>
+          <button class="secondary" id="migrate-replace" type="button" data-i18n="settings.migrateReplace"></button>
+          <button class="ghost" id="migrate-cancel" type="button" data-i18n="common.cancel"></button>
         </div>
       </div>
     </div>

@@ -99,7 +99,10 @@ fn parse_schema_file(path: &Path) -> Option<(String, String)> {
 }
 
 /// 用户目录优先：同名 id 以本地文件为准；坏 YAML 直接跳过，不影响其它方案。
-fn collect_schemas(rime_dir: &Path, shared_dirs: &[PathBuf]) -> Vec<(String, String, &'static str)> {
+fn collect_schemas(
+    rime_dir: &Path,
+    shared_dirs: &[PathBuf],
+) -> Vec<(String, String, &'static str)> {
     let mut found: Vec<(String, String, &'static str)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     let mut scan = |dir: &Path, source: &'static str| {
@@ -313,10 +316,16 @@ fn serde_rewrite(text: &str, ids: &[String]) -> Result<String, String> {
     let mut list = Vec::with_capacity(ids.len());
     for id in ids {
         let mut item = Mapping::new();
-        item.insert(Value::String("schema".to_string()), Value::String(id.clone()));
+        item.insert(
+            Value::String("schema".to_string()),
+            Value::String(id.clone()),
+        );
         list.push(Value::Mapping(item));
     }
-    patch.insert(Value::String("schema_list".to_string()), Value::Sequence(list));
+    patch.insert(
+        Value::String("schema_list".to_string()),
+        Value::Sequence(list),
+    );
     serde_yaml::to_string(&doc).map_err(|error| format!("生成 YAML 失败：{error}"))
 }
 
@@ -361,9 +370,7 @@ fn rewrite_schema_list(text: &str, ids: &[String]) -> Result<String, String> {
     let patch_end = (patch + 1..lines.len())
         .find(|&index| {
             let line = &lines[index];
-            !line.trim().is_empty()
-                && indent_of(line) == 0
-                && !line.trim_start().starts_with('#')
+            !line.trim().is_empty() && indent_of(line) == 0 && !line.trim_start().starts_with('#')
         })
         .unwrap_or(lines.len());
 
@@ -581,7 +588,10 @@ fn list_for_dir(rime_dir: &Path, shared_dirs: &[PathBuf]) -> Result<Vec<SchemaVi
             Vec::new()
         }
     };
-    Ok(order_schemas(collect_schemas(rime_dir, shared_dirs), &enabled))
+    Ok(order_schemas(
+        collect_schemas(rime_dir, shared_dirs),
+        &enabled,
+    ))
 }
 
 #[tauri::command]
@@ -604,7 +614,11 @@ pub fn cmd_set_schemas(
     let rime = detect_rime(&config)?.path;
     let trigger = platform::default_trigger(config.stop_fcitx5_during_apply);
     let result = apply_schemas(&rime, &shared_data_dirs(), &ids, trigger.as_ref())?;
-    let enabled = result.schemas.iter().filter(|schema| schema.enabled).count();
+    let enabled = result
+        .schemas
+        .iter()
+        .filter(|schema| schema.enabled)
+        .count();
     match &result.deploy_error {
         None => push_log(
             &state.0,
@@ -625,10 +639,8 @@ mod tests {
     use std::fs;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rime-sync-schemas-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rime-sync-schemas-{tag}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -663,7 +675,10 @@ mod tests {
     #[test]
     fn missing_name_falls_back_to_schema_id() {
         let dir = temp_dir("no-name");
-        write(&dir.join("wubi86.schema.yaml"), &schema_file("wubi86", None));
+        write(
+            &dir.join("wubi86.schema.yaml"),
+            &schema_file("wubi86", None),
+        );
         let found = collect_schemas(&dir, &[]);
         assert_eq!(
             found,
@@ -674,7 +689,10 @@ mod tests {
     #[test]
     fn missing_schema_id_falls_back_to_file_name() {
         let dir = temp_dir("no-id");
-        write(&dir.join("double_pinyin.schema.yaml"), "schema:\n  name: 双拼\n");
+        write(
+            &dir.join("double_pinyin.schema.yaml"),
+            "schema:\n  name: 双拼\n",
+        );
         let found = collect_schemas(&dir, &[]);
         assert_eq!(
             found,
@@ -689,7 +707,10 @@ mod tests {
             &dir.join("broken.schema.yaml"),
             "schema: [unclosed\n  name: : :\n",
         );
-        write(&dir.join("ok.schema.yaml"), &schema_file("ok", Some("可用")));
+        write(
+            &dir.join("ok.schema.yaml"),
+            &schema_file("ok", Some("可用")),
+        );
         let found = collect_schemas(&dir, &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "ok");

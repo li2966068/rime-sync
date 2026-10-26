@@ -2,11 +2,12 @@
 //!
 //! 明文密码不再写入 config.json；config 只记录 password_ref（Keyring / File / None）。
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::PasswordRef;
 
@@ -14,6 +15,55 @@ pub const SERVICE: &str = "rime-sync";
 pub const SECRETS_FILE: &str = "secrets.json";
 /// 测试/运维钩子：RIME_SYNC_SECRET_BACKEND=file 可强制走文件后端。
 pub const BACKEND_ENV: &str = "RIME_SYNC_SECRET_BACKEND";
+/// keyring 单次调用（含探测）的默认上限。
+///
+/// 桌面会话里 D-Bus 可能“连得上但永不回包”（例如 Secret Service 没起来），
+/// keyring 的同步调用会永久阻塞——所以每次调用都必须有上限，超时按不可用处理。
+pub const DEFAULT_KEYRING_TIMEOUT: Duration = Duration::from_secs(2);
+/// 测试/运维钩子：RIME_SYNC_SECRET_TIMEOUT_MS 覆盖上面的超时（毫秒，0 忽略）。
+pub const TIMEOUT_ENV: &str = "RIME_SYNC_SECRET_TIMEOUT_MS";
+
+pub fn keyring_timeout() -> Duration {
+    std::env::var(TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_KEYRING_TIMEOUT)
+}
+
+/// 在独立线程里跑 `job`，主线程最多等 `limit`。
+///
+/// 超时的线程杀不掉（D-Bus 想阻塞多久就多久），只能丢弃句柄让它自行结束；
+/// 这里保证的是**调用方一定在 limit 内拿到结论**，不连累 CLI/GUI 的交互线程。
+fn run_with_timeout<T, F>(label: &str, limit: Duration, job: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("rime-sync-secret-{label}"))
+        .spawn(move || {
+            let _ = sender.send(job());
+        })
+        .with_context(|| format!("spawn keyring {label} worker"))?;
+    let started = Instant::now();
+    match receiver.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "keyring {label} 调用超时（已等 {}ms，上限 {}ms）：按不可用处理，回退 file 后端",
+                started.elapsed().as_millis(),
+                limit.as_millis()
+            );
+            bail!("keyring {label} timed out after {}ms", limit.as_millis())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("keyring {label} worker exited without a result")
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretBackend {
@@ -176,9 +226,53 @@ impl SecretStore for FileStore {
     }
 }
 
+/// 给任意后端套上“单次调用最多等 limit”。真正会阻塞的是 keyring（D-Bus），
+/// 但测试里也能用任意慢实现验证超时与回退。
+pub struct TimedStore {
+    inner: Arc<dyn SecretStore>,
+    limit: Duration,
+}
+
+impl TimedStore {
+    pub fn new(inner: Arc<dyn SecretStore>, limit: Duration) -> Self {
+        Self { inner, limit }
+    }
+
+    fn call<T, F>(&self, label: &str, job: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<dyn SecretStore>) -> Result<T> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        run_with_timeout(label, self.limit, move || job(inner))
+    }
+}
+
+impl SecretStore for TimedStore {
+    fn backend(&self) -> SecretBackend {
+        self.inner.backend()
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>> {
+        let account = account.to_string();
+        self.call("get", move |store| store.get(&account))
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<()> {
+        let account = account.to_string();
+        let secret = secret.to_string();
+        self.call("set", move |store| store.set(&account, &secret))
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        let account = account.to_string();
+        self.call("delete", move |store| store.delete(&account))
+    }
+}
+
 /// detect() 的结果：实际使用的后端 + 回落说明（用于 CLI 提示，不含任何密码）。
 pub struct SecretSelection {
-    pub store: Box<dyn SecretStore>,
+    pub store: Arc<dyn SecretStore>,
     pub backend: SecretBackend,
     pub note: Option<String>,
 }
@@ -216,28 +310,41 @@ fn detect_with(app_data_dir: &Path, primary: Box<dyn SecretStore>) -> SecretSele
         return SecretSelection {
             backend: SecretBackend::File,
             note: Some(format!("forced by {BACKEND_ENV}=file")),
-            store: Box::new(fallback()),
+            store: Arc::new(fallback()),
         };
     }
-    match probe(primary.as_ref()) {
+    let limit = keyring_timeout();
+    let primary: Arc<dyn SecretStore> = Arc::from(primary);
+    let timed: Arc<dyn SecretStore> = Arc::new(TimedStore::new(Arc::clone(&primary), limit));
+    let started = Instant::now();
+    // 探测用**未包装**的后端：整体一个 2s 预算，而不是写/读/删各自 2s 层层叠加。
+    match probe(Arc::clone(&primary), limit) {
         Ok(()) => SecretSelection {
             backend: primary.backend(),
             note: None,
-            store: primary,
+            store: timed,
         },
         Err(error) => {
-            tracing::warn!("keyring unavailable, falling back to 0600 file store: {error}");
+            tracing::warn!(
+                "keyring 探测失败（耗时 {}ms），回退 0600 文件后端: {error}",
+                started.elapsed().as_millis()
+            );
             SecretSelection {
                 backend: SecretBackend::File,
                 note: Some(format!("keyring unavailable ({error}); using 0600 file")),
-                store: Box::new(fallback()),
+                store: Arc::new(fallback()),
             }
         }
     }
 }
 
+/// 整个探测共用一个上限：写/读/删三步不能各自再等一个 2s，否则启动会被拖到 6 秒。
+fn probe(store: Arc<dyn SecretStore>, limit: Duration) -> Result<()> {
+    run_with_timeout("probe", limit, move || probe_once(store.as_ref()))
+}
+
 /// 真的写一次再读一次，避免“Entry 能创建但 Secret Service 不存在”的假可用。
-fn probe(store: &dyn SecretStore) -> Result<()> {
+fn probe_once(store: &dyn SecretStore) -> Result<()> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
@@ -392,5 +499,61 @@ mod tests {
         assert_eq!(SecretBackend::Keyring.password_ref(), PasswordRef::Keyring);
         assert_eq!(SecretBackend::File.password_ref(), PasswordRef::File);
         assert_eq!(SecretBackend::File.as_str(), "file");
+    }
+
+    /// 模拟桌面会话里“连得上但永不回包”的 Secret Service：读操作睡 5 秒。
+    struct SlowStore;
+
+    impl SecretStore for SlowStore {
+        fn backend(&self) -> SecretBackend {
+            SecretBackend::Keyring
+        }
+
+        fn get(&self, _account: &str) -> Result<Option<String>> {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Some("probe".to_string()))
+        }
+
+        fn set(&self, _account: &str, _secret: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 5 秒的 keyring 读调用不能把调用方一起拖住。
+    #[test]
+    fn timed_store_returns_error_instead_of_blocking() {
+        let store = TimedStore::new(Arc::new(SlowStore), DEFAULT_KEYRING_TIMEOUT);
+        let started = Instant::now();
+        let error = store.get("alice").expect_err("must time out");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(3_500), "took {elapsed:?}");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+
+    /// 探测超时 → 明确判定 keyring 不可用 → 回退 0600 文件，且整体耗时仍在一个上限附近。
+    #[test]
+    fn detect_times_out_on_hung_keyring_and_falls_back_to_file() {
+        let dir = temp_dir("slow");
+        let started = Instant::now();
+        let selection = detect_with(&dir, Box::new(SlowStore));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "detect took {elapsed:?}"
+        );
+        assert_eq!(selection.backend, SecretBackend::File);
+        let note = selection.note.as_deref().unwrap_or_default();
+        assert!(note.contains("keyring unavailable"), "{note}");
+        // 回退后端真的可用。
+        selection.store.set("alice", "s3cret").expect("set");
+        assert_eq!(
+            selection.store.get("alice").expect("get"),
+            Some("s3cret".into())
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

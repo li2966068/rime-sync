@@ -34,7 +34,7 @@ WEASEL_STRICT=1
 STATUS_HELPER=/usr/bin/rime-sync-status
 UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
 LOCALE_MO=usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo
-WEASEL_CAPTION="Rime 同步"
+WEASEL_CAPTION="输入法自建同步"
 
 FAILED=0
 CHECKS=0

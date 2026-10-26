@@ -652,9 +652,9 @@ jobs:
         shell: pwsh
         run: |
           if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'failure') {
-            Write-Host '::error title=Weasel 回退::自编译 Weasel 失败，回退上游官方安装包：本版 Windows 版将没有「Rime 同步…」入口（已写进 summary 与发布说明）'
+            Write-Host '::error title=Weasel 回退::自编译 Weasel 失败，回退上游官方安装包：本版 Windows 版将没有「输入法自建同步」入口（已写进 summary 与发布说明）'
           } else {
-            Write-Host '::error title=Weasel 回退::RIMESYNC_WEASEL_MODE=fetch：直接使用上游官方安装包，本版没有「Rime 同步…」入口'
+            Write-Host '::error title=Weasel 回退::RIMESYNC_WEASEL_MODE=fetch：直接使用上游官方安装包，本版没有「输入法自建同步」入口'
           }
           if ($env:GITHUB_STEP_SUMMARY) {
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @(

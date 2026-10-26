@@ -12,6 +12,7 @@ use rime_sync_core::config::Config;
 use rime_sync_core::dedupe::{self, BackupFingerprint, DedupeGroup, DeviceDirEntry, SnapshotFile};
 use rime_sync_core::index::sha256_hex;
 use rime_sync_core::plan;
+use rime_sync_core::profile::{self, Profile};
 use rime_sync_core::rime_dir;
 use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
@@ -209,20 +210,20 @@ pub fn cmd_dedupe_apply(
     }
 }
 
-fn scan_sync_dirs(client: &DavClient) -> Result<Vec<String>, String> {
+fn scan_dir_ids(client: &DavClient, root: &str) -> Result<Vec<String>, String> {
     let entries = client
-        .propfind("sync", 1)
-        .map_err(|error| format!("读取远端设备失败：{error:#}"))?;
+        .propfind(root, 1)
+        .map_err(|error| format!("读取远端 {root} 失败：{error:#}"))?;
     let mut dirs = Vec::new();
     for entry in entries {
         if !entry.is_dir {
             continue;
         }
         let id = entry.path.rsplit('/').next().unwrap_or("");
-        if id.is_empty() || id == "sync" || id == "shared" || id.starts_with('.') {
+        if id.is_empty() || id == root || id == "shared" || id.starts_with('.') {
             continue;
         }
-        if entry.path != format!("sync/{id}") {
+        if entry.path != format!("{root}/{id}") {
             continue;
         }
         if plan::validate_rel_path(&entry.path).is_err() {
@@ -235,27 +236,45 @@ fn scan_sync_dirs(client: &DavClient) -> Result<Vec<String>, String> {
     Ok(dirs)
 }
 
+fn scan_sync_dirs(client: &DavClient) -> Result<Vec<String>, String> {
+    scan_dir_ids(client, "sync")
+}
+
 fn preview_devices(client: &DavClient, self_id: &str) -> DedupeSection {
-    let dirs = match scan_sync_dirs(client) {
+    // 新布局的设备足迹只有 sync/<id>（配置在 sync/<id>/config 里）；0.6.4 开发期间
+    // 的旧布局 profiles/<id> 若还没迁移，也算同一台设备的占用，一并扫描、一并计费。
+    let mut dirs = match scan_sync_dirs(client) {
         Ok(dirs) => dirs,
         Err(error) => return DedupeSection::error(error),
     };
+    match scan_dir_ids(client, profile::LEGACY_PROFILES_DIR) {
+        Ok(legacy) => dirs.extend(legacy),
+        Err(error) => return DedupeSection::error(error),
+    }
+    dirs.retain(|id| id != self_id);
+    dirs.sort();
+    dirs.dedup();
     let mut warnings = Vec::new();
     let mut entries = Vec::new();
     for id in dirs {
-        let rel = format!("sync/{id}");
-        let size = match remote_tree::walk(
-            client,
-            &rel,
-            remote_tree::MAX_DEPTH,
-            remote_tree::MAX_ENTRIES,
-        ) {
-            Ok(entries) => remote_tree::tree_size(&entries),
-            Err(error) => {
-                warnings.push(format!("{rel}: {error:#}"));
-                0
-            }
+        let Ok(device) = Profile::new(&id) else {
+            continue;
         };
+        let rel = device.remote_sync();
+        let legacy_rel = device.legacy_remote_root();
+        let mut size = 0u64;
+        // sync/<id> 已含 config/；旧布局 profiles/<id> 若还在，一并计费。
+        for tree in [&rel, &legacy_rel] {
+            match remote_tree::walk(
+                client,
+                tree,
+                remote_tree::MAX_DEPTH,
+                remote_tree::MAX_ENTRIES,
+            ) {
+                Ok(found) => size += remote_tree::tree_size(&found),
+                Err(error) => warnings.push(format!("{tree}: {error:#}")),
+            }
+        }
         let owner = client
             .get(&format!("{rel}/owner.json"))
             .ok()
@@ -427,10 +446,38 @@ fn apply_devices(
         let result: Result<u64, String> = (|| {
             // 闸门按 installation_id 认本机目录；旧 device_id 目录可以删。
             check_device_delete(id, &self_id)?;
-            let rel = format!("sync/{id}");
-            let report =
-                remote_tree::delete_tree(&client, &rel).map_err(|error| format!("{error:#}"))?;
-            Ok(report.freed_bytes)
+            let Ok(device) = Profile::new(id) else {
+                return Err("设备 ID 无效".to_string());
+            };
+            let rel = device.remote_sync();
+            let mut freed = remote_tree::delete_tree(&client, &rel)
+                .map_err(|error| format!("{error:#}"))?
+                .freed_bytes;
+            // 0.6.4：配置在 sync/<id>/config（已随设备目录删除），再显式删一次兜底。
+            let profile_rel = device.remote_root();
+            if dedupe::validate_profile_delete_path(&profile_rel, &self_id).is_ok()
+                && !client
+                    .propfind(&profile_rel, 0)
+                    .map_err(|error| format!("{error:#}"))?
+                    .is_empty()
+            {
+                freed += remote_tree::delete_tree(&client, &profile_rel)
+                    .map_err(|error| format!("{error:#}"))?
+                    .freed_bytes;
+            }
+            // 0.6.4 旧布局 profiles/<id>（迁移失败残留）也删掉，与预览计费口径一致。
+            let legacy_rel = device.legacy_remote_root();
+            if dedupe::validate_remote_delete_path(&legacy_rel, &self_id).is_ok()
+                && !client
+                    .propfind(&legacy_rel, 0)
+                    .map_err(|error| format!("{error:#}"))?
+                    .is_empty()
+            {
+                freed += remote_tree::delete_tree(&client, &legacy_rel)
+                    .map_err(|error| format!("{error:#}"))?
+                    .freed_bytes;
+            }
+            Ok(freed)
         })();
         match result {
             Ok(bytes) => acc.ok(id, bytes),

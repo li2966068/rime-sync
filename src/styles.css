@@ -545,6 +545,7 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 .table tbody tr:last-child td { border-bottom: none; }
 .table tr.is-self td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .danger-text { color: var(--danger); }
+.warn-text { color: var(--warn); }
 .empty { padding: 10px 2px; }
 
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }

@@ -354,6 +354,25 @@ pub fn validate_remote_delete_path(rel: &str, self_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// profile 删除闸门：只允许 sync/<id>/config 三段，且不得删除本机 profile。
+pub fn validate_profile_delete_path(rel: &str, self_id: &str) -> Result<()> {
+    plan::validate_rel_path(rel)?;
+    let parts: Vec<&str> = rel.split('/').collect();
+    ensure!(
+        parts.len() == 3 && parts[0] == "sync" && parts[2] == "config",
+        "profile path must be sync/<id>/config: {rel}"
+    );
+    ensure!(
+        !parts[1].is_empty() && !parts[1].starts_with('.'),
+        "invalid profile id: {rel}"
+    );
+    ensure!(
+        parts[1] != self_id,
+        "refusing to delete the local profile: {rel}"
+    );
+    Ok(())
+}
+
 /// 快照删除闸门：在 validate_remote_delete_path 之上再限定 *.userdb.txt 且位于设备目录内。
 pub fn validate_snapshot_delete_path(rel: &str, self_id: &str) -> Result<()> {
     validate_remote_delete_path(rel, self_id)?;
@@ -592,6 +611,18 @@ mod tests {
     }
 
     /// 自删闸门必须认 installation_id：旧 device_id 目录是普通设备，可以删。
+    #[test]
+    fn profile_delete_gate_protects_self_and_out_of_bounds() {
+        assert!(validate_profile_delete_path("sync/dev-old/config", "self").is_ok());
+        assert!(validate_profile_delete_path("sync/self/config", "self").is_err());
+        assert!(validate_profile_delete_path("sync/a/config/b", "self").is_err());
+        assert!(validate_profile_delete_path("sync/dev-old", "self").is_err());
+        assert!(validate_profile_delete_path("profiles/dev-old", "self").is_err());
+        assert!(validate_profile_delete_path("sync/dev-old/files", "self").is_err());
+        assert!(validate_profile_delete_path("sync/../config", "self").is_err());
+        assert!(validate_profile_delete_path("sync/.hidden/config", "self").is_err());
+    }
+
     #[test]
     fn delete_gate_protects_installation_id_directory() {
         let self_id = "e6169df8-uuid";

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::backup::BackupManager;
@@ -21,6 +21,7 @@ use crate::merge3::{
 };
 use crate::plan;
 use crate::platform::RimeTrigger;
+use crate::profile::{self, Profile};
 use crate::retry::RetryState;
 use crate::rime_dir;
 use crate::webdav::{DavClient, PutOutcome};
@@ -119,7 +120,8 @@ impl PlanKind {
 }
 
 /// 「这次会做什么」的一条记录。path 是动作真正作用的那一侧路径：
-/// 快照是 sync/<installation_id>/<schema>.userdb.txt，shared 文件是 shared/files/<rel>。
+/// 快照是 sync/<installation_id>/<schema>.userdb.txt，配置是本地 rel（远端
+/// sync/<id>/config/files/<rel>），词库源是 shared/files/<rel>。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanAction {
     pub kind: PlanKind,
@@ -167,6 +169,9 @@ pub struct ConflictDetail {
 /// apply 前后导出词库条目数用的 schema 名。
 const USERDB_EXPORT_SCHEMA: &str = "luna_pinyin";
 
+/// 旧布局迁移的递归深度上限：设备配置只有 files/<rel> 一层，留足余量防跑飞。
+const MAX_MIGRATION_DEPTH: usize = 8;
+
 /// 临时导出文件：离开作用域即删除（清理失败的告警不能反过来影响 apply）。
 struct TempPath(PathBuf);
 
@@ -212,6 +217,73 @@ impl ProgressSink {
 impl std::fmt::Debug for ProgressSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ProgressSink(..)")
+    }
+}
+
+/// 本轮同步作用在哪一侧的远端树。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKind {
+    /// shared/files：词库源（*.dict.yaml / *.txt），多设备共享。
+    Shared,
+    /// sync/<id>/config/files：设备配置，每台设备独立。
+    Profile,
+}
+
+impl TreeKind {
+    fn allows(self, category: plan::Category) -> bool {
+        match self {
+            TreeKind::Shared => category.is_shared_source(),
+            TreeKind::Profile => category.is_device_config(),
+        }
+    }
+}
+
+/// 一棵三向合并树的远端路径 + 本地基线位置。
+struct TreeScope {
+    kind: TreeKind,
+    remote_files: String,
+    remote_manifest: String,
+    /// Profile 用本地 manifest 存基线；Shared 沿用 state/index.json 的 files。
+    local_manifest: Option<PathBuf>,
+}
+
+impl TreeScope {
+    fn shared() -> Self {
+        Self {
+            kind: TreeKind::Shared,
+            remote_files: profile::SHARED_FILES_DIR.to_string(),
+            remote_manifest: profile::SHARED_MANIFEST.to_string(),
+            local_manifest: None,
+        }
+    }
+
+    fn profile(profile: Profile) -> Self {
+        Self {
+            kind: TreeKind::Profile,
+            remote_files: profile.remote_files(),
+            remote_manifest: profile.remote_manifest(),
+            local_manifest: None,
+        }
+    }
+
+    fn with_local_manifest(mut self, path: PathBuf) -> Self {
+        self.local_manifest = Some(path);
+        self
+    }
+
+    fn allows(&self, category: plan::Category) -> bool {
+        self.kind.allows(category)
+    }
+
+    fn assert_allowed(&self, rel: &str) -> Result<()> {
+        match self.kind {
+            TreeKind::Shared => plan::assert_shared_allowed(rel),
+            TreeKind::Profile => plan::assert_profile_allowed(rel),
+        }
+    }
+
+    fn remote_file(&self, rel: &str) -> String {
+        format!("{}/{rel}", self.remote_files)
     }
 }
 
@@ -703,6 +775,7 @@ impl Engine {
         // librime / 小狼毫把快照写在 sync/<installation_id>/，不是 sync/<device_id>/。
         let local_id = self.local_sync_id();
         plan::validate_rel_path(&local_id).context("invalid installation_id")?;
+        let profile = Profile::new(&local_id).context("invalid installation_id for profile")?;
         let remote_sync = format!("sync/{local_id}");
         self.cancelled()?;
 
@@ -723,8 +796,13 @@ impl Engine {
                     self.config.first_sync_policy.id()
                 );
             }
+            // 只读策略绝不写远端，因此远端布局迁移留到正常策略的那一轮；
+            // 本地基线迁移不涉及远端，先做（否则会误判成「还没种子」）。
+            self.migrate_local_profile_state(&profile, report);
             self.pull_snapshots(report)?;
-            self.sync_shared(report, true)?;
+            self.seed_profile_from_shared(&profile, report)?;
+            self.sync_tree(&self.profile_scope(&profile), report, true)?;
+            self.sync_tree(&TreeScope::shared(), report, true)?;
             return Ok(());
         }
         if report.first_sync {
@@ -735,6 +813,8 @@ impl Engine {
         }
 
         // MKCOL / owner.json 都是写操作：预演一律不做（目录不存在也不影响后续读取）。
+        // profile_ready=false：旧布局迁移失败，配置树本轮不碰（详见迁移函数）。
+        let mut profile_ready = true;
         if !self.dry_run {
             self.emit("pull", 0, 0, "ensure remote layout");
             self.dav.ensure_base()?;
@@ -742,11 +822,27 @@ impl Engine {
             self.dav.ensure_dir(&remote_sync)?;
             self.dav.ensure_dir("shared")?;
             self.dav.ensure_dir("shared/files")?;
+            // 一次性布局迁移：旧 profiles/<id> → sync/<id>/config（失败只告警）。
+            profile_ready = self.migrate_remote_profile_layout(&profile, report)?;
+            self.dav.ensure_dir(&profile.remote_files())?;
             self.write_owner(&remote_sync)?;
         }
 
+        self.migrate_local_profile_state(&profile, report);
+        if self.dry_run {
+            self.plan_legacy_remote_migration(&profile)?;
+        }
         self.pull_snapshots(report)?;
-        self.sync_shared(report, false)?;
+        if profile_ready {
+            self.seed_profile_from_shared(&profile, report)?;
+            self.sync_tree(&self.profile_scope(&profile), report, false)?;
+        } else {
+            report.skipped.push(format!(
+                "sync/{}/config: legacy layout migration failed, config sync skipped",
+                profile.id()
+            ));
+        }
+        self.sync_tree(&TreeScope::shared(), report, false)?;
         self.push_snapshots(report)?;
         Ok(())
     }
@@ -771,6 +867,20 @@ impl Engine {
                 continue;
             }
             other_devices += 1;
+        }
+        // 0.6.4 开发期间的旧布局（profiles/<id>）里的数据同样算「远端已有数据」：
+        // 只有旧配置目录、还没迁移过来的设备不能再被当成「远端空白」。
+        if other_devices == 0 {
+            let legacy_root = profile::LEGACY_PROFILES_DIR;
+            for entry in self.dav.propfind(legacy_root, 1)? {
+                if !entry.is_dir || !entry.path.starts_with(&format!("{legacy_root}/")) {
+                    continue;
+                }
+                let name = entry.path.rsplit('/').next().unwrap_or_default();
+                if profile::is_legacy_profile_dir_name(name) && name != local_id && name != device {
+                    other_devices += 1;
+                }
+            }
         }
         let mut shared_files = 0usize;
         if other_devices == 0 {
@@ -817,6 +927,165 @@ impl Engine {
         Ok(())
     }
 
+    /// 0.6.4 布局迁移（本机一半）：<state_dir>/profiles/<id> → <state_dir>/sync/<id>/config。
+    ///
+    /// 预演不写任何状态，直接跳过；失败只告警、保留旧目录，同步照常继续。
+    fn migrate_local_profile_state(&self, profile: &Profile, report: &mut Report) {
+        if self.dry_run {
+            return;
+        }
+        match profile::migrate_legacy_local(profile, &self.state_dir) {
+            Ok(Some(note)) => report.notes.push(note),
+            Ok(None) => {}
+            Err(error) => report.notes.push(format!(
+                "本机配置基线迁移到 {} 失败：{error:#}；旧目录保留，可稍后重试",
+                profile.local_manifest(&self.state_dir).display()
+            )),
+        }
+    }
+
+    /// 0.6.4 布局迁移（远端一半）：profiles/<id> → sync/<id>/config。
+    ///
+    /// 只在「旧目录存在且新 manifest 不存在」时执行一次：先递归复制（manifest 最后
+    /// 写，保证目标侧要么完整要么没有基线），整棵树复制成功后才删旧目录。
+    ///
+    /// 返回值 = 配置树是否可用（可以继续按新路径做三向合并）。迁移失败时返回
+    /// false：旧目录保留 + notes 告警，本轮跳过配置树同步——否则空的新基线会被
+    /// 当成「远端已删」，反而把本机配置删掉。快照/词库源同步不受影响。
+    fn migrate_remote_profile_layout(
+        &mut self,
+        profile: &Profile,
+        report: &mut Report,
+    ) -> Result<bool> {
+        let legacy = profile.legacy_remote_root();
+        let target = profile.remote_root();
+        // 探测失败 = 「不知道旧目录还在不在」：本轮不动配置树最安全。
+        let legacy_exists = match self.dav.propfind(&legacy, 0) {
+            Ok(entries) => entries.iter().any(|entry| entry.is_dir),
+            Err(error) => {
+                report.notes.push(format!(
+                    "检查旧配置目录 {legacy} 失败：{error:#}；旧目录保留，本轮跳过配置同步"
+                ));
+                return Ok(false);
+            }
+        };
+        if !legacy_exists {
+            return Ok(true);
+        }
+        match self.dav.get(&profile.remote_manifest()) {
+            // 新布局已有基线：不再迁移（旧目录可能是上次删失败的残渣）。
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(error) => {
+                report.notes.push(format!(
+                    "读取 {}/manifest.json 失败：{error:#}；旧目录保留，本轮跳过配置同步",
+                    target
+                ));
+                return Ok(false);
+            }
+        }
+        self.emit("migrate", 0, 0, format!("migrate {legacy} -> {target}"));
+        let copied = match self.copy_remote_tree(&legacy, &target, 0) {
+            Ok(copied) => copied,
+            Err(error) => {
+                // 迁移未提交（新 manifest 没写成）：清掉半成品，下轮重试。
+                let cleanup = self.delete_remote_tree(&target, 0);
+                report.notes.push(format!(
+                    "旧配置目录 {legacy} 自动迁移失败：{error:#}；旧目录保留，本轮跳过配置同步{}",
+                    match cleanup {
+                        Ok(()) => "（未完成的目标目录已清理，下轮重试）".to_string(),
+                        Err(error) => format!("（清理未完成的目标目录失败：{error:#}）"),
+                    }
+                ));
+                return Ok(false);
+            }
+        };
+        match self.delete_remote_tree(&legacy, 0) {
+            Ok(()) => report.notes.push(format!(
+                "已把旧配置目录 {legacy} 迁移到 {target}（{copied} 个文件）并删除旧目录"
+            )),
+            Err(error) => report.notes.push(format!(
+                "已把旧配置目录 {legacy} 迁移到 {target}（{copied} 个文件），但删除旧目录失败：{error:#}；可稍后手动清理"
+            )),
+        }
+        Ok(true)
+    }
+
+    /// 预演里的迁移说明：只读探测 + 记录一条 skip，绝不 PUT/MKCOL/DELETE。
+    fn plan_legacy_remote_migration(&mut self, profile: &Profile) -> Result<()> {
+        let legacy = profile.legacy_remote_root();
+        if self.dav.propfind(&legacy, 0)?.is_empty()
+            || self.dav.get(&profile.remote_manifest())?.is_some()
+        {
+            return Ok(());
+        }
+        self.record(
+            PlanKind::Skip,
+            &legacy,
+            format!(
+                "legacy profile layout: migrated to {} before sync",
+                profile.remote_root()
+            ),
+        );
+        Ok(())
+    }
+
+    /// 递归复制远端一棵子树（相对路径原样保留）。
+    fn copy_remote_tree(&self, src: &str, dst: &str, depth: usize) -> Result<usize> {
+        ensure!(
+            depth <= MAX_MIGRATION_DEPTH,
+            "legacy profile tree is too deep: {src}"
+        );
+        self.dav.ensure_dir(dst)?;
+        let mut copied = 0usize;
+        // manifest.json 必须最后写：目标侧看到基线就代表迁移已提交。
+        let mut entries = self.dav.propfind(src, 1)?;
+        entries.sort_by_key(|entry| {
+            entry.path.rsplit('/').next().unwrap_or_default() == profile::MANIFEST_NAME
+        });
+        for entry in entries {
+            if entry.path == src {
+                continue;
+            }
+            plan::validate_rel_path(&entry.path)
+                .with_context(|| format!("unsafe path in {src}"))?;
+            let name = entry.path.rsplit('/').next().unwrap_or_default();
+            ensure!(
+                !name.is_empty() && name != "." && name != "..",
+                "unsafe entry in {src}: {}",
+                entry.path
+            );
+            let target = format!("{dst}/{name}");
+            if entry.is_dir {
+                copied += self.copy_remote_tree(&entry.path, &target, depth + 1)?;
+            } else if let Some(bytes) = self.dav.get(&entry.path)? {
+                self.dav.put(&target, &bytes, None)?;
+                copied += 1;
+            }
+        }
+        Ok(copied)
+    }
+
+    /// 递归删除远端一棵子树（先文件、后目录；服务端 DELETE 未必递归）。
+    fn delete_remote_tree(&self, root: &str, depth: usize) -> Result<()> {
+        ensure!(
+            depth <= MAX_MIGRATION_DEPTH,
+            "legacy profile tree is too deep: {root}"
+        );
+        for entry in self.dav.propfind(root, 1)? {
+            if entry.path == root {
+                continue;
+            }
+            if entry.is_dir {
+                self.delete_remote_tree(&entry.path, depth + 1)?;
+            } else {
+                self.dav.delete(&entry.path)?;
+            }
+        }
+        self.dav.delete(root)?;
+        Ok(())
+    }
+
     fn pull_snapshots(&mut self, report: &mut Report) -> Result<()> {
         let local_id = self.local_sync_id();
         let device = self.config.device_id.clone();
@@ -851,6 +1120,12 @@ impl Engine {
             };
             for entry in entries {
                 if entry.is_dir {
+                    continue;
+                }
+                // sync/<id>/config 是设备配置目录（files/ + manifest.json）：快照只认
+                // 设备目录顶层的 *.userdb.txt，配置目录里的任何文件都不能当快照下载。
+                if entry.path.split('/').any(profile::is_config_dir_name) {
+                    tracing::debug!("skip profile config entry {}", entry.path);
                     continue;
                 }
                 if entry.path.ends_with("/owner.json") {
@@ -988,13 +1263,24 @@ impl Engine {
         Ok(())
     }
 
-    /// read_only=true 时只做远端 -> 本地方向的合并，绝不 PUT / MKCOL / DELETE。
-    fn sync_shared(&mut self, report: &mut Report, read_only: bool) -> Result<()> {
-        let manifest_bytes = self.dav.get("shared/manifest.json")?;
+    /// 本机 profile 的同步作用域（远端 sync/<id>/config/files + 本地基线）。
+    fn profile_scope(&self, profile: &Profile) -> TreeScope {
+        TreeScope::profile(profile.clone())
+            .with_local_manifest(profile.local_manifest(&self.state_dir))
+    }
+
+    /// 配置 / 词库源的通用三向合并树。
+    ///
+    /// - Shared  = shared/files（只收词库源；配置不再读写，老客户端的旧文件原样保留）
+    /// - Profile = sync/<id>/config/files（只收设备配置，每台设备各同步各的）
+    ///
+    /// read_only=true 时只做远端 -> 本地方向，绝不 PUT / MKCOL / DELETE，
+    /// 也不写本地 profile 基线。
+    fn sync_tree(&mut self, scope: &TreeScope, report: &mut Report, read_only: bool) -> Result<()> {
+        let manifest_bytes = self.dav.get(&scope.remote_manifest)?;
         let mut manifest = match &manifest_bytes {
-            Some(bytes) => {
-                serde_json::from_slice::<FileIndex>(bytes).context("parse shared/manifest.json")?
-            }
+            Some(bytes) => serde_json::from_slice::<FileIndex>(bytes)
+                .with_context(|| format!("parse {}", scope.remote_manifest))?,
             None => FileIndex::default(),
         };
         if manifest.version == 0 {
@@ -1002,9 +1288,14 @@ impl Engine {
         }
 
         for key in manifest.files.keys() {
+            plan::validate_rel_path(key)
+                .with_context(|| format!("remote manifest contains unsafe path: {key}"))?;
             let class = plan::classify(key);
-            plan::assert_shared_allowed(key)
-                .with_context(|| format!("remote manifest contains forbidden path: {key}"))?;
+            // 另一侧目录混进来的旧条目（shared 里的配置 / profile 里的词库源）不参与本轮。
+            if !scope.allows(class.category) {
+                continue;
+            }
+            scope.assert_allowed(key)?;
             if !self.config.wants(class.category) {
                 report
                     .skipped
@@ -1012,34 +1303,50 @@ impl Engine {
             }
         }
 
-        let local_files = self.scan_local_shared()?;
+        let local_files = self.scan_local_tree(scope.kind)?;
         // 设备本地键：只在 *.custom.yaml 上生效；克隆一份避免与 &mut self 借用冲突。
         let device_local = self.config.device_local_keys.clone();
+        let mut base_index = match &scope.local_manifest {
+            Some(path) => profile::load_manifest(path)?,
+            None => self.index.clone(),
+        };
+        // 0.6.3 把配置基线记在 index.files：这些条目已不属于 shared 树，先清掉。
+        base_index
+            .files
+            .retain(|rel, _| scope.allows(plan::classify(rel).category));
         let mut keys: BTreeSet<String> = BTreeSet::new();
-        keys.extend(manifest.files.keys().cloned());
-        keys.extend(self.index.files.keys().cloned());
-        keys.extend(local_files.keys().cloned());
+        for key in manifest
+            .files
+            .keys()
+            .chain(base_index.files.keys())
+            .chain(local_files.keys())
+        {
+            if scope.allows(plan::classify(key).category) {
+                keys.insert(key.clone());
+            }
+        }
 
         let total = keys.len();
         for (index, rel) in keys.iter().enumerate() {
             self.cancelled()?;
             plan::validate_rel_path(rel).with_context(|| format!("unsafe path: {rel}"))?;
             let class = plan::classify(rel);
-            if !class.category.is_shared() || !self.config.wants(class.category) {
+            if !scope.allows(class.category) || !self.config.wants(class.category) {
                 report
                     .skipped
                     .push(format!("{rel}: kind disabled by sync_kinds"));
                 continue;
             }
-            plan::assert_shared_allowed(rel)?;
+            scope.assert_allowed(rel)?;
 
             let local_path = safe_join(&self.rime_dir, rel)?;
             let local_bytes = fs::read(&local_path).ok();
             let local_hash = local_bytes.as_ref().map(|bytes| sha256_hex(bytes));
-            let base = self.index.files.get(rel).cloned();
+            let base = base_index.files.get(rel).cloned();
             let remote_meta = manifest.files.get(rel).cloned();
             let base_hash = base.as_ref().map(|meta| meta.sha256.clone());
             let remote_hash = remote_meta.as_ref().map(|meta| meta.sha256.clone());
+            let remote_path = scope.remote_file(rel);
 
             // *.custom.yaml 用「patch 段规范化摘要」做三向判定：小狼毫每次改设置都会
             // 重写 customization 头，整文件摘要会把纯 metadata 变化当成内容变化。
@@ -1065,7 +1372,7 @@ impl Engine {
                     MergeResult::Unchanged
                 } else {
                     let Some(bytes) =
-                        self.fetch_shared_remote(rel, remote_meta.as_ref(), report)?
+                        self.fetch_tree_remote(&remote_path, remote_meta.as_ref(), report)?
                     else {
                         continue;
                     };
@@ -1143,10 +1450,10 @@ impl Engine {
                         // 远端还是旧格式（带着设备私有键）：用共享视图把它清干净。
                         if !read_only && sha256_hex(&shared) != meta.sha256 {
                             match self.put(
-                                &format!("shared/files/{rel}"),
+                                &remote_path,
                                 &shared,
                                 meta.etag.as_deref(),
-                                "shared upload: strip device-local keys",
+                                "tree upload: strip device-local keys",
                             )? {
                                 PutOutcome::Written => {
                                     meta = FileMeta::local(&shared);
@@ -1170,7 +1477,7 @@ impl Engine {
                             self.write_pulled(
                                 rel,
                                 &adopted,
-                                "shared merge: metadata-only, adopt remote",
+                                "tree merge: metadata-only, adopt remote",
                             )?;
                             report.config_changed = true;
                         }
@@ -1182,7 +1489,7 @@ impl Engine {
                             &bytes
                         };
                         self.remember_base(Some(&meta.sha256), Some(base));
-                        self.index.files.insert(rel.clone(), meta);
+                        base_index.files.insert(rel.clone(), meta);
                         report.merged += 1;
                         tracing::info!(
                             "{rel}: only the customization header differs (metadata-only); adopting remote bytes"
@@ -1192,11 +1499,11 @@ impl Engine {
                     self.remember_base(local_hash.as_deref(), local_bytes.as_deref());
                     match remote_meta {
                         Some(meta) => {
-                            self.index.files.insert(rel.clone(), meta);
+                            base_index.files.insert(rel.clone(), meta);
                         }
                         None => {
                             if local_hash.is_none() {
-                                self.index.files.remove(rel);
+                                base_index.files.remove(rel);
                             }
                         }
                     }
@@ -1217,18 +1524,17 @@ impl Engine {
                         bytes.clone()
                     };
                     let if_match = remote_meta.as_ref().and_then(|meta| meta.etag.as_deref());
-                    let remote_path = format!("shared/files/{rel}");
                     match self.put(
                         &remote_path,
                         &upload,
                         if_match,
-                        "shared upload: local changed",
+                        "tree upload: local changed",
                     )? {
                         PutOutcome::Written => {
                             let meta = FileMeta::local(&upload);
                             self.remember_base(Some(&meta.sha256), Some(&upload));
                             manifest.files.insert(rel.clone(), meta.clone());
-                            self.index.files.insert(rel.clone(), meta);
+                            base_index.files.insert(rel.clone(), meta);
                             report.pushed += 1;
                             report.merged += 1;
                         }
@@ -1242,7 +1548,6 @@ impl Engine {
                 MergeResult::TakeRemote => {
                     let mut meta =
                         remote_meta.ok_or_else(|| anyhow!("missing remote metadata for {rel}"))?;
-                    let remote_path = format!("shared/files/{rel}");
                     let bytes = match remote_bytes.take() {
                         Some(bytes) => bytes,
                         None => {
@@ -1295,7 +1600,7 @@ impl Engine {
                             &remote_path,
                             &shared,
                             meta.etag.as_deref(),
-                            "shared upload: strip device-local keys",
+                            "tree upload: strip device-local keys",
                         )? {
                             PutOutcome::Written => {
                                 meta = FileMeta::local(&shared);
@@ -1309,7 +1614,7 @@ impl Engine {
                             }
                         }
                     }
-                    self.write_pulled(rel, &local_write, "shared merge: take remote")?;
+                    self.write_pulled(rel, &local_write, "tree merge: take remote")?;
                     // base 缓存按内容寻址，不能把共享视图存到旧远端摘要下面。
                     let base = if sha256_hex(&shared) == meta.sha256 {
                         &shared
@@ -1317,7 +1622,7 @@ impl Engine {
                         &bytes
                     };
                     self.remember_base(Some(&meta.sha256), Some(base));
-                    self.index.files.insert(rel.clone(), meta);
+                    base_index.files.insert(rel.clone(), meta);
                     report.pulled += 1;
                     report.merged += 1;
                 }
@@ -1331,7 +1636,9 @@ impl Engine {
                             remote_meta.as_ref(),
                             remote_bytes.as_deref(),
                             base.as_ref(),
+                            &remote_path,
                             &mut manifest,
+                            &mut base_index,
                             report,
                         )?
                     {
@@ -1363,7 +1670,7 @@ impl Engine {
                                 .with_context(|| format!("remove {rel}"))?;
                         }
                     }
-                    self.index.files.remove(rel);
+                    base_index.files.remove(rel);
                     manifest.files.remove(rel);
                     report.merged += 1;
                 }
@@ -1374,12 +1681,9 @@ impl Engine {
                         ));
                         continue;
                     }
-                    self.delete_remote(
-                        &format!("shared/files/{rel}"),
-                        "shared delete: removed locally",
-                    )?;
+                    self.delete_remote(&remote_path, "tree delete: removed locally")?;
                     manifest.files.remove(rel);
-                    self.index.files.remove(rel);
+                    base_index.files.remove(rel);
                     report.pushed += 1;
                     report.merged += 1;
                 }
@@ -1392,39 +1696,159 @@ impl Engine {
         }
 
         if !read_only {
+            if !self.dry_run {
+                match &scope.local_manifest {
+                    Some(path) => {
+                        profile::save_manifest(path, &base_index)?;
+                        // 配置基线已迁出 index.files：清掉旧版本残留的配置条目。
+                        // 绝不能碰 shared 的基线——它就在同一个 index.files 里。
+                        self.index
+                            .files
+                            .retain(|rel, _| !scope.allows(plan::classify(rel).category));
+                    }
+                    None => self.index.files = base_index.files,
+                }
+            }
             let bytes = serde_json::to_vec_pretty(&manifest)?;
             if manifest_bytes.as_deref() != Some(bytes.as_slice()) {
-                self.put(
-                    "shared/manifest.json",
-                    &bytes,
-                    None,
-                    "shared manifest update",
-                )?;
+                self.put(&scope.remote_manifest, &bytes, None, "manifest update")?;
             }
         }
         Ok(())
     }
 
-    /// 取 shared/files/<rel> 并按 manifest 校验摘要；不一致时记冲突并返回 None。
-    fn fetch_shared_remote(
+    /// 首次同步种子：本地还没有 profile 基线时，从 shared/files 拉取模板配置一次。
+    ///
+    /// 只补本地缺失的文件（本地已有配置绝不覆盖），随后建立本地 profile 基线，
+    /// 之后的同步只读写 sync/<id>/config/files。
+    fn seed_profile_from_shared(&mut self, profile: &Profile, report: &mut Report) -> Result<bool> {
+        let manifest_path = profile.local_manifest(&self.state_dir);
+        if profile::manifest_exists(&manifest_path) {
+            return Ok(false);
+        }
+
+        let shared_manifest = match self.dav.get(profile::SHARED_MANIFEST)? {
+            Some(bytes) => serde_json::from_slice::<FileIndex>(&bytes).ok(),
+            None => None,
+        };
+        // rel -> 远端元数据（旧远端可能没有 manifest，此时为 None，按 GET 结果校验）。
+        let mut candidates: BTreeMap<String, Option<FileMeta>> = BTreeMap::new();
+        if let Some(manifest) = &shared_manifest {
+            for (rel, meta) in &manifest.files {
+                if plan::classify(rel).category.is_device_config()
+                    && self.config.wants(plan::classify(rel).category)
+                    && !self.config.excluded(rel)
+                {
+                    candidates.insert(rel.clone(), Some(meta.clone()));
+                }
+            }
+        } else {
+            // 0.5 之前的远端没有 shared/manifest.json：退化为扫描 shared/files 一层。
+            for entry in self.dav.propfind(profile::SHARED_FILES_DIR, 1)? {
+                if entry.is_dir {
+                    continue;
+                }
+                let Some(rel) = entry.path.strip_prefix("shared/files/") else {
+                    continue;
+                };
+                if plan::classify(rel).category.is_device_config()
+                    && self.config.wants(plan::classify(rel).category)
+                    && !self.config.excluded(rel)
+                {
+                    candidates.insert(rel.to_string(), None);
+                }
+            }
+        }
+        // 预演：先看一眼远端 profile 是否已有同名文件，才能如实预告「拉种子 + 上传」两步。
+        let remote_profile = if self.dry_run {
+            match self.dav.get(&profile.remote_manifest())? {
+                Some(bytes) => serde_json::from_slice::<FileIndex>(&bytes).ok(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let had_shared_config = !candidates.is_empty();
+        let mut pulled = 0usize;
+        for (rel, meta) in candidates {
+            self.cancelled()?;
+            plan::assert_profile_allowed(&rel)?;
+            let local = safe_join(&self.rime_dir, &rel)?;
+            if local.exists() {
+                // 不覆盖本地已有配置：老用户升级时本地就是初值。
+                continue;
+            }
+            let remote_path = format!("{}/{rel}", profile::SHARED_FILES_DIR);
+            let Some(bytes) = self.dav.get(&remote_path)? else {
+                continue;
+            };
+            if let Some(meta) = meta {
+                if sha256_hex(&bytes) != meta.sha256 {
+                    report
+                        .conflicts
+                        .push(format!("{rel}: shared seed hash does not match manifest"));
+                    continue;
+                }
+            }
+            if self.dry_run {
+                // 与真实 transport 的 Pull 路径口径一致：动作落在本地 rel 上。
+                self.record(PlanKind::Pull, &rel, "profile seed from shared");
+                let already = remote_profile
+                    .as_ref()
+                    .is_some_and(|index| index.files.contains_key(&rel));
+                if !already {
+                    // 种子落盘后，profile 里还没有它 → 同一轮会接着上传。
+                    self.record(
+                        PlanKind::Push,
+                        profile.remote_file(&rel),
+                        "profile seed upload",
+                    );
+                }
+            } else {
+                write_file(&self.rime_dir, &rel, &bytes)?;
+            }
+            pulled += 1;
+            report.pulled += 1;
+        }
+
+        if pulled > 0 {
+            report.config_changed = true;
+            report.notes.push(format!(
+                "首同步：从 shared/files 拉取 {pulled} 个默认配置作为本机初值；此后只同步 sync/{}/config",
+                profile.id()
+            ));
+        } else if had_shared_config {
+            report.notes.push(format!(
+                "shared/files 中的旧共享配置已保留但不再使用；本机配置改走 sync/{}/config",
+                profile.id()
+            ));
+        }
+        if !self.dry_run {
+            profile::save_manifest(&manifest_path, &FileIndex::default())?;
+        }
+        Ok(true)
+    }
+
+    /// 取远端文件并按 manifest 校验摘要；不一致时记冲突并返回 None。
+    fn fetch_tree_remote(
         &self,
-        rel: &str,
+        remote_path: &str,
         meta: Option<&FileMeta>,
         report: &mut Report,
     ) -> Result<Option<Vec<u8>>> {
         let Some(meta) = meta else {
             return Ok(None);
         };
-        let Some(bytes) = self.dav.get(&format!("shared/files/{rel}"))? else {
+        let Some(bytes) = self.dav.get(remote_path)? else {
             report
                 .conflicts
-                .push(format!("{rel}: manifest entry has no remote file"));
+                .push(format!("{remote_path}: manifest entry has no remote file"));
             return Ok(None);
         };
         if sha256_hex(&bytes) != meta.sha256 {
-            report
-                .conflicts
-                .push(format!("{rel}: remote hash does not match manifest"));
+            report.conflicts.push(format!(
+                "{remote_path}: remote hash does not match manifest"
+            ));
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -1441,17 +1865,18 @@ impl Engine {
         remote_meta: Option<&FileMeta>,
         known_remote: Option<&[u8]>,
         base: Option<&FileMeta>,
+        remote_path: &str,
         manifest: &mut FileIndex,
+        base_index: &mut FileIndex,
         report: &mut Report,
     ) -> Result<bool> {
         let (Some(local_bytes), Some(meta)) = (local, remote_meta) else {
             return Ok(false);
         };
-        let remote_path = format!("shared/files/{rel}");
         let remote_bytes = match known_remote {
             Some(bytes) => bytes.to_vec(),
             None => {
-                let Some(bytes) = self.dav.get(&remote_path)? else {
+                let Some(bytes) = self.dav.get(remote_path)? else {
                     return Ok(false);
                 };
                 bytes
@@ -1489,7 +1914,7 @@ impl Engine {
         let shared_hash = sha256_hex(&shared_bytes);
         if shared_hash != meta.sha256 {
             match self.put(
-                &remote_path,
+                remote_path,
                 &shared_bytes,
                 meta.etag.as_deref(),
                 "patch merge upload",
@@ -1498,7 +1923,7 @@ impl Engine {
                     let new_meta = FileMeta::local(&shared_bytes);
                     self.remember_base(Some(&shared_hash), Some(&shared_bytes));
                     manifest.files.insert(rel.to_string(), new_meta.clone());
-                    self.index.files.insert(rel.to_string(), new_meta);
+                    base_index.files.insert(rel.to_string(), new_meta);
                     report.pushed += 1;
                 }
                 PutOutcome::PreconditionFailed => {
@@ -1591,9 +2016,9 @@ impl Engine {
         Ok(false)
     }
 
-    fn scan_local_shared(&self) -> Result<BTreeMap<String, PathBuf>> {
+    fn scan_local_tree(&self, kind: TreeKind) -> Result<BTreeMap<String, PathBuf>> {
         let mut out = BTreeMap::new();
-        self.walk_local(&self.rime_dir, 0, &mut out)?;
+        self.walk_local(&self.rime_dir, 0, kind, &mut out)?;
         Ok(out)
     }
 
@@ -1601,6 +2026,7 @@ impl Engine {
         &self,
         dir: &Path,
         depth: usize,
+        kind: TreeKind,
         out: &mut BTreeMap<String, PathBuf>,
     ) -> Result<()> {
         if depth > 4 {
@@ -1618,7 +2044,7 @@ impl Engine {
                 if plan::is_excluded_dir(&name) {
                     continue;
                 }
-                self.walk_local(&entry.path(), depth + 1, out)?;
+                self.walk_local(&entry.path(), depth + 1, kind, out)?;
                 continue;
             }
             if !file_type.is_file() {
@@ -1630,7 +2056,7 @@ impl Engine {
             };
             let rel = relative.to_string_lossy().replace('\\', "/");
             let class = plan::classify(&rel);
-            if !class.category.is_shared()
+            if !kind.allows(class.category)
                 || !self.config.wants(class.category)
                 || plan::is_conflict_copy(&name)
                 || self.config.excluded(&rel)

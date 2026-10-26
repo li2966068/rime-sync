@@ -37,9 +37,19 @@ impl Category {
         }
     }
 
-    /// 是否进入 shared 三向合并树。
+    /// 是否是设备配置：进 profiles/<id>/files 三向合并树。
+    pub fn is_device_config(&self) -> bool {
+        matches!(self, Category::CustomYaml)
+    }
+
+    /// 是否是词库源：仍走 shared/files 共享树。
+    pub fn is_shared_source(&self) -> bool {
+        matches!(self, Category::DictSource)
+    }
+
+    /// 是否可进入某一侧的同步树（配置进 profile，词库源进 shared）。
     pub fn is_shared(&self) -> bool {
-        matches!(self, Category::CustomYaml | Category::DictSource)
+        self.is_device_config() || self.is_shared_source()
     }
 }
 
@@ -178,6 +188,19 @@ pub fn assert_remote_shared_path(full_remote_path: &str) -> Result<String> {
         })?;
     assert_shared_allowed(inner)?;
     Ok(inner.to_string())
+}
+
+/// profile 树（profiles/<id>/files）只允许配置类文件。
+pub fn assert_profile_allowed(rel: &str) -> Result<()> {
+    validate_rel_path(rel)?;
+    assert_no_userdb_dir(rel)?;
+    let class = classify(rel);
+    ensure!(
+        class.category.is_device_config(),
+        "refusing non-config file in profile tree: {rel} ({})",
+        class.reason
+    );
+    Ok(())
 }
 
 /// full remote path 形如 sync/<device>/<file>.userdb.txt。

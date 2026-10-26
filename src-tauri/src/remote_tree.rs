@@ -3,6 +3,8 @@
 //! 顺序规划（copy_plan / deletion_order）是纯函数，单测覆盖复制与删除顺序；
 //! 真正的 I/O 只是 PROPFIND / GET / PUT / MKCOL / DELETE。
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use rime_sync_core::webdav::DavClient;
 
@@ -138,6 +140,45 @@ pub(crate) fn copy_tree(client: &DavClient, src: &str, dst: &str) -> Result<Copy
         report.files += 1;
     }
     Ok(report)
+}
+
+/// 把 from 里 into 缺失的 *.userdb.txt 复制进 into（同名保留 into 的版本）。
+///
+/// 设备迁移的 merge 模式用它：目标目录已有 A 快照、源目录有 B，先把 A 里
+/// 源没有的补进源，再走正常的「源 → 目标」复制，结果就是 A ∪ B 且同名以源为准。
+pub(crate) fn merge_missing_snapshots(client: &DavClient, from: &str, into: &str) -> Result<usize> {
+    let source = walk(client, from, MAX_DEPTH, MAX_ENTRIES)?;
+    if source.is_empty() {
+        return Ok(0);
+    }
+    let existing: HashSet<String> = walk(client, into, MAX_DEPTH, MAX_ENTRIES)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    let mut copied = 0usize;
+    for entry in source
+        .iter()
+        .filter(|entry| !entry.is_dir && entry.path.ends_with(".userdb.txt"))
+    {
+        let Some(suffix) = entry.path.strip_prefix(from) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let target = format!("{into}{suffix}");
+        if existing.contains(&target) {
+            continue;
+        }
+        let bytes = client
+            .get(&entry.path)?
+            .ok_or_else(|| anyhow!("远端文件读取失败（404）：{}", entry.path))?;
+        client
+            .put(&target, &bytes, None)
+            .with_context(|| format!("PUT {target}"))?;
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 /// 显式递归删除：不依赖服务端 DELETE 集合是否递归。

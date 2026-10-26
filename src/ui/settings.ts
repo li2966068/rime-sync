@@ -1,8 +1,16 @@
-import { api, type Config, type DeviceIdCheck } from "../api";
+import {
+  api,
+  type Config,
+  type DeviceIdCheck,
+  type MigrateConflict,
+  type MigrateMode,
+  type MigrateResult,
+} from "../api";
 import { t } from "../i18n";
 import { el } from "./dom";
 import { errorText } from "./format";
 import { toast } from "./toast";
+import { confirmDialog } from "./modal";
 import { localLog } from "./logs";
 import { config, busy, setConfig, requireConfig } from "./state";
 import { clampBackupKeep, renderBackupKeep } from "./backups";
@@ -34,6 +42,23 @@ export function renderConfig(next: Config): void {
   el.footerConfig.textContent = next.device_id ? t("footer.device", { id: next.device_id }) : "";
   renderDeviceKeys();
   renderFirstSyncBanner();
+  // 本机目录名（installation_id）与显示名称（label）可能不同：设置页给出提示。
+  void refreshIdentityHint();
+}
+
+/// 显示名称与本机远端目录名（installation_id）不一致时提示用户远端真正的目录。
+export async function refreshIdentityHint(): Promise<void> {
+  try {
+    const identity = await api.localIdentity();
+    const differs = identity.differs && identity.installation_id.length > 0;
+    el.deviceIdentityHint.hidden = !differs;
+    el.deviceIdentityHint.textContent = differs
+      ? t("settings.deviceIdentityHint", { installation_id: identity.installation_id })
+      : "";
+  } catch {
+    el.deviceIdentityHint.hidden = true;
+    el.deviceIdentityHint.textContent = "";
+  }
 }
 
 /* ---------- 首同步保护（SPEC-4 §A1） ---------- */
@@ -209,6 +234,97 @@ export function settleDeviceChoice(choice: DeviceChoice): void {
   resolve?.(choice);
 }
 
+/* ---------- 迁移冲突：取消 / 合并 / 删除目标后迁移 ---------- */
+
+type MigrateChoice = Extract<MigrateMode, "cancel" | "merge" | "replace">;
+let migrateChoiceResolve: ((choice: MigrateChoice) => void) | null = null;
+
+/// 结构化冲突（目标目录已存在）→ 三选一。replace 不可用时按钮禁用并显示原因。
+function migrateConflictDialog(conflict: MigrateConflict): Promise<MigrateChoice> {
+  const owner = conflict.target_owner?.device_id ?? t("settings.migrateConflictNoOwner");
+  el.migrateModalBody.textContent = t("settings.migrateConflictBody", {
+    target: conflict.target,
+    count: conflict.target_snapshot_count,
+    owner,
+  });
+  el.migrateModalTarget.textContent = conflict.can_replace
+    ? t("settings.migrateConflictLegacy")
+    : (conflict.replace_blocked_reason ?? t("settings.migrateConflictKept"));
+  el.migrateReplace.disabled = !conflict.can_replace;
+  el.migrateModal.hidden = false;
+  el.migrateMerge.focus();
+  return new Promise((resolve) => {
+    migrateChoiceResolve = resolve;
+  });
+}
+
+export function settleMigrateChoice(choice: MigrateChoice): void {
+  el.migrateModal.hidden = true;
+  const resolve = migrateChoiceResolve;
+  migrateChoiceResolve = null;
+  resolve?.(choice);
+}
+
+async function callMigrate(
+  oldId: string,
+  newId: string,
+  mode: MigrateMode,
+): Promise<MigrateResult | null> {
+  try {
+    return await api.migrateDevice(oldId, newId, mode);
+  } catch (error) {
+    // 后端错误里带步骤名（CHECK / SET_ID / LOCAL_RENAME / COPY / CONFIG / DELETE）。
+    const text = t("settings.deviceMigrateFail", { error: errorText(error) });
+    el.settingsHint.textContent = text;
+    toast(text);
+    localLog(text);
+    return null;
+  }
+}
+
+/// 目标目录已存在时先只做预检（mode=cancel），再按用户选择重试一次。
+async function migrateDevice(oldId: string, newId: string): Promise<MigrateResult | null> {
+  el.settingsHint.textContent = t("settings.deviceChecking");
+  let result = await callMigrate(oldId, newId, "cancel");
+  if (!result) {
+    return null;
+  }
+  if (!result.conflict) {
+    return result;
+  }
+  const conflict = result.conflict;
+  const choice = await migrateConflictDialog(conflict);
+  if (choice === "cancel") {
+    el.settingsHint.textContent = t("settings.migrateCancelled");
+    return null;
+  }
+  if (choice === "replace") {
+    const confirmed = await confirmDialog(
+      t("settings.migrateReplaceConfirmTitle"),
+      t("settings.migrateReplaceConfirmBody", {
+        target: conflict.target,
+        count: conflict.target_snapshot_count,
+      }),
+    );
+    if (!confirmed) {
+      el.settingsHint.textContent = t("settings.migrateCancelled");
+      return null;
+    }
+  }
+  result = await callMigrate(oldId, newId, choice);
+  if (!result) {
+    return null;
+  }
+  if (result.conflict) {
+    const detail = t("settings.migrateConflictAgain", { target: result.conflict.target });
+    const text = t("settings.deviceMigrateFail", { error: detail });
+    el.settingsHint.textContent = text;
+    toast(text);
+    return null;
+  }
+  return result;
+}
+
 /// 设备名称变更后：先把本机身份登记到远端（目录名 = installation_id，幂等，只写 owner.json），
 /// 再刷新设备页。远端登记失败不影响本地已保存的名称：同步时会再写一次 owner.json。
 async function refreshAfterIdentityChange(): Promise<void> {
@@ -266,25 +382,27 @@ export async function saveSettings(): Promise<void> {
   }
   if (choice === "migrate") {
     // 后端把 installation.yaml、本地与远端 sync 目录一起改名，并保存 device_id 标签；
-    // 失败时后端已回滚，这里只需保留旧配置。
-    el.settingsHint.textContent = t("settings.deviceChecking");
-    try {
-      const result = await api.migrateDevice(previousId, nextId);
-      // 后端按结构化结果说明到底做了什么：无需迁移 / 只改本地目录 / 复制了远端目录。
-      const message = result.skipped
-        ? t("settings.deviceMigrateSkipped")
-        : result.remote_renamed
-          ? t("settings.deviceMigrateOk", { files: result.copied_files })
-          : t("settings.deviceMigrateLocalRenamed");
-      toast(message);
-      if (result.warnings.length > 0) {
-        localLog(result.warnings.join("；"));
-      }
-    } catch (error) {
-      const text = t("settings.deviceMigrateFail", { error: errorText(error) });
-      el.settingsHint.textContent = text;
-      toast(text);
+    // 目标目录已存在时先返回冲突，由 migrateDevice() 弹三选一。
+    const result = await migrateDevice(previousId, nextId);
+    if (!result) {
       return;
+    }
+    // 后端按结构化结果说明到底做了什么：无需迁移 / 合并 / 替换 / 只改本地目录。
+    const message = result.skipped
+      ? t("settings.deviceMigrateSkipped")
+      : result.mode === "merge"
+        ? t("settings.deviceMigrateMerged", {
+            files: result.copied_files,
+            merged: result.merged_files,
+          })
+        : result.mode === "replace"
+          ? t("settings.deviceMigrateReplaced", { files: result.copied_files })
+          : result.remote_renamed
+            ? t("settings.deviceMigrateOk", { files: result.copied_files })
+            : t("settings.deviceMigrateLocalRenamed");
+    toast(message);
+    if (result.warnings.length > 0) {
+      localLog(result.warnings.join("；"));
     }
   }
   try {
