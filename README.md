@@ -118,6 +118,22 @@ rime-sync-config            # 或从应用菜单「Rime 同步 · 配置」打�
 密码保存位置：优先系统钥匙串（service = `rime-sync`，account = WebDAV 用户名）；
 无 Secret Service 的 headless 环境回落到 0600 文件，并在界面标明所用后端。
 
+### 开机自启动（0.6.7）
+
+设置页「开机自启动」开关一键写入/删除登录自启条目，**条目固定带 `--autostart`**：
+带它启动时只建托盘、不弹主窗口，点托盘图标才显示窗口。
+
+| 平台 | 写入位置 | 目标路径 |
+| --- | --- | --- |
+| Linux（deb / trixie.run） | `~/.config/autostart/rime-sync.desktop`（0644） | `/usr/bin/rime-sync-app` |
+| Linux（AppImage） | 同上 | `$APPIMAGE` 的真实路径 |
+| Windows（NSIS，perMachine） | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `RimeSync` | `rime-sync-app.exe` 的绝对路径 |
+
+- 都是用户级配置，不需要管理员/root；关闭开关即删除条目。
+- **AppImage 移动位置或改名后，条目仍指向旧路径**：设置页会提示「自启条目指向的可执行文件已变化」，
+  关一次再开一次即可；也可手动删除 `~/.config/autostart/rime-sync.desktop`。
+- 托盘建不起来时（缺 appindicator / headless）不会静默隐藏窗口，而是保留主窗口，避免无界面可操作。
+
 ---
 
 ## 5. AList 配置（权限勾选表）

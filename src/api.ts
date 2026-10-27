@@ -15,6 +15,18 @@ export interface SyncKinds {
 
 export type FirstSyncPolicy = "preview" | "pull-only" | "normal";
 
+/** 开机自启机制的三种形态（后端 AutostartView.mechanism）。 */
+export type AutostartMechanism = "xdg-desktop" | "registry" | "launch-agent";
+
+export interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+  mechanism: AutostartMechanism;
+  /** 实际写入自启条目的可执行路径（AppImage 为 $APPIMAGE 的真实路径）。 */
+  target: string;
+  error: string | null;
+}
+
 export interface Config {
   webdav: WebDavConfig;
   password_ref: "keyring" | "file" | "none";
@@ -504,4 +516,8 @@ export const api = {
 
   checkUpdate: () => invoke<UpdateInfo>("cmd_check_update"),
   installUpdate: () => invoke<InstallResult>("cmd_install_update"),
+
+  autostartStatus: () => invoke<AutostartState>("cmd_autostart_status"),
+  // 开关自启：成功返回写入后的真实状态，失败 reject 可读错误（权限、路径变化等）。
+  setAutostart: (enabled: boolean) => invoke<AutostartState>("cmd_set_autostart", { enabled }),
 };

@@ -23,7 +23,7 @@ use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-mod autostart_cmds;
+mod autostart;
 mod backup_cmds;
 mod conflict_cmds;
 mod dedupe_cmds;
@@ -891,21 +891,38 @@ fn first_transport(
 }
 
 const SETUP_FLAG: &str = "--setup";
+const AUTOSTART_FLAG: &str = "--autostart";
+/// 旧版自启条目用的参数，继续兼容：行为与 --autostart 相同。
+const MINIMIZED_FLAG: &str = "--minimized";
 
 /// 安装完成后用 --setup 启动：无论是否首次运行，都强制进入同步设置向导。
 fn setup_requested(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|arg| arg == SETUP_FLAG)
 }
 
+/// 自启启动参数：--autostart（自启条目写入的参数）或旧的 --minimized。
+/// 命中时只驻留托盘，不显示主窗口。
+fn autostart_requested(args: impl IntoIterator<Item = String>) -> Option<&'static str> {
+    let mut minimized = false;
+    for arg in args {
+        if arg == AUTOSTART_FLAG {
+            return Some(AUTOSTART_FLAG);
+        }
+        if arg == MINIMIZED_FLAG {
+            minimized = true;
+        }
+    }
+    if minimized {
+        Some(MINIMIZED_FLAG)
+    } else {
+        None
+    }
+}
+
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        // 开机自启（SPEC-4 §B3）：带 --minimized 自启时静默进托盘。
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--minimized"]),
-        ))
         .manage(AppState::default())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -927,10 +944,23 @@ pub fn run() {
                     push_log(&state.0, format!("托盘不可用，关闭窗口将直接退出：{error}"))
                 }
             }
-            if std::env::args().any(|arg| arg == "--minimized") && tray::ready() {
-                if let Some(window) = handle.get_webview_window("main") {
-                    let _ = window.hide();
-                    push_log(&state.0, "以 --minimized 启动：已隐藏到托盘");
+            // 开机自启：只建托盘，不弹主窗口。托盘没建起来时保留窗口，
+            // 否则会变成既没有窗口也没有托盘的僵尸进程。
+            if let Some(flag) = autostart_requested(std::env::args()) {
+                if tray::ready() {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.hide();
+                        push_log(
+                            &state.0,
+                            format!("以 {flag} 启动：不显示主窗口，仅驻留托盘"),
+                        );
+                        eprintln!("[rime-sync] autostart: started with {flag}; main window hidden");
+                    }
+                } else {
+                    push_log(
+                        &state.0,
+                        format!("以 {flag} 启动但托盘不可用：保留主窗口，避免无界面可操作"),
+                    );
                 }
             }
             Ok(())
@@ -1000,8 +1030,8 @@ pub fn run() {
             update_cmds::cmd_check_update,
             update_cmds::cmd_install_update,
             tray::cmd_tray_status,
-            autostart_cmds::cmd_get_autostart,
-            autostart_cmds::cmd_set_autostart,
+            autostart::cmd_autostart_status,
+            autostart::cmd_set_autostart,
             platform_prefs::cmd_get_close_to_tray,
             platform_prefs::cmd_set_close_to_tray
         ]);

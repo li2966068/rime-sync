@@ -125,6 +125,12 @@ export const el = {
   saveSettings: byId<HTMLButtonElement>("btn-save-settings"),
   settingsHint: byId<HTMLSpanElement>("settings-hint"),
 
+  autostartToggle: byId<HTMLInputElement>("autostart-toggle"),
+  autostartState: byId<HTMLSpanElement>("autostart-state"),
+  autostartMechanism: byId<HTMLParagraphElement>("autostart-mechanism"),
+  autostartTarget: byId<HTMLParagraphElement>("autostart-target"),
+  autostartError: byId<HTMLParagraphElement>("autostart-error"),
+
   backupList: byId<HTMLDivElement>("backup-list"),
   backupCreate: byId<HTMLButtonElement>("btn-backup-create"),
   backupPrune: byId<HTMLButtonElement>("btn-backup-prune"),

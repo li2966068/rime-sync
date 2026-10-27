@@ -176,3 +176,18 @@ full + thin 组装约 30–60 s（闭包拷贝占大头）。
 > CI 里闭包是按当次 IME deb 现算的（`fetch-vendor-deps.sh debian-13`），不会出现
 > 「闭包缺新依赖」的情况。用 0.5.2 的 IME deb 配旧闭包会报
 > `libdouble-conversion3 / libpcre2-16-0 / libqt5core5t64` 缺失，这是快照问题。
+
+---
+
+## 8. 开机自启动（0.6.7）
+
+安装完成后在设置页「开机自启动」一键开启，写的是**用户级**条目，不需要 root：
+
+- 文件：`~/.config/autostart/rime-sync.desktop`，权限 0644，内容含
+  `Type=Application`、`Name=Rime 同步`、`Exec="<路径>" --autostart`、`Icon=rime-sync`、`Terminal=false`。
+- 路径：deb 安装为 `/usr/bin/rime-sync-app`；AppImage 运行时取 `$APPIMAGE` 的真实路径
+  （`current_exe()` 指向的临时挂载点重启即失效，不能写进条目）。
+- `--autostart` 启动时只驻留托盘、不显示主窗口；同步仍按设置页的搬运间隔执行。
+- 关闭开关会删除该文件（同时清理旧版本可能留下的 `rime-sync-app.desktop`）。
+- `rime-sync-uninstall.desktop` 不清理用户目录里的自启条目，需要时删掉上面的文件即可。
+- **AppImage 移动/改名后必须重新开启一次**，否则条目指向不存在的旧路径；设置页会给出提示。

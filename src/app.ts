@@ -27,6 +27,7 @@ import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
 import { addDeviceLocalKey, removeDeviceLocalKey } from "./ui/device_keys";
 import { refreshLanguageDependent } from "./ui/language";
+import { loadAutostart, toggleAutostart } from "./ui/autostart";
 import { api, type Report, type Progress, type ConflictChoice, type WatchEvent } from "./api";
 import { getLang, setLang, t, applyI18n } from "./i18n";
 import { getVersion } from "@tauri-apps/api/app";
@@ -52,6 +53,8 @@ export function switchPanel(name: string): void {
   if (name === "settings") {
     void loadBackups();
     void ensureSchemasLoaded();
+    // 自启条目可能被用户在系统里改动过，每次进设置页都重新读一次。
+    void loadAutostart();
   }
 }
 
@@ -297,6 +300,10 @@ export function bindEvents(): void {
     }
   });
 
+  el.autostartToggle.addEventListener("change", () => {
+    void toggleAutostart(el.autostartToggle.checked);
+  });
+
   el.saveSettings.addEventListener("click", () => {
     void saveSettings().catch((error: unknown) => {
       toast(t("conn.saveFail", { error: errorText(error) }));
@@ -499,6 +506,7 @@ export async function init(): Promise<void> {
     await loadBackups();
     await loadSchemas();
     await refreshInstallWarning();
+    await loadAutostart();
     localLog("界面已就绪");
     setFooter(t("footer.ready"));
     if (needsSetup) {

@@ -8,6 +8,7 @@ import { renderSchemas } from "./schemas";
 import { renderDedupe } from "./dedupe";
 import { renderUpdate } from "./update";
 import { renderWatch } from "./watch";
+import { renderAutostart } from "./autostart";
 import { renderFirstSyncBanner } from "./settings";
 import { renderDeviceKeys } from "./device_keys";
 import { wizard, wizardTitleText } from "./wizard";
@@ -27,6 +28,7 @@ export function refreshLanguageDependent(): void {
   el.progressLabel.textContent = t("sync.progressWaiting");
   el.conflictsCount.textContent = t("conflicts.count", { count: conflicts.length });
   renderFirstSyncBanner();
+  renderAutostart();
   renderWatch();
   renderConflictList();
   if (activeConflict) {

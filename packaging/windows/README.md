@@ -334,6 +334,18 @@ bash packaging/windows/check-nsis-hooks.sh            # 没有 makensis 时打�
 bash packaging/windows/check-nsis-hooks.sh --strict   # 没有 makensis 视为失败
 ```
 
+---
+
+## 9. 开机自启动（0.6.7）
+
+设置页「开机自启动」写入**用户级** Run 键，`perMachine` 安装也不需要管理员：
+
+- 键：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `RimeSync`，
+  数据 `"<安装目录>\rime-sync-app.exe" --autostart`（路径加引号，兼容空格与中文）。
+- 关闭开关删除该值；卸载程序不主动清理它（值指向已删除的 exe 时，登录启动会失败并被系统忽略）。
+- `--autostart` 启动只建托盘、不显示主窗口；点托盘图标或托盘菜单「打开主窗口」才显示。
+- 注册表写入失败（组策略/杀软拦截）时，设置页显示后端返回的 `reg.exe` 错误原文。
+
 输出示例（0 warning 0 error；离线包体积比在线包正好大一个假载荷 = 确实内嵌了 Standalone）：
 
 ```text

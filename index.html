@@ -298,6 +298,25 @@
             </label>
           </div>
 
+          <!-- 开机自启动：Linux 写 ~/.config/autostart/rime-sync.desktop，
+               Windows 写 HKCU Run。条目固定带 --autostart，启动后只驻留托盘。 -->
+          <div class="card" id="autostart-card">
+            <div class="card-head">
+              <h3 data-i18n="settings.autostart">开机自启动</h3>
+              <span class="pill" id="autostart-state" data-i18n="settings.autostartOff">未开启</span>
+            </div>
+            <p class="hint" data-i18n="settings.autostartDesc"></p>
+            <label class="switch">
+              <input type="checkbox" id="autostart-toggle" />
+              <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+              <span data-i18n="settings.autostartToggle">登录后自动启动</span>
+            </label>
+            <p class="hint" id="autostart-mechanism"></p>
+            <p class="hint mono" id="autostart-target" hidden></p>
+            <p class="hint warn-text" id="autostart-error" hidden></p>
+            <p class="hint" data-i18n="settings.autostartAppImageHint"></p>
+          </div>
+
           <!-- 输入方案：列出用户目录与 shared data 里的 *.schema.yaml。
                顺序即候选切换顺序，保存后自动重新部署。 -->
           <div class="card" id="schema-card">
