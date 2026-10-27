@@ -261,7 +261,7 @@ jobs:
           fi
           grep -qF 'matrix.image' "$wf" || { echo "::error::$wf 没把 matrix.image 传给 IMAGE"; exit 1; }
           grep -qF 'IMAGE: ' "$wf" || { echo "::error::$wf 的 ime job 没有 IMAGE 环境变量"; exit 1; }
-          for f in "bash scripts/ime/build-linux.sh" 'fetch-vendor-deps.sh "$DISTRO"' 'build-offline-installer.sh "$DISTRO"'; do
+          for f in "bash scripts/ime/build-linux.sh" 'fetch-vendor-deps.sh "$DISTRO"' 'build-offline-installer.sh --both "$DISTRO"'; do
             grep -qF "$f" "$wf" || { echo "::error::$wf 未按发行版调用 $f"; exit 1; }
           done
           ime_needs=$(awk '/^  ime:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
