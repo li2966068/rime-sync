@@ -406,7 +406,8 @@ jobs:
   collect:
     name: collect · 汇总并断言安装器
     # ime 成功才会跑（任一发行版失败 = collect 不跑 = 不发布）。
-    needs: [linux-app, ime, prepare-draft]
+    # windows 也要等：新的资产断言会检查两个 exe，早跑会误判缺失。
+    needs: [linux-app, ime, windows, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
