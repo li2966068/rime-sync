@@ -4,11 +4,13 @@
 # together with the vendored Rime schema data (/usr/share/rime-data).
 #
 #   scripts/ime/package-ime-deb.sh
-#   STAGING=build/ime-staging/ubuntu-22.04 OUT=build/deb/ubuntu-22.04 \
-#     SUITE=jammy DISTRO_KEY=ubuntu-22.04 scripts/ime/package-ime-deb.sh
+#   STAGING=build/ime-staging/debian-13 OUT=build/deb/debian-13 \
+#     SUITE=trixie DISTRO_KEY=debian-13 scripts/ime/package-ime-deb.sh
 #
-# The Debian version gets a "~<suite>" suffix so the four distribution builds
-# can never be mistaken for one another (0.4.0~jammy < 0.4.0~noble < 0.4.0).
+# The Debian version gets a "~<suite>" suffix so artifacts of different
+# distributions can never be mistaken for one another (0.4.0~bookworm <
+# 0.4.0~trixie). 0.6.6 起只发布 trixie，但后缀与参数保留：这个 deb 现在装在
+# 两个 .run 里（不再是独立发布资产），将来加发行版不需要改脚本。
 # Version base comes from src-tauri/tauri.conf.json (single source of truth for
 # the app version); the package is deliberately not versioned separately.
 set -euo pipefail
@@ -75,8 +77,8 @@ DEPS=$(printf '%s' "$DEPS" | sed -E \
 # We ship the same librime soname the distribution packages do, and we ship
 # the schema data itself. Debian/Ubuntu time_t rebuilds renamed librime1 to
 # librime1t64; list both unconditionally (Conflicts with a package that does
-# not exist is harmless) so a package built for jammy can never coexist with a
-# t64 librime by accident.
+# not exist is harmless) so a package built for an older suite can never
+# coexist with a t64 librime by accident.
 # Debian 12/13 split the distro rime data into per-recipe packages; we ship the
 # same files under /usr/share/rime-data, so apt (unlike plain dpkg -i) would
 # fail with "trying to overwrite ... default.yaml". Keep this list in sync with

@@ -35,10 +35,17 @@ GNOME/Wayland 下还需要在「设置 → 键盘 → 输入源」里加入「Fc
 本包也不包含任何 Rime 词典数据（体积原因）；词典由 librime-data 提供，
 用户自定义词库请用 rime-sync 的 WebDAV 同步。
 
-三、完全离线安装（自带依赖）
---------------------------
-本包自带一份 ubuntu 22.04 的 fcitx5-rime 依赖闭包（82 个 .deb，约 28 MB），
-装到 /usr/share/rime-sync/vendor/。安装期的 postinst 会排队一个后台任务：
+三、安装包的两种形态（全量 / 非全量）
+------------------------------------
+0.6.6 起 Linux 只发布 Debian 13（trixie）的两个 .run，两者都是
+「输入法本体 + 同步工具」，安装顺序都是先 IME 后 sync：
+
+    rime-sync-installer_<ver>.trixie.run        全量：自带依赖闭包（约 170 MB）
+    rime-sync-installer_<ver>.trixie.thin.run   非全量：依赖由 apt 从系统仓库装
+
+不再单独发布 rime-inputmethod 的 deb：它只是这两个 .run 的载荷。
+本 deb（rime-sync）本身的 postinst 仍保留旧行为——装到
+/usr/share/rime-sync/vendor/ 的依赖闭包由 postinst 排队一个后台任务：
 
     有网  -> apt-get install fcitx5 fcitx5-rime librime-data
     无网  -> 校验 VENDOR-INFO（发行版/版本）与 SHA256SUMS 后 dpkg -i 自带 .deb
@@ -72,10 +79,11 @@ postinst 本身立即返回，绝不会卡住或让安装失败。日志在
     sudo dpkg -i /usr/share/rime-sync/vendor/*.deb     # 手工重放离线包
     sudo apt-get -f install                            # 万一还有缺失依赖
 
-换一个发行版/版本重抓离线包（同样需要 docker 与网络）：
+重抓 trixie 的离线闭包（同样需要 docker 与网络）：
 
-    packaging/linux/fetch-vendor-debs.sh                            # ubuntu:22.04
-    IMAGE=ubuntu:24.04 VERSION_ID=24.04 packaging/linux/fetch-vendor-debs.sh
+    scripts/ime/fetch-vendor-deps.sh debian-13
+    # 旧脚本（打包进 /usr/share/rime-sync/vendor/ 用）：
+    IMAGE=debian:13 VERSION_ID=13 DISTRO=debian packaging/linux/fetch-vendor-debs.sh
 
 离线包对"系统已有包"的处理（0.6.0 起，install.sh）：
 

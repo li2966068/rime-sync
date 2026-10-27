@@ -230,7 +230,7 @@ jobs:
           fi
           exit $bad
 
-      # 矩阵 + 汇总 job + publish 依赖：任一发行版缺席都不能发布。
+      # 矩阵 + 汇总 job + publish 依赖：trixie 的两个安装器缺席就不能发布。
       - name: guard · release.yml matrix / collect / publish needs
         run: |
           set -euo pipefail
@@ -239,9 +239,26 @@ jobs:
             grep -qE "^  ${job}:" "$wf" || { echo "::error::$wf 缺少 job $job"; exit 1; }
           done
           grep -qE '^    strategy:' "$wf" || { echo "::error::$wf 的 ime job 没有 matrix"; exit 1; }
-          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-            grep -qF "          - distro: $d" "$wf" || { echo "::error::$wf 的 matrix 缺少 $d"; exit 1; }
+          # 0.6.6 起 Linux 只编译 trixie：矩阵只能有 debian-13，旧发行版残留要立刻抓出来。
+          grep -qF '          - distro: debian-13' "$wf" ||
+            { echo "::error::$wf 的 matrix 缺少 debian-13"; exit 1; }
+          for d in ubuntu-22.04 ubuntu-24.04 debian-12; do
+            if grep -qF "          - distro: $d" "$wf"; then
+              echo "::error::$wf 的 matrix 仍含 $d：Linux 只编译 trixie"
+              exit 1
+            fi
           done
+          # 全量 + 非全量两个安装器都要组装、都要断言；独立 IME deb 不再上传。
+          grep -qF 'build-offline-installer.sh --both' "$wf" ||
+            { echo "::error::$wf 没有组装 full + thin 两个安装器"; exit 1; }
+          grep -qF '.thin.run' "$wf" ||
+            { echo "::error::$wf 没有 thin 安装器（--both 之外未见 .thin.run）"; exit 1; }
+          grep -qF 'rime-sync-installer_' packaging/linux/build-offline-installer.sh ||
+            { echo "::error::build-offline-installer.sh 不产出 rime-sync-installer_*.run"; exit 1; }
+          if grep -qE '^ *gh release upload .*rime-inputmethod' "$wf"; then
+            echo "::error::$wf 仍把 rime-inputmethod deb 当独立资产上传"
+            exit 1
+          fi
           grep -qF 'matrix.image' "$wf" || { echo "::error::$wf 没把 matrix.image 传给 IMAGE"; exit 1; }
           grep -qF 'IMAGE: ' "$wf" || { echo "::error::$wf 的 ime job 没有 IMAGE 环境变量"; exit 1; }
           for f in "bash scripts/ime/build-linux.sh" 'fetch-vendor-deps.sh "$DISTRO"' 'build-offline-installer.sh "$DISTRO"'; do
@@ -268,6 +285,52 @@ jobs:
             echo "::error::ime job 里 gh release download（第 ${dl:-?} 行）必须先于 fetch-vendor-deps（第 ${fv:-?} 行）"
             exit 1
           fi
+      # 资产清单断言逻辑自检（.github/scripts/assert-release-assets.sh）：
+      # 用假清单证明「trixie 两个 .run + 0 个独立 IME deb」才通过，
+      # 而旧的四发行版 + 独立 IME deb 清单必须失败。
+      - name: guard · release asset inventory assertions
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          ver=0.0.0
+          cat >"$tmp/good.txt" <<EOF
+          rime-sync_0.0.0_amd64.AppImage 110295544
+          rime-sync_0.0.0_amd64.AppImage.sig 440
+          rime-sync_0.0.0_amd64.deb 3571090
+          rime-sync-installer_0.0.0.trixie.run 184499458
+          rime-sync-installer_0.0.0.trixie.thin.run 6900000
+          rime-sync_0.0.0_x64-setup.exe 14000000
+          rime-sync_0.0.0_x64-setup.exe.sig 440
+          rime-sync_0.0.0_x64-offline-setup.exe 150000000
+          rime-sync_0.0.0_x64-offline-setup.exe.sig 440
+          EOF
+          bash .github/scripts/assert-release-assets.sh --assets "$tmp/good.txt" --version "$ver"
+
+          # 旧清单：四个发行版各一个 .run + 四个独立 IME deb，必须被断言拒绝。
+          cat >"$tmp/bad.txt" <<EOF
+          rime-sync_0.0.0_amd64.AppImage 110295544
+          rime-sync_0.0.0_amd64.AppImage.sig 440
+          rime-sync_0.0.0_amd64.deb 3571090
+          rime-sync-installer_0.0.0.jammy.run 135548197
+          rime-sync-installer_0.0.0.noble.run 147344106
+          rime-sync-installer_0.0.0.bookworm.run 173381663
+          rime-sync-installer_0.0.0.trixie.run 184499458
+          rime-inputmethod_0.0.0.jammy_amd64.deb 3156512
+          rime-inputmethod_0.0.0.noble_amd64.deb 3272312
+          rime-inputmethod_0.0.0.bookworm_amd64.deb 3171772
+          rime-inputmethod_0.0.0.trixie_amd64.deb 3254204
+          rime-sync_0.0.0_x64-setup.exe 14000000
+          rime-sync_0.0.0_x64-setup.exe.sig 440
+          rime-sync_0.0.0_x64-offline-setup.exe 150000000
+          rime-sync_0.0.0_x64-offline-setup.exe.sig 440
+          EOF
+          if bash .github/scripts/assert-release-assets.sh --assets "$tmp/bad.txt" --version "$ver"; then
+            echo "::error::旧资产清单（四发行版 + 独立 IME deb）竟然通过了断言"
+            exit 1
+          fi
+          rm -rf "$tmp"
+          echo "资产清单断言自检 OK"
+
       - name: legacy flat vendor fetch stays out of release.yml
         run: |
           set -euo pipefail

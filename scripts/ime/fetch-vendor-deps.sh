@@ -2,9 +2,9 @@
 # fetch-vendor-deps.sh -- download the offline runtime dependency closure for
 # one or more distribution builds of the input method + sync app.
 #
-#   scripts/ime/fetch-vendor-deps.sh                       # all four (built ones)
-#   scripts/ime/fetch-vendor-deps.sh ubuntu-22.04
-#   APT_MIRROR=http://mirrors.aliyun.com scripts/ime/fetch-vendor-deps.sh ubuntu-24.04
+#   scripts/ime/fetch-vendor-deps.sh                       # trixie (if built)
+#   scripts/ime/fetch-vendor-deps.sh debian-13
+#   APT_MIRROR=http://mirrors.aliyun.com scripts/ime/fetch-vendor-deps.sh debian-13
 #
 # For each distribution this resolves the runtime dependencies of
 #   build/deb/<distro>/rime-inputmethod_*.deb   (our self-built librime/addon)
@@ -42,10 +42,7 @@ ROOT_PKGS=${ROOT_PKGS:-"fcitx5"}
 
 image_for() {
   case "$1" in
-    ubuntu-22.04) echo ubuntu:22.04 ;;
-    ubuntu-24.04) echo ubuntu:24.04 ;;
-    debian-12)    echo debian:12 ;;
-    debian-13)    echo debian:13 ;;
+    debian-13) echo debian:13 ;;
     *) return 1 ;;
   esac
 }
@@ -53,7 +50,7 @@ image_for() {
 DISTROS=("$@")
 if [ "${#DISTROS[@]}" -eq 0 ]; then
   DISTROS=()
-  for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
+  for d in debian-13; do
     compgen -G "$REPO_ROOT/build/deb/$d/rime-inputmethod_*.deb" >/dev/null && DISTROS+=("$d")
   done
   [ "${#DISTROS[@]}" -gt 0 ] || {

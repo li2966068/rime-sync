@@ -251,12 +251,19 @@ shell 变量可能被映射到「所有用户」上下文。读不到 `%APPDATA%
 
 **任何路径都不再联网下载**：在线包只把地址打印在弹框里，离线包用内嵌的 Standalone 安装器。
 
-### 8.1 两个变体
+### 8.1 两个变体（都是「Weasel + rime-sync」一个包）
+
+0.6.6 起 Windows 与 Linux 一致：一个安装包 = 输入法本体 + 同步工具，再分全量 / 非全量。
+两个 exe **都内嵌 Weasel 安装器**，安装顺序都是 PREINSTALL 装 Weasel（`phase=IME-INSTALL`）
+→ Tauri 装 rime-sync 本体 → POSTINSTALL 建快捷方式。
 
 ```text
-rime-sync_<ver>_x64-setup.exe          在线包（默认）：缺 WebView2 时弹框给地址，不下载
-rime-sync_<ver>_x64-offline-setup.exe  离线包：内嵌 WebView2 Standalone + Weasel，全程不联网
+rime-sync_<ver>_x64-setup.exe          非全量（默认）：缺 WebView2 时弹框给地址，不下载
+rime-sync_<ver>_x64-offline-setup.exe  全量：内嵌 WebView2 Standalone + Weasel，全程不联网
 ```
+
+非全量包只省掉 WebView2 运行时（约 130 MiB）；Weasel 与 rime-sync 本体两个包都有。
+受限代理/内网机器用全量包，或给非全量包加 `/SKIPWEBVIEW`（运行库已由域内分发时）。
 
 离线包由 `src-tauri/tauri.offline.conf.json` 选用 `packaging/nsis-hooks-offline.nsh`：
 该文件第一行 `!define RIMESYNC_EMBED_WEBVIEW`，然后 include 主钩子 —— 其余逻辑完全相同。

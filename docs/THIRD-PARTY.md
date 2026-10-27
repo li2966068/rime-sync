@@ -181,9 +181,18 @@ rime-sync 的界面是 WebView（Tauri v2），Windows 上需要 Microsoft Edge 
 
 ## 4. Linux 侧的第三方 deb
 
+0.6.6 起 Linux 只发布 Debian 13（trixie）的两个安装器，两者都是「Rime 输入法 + rime-sync」：
 
-deb 安装时会从 `packaging/linux/vendor/` 安装 fcitx5 / librime 等发行版软件包，
-其版本、来源与许可证见 `packaging/linux/README.Debian` 与各包自带版权文件。
+| 安装器 | 第三方组件 | 分发方式 |
+| --- | --- | --- |
+| `rime-sync-installer_<ver>.trixie.run`（全量） | fcitx5 / GTK / WebKit 等运行库闭包（`scripts/ime/fetch-vendor-deps.sh debian-13` 抓取） | 随包内置在 `vendor/*.deb`，安装时用 dpkg 解包 |
+| `rime-sync-installer_<ver>.trixie.thin.run`（非全量） | 同上 | 不内置：安装时由 `apt-get` 从目标机的发行版仓库安装 |
+
+两种情形下这些软件包都由 Debian 项目分发，许可证随各包自带的
+`/usr/share/doc/<pkg>/copyright` 提供；版本清单在
+`packaging/linux/vendor/debian-13/{VENDOR-INFO,DEPS.txt}`。构建期抓取的闭包不入库
+（`packaging/linux/vendor/` 下只有历史快照），其来源与版本见
+`packaging/linux/README.Debian`。
 
 ## 5. 其他
 

@@ -1,8 +1,10 @@
 name: offline-verify
 
-# 手动回归：把四发行版离线安装器真装一遍（--network none 容器内安装 + 断言）。
-# 不进 tag 触发的发布路径：单次约 90-120 分钟，只用于发版前/改动安装器后的人工验收。
-# 产物证据：build/evidence/<distro>/{test-image.log,offline-install.log,sizes.txt} + SIZES.txt。
+# 手动回归：把 trixie 的两个安装器真装一遍（容器内安装 + 断言）。
+#   full -> docker run --network none：断网安装必须成功
+#   thin -> 断网必须失败并提示改用全量包；联网必须安装成功
+# 不进 tag 触发的发布路径：单次约 60-90 分钟，只用于发版前/改动安装器后的人工验收。
+# 产物证据：build/evidence/<distro>/{test-image.log,*install.log,sizes.txt} + SIZES.txt。
 on:
   workflow_dispatch:
     inputs:
@@ -12,9 +14,14 @@ on:
         default: master
         type: string
       distros:
-        description: "只验证部分发行版（空格分隔，例如 ubuntu-22.04 debian-12）；留空=全部四套"
+        description: "要验证的发行版（留空=debian-13：Linux 只出 trixie）"
         required: false
         default: ""
+        type: string
+      skip_thin_online:
+        description: "跳过 thin 包的联网安装（默认 false：断网失败路径 + 联网成功路径都验）"
+        required: false
+        default: "false"
         type: string
 
 concurrency:
@@ -62,7 +69,7 @@ jobs:
           avail_gib=$(( avail / 1024 / 1024 ))
           echo "可用磁盘: ${avail_gib} GiB"
           if [ "$avail_gib" -lt 12 ]; then
-            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 12 GiB）：四套构建镜像 + 四套测试镜像装不下"
+            echo "::error::可用磁盘仅 ${avail_gib} GiB（< 12 GiB）：trixie 构建镜像 + 测试镜像装不下"
             exit 1
           fi
 
@@ -119,7 +126,7 @@ jobs:
           cp -f "${debs[0]}" packaging/out/
           echo "offline bundle 输入: packaging/out/$(basename "${debs[0]}")"
 
-      - name: build input-method debs for 4 distros (docker)
+      - name: build input-method deb (docker, trixie only)
         timeout-minutes: 60
         run: |
           set -euo pipefail
@@ -127,10 +134,8 @@ jobs:
           ALL=1 bash scripts/ime/build-linux.sh || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::error::scripts/ime/build-linux.sh ALL=1 失败（exit $rc）"
-            for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-              compgen -G "build/deb/$d/rime-inputmethod_*.deb" >/dev/null || \
-                echo "::error file=scripts/ime/build-linux.sh::$d 的 rime-inputmethod deb 未生成"
-            done
+            compgen -G "build/deb/debian-13/rime-inputmethod_*.deb" >/dev/null || \
+              echo "::error file=scripts/ime/build-linux.sh::debian-13 的 rime-inputmethod deb 未生成"
             exit "$rc"
           fi
           du -sh build/deb
@@ -143,7 +148,7 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: fetch offline vendor dependency closure (4 distros)
+      - name: fetch full-installer dependency closure (trixie)
         timeout-minutes: 40
         run: |
           set -euo pipefail
@@ -151,14 +156,10 @@ jobs:
             echo "::error::scripts/ime/fetch-vendor-deps.sh 失败（见上方日志）"
             exit 1
           }
-          status=0
-          for d in ubuntu-22.04 ubuntu-24.04 debian-12 debian-13; do
-            dir=packaging/linux/vendor/$d
-            n=$(find "$dir" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l)
-            echo "$d: $n debs"
-            [ "$n" -ge 100 ] || { echo "::error::$d: vendor 闭包只有 $n 个 .deb（< 100）"; status=1; }
-          done
-          exit $status
+          dir=packaging/linux/vendor/debian-13
+          n=$(find "$dir" -maxdepth 1 -name "*.deb" 2>/dev/null | wc -l)
+          echo "debian-13: $n debs"
+          [ "$n" -ge 100 ] || { echo "::error::debian-13: vendor 闭包只有 $n 个 .deb（< 100）"; exit 1; }
 
       - name: free disk before assembling .run
         run: |
@@ -166,26 +167,34 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: assemble offline installers (.run × 4)
+      - name: assemble installers · full + thin (trixie)
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          bash packaging/linux/build-offline-installer.sh || {
+          # --both：全量（内置依赖闭包）+ 非全量（apt 装依赖），两者都是 IME + 同步工具。
+          bash packaging/linux/build-offline-installer.sh --both debian-13 || {
             echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
             exit 1
           }
 
-      # 真正的验收：四发行版各建一个测试镜像，在 --network none 容器里跑 .run 安装 + 断言。
-      - name: verify offline install (--network none)
+      # 真正的验收：trixie 建一个测试镜像，分别验 full（断网安装成功）与
+      # thin（断网必须明确失败 + 联网必须成功）。
+      - name: verify installers (full offline + thin offline/online)
         timeout-minutes: 90
         env:
           DISTROS: ${{ inputs.distros }}
+          SKIP_THIN_ONLINE: ${{ inputs.skip_thin_online }}
         run: |
           set -euo pipefail
           read -r -a wanted <<< "$DISTROS"
-          echo "verifying: ${wanted[*]:-all four distros}"
-          bash packaging/linux/verify-offline.sh "${wanted[@]}" || {
-            echo "::error::packaging/linux/verify-offline.sh 失败：离线安装断言未通过（证据见 build/evidence）"
+          if [ "${#wanted[@]}" -eq 0 ]; then
+            wanted=(debian-13)
+          fi
+          echo "verifying: ${wanted[*]}"
+          args=()
+          [ "$SKIP_THIN_ONLINE" = "true" ] && args+=(--skip-online)
+          bash packaging/linux/verify-offline.sh "${args[@]}" "${wanted[@]}" || {
+            echo "::error::packaging/linux/verify-offline.sh 失败：安装断言未通过（证据见 build/evidence）"
             exit 1
           }
 

@@ -3,18 +3,17 @@
 # config page addon + vendored schema data) from the vendored sources inside
 # Docker, then pack a distribution-specific rime-inputmethod deb.
 #
-#   scripts/ime/build-linux.sh                       # ubuntu:22.04
-#   IMAGE=ubuntu:24.04 scripts/ime/build-linux.sh
-#   IMAGE=debian:12   scripts/ime/build-linux.sh
-#   ALL=1             scripts/ime/build-linux.sh     # all four, sequentially
+#   scripts/ime/build-linux.sh                       # debian:13 (trixie)
+#   IMAGE=debian:13   scripts/ime/build-linux.sh
+#   ALL=1             scripts/ime/build-linux.sh     # trixie (kept as a driver)
 #   JOBS=8 STAGING=/tmp/stg scripts/ime/build-linux.sh
 #
 # Supported targets (each is a *separate* build; fcitx5 5.0 and 5.1 are not
-# ABI compatible, so a 22.04 artifact must never be reused on 24.04):
-#   ubuntu:22.04 -> ubuntu-22.04 / jammy
-#   ubuntu:24.04 -> ubuntu-24.04 / noble
-#   debian:12    -> debian-12    / bookworm
+# ABI compatible, so an artifact built for one release must never be reused on
+# another). 0.6.6 起只发布 trixie：
 #   debian:13    -> debian-13    / trixie
+# 需要再加发行版时，在这里补一条 + packaging/linux/build-offline-installer.sh
+# 的 suite_for，并把 release.yml 的 ime matrix 加回去即可（DISTRO_KEY/SUITE 仍是参数）。
 #
 # Everything happens in the container: the host needs only docker (which is what
 # the ubuntu-22.04 GitHub runner already has, so CI can call this script as-is).
@@ -28,13 +27,13 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 
-IMAGE=${IMAGE:-ubuntu:22.04}
+IMAGE=${IMAGE:-debian:13}
 
-# Multi-distribution driver: ALL=1 or IMAGES="ubuntu:22.04 debian:12".
+# Multi-distribution driver: ALL=1 or IMAGES="debian:13".
 if [ -z "${_RIME_BUILD_CHILD:-}" ]; then
   IMAGES=${IMAGES:-}
   if [ "${ALL:-0}" = "1" ]; then
-    IMAGES="ubuntu:22.04 ubuntu:24.04 debian:12 debian:13"
+    IMAGES="debian:13"
   fi
   if [ -n "$IMAGES" ]; then
     rc=0
@@ -47,12 +46,9 @@ if [ -z "${_RIME_BUILD_CHILD:-}" ]; then
 fi
 
 case "$IMAGE" in
-  ubuntu:22.04) DEF_KEY=ubuntu-22.04; DEF_SUITE=jammy ;;
-  ubuntu:24.04) DEF_KEY=ubuntu-24.04; DEF_SUITE=noble ;;
-  debian:12)    DEF_KEY=debian-12;    DEF_SUITE=bookworm ;;
-  debian:13)    DEF_KEY=debian-13;    DEF_SUITE=trixie ;;
+  debian:13) DEF_KEY=debian-13; DEF_SUITE=trixie ;;
   *)
-    echo "!! unsupported IMAGE '$IMAGE' (use ubuntu:22.04|ubuntu:24.04|debian:12|debian:13)" >&2
+    echo "!! unsupported IMAGE '$IMAGE' (Linux ships trixie only: use debian:13)" >&2
     exit 2
     ;;
 esac

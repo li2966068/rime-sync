@@ -1,17 +1,20 @@
 #!/bin/bash
-# rime-sync 一键离线安装器
+# rime-sync 一键安装器（输入法本体 + 同步工具）
 #
 #   sudo ./install.sh                     # 自动识别发行版并安装
-#   sudo ./install.sh --payload DIR       # 指定离线包根目录
+#   sudo ./install.sh --payload DIR       # 指定安装包根目录
 #   sudo ./install.sh --uninstall [--yes] [--keep-ime] [--purge-data]
 #                                         # 交给统一卸载脚本（默认保留用户数据；--purge-data 才删）
 #
-# 目录约定（.run 自解压后也是这个结构）：
+# 目录约定（.run 自解压后也是这个结构；Linux 只出 trixie）：
 #   install.sh
-#   ubuntu-22.04/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/*.deb}
-#   ubuntu-24.04/...
-#   debian-12/...
-#   debian-13/...
+#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/*.deb}   全量（full）
+#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb}                非全量（thin）
+#
+# 两种安装包都是「输入法本体 + 同步工具」，区别只在依赖层：
+#   full  -> .run 内置 fcitx5/GTK/WebKit 依赖闭包，断网可装（vendor/ 存在）
+#   thin  -> 不带闭包，安装时 apt-get 装缺失依赖（BUNDLE-INFO: variant=thin）
+# 安装顺序两种包完全一致：先 rime-inputmethod，再 rime-sync。
 #
 # 行为约定：
 #   * 必须先装 rime-inputmethod，再装 rime-sync；任一步失败立即停止并保留日志
@@ -23,9 +26,11 @@
 #   * 可重复执行：旧版已装时直接 dpkg -i 覆盖升级，不需要先卸载
 #
 # 选项：
-#   --payload DIR     指定离线包根目录
-#   --upgrade-vendor  允许把系统已装（ii）的依赖升级到离线包版本（默认不动系统库）
+#   --payload DIR     指定安装包根目录
+#   --upgrade-vendor  全量包：允许把系统已装（ii）的依赖升级到内置版本（默认不动系统库）
 #   --uninstall       交给统一卸载脚本（--yes/--keep-ime/--purge-data 见下）
+#
+# 非全量包（thin）离线时的行为：apt 失败即停止，打印手动步骤并提示改用全量包。
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -112,15 +117,12 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
   exec bash "$UNINSTALLER" "${uninstall_args[@]}"
 fi
 
-say "rime-sync 离线安装器"
+say "rime-sync 安装器（输入法本体 + 同步工具）"
 say "系统: $OS_PRETTY"
 
 case "$OS_ID:$OS_VER" in
-  ubuntu:22.04) DISTRO_KEY=ubuntu-22.04 ;;
-  ubuntu:24.04) DISTRO_KEY=ubuntu-24.04 ;;
-  debian:12)    DISTRO_KEY=debian-12 ;;
-  debian:13)    DISTRO_KEY=debian-13 ;;
-  *)            DISTRO_KEY="$OS_ID-$OS_VER" ;;
+  debian:13) DISTRO_KEY=debian-13 ;;
+  *)         DISTRO_KEY="$OS_ID-$OS_VER" ;;
 esac
 
 if [ -z "$PAYLOAD" ]; then
@@ -149,9 +151,9 @@ verify_installed() {
 
 # ------------------------------------------------------- offline set missing
 if [ ! -d "$PAYLOAD/$DISTRO_KEY" ]; then
-  say "没有找到本机（$DISTRO_KEY）对应的离线安装集。"
-  say "当前离线包支持的发行版："
-  for d in "$PAYLOAD"/ubuntu-22.04 "$PAYLOAD"/ubuntu-24.04 "$PAYLOAD"/debian-12 "$PAYLOAD"/debian-13; do
+  say "没有找到本机（$DISTRO_KEY）对应的安装集：本安装包只支持 Debian 13（trixie）。"
+  say "当前安装包支持的发行版：Debian 13（trixie）"
+  for d in "$PAYLOAD"/debian-13 "$PAYLOAD"/debian-13-thin; do
     [ -d "$d" ] && say "  - $(basename "$d")"
   done
   if [ "$ASSUME_YES" -eq 1 ]; then
@@ -164,7 +166,7 @@ if [ ! -d "$PAYLOAD/$DISTRO_KEY" ]; then
   case "${answer:-n}" in
     y|Y|yes|YES) : ;;
     *)
-      say "已取消。请换用对应发行版的离线包（如 $(basename "$PAYLOAD")_<distro>.run）。"
+      say "已取消。请在 Debian 13（trixie）上使用本安装包，或改用联网 apt 方式安装。"
       exit 2
       ;;
   esac
@@ -187,9 +189,43 @@ IME_DEB=$(ls -1t "$DIR"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
 SYNC_DEB=$(ls -1t "$DIR"/rime-sync_*.deb 2>/dev/null | head -n 1 || true)
 [ -n "$IME_DEB" ] || fail "$DIR 缺少 rime-inputmethod_*.deb"
 [ -n "$SYNC_DEB" ] || fail "$DIR 缺少 rime-sync_*.deb"
-say "离线集: $DIR"
+say "安装集: $DIR"
 say "  IME : $(basename "$IME_DEB")"
 say "  SYNC: $(basename "$SYNC_DEB")"
+
+# ------------------------------------------------------------- package variant
+# full = 内置依赖闭包（vendor/*.deb）；thin = 依赖由 apt 解析。
+# 以 BUNDLE-INFO 为准，缺失时按 vendor 是否为空退化判断（兼容旧包）。
+VARIANT=full
+if [ -r "$DIR/BUNDLE-INFO" ]; then
+  v=$(sed -n 's/^variant=//p' "$DIR/BUNDLE-INFO" | head -n 1)
+  [ -n "$v" ] && VARIANT=$v
+fi
+if [ "$VARIANT" != "thin" ] && ! compgen -G "$DIR/vendor/*.deb" >/dev/null; then
+  VARIANT=thin
+fi
+case "$VARIANT" in
+  full) say "安装包类型: 全量（full）：内置依赖闭包，无需联网" ;;
+  thin) say "安装包类型: 非全量（thin）：依赖由 apt 从系统仓库安装（需要联网或本地仓库）" ;;
+  *)
+    say "!! BUNDLE-INFO 里的 variant=$VARIANT 不是 full/thin"
+    fail "无法识别的安装包类型"
+    ;;
+esac
+
+# 非全量包装不上依赖时的统一出口：说清原因、给手动步骤、指向全量包。
+thin_dep_advice() {
+  say "---- 非全量包（thin）需要系统仓库或联网 ----"
+  say "本包不内置依赖闭包，fcitx5 / GTK / WebKit 运行库要由 apt 从发行版仓库补齐。"
+  say "离线机器请改用全量包：rime-sync-installer_<ver>.trixie.run（内置依赖闭包，断网可装）"
+  say "有网络（或已挂本地仓库）时的手动步骤："
+  say "  sudo apt-get update"
+  say "  sudo apt-get install -y --no-install-recommends fcitx5 fcitx5-modules"
+  say "  sudo apt-get install -y --no-install-recommends $(basename "$IME_DEB")"
+  say "  sudo apt-get install -y --no-install-recommends $(basename "$SYNC_DEB")"
+  say "  sudo apt --fix-broken install   # 万一仍有未满足的依赖"
+  say "日志：$LOG"
+}
 
 # --------------------------------------------------- remove conflicting pkgs
 for p in fcitx5-rime librime1t64 librime1 librime-data; do
@@ -320,7 +356,31 @@ if [ -n "$FOREIGN_ARCHS" ]; then
   say "检测到外部架构：$FOREIGN_ARCHS（多架构系统：只补缺失包，不升级系统已有库）"
 fi
 
-if [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*.deb" >/dev/null; then
+if [ "$VARIANT" = "thin" ]; then
+  # ------------------------------------------------------------ thin deps (apt)
+  # 与全量包的区别只有这一层：依赖不打包，交给 apt 解析。
+  # 单独先装 fcitx5 守护进程：IME deb 只依赖 libfcitx5*，没有守护进程 addon 无处加载。
+  command -v apt-get >/dev/null 2>&1 || {
+    thin_dep_advice
+    fail "非全量包需要 apt-get，但本机没有"
+  }
+  export DEBIAN_FRONTEND=noninteractive
+  step "apt-get update (thin)"
+  say "步骤 0/2：更新 apt 索引（非全量包：依赖走系统仓库）"
+  if ! apt-get update; then
+    thin_dep_advice
+    fail "apt-get update 失败：非全量包需要联网或本地仓库"
+  fi
+  step "apt install fcitx5 runtime (thin)"
+  say "安装 fcitx5 运行库：fcitx5 fcitx5-modules（--no-install-recommends，避免装回发行版 fcitx5-rime）"
+  if ! apt-get install -y --no-install-recommends fcitx5 fcitx5-modules; then
+    thin_dep_advice
+    fail "apt 安装 fcitx5 运行库失败：非全量包需要联网或本地仓库"
+  fi
+  step "thin deps ready"
+fi
+
+if [ "$VARIANT" != "thin" ] && [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*.deb" >/dev/null; then
   COUNT=$(find "$DIR/vendor" -maxdepth 1 -name '*.deb' | wc -l)
   say "安装离线运行期依赖（$COUNT 个 .deb）"
   if [ -r "$DIR/vendor/SHA256SUMS" ]; then
@@ -444,28 +504,42 @@ if [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*.deb" >/dev/null; then
   fi
   say "离线依赖就绪（本批 ${#OUR_PKGS[@]} 个包，本次解包 ${#unpack_candidates[@]} 个，未配置 0 个）"
   step "vendor deps ready"
-else
-  say "警告：$DIR/vendor 为空，跳过离线依赖（要求系统已具备 fcitx5 与 GTK/WebKit 运行库）"
+elif [ "$VARIANT" != "thin" ]; then
+  say "警告：$DIR/vendor 为空，跳过依赖安装（要求系统已具备 fcitx5 与 GTK/WebKit 运行库）"
 fi
 
 # --------------------------------------------------------------- strict order
-step "dpkg -i $(basename "$IME_DEB")"
+# 两种安装包都是先 IME 后 sync。差别只在执行器：
+#   full  -> dpkg -i（依赖已由内置闭包解析）
+#   thin  -> apt-get install ./pkg.deb（依赖由仓库解析，顺序不变）
+install_local_deb() { # $1=deb 文件 $2=中文名称
+  local deb=$1 label=$2
+  if [ "$VARIANT" = "thin" ]; then
+    if ! apt-get install -y --no-install-recommends "$deb"; then
+      thin_dep_advice
+      fail "$label 安装失败（$(basename "$deb")）"
+    fi
+    return 0
+  fi
+  if ! dpkg -i --force-confdef --force-confold "$deb"; then
+    say_multiarch_advice
+    say "!! 若上面的 dpkg 报错指向系统已有包（半配置 / 多架构版本不一致），按建议修好后重跑本安装器；"
+    say "   rime-sync 自身的安装内容没有问题。"
+    fail "$label 安装失败（$(basename "$deb")）"
+  fi
+}
+
+STEP_INSTALL="dpkg -i"
+[ "$VARIANT" = "thin" ] && STEP_INSTALL="apt install"
+
+step "$STEP_INSTALL $(basename "$IME_DEB")"
 say "步骤 1/2：安装输入法 $(basename "$IME_DEB")（已装旧版时直接覆盖升级，不需要先卸载）"
-if ! dpkg -i --force-confdef --force-confold "$IME_DEB"; then
-  say_multiarch_advice
-  say "!! 若上面的 dpkg 报错指向系统已有包（半配置 / 多架构版本不一致），按建议修好后重跑本安装器；"
-  say "   rime-sync 自身的安装内容没有问题。"
-  fail "输入法安装失败（$(basename "$IME_DEB")）"
-fi
+install_local_deb "$IME_DEB" "输入法"
 verify_installed rime-inputmethod || fail "rime-inputmethod 未正确安装"
 
-step "dpkg -i $(basename "$SYNC_DEB")"
+step "$STEP_INSTALL $(basename "$SYNC_DEB")"
 say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")（覆盖升级，保留用户数据）"
-if ! dpkg -i --force-confdef --force-confold "$SYNC_DEB"; then
-  say_multiarch_advice
-  say "!! 若上面的 dpkg 报错指向系统已有包（半配置 / 多架构版本不一致），按建议修好后重跑本安装器。"
-  fail "同步程序安装失败（$(basename "$SYNC_DEB")）"
-fi
+install_local_deb "$SYNC_DEB" "同步程序"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
 
 # --------------------------------------------------- recommended user config

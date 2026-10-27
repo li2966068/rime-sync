@@ -104,7 +104,8 @@ jobs:
             echo "- 构建产物直传到该草稿；publish 最后一步才 --draft=false 转正。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # 应用本体（deb + AppImage）。矩阵里的四个发行版 job 都复用这一个 rime-sync deb。
+  # 应用本体（deb + AppImage）。ime（trixie）复用这一个 rime-sync deb：它只作为
+  # 工作流内部输入，转正前会被 publish 从资产里删掉。
   linux-app:
     name: linux-app · deb + AppImage
     needs: prepare-draft
@@ -157,8 +158,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # 这里刻意不抓 vendor 闭包：tauri deb 的 bundle.linux.deb.files 会把
-      # packaging/linux/vendor/ 整个拷进 /usr/share/rime-sync/vendor/，四份发行版闭包
-      # 会互相冲突且撑到 ~700 MiB。闭包只在 ime-<distro> 里按发行版单份使用。
+      # packaging/linux/vendor/ 整个拷进 /usr/share/rime-sync/vendor/，闭包会撑到
+      # ~170 MiB。闭包只在 ime-<distro> 的 .run 里按发行版单份使用。
       # fcitx5 配置页的「立即同步」按钮调用 /usr/bin/rime-sync-cli；CLI 不在 tauri 产物里，
       # 必须在打包前编译好并放到 deb.files 指定的位置，否则该按钮会静默 no-op。
       - name: build CLI for the deb
@@ -212,30 +213,21 @@ jobs:
           printf '  %s\n' "${debs[@]}" "${appimages[@]}" "${sigs[@]}"
           gh release upload "$TAG" "${debs[@]}" "${appimages[@]}" "${sigs[@]}" --clobber
 
-  # 四发行版各占一个 runner：镜像/闭包/.run 全部按发行版隔离，互不踩磁盘。
-  # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，组装 1-2 min。
+  # Linux 只出 trixie（Debian 13）。矩阵保留一个条目：job 名/步骤名仍按发行版参数化，
+  # 以后要加发行版只需在这里加一行 + build-offline-installer.sh 的 suite_for 加一条。
+  # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，full+thin 组装 2-4 min。
   ime:
     name: ime · ${{ matrix.distro }}
     # linux-app 提供 rime-sync deb；prepare-draft 提供 tag（从草稿 Release 取/放资产都要它）。
     needs: [linux-app, prepare-draft]
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     permissions:
       contents: write
     strategy:
-      # 单个发行版失败不取消其它三个：一次跑完就能看出是哪几套坏了。
       fail-fast: false
       matrix:
         include:
-          - distro: ubuntu-22.04
-            suite: jammy
-            image: ubuntu:22.04
-          - distro: ubuntu-24.04
-            suite: noble
-            image: ubuntu:24.04
-          - distro: debian-12
-            suite: bookworm
-            image: debian:12
           - distro: debian-13
             suite: trixie
             image: debian:13
@@ -331,33 +323,53 @@ jobs:
             [ -f "$dir/$f" ] || { echo "::error::$DISTRO: 缺少 $f"; exit 1; }
           done
 
-      - name: assemble offline installer (${{ matrix.distro }})
-        timeout-minutes: 15
+      - name: assemble installers · full + thin (${{ matrix.distro }})
+        timeout-minutes: 20
         env:
           DISTRO: ${{ matrix.distro }}
           SUITE: ${{ matrix.suite }}
         run: |
           set -euo pipefail
-          bash packaging/linux/build-offline-installer.sh "$DISTRO" || {
+          # 一次调用出两个包：都是「IME + 同步工具」，区别只在依赖层。
+          #   full -> 内置依赖闭包（断网可装）；thin -> 安装时 apt 装依赖
+          bash packaging/linux/build-offline-installer.sh --both "$DISTRO" || {
             echo "::error file=packaging/linux/build-offline-installer.sh::${DISTRO} 的 .run 组装失败"
             exit 1
           }
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-          run_file=packaging/linux/out/rime-sync-installer_${ver}~${SUITE}.run
-          if [ ! -f "$run_file" ]; then
-            echo "::error::缺少 $DISTRO 的离线安装器 $run_file"
+          full=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.run
+          thin=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.thin.run
+          for f in "$full" "$thin"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少 $DISTRO 的安装器 $f"
+              exit 1
+            fi
+            [ -x "$f" ] || { echo "::error file=$f::没有可执行位"; exit 1; }
+          done
+          full_size=$(stat -c %s "$full")
+          thin_size=$(stat -c %s "$thin")
+          full_mib=$(( full_size / 1024 / 1024 ))
+          thin_mib=$(( thin_size / 1024 / 1024 ))
+          echo "$full: ${full_mib} MiB"
+          echo "$thin: ${thin_mib} MiB"
+          if [ "$full_size" -lt $(( 100 * 1024 * 1024 )) ]; then
+            echo "::error file=$full::${DISTRO} 全量包仅 ${full_mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
             exit 1
           fi
-          [ -x "$run_file" ] || { echo "::error file=$run_file::没有可执行位"; exit 1; }
-          size=$(stat -c %s "$run_file")
-          mib=$(( size / 1024 / 1024 ))
-          echo "$run_file: ${mib} MiB"
-          if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
-            echo "::error file=$run_file::${DISTRO} 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
+          if [ "$thin_size" -lt $(( 5 * 1024 * 1024 )) ]; then
+            echo "::error file=$thin::${DISTRO} 非全量包仅 ${thin_mib} MiB（< 5 MiB）：IME 或 sync deb 没打进去"
+            exit 1
+          fi
+          if [ "$thin_size" -gt $(( 60 * 1024 * 1024 )) ]; then
+            echo "::error file=$thin::${DISTRO} 非全量包 ${thin_mib} MiB（> 60 MiB）：依赖闭包被打进 thin 包了"
+            exit 1
+          fi
+          if [ "$thin_size" -gt $(( full_size / 2 )) ]; then
+            echo "::error file=$thin::${DISTRO} 非全量包不小于全量包一半：thin 应显著更小"
             exit 1
           fi
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-            echo "- $DISTRO ($SUITE): $(basename "$run_file") — ${mib} MiB / vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
+            echo "- $DISTRO ($SUITE): $(basename "$full") ${full_mib} MiB（全量）+ $(basename "$thin") ${thin_mib} MiB（非全量）/ vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: cleanup docker images
@@ -367,11 +379,13 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      # 直传草稿 Release。资产名 = basename，四套矩阵不会撞名：
-      #   rime-sync-installer_<ver>~<suite>.run
-      #   rime-inputmethod_<ver>~<suite>_amd64.deb
-      # 注意：不要上传 rime-smoke（四个发行版同名，--clobber 会互相覆盖，只剩最后一个）。
-      - name: upload ime artifacts to draft release (${{ matrix.distro }})
+      # 直传草稿 Release。资产名 = basename：
+      #   rime-sync-installer_<ver>.<suite>.run        全量
+      #   rime-sync-installer_<ver>.<suite>.thin.run   非全量
+      # 0.6.6 起 rime-inputmethod deb 不再作为独立资产：它只在两个 .run 里
+      # （verify-artifacts 会从 thin.run 里解出来做入口断言）。
+      # 注意：不要上传 rime-smoke（与发行版同名时 --clobber 会互相覆盖）。
+      - name: upload installers to draft release (${{ matrix.distro }})
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-draft.outputs.tag }}
@@ -380,23 +394,18 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           runs=(packaging/linux/out/*.run)
-          if [ "${#runs[@]}" -ne 1 ]; then
-            echo "::error::$DISTRO: 期望恰好 1 个 .run，实际 ${#runs[@]} 个"
+          if [ "${#runs[@]}" -ne 2 ]; then
+            echo "::error::$DISTRO: 期望恰好 2 个 .run（全量 + thin），实际 ${#runs[@]} 个"
             exit 1
           fi
-          # 与 build-linux.sh 的产物名一致；取最新一个，避免容器里残留的旧 deb 被一起上传。
-          deb=$(ls -1t "build/deb/$DISTRO"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
-          if [ -z "$deb" ]; then
-            echo "::error::$DISTRO: 没有 rime-inputmethod deb 可上传"
-            exit 1
-          fi
-          printf '  %s\n  %s\n' "${runs[@]}" "$deb"
-          gh release upload "$TAG" "${runs[@]}" "$deb" --clobber
+          printf '  %s\n' "${runs[@]}"
+          gh release upload "$TAG" "${runs[@]}" --clobber
 
-  # 汇总 + 验收：只有四套 .run 与四个 IME deb 都在，publish 才会被触发。
+  # 汇总 + 验收：只有 trixie 的全量 + 非全量两个 .run 都在、且没有独立的 IME deb 资产，
+  # publish 才会被触发。
   collect:
-    name: collect · 汇总并断言离线安装器
-    # 四套 ime 全部成功才会跑（fail-fast: false，任一发行版失败 = collect 不跑 = 不发布）。
+    name: collect · 汇总并断言安装器
+    # ime 成功才会跑（任一发行版失败 = collect 不跑 = 不发布）。
     needs: [linux-app, ime, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
@@ -409,7 +418,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       # 不再下载产物（几百 MiB 的 .run 没必要重复搬一次）：直接读草稿 Release 的资产清单。
-      # GitHub 返回的 name+size 就是上传完成时的实际值，用来断言「四套安装器都在且体积够」。
+      # GitHub 返回的 name+size 就是上传完成时的实际值，用来断言「两个安装器都在且体积符合预期」。
       - name: list draft release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -420,7 +429,9 @@ jobs:
             --jq '"draft=\(.isDraft), assets=\(.assets | length)"'
           gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)"' | sort
 
-      - name: assert 4 installers + 4 input-method debs
+      # 资产清单的断言逻辑独立成脚本：可以用假清单离线自检（CI 的
+      # "guard · release asset inventory" 就是跑它的自检）。
+      - name: assert 2 installers (full + thin), no standalone IME deb
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-draft.outputs.tag }}
@@ -428,71 +439,10 @@ jobs:
           set -euo pipefail
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
           gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > /tmp/assets.txt
-          # 只按「资产名 + 字节数」比对：这就是 publish 之后用户能下载到的东西。
-          asset_size() { awk -v n="$1" '$1==n {print $2; exit}' /tmp/assets.txt; }
-          status=0
-          for pair in ubuntu-22.04:jammy ubuntu-24.04:noble debian-12:bookworm debian-13:trixie; do
-            d=${pair%%:*}
-            suite=${pair##*:}
-            run_asset=rime-sync-installer_${ver}.${suite}.run
-            size=$(asset_size "$run_asset")
-            if [ -z "$size" ]; then
-              echo "::error::缺少 $d 的离线安装器（$run_asset）"
-              status=1
-            else
-              mib=$(( size / 1024 / 1024 ))
-              echo "  $run_asset: ${mib} MiB"
-              if [ "$size" -lt $(( 100 * 1024 * 1024 )) ]; then
-                echo "::error::$d 安装器仅 ${mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
-                status=1
-              fi
-            fi
-            ime_asset=rime-inputmethod_${ver}.${suite}_amd64.deb
-            if [ -z "$(asset_size "$ime_asset")" ]; then
-              echo "::error::缺少 $d 的 rime-inputmethod deb（$ime_asset）"
-              status=1
-            else
-              echo "  $ime_asset: $(( $(asset_size "$ime_asset") / 1024 / 1024 )) MiB"
-            fi
-          done
-          # 四套 deb 必须都在：同名资产会被 --clobber 互相覆盖，这里能立刻抓出来。
-          ime_count=$(awk '$1 ~ /^rime-inputmethod_/ {c++} END {print c+0}' /tmp/assets.txt)
-          echo "  rime-inputmethod 资产数：$ime_count"
-          if [ "$ime_count" -ne 4 ]; then
-            echo "::error::草稿 Release 里 rime-inputmethod deb 有 $ime_count 个（期望 4）：资产名撞名会互相覆盖"
-            status=1
-          fi
-          for name in "rime-sync_${ver}_amd64.deb" "rime-sync_${ver}_amd64.AppImage"; do
-            if [ -z "$(asset_size "$name")" ]; then
-              echo "::error::缺少 $name"
-              status=1
-            fi
-          done
-          # Windows 两件套：在线包（≥ 12 MiB：内嵌 Weasel）与离线包（≥ 100 MiB：内嵌 WebView2）。
-          # 离线包是 0.6.5 为受限代理/内网新增的变体，缺了就等于本次发布没解决问题。
-          for pair in "rime-sync_${ver}_x64-setup.exe:12" "rime-sync_${ver}_x64-offline-setup.exe:100"; do
-            win_name=${pair%:*}
-            min_mib=${pair##*:}
-            size=$(asset_size "$win_name")
-            if [ -z "$size" ]; then
-              echo "::error::缺少 Windows 安装包（$win_name）"
-              status=1
-            else
-              mib=$(( size / 1024 / 1024 ))
-              echo "  $win_name: ${mib} MiB"
-              if [ "$size" -lt $(( min_mib * 1024 * 1024 )) ]; then
-                echo "::error::$win_name 仅 ${mib} MiB（< ${min_mib} MiB）：内嵌载荷没打进去"
-                status=1
-              fi
-            fi
-          done
-          for name in "rime-sync_${ver}_x64-setup.exe.sig" "rime-sync_${ver}_x64-offline-setup.exe.sig"; do
-            if [ -z "$(asset_size "$name")" ]; then
-              echo "::error::缺少 $name（updater / 离线包签名）"
-              status=1
-            fi
-          done
-          exit $status
+          bash .github/scripts/assert-release-assets.sh \
+            --assets /tmp/assets.txt \
+            --version "$ver" \
+            --suite trixie
 
   windows:
     name: windows · nsis + portable zip
@@ -917,7 +867,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       # 草稿 Release 是唯一产物来源（不再有 workflow artifact）。
-      # 只下断言要用的：4 个 IME deb + 1 个 rime-sync deb + setup.exe。
+      # 只下断言要用的：thin .run（几 MiB，里面装着 IME deb）+ rime-sync deb + setup.exe。
       # 资产名是扁平的，全部落在 dist/ 根下；脚本用 find 递归找，不依赖目录布局。
       - name: download built artifacts from draft release
         env:
@@ -927,8 +877,36 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist
-          gh release download "$TAG" --dir dist --pattern '*.deb' --pattern '*-setup.exe'
+          gh release download "$TAG" --dir dist --pattern '*.deb' --pattern '*-setup.exe' \
+            --pattern '*.thin.run'
           find dist -maxdepth 2 -type f -printf '%P  %s bytes\n' | sort
+
+      # 0.6.6 起 rime-inputmethod deb 不再作为独立资产发布，但"入口必须在 IME 包内"这条
+      # 断言不能丢：从 thin .run 的自解压载荷里把它取出来再交给 verify-artifacts.sh。
+      - name: extract IME deb from thin installer
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          runs=(dist/*.thin.run)
+          if [ "${#runs[@]}" -ne 1 ]; then
+            echo "::error::期望恰好 1 个 thin .run，实际 ${#runs[@]} 个"
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          marker=__RIME_SYNC_PAYLOAD_BELOW__
+          line=$(awk -v m="$marker" '$0 == m { print NR + 1; exit }' "${runs[0]}")
+          [ -n "$line" ] || { echo "::error::${runs[0]} 里没有载荷标记"; exit 1; }
+          tail -n +"$line" "${runs[0]}" | tar -xzf - -C "$tmp"
+          mapfile -t ime < <(find "$tmp" -type f -name 'rime-inputmethod_*.deb' | sort)
+          if [ "${#ime[@]}" -ne 1 ]; then
+            echo "::error::thin .run 里应有恰好 1 个 rime-inputmethod deb，实际 ${#ime[@]} 个"
+            find "$tmp" -type f | sed -n '1,20p'
+            exit 1
+          fi
+          cp -f "${ime[0]}" dist/
+          echo "从 $(basename "${runs[0]}") 取出 $(basename "${ime[0]}")（$(( $(stat -c %s "${ime[0]}") / 1024 / 1024 )) MiB）"
+          rm -rf "$tmp"
+          find dist -maxdepth 1 -type f -printf '%P  %s bytes\n' | sort
 
       - name: install extraction tools
         run: |
@@ -1049,6 +1027,34 @@ jobs:
             --tag "$TAG" \
             --notes-file dist/notes.md \
             --out dist/latest.json
+
+      # 0.6.6：Linux 只发「一个包 = 输入法本体 + 同步工具」，rime-sync deb 只是工作流
+      # 内部传递（ime 抓依赖闭包、verify-artifacts 断言），转正前必须从资产里删掉。
+      - name: drop internal assets before publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          internal=()
+          while IFS= read -r n; do
+            [ -n "$n" ] && internal+=("$n")
+          done < <(gh release view "$TAG" --json assets --jq '.assets[].name' |
+            grep -E '^rime-sync_.*_amd64\.deb$' || true)
+          if [ "${#internal[@]}" -eq 0 ]; then
+            echo "没有需要删除的内部 deb 资产"
+          else
+            for a in "${internal[@]}"; do
+              printf '删除内部资产: %s\n' "$a"
+              gh release delete-asset "$TAG" "$a" --yes
+            done
+          fi
+          # 删干净才转正：发布后用户能下载到的 Linux 资产只有 AppImage（更新用）与两个 .run。
+          left=$(gh release view "$TAG" --json assets --jq '.assets[].name' | grep -cE '\.deb$' || true)
+          if [ "$left" -ne 0 ]; then
+            echo "::error::转正前仍有 $left 个 .deb 资产（deb 不作为发布资产）"
+            exit 1
+          fi
 
       # 草稿 → 正式：资产在上一步之前就全部到位了，这里只补 latest.json 再转正。
       # 顺序刻意是「先传 latest.json，后 --draft=false」：反过来的话会有几秒钟
