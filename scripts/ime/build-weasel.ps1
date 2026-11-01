@@ -72,6 +72,7 @@ param(
     [string]$BoostVersion = '1.84.0',
     [string]$BoostRoot = '',
     [switch]$RebuildBoost,
+    [switch]$BoostOnly,
     [ValidateSet('self', 'prebuilt')]
     [string]$LibrimeSource = 'self',
     [string]$LibrimeTag = '',
@@ -1127,6 +1128,10 @@ if ($Check) {
 }
 
 Ensure-Boost
+if ($BoostOnly) {
+    Write-Step '仅构建 boost（-BoostOnly）：已就绪，退出'
+    exit 0
+}
 Ensure-Librime
 Prepare-Data
 Render-Props

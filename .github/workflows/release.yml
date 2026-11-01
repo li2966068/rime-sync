@@ -585,6 +585,20 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # 自建 librime 需要 boost 的 stage\lib（由 build-weasel.ps1 的 Ensure-Boost 负责）。
+      # 这里先单独把 boost 建好，否则 build-librime-win.ps1 会因 BOOST_ROOT 不可用直接失败
+      # （首次跑就是这么挂的：缓存只有 boost 源码树，没有 stage\lib）。
+      - name: bootstrap boost for self-built librime
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        timeout-minutes: 40
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -BoostOnly
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::boost 构建失败（exit $LASTEXITCODE）：自建 librime 需要 boost 的 stage\lib；先修 boost 再谈 librime"
+            exit $LASTEXITCODE
+          }
+
       # 0.6.9：先自建 librime，再编 Weasel。
       # 为什么必须自建：上游预编译包（1.13.1）里没有外部插件加载逻辑（librime 的
       # plugins/PluginManager 在 _WIN32 下是 TODO），所以 rimesync-extra 只有在
