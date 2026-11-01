@@ -569,7 +569,7 @@ jobs:
           key: >-
             ${{ runner.os }}-librime-1.17.0-pins1-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}
           restore-keys: |
-            ${{ runner.os }}-librime-1.17.0-
+            ${{ runner.os }}-librime-1.17.0-pins1-
 
       # 先在 1 分钟内把工具链看清楚，再进 90 分钟的自编译。
       # -Check 不下载、不编译，只打印 repo root/VS/cl.exe/b2/boost 状态；
