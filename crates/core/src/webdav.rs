@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::index::FileMeta;
 use crate::plan;
 use crate::presets::{self, Preset};
+use crate::proxy::ProxyConfig;
 
 const MAX_RETRIES: usize = 3;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -73,10 +74,24 @@ pub struct DavClient {
     remote_dir: String,
     username: String,
     password: String,
+    /// 已启用代理时的一行描述（不含凭据），用于错误信息定位「代理还是服务器」。
+    proxy_note: Option<String>,
 }
 
 impl DavClient {
     pub fn new(url: &str, username: &str, password: &str, remote_dir: &str) -> Result<Self> {
+        Self::with_proxy(url, username, password, remote_dir, None)
+    }
+
+    /// 带代理的构造：config.proxy 启用时所有请求统一走它；
+    /// 未启用时传 None，保持 reqwest 读 HTTP_PROXY 等环境变量的默认行为。
+    pub fn with_proxy(
+        url: &str,
+        username: &str,
+        password: &str,
+        remote_dir: &str,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<Self> {
         let url = url.trim().trim_end_matches('/');
         ensure!(
             url.starts_with("http://") || url.starts_with("https://"),
@@ -97,12 +112,7 @@ impl DavClient {
             .filter(|segment| !segment.is_empty())
             .map(str::to_string)
             .collect();
-        let http = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("rime-sync/0.1")
-            .build()
-            .context("build http client")?;
+        let http = Self::build_client(proxy)?;
         Ok(Self {
             http,
             root: url.to_string(),
@@ -112,7 +122,24 @@ impl DavClient {
             remote_dir: remote.to_string(),
             username: username.to_string(),
             password: password.to_string(),
+            proxy_note: proxy
+                .filter(|proxy| proxy.is_active())
+                .map(|proxy| proxy.describe()),
         })
+    }
+
+    /// test-conn / transport / preview / status / backups 共用这一个 builder。
+    pub fn build_client(proxy: Option<&ProxyConfig>) -> Result<Client> {
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent("rime-sync/0.1");
+        if let Some(proxy) = proxy {
+            if let Some(proxy) = proxy.proxy().context("build proxy")? {
+                builder = builder.proxy(proxy);
+            }
+        }
+        builder.build().context("build http client")
     }
 
     pub fn base_url(&self) -> &str {
@@ -172,8 +199,9 @@ impl DavClient {
             401 | 403 => (
                 false,
                 format!(
-                    "认证失败（HTTP {}）：请检查用户名与密码/应用密码",
-                    probe.status
+                    "认证失败（HTTP {}）：请检查用户名与密码/应用密码{}",
+                    probe.status,
+                    self.proxy_hint()
                 ),
             ),
             404 if remote_dir.is_empty() => (
@@ -258,6 +286,32 @@ impl DavClient {
         Ok(format!("{}/{}", self.base, encode_path(rel)))
     }
 
+    /// 连接失败时把「代理」写清楚：用户需要知道该查代理还是查服务器。
+    fn failure_context(&self, method: &str, url: &str) -> String {
+        match self.proxy_note.as_deref() {
+            Some(note) => format!(
+                "{method} {url} failed（已启用代理 {note}：请确认代理在运行、地址与认证正确）"
+            ),
+            None => format!("{method} {url} failed"),
+        }
+    }
+
+    /// 401/403 可能来自 WebDAV 服务器，也可能来自「凭据错误」的代理
+    /// （tinyproxy 对错误凭据返回 401 而不是 407），所以两种可能都要说清楚。
+    fn proxy_hint(&self) -> String {
+        match self.proxy_note.as_deref() {
+            Some(note) => format!("；已启用代理 {note}，若代理需要认证请一并检查代理用户名/密码"),
+            None => String::new(),
+        }
+    }
+
+    fn proxy_suffix(&self) -> String {
+        match self.proxy_note.as_deref() {
+            Some(note) => format!("（已启用代理 {note}）"),
+            None => String::new(),
+        }
+    }
+
     fn send(
         &self,
         method: Method,
@@ -279,6 +333,15 @@ impl DavClient {
             }
             match request.send() {
                 Ok(response) => {
+                    // 代理认证失败是「代理问题」，不能显示成服务器 401/403。
+                    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                        return Err(anyhow!(
+                            "代理认证失败（HTTP 407）：请检查代理用户名与密码（代理 {}）",
+                            self.proxy_note
+                                .as_deref()
+                                .unwrap_or("(未启用配置代理，可能来自环境变量)")
+                        ));
+                    }
                     if response.status().is_server_error() && attempt < MAX_RETRIES {
                         last_error = format!("HTTP {}", response.status());
                         sleep(backoff(attempt));
@@ -294,12 +357,13 @@ impl DavClient {
                         continue;
                     }
                     return Err(anyhow::Error::new(error))
-                        .with_context(|| format!("{method} {url} failed"));
+                        .with_context(|| self.failure_context(method.as_str(), url));
                 }
             }
         }
         Err(anyhow!(
-            "{method} {url} failed after {MAX_RETRIES} retries: {last_error}"
+            "{method} {url} failed after {MAX_RETRIES} retries{}: {last_error}",
+            self.proxy_suffix()
         ))
     }
 

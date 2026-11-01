@@ -247,17 +247,48 @@ Function RimeSyncSeedRimeConfig
       Call RimeSyncLog
       Goto rimesync_seed_skip_default
     rimesync_seed_default_ok:
-      CopyFiles /SILENT "$INSTDIR\resources\default.custom.yaml" "$APPDATA\Rime\default.custom.yaml"
+      CopyFiles /SILENT "$INSTDIR\\resources\default.custom.yaml" "$APPDATA\Rime\default.custom.yaml"
       DetailPrint "[rime-sync] 写入推荐 default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
       StrCpy $R3 "[rime-sync] $R2 seed default.custom.yaml"
       Call RimeSyncLog
   rimesync_seed_skip_default:
   IfFileExists "$APPDATA\Rime\weasel.custom.yaml" rimesync_seed_skip_weasel
-    CopyFiles /SILENT "$INSTDIR\resources\weasel.custom.yaml" "$APPDATA\Rime\weasel.custom.yaml"
+    CopyFiles /SILENT "$INSTDIR\\resources\weasel.custom.yaml" "$APPDATA\Rime\weasel.custom.yaml"
     DetailPrint "[rime-sync] 写入推荐 weasel.custom.yaml（候选横向排列）"
     StrCpy $R3 "[rime-sync] $R2 seed weasel.custom.yaml"
     Call RimeSyncLog
   rimesync_seed_skip_weasel:
+  ; 随包的 schema 增强配置（v 数值转换 / 中文标点直出）。当前 Windows 安装包还没有
+  ; resources\schemas 目录（需要 tauri.conf.json 的 resources 映射），所以先探测：
+  ; 有模板才写，写入规则与 default.custom.yaml 一致——用户目录里已有同名文件就跳过。
+  IfFileExists "$INSTDIR\\resources\schemas\*.*" rimesync_schema_seed_root
+    StrCpy $R3 "[rime-sync] $R2 seed skipped: no resources\schemas"
+    Call RimeSyncLog
+    Goto rimesync_schema_seed_done
+  rimesync_schema_seed_root:
+  ; 模板引用的方案必须真在 Weasel 的 data 里，否则部署会失败（同 default.custom.yaml 的守卫）。
+  Call RimeSyncFindWeaselRoot
+  StrCmp $R8 "" rimesync_schema_seed_done
+  IfFileExists "$R8\data\wubi86.schema.yaml" rimesync_schema_seed_begin rimesync_schema_seed_done
+  rimesync_schema_seed_begin:
+  Push $R5
+  Push $R6
+  FindFirst $R5 $R6 "$INSTDIR\\resources\schemas\*.custom.yaml"
+  rimesync_schema_seed_loop:
+  StrCmp $R6 "" rimesync_schema_seed_end
+    IfFileExists "$APPDATA\Rime\$R6" rimesync_schema_seed_next
+      CopyFiles /SILENT "$INSTDIR\\resources\schemas\$R6" "$APPDATA\Rime\$R6"
+      DetailPrint "[rime-sync] 写入 $R6（v 数值转换 / 中文标点直出）"
+      StrCpy $R3 "[rime-sync] $R2 seed $R6"
+      Call RimeSyncLog
+    rimesync_schema_seed_next:
+    FindNext $R5 $R6
+    Goto rimesync_schema_seed_loop
+  rimesync_schema_seed_end:
+  FindClose $R5
+  Pop $R6
+  Pop $R5
+  rimesync_schema_seed_done:
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
@@ -733,8 +764,8 @@ Function RimeSyncInstallWeaselPre
   !else
     ; 兜底：旧布局（resources 里带安装包）只在 POSTINSTALL 之后才存在，
     ; 但这里仍检查一次，便于“自定义模板先解压 resources”的场景。
-    IfFileExists "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}" 0 rimesync_pre_checked
-      StrCpy $R0 "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}"
+    IfFileExists "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}" 0 rimesync_pre_checked
+      StrCpy $R0 "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}"
     rimesync_pre_checked:
   !endif
 
@@ -1136,7 +1167,7 @@ FunctionEnd
   ; 0.6.5 顺序：系统版本 → WebView2 → 输入法 → 交还 Tauri 拷主程序。
   ; 三步都在 Tauri File 主程序之前，任何一步 Abort 都不会留下半个安装。
   Call RimeSyncCheckWindows
-  CreateDirectory "$INSTDIR\resources"
+  CreateDirectory "$INSTDIR\\resources"
   Call RimeSyncEnsureWebView2
   Call RimeSyncInstallWeaselPre
 !macroend
@@ -1198,11 +1229,11 @@ FunctionEnd
   Delete "${RIMESYNC_ORDER_LOG}"
 
   ; 旧版内嵌的小狼毫安装包与许可证文本（Tauri 也会清理 resources，这里显式兜底）
-  Delete "$INSTDIR\resources\${RIMESYNC_WEASEL_INSTALLER}"
-  Delete "$INSTDIR\resources\WEASEL-NOTICE.txt"
-  Delete "$INSTDIR\resources\GPL-3.0.txt"
-  Delete "$INSTDIR\resources\README.md"
-  RMDir "$INSTDIR\resources"
+  Delete "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}"
+  Delete "$INSTDIR\\resources\WEASEL-NOTICE.txt"
+  Delete "$INSTDIR\\resources\GPL-3.0.txt"
+  Delete "$INSTDIR\\resources\README.md"
+  RMDir "$INSTDIR\\resources"
 
   ; 2) 最后按用户选择删除本地用户数据（%APPDATA% 里的两条路径；已在上一步确认）
   Call un.RimeSyncPurgeUserData

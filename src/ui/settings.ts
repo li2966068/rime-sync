@@ -15,6 +15,7 @@ import { localLog } from "./logs";
 import { config, busy, setConfig, requireConfig } from "./state";
 import { clampBackupKeep, renderBackupKeep } from "./backups";
 import { refreshSecretStatus } from "./secret";
+import { proxyDraft, proxyValidationError, renderProxy } from "./proxy";
 import { loadDevices } from "./devices";
 import { renderDeviceKeys } from "./device_keys";
 
@@ -30,6 +31,7 @@ export function renderConfig(next: Config): void {
   // 后端序列化时跳过 password，这里可能是 undefined。
   el.pass.value = next.webdav.password ?? "";
   el.dir.value = next.webdav.remote_dir;
+  renderProxy(next.proxy);
   el.rimeDir.value = next.rime_dir ?? "";
   el.interval.value = String(next.transport_interval_minutes);
   el.deviceId.value = next.device_id;
@@ -116,10 +118,16 @@ export function settingsDraft(): Config {
       .map((line) => line.trim())
       .filter((line) => line.length > 0),
     stop_fcitx5_during_apply: el.stopFcitx5.checked,
+    proxy: proxyDraft(),
   };
 }
 
 export async function persist(draft: Config, message: string): Promise<void> {
+  const proxyError = proxyValidationError(draft.proxy);
+  if (proxyError) {
+    toast(t("proxy.invalid", { error: proxyError }));
+    throw new Error(proxyError);
+  }
   const saved = await api.setConfig(draft);
   renderConfig(saved);
   void refreshSecretStatus();

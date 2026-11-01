@@ -32,6 +32,17 @@ GNOME/Wayland 下还需要在「设置 → 键盘 → 输入源」里加入「Fc
     fcitx5-remote -r           # 重新部署
 
 注意：模板只是模板，包不会覆盖用户已有的 default.custom.yaml。
+
+v 数值转中文（v123 / v12.5）与中文标点直出（不按 Shift 出主字符，Shift + 键 取备选）
+需要额外的方案配置，模板在 /usr/share/rime-sync/defaults/schemas/（16 个随包方案各一份）：
+
+    cp /usr/share/rime-sync/defaults/schemas/*.custom.yaml ~/.local/share/fcitx5/rime/
+    fcitx5-remote -r           # 重新部署
+
+安装器只在用户目录缺同名文件时写入，升级不会改已有配置；要主动打开可以
+加 --with-schema-tweaks 重跑安装器，或
+    sudo RIMESYNC_WITH_SCHEMA_TWEAKS=1 dpkg --configure rime-sync
+关闭：删掉对应的 *.custom.yaml 再重新部署（详见 docs/INPUT-ENHANCEMENTS.md）。
 本包也不包含任何 Rime 词典数据（体积原因）；词典由 librime-data 提供，
 用户自定义词库请用 rime-sync 的 WebDAV 同步。
 

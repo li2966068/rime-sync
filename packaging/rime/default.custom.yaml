@@ -21,3 +21,25 @@ patch:
     - {schema: bopomofo}
     - {schema: bopomofo_tw}
     - {schema: bopomofo_express}
+
+  # 中文标点直出主字符表（参考用，不生效 —— 不要直接改成 punctuator/half_shape）。
+  # librime 读的 punctuator 是**方案**配置；6 个随包方案写的是
+  #   punctuator:import_preset: default
+  # 在 default.custom.yaml 里再写 punctuator/half_shape 会整体顶掉 preset 的键
+  # （实测：只剩写进去的键，逗号/问号直接不响应），所以真正生效的映射放在
+  # 每个方案自己的 custom 文件里：/usr/share/rime-sync/defaults/schemas/<schema>.custom.yaml
+  # 没装 rimesync_punct 插件时，就是靠那份内联的 punctuator 直出主字符。
+  rimesync/punctuator_primary:
+    "\\": '、'
+    '/': '、'
+    '<': '《'
+    '>': '》'
+    '[': '「'
+    ']': '」'
+    '{': '『'
+    '}': '』'
+    '|': '·'
+    '%': '％'
+    '$': '￥'
+    '*': '×'
+    '~': '～'

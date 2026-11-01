@@ -8,6 +8,7 @@ import { refreshSecretStatus } from "./ui/secret";
 import { beginSaveBackupKeep, loadBackups, createBackup, deleteBackup, pruneBackups, restoreBackup } from "./ui/backups";
 import { renderConfig, switchToTwoWay, saveRimeDir, pickRimeDir, detectRimeDir, randomDeviceId, settleDeviceChoice, settleMigrateChoice, saveSettings } from "./ui/settings";
 import { saveConnection, testConnection, probeWrite, listRemote, refreshNetwork } from "./ui/connection";
+import { syncProxyDisabled } from "./ui/proxy";
 import { renderProgress, renderReport, run } from "./ui/sync";
 import { previewSync } from "./ui/plan";
 import { conflicts, activeConflict, renderDiff, loadConflicts, resolveOne, confirmResolve, resolveFromList, resolveAll } from "./ui/conflicts";
@@ -76,6 +77,8 @@ export function bindEvents(): void {
     el.togglePass.textContent = showing ? t("conn.show") : t("conn.hide");
     el.togglePass.setAttribute("aria-pressed", String(!showing));
   });
+
+  el.proxyEnabled.addEventListener("change", syncProxyDisabled);
 
   el.saveConn.addEventListener("click", () => {
     void saveConnection().catch(() => undefined);

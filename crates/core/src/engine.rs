@@ -323,11 +323,12 @@ impl Engine {
         if !rime_dir.is_dir() {
             bail!("rime dir is not a directory: {}", rime_dir.display());
         }
-        let dav = DavClient::new(
+        let dav = DavClient::with_proxy(
             &config.webdav.url,
             &config.webdav.username,
             &config.webdav.password,
             &config.webdav.remote_dir,
+            Some(&config.proxy),
         )?;
         let index_path = state_dir.join("index.json");
         let index_existed = index_path.is_file();

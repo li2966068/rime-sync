@@ -7,6 +7,7 @@ import { localLog } from "./logs";
 import { busy, requireConfig } from "./state";
 import { refreshSecretStatus } from "./secret";
 import { renderConfig } from "./settings";
+import { proxyDraft, proxyValidationError } from "./proxy";
 
 // 连接页：WebDAV 连通性、写探测、远端列表与网络状态。
 
@@ -21,12 +22,19 @@ export function connectionDraft(): Config {
       // 留空 = 服务器根（SPEC-3 §A4）。
       remote_dir: el.dir.value.trim(),
     },
+    proxy: proxyDraft(),
   };
 }
 
 export async function saveConnection(notify = true): Promise<void> {
   try {
-    const saved = await api.setConfig(connectionDraft());
+    const draft = connectionDraft();
+    // 保存时校验代理地址：非法 URL 不落盘（后端也会再校验一次）。
+    const proxyError = proxyValidationError(draft.proxy);
+    if (proxyError) {
+      throw new Error(t("proxy.invalid", { error: proxyError }));
+    }
+    const saved = await api.setConfig(draft);
     renderConfig(saved);
     if (notify) {
       toast(t("conn.saved"));

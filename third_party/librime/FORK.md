@@ -26,8 +26,16 @@ opencc, Threads; googletest only with `-DBUILD_TEST=ON` (we build with it off).
 
 ## Local modifications
 
-None — the tree is byte-identical to upstream `1.17.0` apart from the removed
-`.git` directory and the empty `deps/` working trees.
+1. **`plugins/rimesync-extra/`** — one added plugin directory, compiled into
+   `librime` by `plugins/CMakeLists.txt` (`file(GLOB "*")` with
+   `BUILD_MERGED_PLUGINS=ON`). It provides the `rimesync_vnum` translator
+   (v-mode number to Chinese) and the `rimesync_punct` processor (immediate
+   Chinese punctuation plus a Shift alternatives menu). No upstream file is
+   patched. See `PLUGINS.md`.
+
+Apart from that added directory the tree is byte-identical to upstream
+`1.17.0`, apart from the removed `.git` directory and the empty `deps/`
+working trees.
 
 ## Build-knowledge that belongs with this pin
 

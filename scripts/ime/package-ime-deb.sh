@@ -137,6 +137,31 @@ for schema in $schema_ids; do
 done
 [ -z "$missing" ] || { echo "!! schema_list names schemas that are not packaged:$missing" >&2; exit 1; }
 echo "schema_list: $(printf '%s\n' "$schema_ids" | wc -l) schemas, all packaged"
+# ------------------------------------------------- schema custom 模板 --------
+# 16 个随包方案的 <schema>.custom.yaml：给引擎加 rimesync_vnum / rimesync_punct，
+# 并把 punctuator 半角主字符改成单值 commit。安装器（postinst / install.sh）只在
+# 用户 Rime 目录缺文件时写入，升级默认不动，见 docs/INPUT-ENHANCEMENTS.md。
+# 构建时优先现场生成（保证与 vendored schema 一致）；没有 python3+PyYAML 时退回
+# 仓库里已提交的产物（packaging/rime/schemas），数量与方案表对齐后仍然打包。
+GEN=$REPO_ROOT/scripts/ime/gen-schema-custom.py
+TEMPLATES_DST=$PKGROOT/usr/share/rime-sync/defaults/schemas
+mkdir -p "$TEMPLATES_DST"
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+  python3 "$GEN" --out "$TEMPLATES_DST" >/dev/null
+  echo "schema custom 模板：现场生成 $(find "$TEMPLATES_DST" -maxdepth 1 -name '*.custom.yaml' | wc -l) 个"
+else
+  echo "!! python3/PyYAML 不可用，改用仓库里已生成的 packaging/rime/schemas/*.custom.yaml"
+  cp -f "$REPO_ROOT"/packaging/rime/schemas/*.custom.yaml "$TEMPLATES_DST"/
+fi
+templ_count=$(find "$TEMPLATES_DST" -maxdepth 1 -name '*.custom.yaml' | wc -l)
+schema_count=$(printf '%s\n' "$schema_ids" | wc -l)
+[ "$templ_count" -eq "$schema_count" ] ||
+  { echo "!! schema custom 模板数 $templ_count != schema_list $schema_count" >&2; exit 1; }
+for schema in $schema_ids; do
+  test -f "$TEMPLATES_DST/$schema.custom.yaml" ||
+    { echo "!! 缺少 $schema.custom.yaml" >&2; exit 1; }
+done
+echo "schema custom 模板: $templ_count 个 -> /usr/share/rime-sync/defaults/schemas"
 cp "$REPO_ROOT/third_party/librime/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.librime" 2>/dev/null || true
 cp "$REPO_ROOT/third_party/fcitx5-rime/LICENSES/LGPL-2.1-or-later.txt" \
    "$PKGROOT/usr/share/doc/$PKG/copyright.fcitx5-rime" 2>/dev/null || true
@@ -230,6 +255,7 @@ ADDON_SO_REL=${ADDON_SO#"$ROOT"/}
 deb_assert "$ADDON_SO_REL" -rw-r--r-- "rimesync.so (fcitx5 config page addon)"
 deb_assert usr/share/fcitx5/addon/rimesync.conf -rw-r--r-- "rimesync.conf (addon metadata)"
 deb_assert usr/bin/rime-sync-open-setup -rwxr-xr-x "rime-sync-open-setup (action button target)"
+deb_assert usr/share/rime-sync/defaults/schemas/luna_pinyin.custom.yaml -rw-r--r--   "schema custom 模板（luna_pinyin：rimesync_vnum / rimesync_punct）"
 # Without this .mo every option of the rime addon (including the new
 # UserDataDirPath) is displayed in English even under LANG=zh_CN.UTF-8.
 deb_assert usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo -rw-r--r-- \

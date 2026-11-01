@@ -202,7 +202,8 @@ pwsh -File packaging/portable-zip.ps1                    # Windows 便携 zip
 ```
 
 系统依赖与体积预期见 [packaging/README.md](packaging/README.md)；平台机制细节见
-[docs/platform-notes.md](docs/platform-notes.md)；用户手册见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)。
+[docs/platform-notes.md](docs/platform-notes.md)；用户手册见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)；
+HTTP/HTTPS/SOCKS5 代理配置见 [docs/PROXY.md](docs/PROXY.md)。
 
 ---
 

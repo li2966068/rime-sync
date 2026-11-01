@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::index::sha256_hex;
 use crate::plan::Category;
+use crate::proxy::ProxyConfig;
 use crate::rime_dir;
 use crate::secret::SecretStore;
 
@@ -177,6 +178,8 @@ pub struct Config {
     pub webdav: WebDavConfig,
     /// 密码保存在钥匙串还是 0600 文件里。
     pub password_ref: PasswordRef,
+    /// 出站代理（0.6.8）：缺省 disabled，旧配置自动兼容。
+    pub proxy: ProxyConfig,
     pub rime_dir: Option<String>,
     pub device_id: String,
     pub transport_interval_minutes: u32,
@@ -206,6 +209,7 @@ impl Default for Config {
         Self {
             webdav: WebDavConfig::default(),
             password_ref: PasswordRef::None,
+            proxy: ProxyConfig::default(),
             rime_dir: None,
             device_id: String::new(),
             transport_interval_minutes: 10,
@@ -244,6 +248,11 @@ impl Config {
     /// 钥匙串/文件后端的 key：WebDAV 用户名。
     pub fn password_account(&self) -> String {
         self.webdav.username.trim().to_string()
+    }
+
+    /// 代理密码：内存优先（--proxy 的密码/环境变量），其次按 password_ref 从后端读。
+    pub fn load_proxy_password(&mut self, store: &dyn SecretStore) -> Result<Option<String>> {
+        self.proxy.load_password(store)
     }
 
     /// 内存里的密码优先（--dav-pass / 环境变量），其次从后端读。
@@ -439,6 +448,8 @@ impl Config {
         if !(self.webdav.url.starts_with("http://") || self.webdav.url.starts_with("https://")) {
             bail!("webdav.url must start with http:// or https://");
         }
+        // 代理启用时才校验：非法地址必须在发起任何请求之前报错（CLI 也不会先落盘）。
+        self.proxy.validate().context("invalid proxy config")?;
         if self.device_id.trim().is_empty() {
             bail!("device_id is empty; cannot identify sync subdirectory");
         }
@@ -756,6 +767,34 @@ mod tests {
             let mode = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GUI 的 cmd_set_config 会把刚输入的代理密码随 Config 传进来（IPC），
+    /// 但落盘时必须被 skip_serializing 丢弃；重新加载后密码只能来自密钥后端。
+    #[test]
+    fn proxy_password_flows_through_ipc_but_never_to_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-proxy-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.json");
+        let ipc = r#"{"webdav":{"url":"http://127.0.0.1:1"},"device_id":"devA","proxy":{"enabled":true,"url":"http://127.0.0.1:7890","username":"alice","password":"typed-secret","password_ref":"none"}}"#;
+        let config: Config = serde_json::from_str(ipc).expect("ipc json");
+        assert_eq!(config.proxy.password, "typed-secret");
+        config.save(&path).expect("save");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("typed-secret"), "代理密码不能落盘: {raw}");
+        assert!(raw.contains("\"proxy\""), "{raw}");
+        let loaded = Config::load(&path).expect("load");
+        assert!(loaded.proxy.password.is_empty());
+        assert!(loaded.proxy.enabled);
+        assert_eq!(loaded.proxy.url, "http://127.0.0.1:7890");
         fs::remove_dir_all(&dir).ok();
     }
 

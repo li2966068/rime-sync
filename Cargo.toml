@@ -16,7 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 quick-xml = "0.38"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# socks：让 reqwest 能构造 socks5/socks5h 代理（0.6.8 代理支持）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks"] }
 clap = { version = "4", features = ["derive"] }
 serde_yaml = "0.9"
 tracing = "0.1"

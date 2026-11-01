@@ -74,6 +74,34 @@
               <input id="dav-dir" type="text" spellcheck="false" data-i18n-placeholder="conn.dirPlaceholder" />
               <p class="hint" data-i18n="conn.dirHint"></p>
             </div>
+
+            <div class="proxy-section">
+              <h3 class="proxy-title" data-i18n="proxy.title">代理</h3>
+              <div class="watch-row">
+                <label class="switch">
+                  <input type="checkbox" id="proxy-enabled" />
+                  <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                  <span data-i18n="proxy.enable">启用代理</span>
+                </label>
+              </div>
+              <div class="field">
+                <label for="proxy-url" data-i18n="proxy.url">代理地址</label>
+                <input id="proxy-url" type="text" spellcheck="false" autocomplete="off" data-i18n-placeholder="proxy.urlPlaceholder" />
+                <p class="hint" data-i18n="proxy.urlHint"></p>
+              </div>
+              <div class="grid-2">
+                <div class="field">
+                  <label for="proxy-user" data-i18n="proxy.user">代理用户名（可选）</label>
+                  <input id="proxy-user" type="text" spellcheck="false" autocomplete="username" />
+                </div>
+                <div class="field">
+                  <label for="proxy-pass" data-i18n="proxy.pass">代理密码（可选）</label>
+                  <input id="proxy-pass" type="password" autocomplete="current-password" />
+                  <p class="hint" data-i18n="proxy.passHint"></p>
+                </div>
+              </div>
+            </div>
+
             <div class="actions">
               <button class="primary" id="btn-save-conn" type="button" data-i18n="conn.save">保存配置</button>
               <button class="secondary" id="btn-test" type="button" data-i18n="conn.test">测试连接</button>

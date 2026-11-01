@@ -1,10 +1,18 @@
 //! 自动更新：薄转发 tauri-plugin-updater。
 //!
 //! 端点与公钥来自 tauri.conf.json；本模块只负责把结果/错误文本化。
+//!
+//! 代理：更新器有独立的 reqwest client，插件提供 `UpdaterBuilder::proxy(Url)`。
+//! http/https 代理（含 basic 认证）可以用同一份 proxy 配置接进来；socks 代理
+//! 会跳过（插件内置的 reqwest 没有编译 socks feature），此时检查更新可能直连。
 
+use rime_sync_core::proxy::ProxyConfig;
 use serde::Serialize;
-use tauri::AppHandle;
-use tauri_plugin_updater::UpdaterExt;
+use std::sync::Arc;
+use tauri::{AppHandle, State};
+use tauri_plugin_updater::{Updater, UpdaterExt};
+
+use crate::AppState;
 
 #[derive(Serialize)]
 pub struct UpdateView {
@@ -22,12 +30,67 @@ pub struct InstallView {
     pub message: String,
 }
 
+/// 更新器只接受一个 URL：把 proxy 配置翻译成带 userinfo 的 URL（reqwest 会解析成
+/// basic 认证）。socks 方案返回 None——留给文档里的已知限制。
+fn updater_proxy_url(proxy: &ProxyConfig) -> Option<tauri::Url> {
+    let spec = proxy.spec().ok()?;
+    if spec.kind.is_socks() {
+        return None;
+    }
+    let mut url = tauri::Url::parse(&spec.to_url()).ok()?;
+    let username = proxy.username.trim();
+    if !username.is_empty() {
+        url.set_username(username).ok()?;
+        url.set_password(Some(&proxy.password)).ok()?;
+    }
+    Some(url)
+}
+
+/// 读配置会探测密钥后端（最多 2s）：放到阻塞线程里，别卡 async runtime。
+fn proxy_for_updater(app: &AppHandle, inner: &Arc<crate::Inner>) -> Option<tauri::Url> {
+    match crate::ensure_config(app, inner) {
+        Ok(config) => {
+            if !config.proxy.enabled {
+                return None;
+            }
+            let url = updater_proxy_url(&config.proxy);
+            if url.is_none() {
+                crate::push_log(
+                    inner,
+                    "更新检查：代理是 socks 类型，更新器不支持（内置 client 无 socks），本次可能直连",
+                );
+            }
+            url
+        }
+        Err(error) => {
+            crate::push_log(inner, format!("更新检查：读取代理配置失败（按直连处理）：{error}"));
+            None
+        }
+    }
+}
+
+async fn build_updater(app: &AppHandle, state: &AppState) -> Result<Updater, String> {
+    let app_for_config = app.clone();
+    let inner = Arc::clone(&state.0);
+    let proxy = tauri::async_runtime::spawn_blocking(move || proxy_for_updater(&app_for_config, &inner))
+        .await
+        .map_err(|error| format!("更新器初始化失败：{error}"))?;
+    let mut builder = app.updater_builder();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("更新器不可用：{error}"))
+}
+
 #[tauri::command]
-pub async fn cmd_check_update(app: AppHandle) -> Result<UpdateView, String> {
+pub async fn cmd_check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateView, String> {
     let current = app.package_info().version.to_string();
-    let updater = app
-        .updater()
-        .map_err(|error| format!("更新器不可用：{error}"))?;
+    let updater = build_updater(&app, &state).await?;
     match updater.check().await {
         Ok(Some(update)) => Ok(UpdateView {
             available: true,
@@ -48,10 +111,11 @@ pub async fn cmd_check_update(app: AppHandle) -> Result<UpdateView, String> {
 }
 
 #[tauri::command]
-pub async fn cmd_install_update(app: AppHandle) -> Result<InstallView, String> {
-    let updater = app
-        .updater()
-        .map_err(|error| format!("更新器不可用：{error}"))?;
+pub async fn cmd_install_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<InstallView, String> {
+    let updater = build_updater(&app, &state).await?;
     let Some(update) = updater
         .check()
         .await

@@ -2,7 +2,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};
 use rime_sync_core::config::{self, Config};
@@ -49,6 +49,12 @@ struct Cli {
     /// 服务商预设：openlist / alist / jianguoyun / nextcloud / synology / custom（会归一化 dav-url）
     #[arg(long, global = true, value_name = "PRESET")]
     preset: Option<String>,
+    /// 走代理（http:// / https:// / socks5:// / socks5h://），覆盖配置文件里的 proxy 段
+    #[arg(long, global = true, value_name = "URL")]
+    proxy: Option<String>,
+    /// 本次不用配置文件里的代理：覆盖 proxy.enabled（HTTP_PROXY 等环境变量仍按 reqwest 默认生效）
+    #[arg(long = "no-proxy", global = true)]
+    no_proxy: bool,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -251,6 +257,21 @@ fn run(cli: Cli) -> Result<()> {
         cli.dav_pass.as_deref(),
         cli.dav_dir.as_deref(),
     );
+    if cli.proxy.is_some() && cli.no_proxy {
+        bail!("--proxy 与 --no-proxy 不能同时使用");
+    }
+    if let Some(url) = cli.proxy.as_deref() {
+        config.proxy.enabled = true;
+        config.proxy.url = url.trim().to_string();
+        // 解析失败立即终止：既不落盘也不发起任何请求。
+        config
+            .proxy
+            .validate()
+            .with_context(|| format!("代理配置无效：{url}"))?;
+    } else if cli.no_proxy {
+        config.proxy.enabled = false;
+    }
+
     if let Some(raw) = cli.preset.as_deref() {
         match Preset::from_id(raw) {
             Some(preset) => {
@@ -297,6 +318,9 @@ fn run(cli: Cli) -> Result<()> {
     if cli.command.needs_credentials() {
         if let Err(error) = config.load_password(secrets.store()) {
             eprintln!("warning: 读取已保存密码失败（继续，按无密码/环境变量处理）: {error:#}");
+        }
+        if let Err(error) = config.load_proxy_password(secrets.store()) {
+            eprintln!("warning: 读取已保存的代理密码失败（继续，按无代理认证处理）: {error:#}");
         }
     }
 
@@ -718,12 +742,19 @@ fn prepare_sync(
 }
 
 fn dav_client(config: &Config) -> Result<DavClient> {
-    DavClient::new(
+    DavClient::with_proxy(
         &config.webdav.url,
         &config.webdav.username,
         &config.webdav.password,
         &config.webdav.remote_dir,
+        Some(&config.proxy),
     )
+    .with_context(|| {
+        format!(
+            "初始化 WebDAV 客户端失败（代理 {}）",
+            config.proxy.describe()
+        )
+    })
 }
 
 fn resolve_rime_dir(explicit: Option<&Path>, config: &Config) -> Result<PathBuf> {

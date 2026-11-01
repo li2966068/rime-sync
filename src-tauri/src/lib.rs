@@ -16,6 +16,7 @@ use rime_sync_core::config::{self, Config};
 use rime_sync_core::engine::{Engine, PlanReport, Progress, ProgressSink, Report};
 use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::platform;
+use rime_sync_core::proxy::PROXY_PASSWORD_ACCOUNT;
 use rime_sync_core::retry::RetryState;
 use rime_sync_core::rime_dir;
 use rime_sync_core::secret::{self, SecretSelection};
@@ -134,6 +135,9 @@ pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, Stri
     if let Err(error) = config.load_password(selection.store.as_ref()) {
         push_log(inner, format!("读取密码失败：{error:#}"));
     }
+    if let Err(error) = config.load_proxy_password(selection.store.as_ref()) {
+        push_log(inner, format!("读取代理密码失败：{error:#}"));
+    }
     Ok(config)
 }
 
@@ -190,11 +194,12 @@ pub(crate) fn dav_client(app: &AppHandle, inner: &Inner) -> Result<(Config, DavC
     if config.webdav.url.trim().is_empty() {
         return Err("请先填写 WebDAV 地址".to_string());
     }
-    let client = DavClient::new(
+    let client = DavClient::with_proxy(
         &config.webdav.url,
         &config.webdav.username,
         &config.webdav.password,
         &config.webdav.remote_dir,
+        Some(&config.proxy),
     )
     .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
     Ok((config, client))
@@ -280,6 +285,16 @@ fn cmd_set_config(
         .rime_dir
         .map(|dir| dir.trim().to_string())
         .filter(|dir| !dir.is_empty());
+    config.proxy.url = config.proxy.url.trim().to_string();
+    config.proxy.username = config.proxy.username.trim().to_string();
+    // 非法代理地址必须在这里拒绝：错误信息直接回到界面，配置文件保持原样。
+    // 未启用时允许地址为空/不完整（用户可能刚清空还没填新的）。
+    if config.proxy.is_active() {
+        config
+            .proxy
+            .spec()
+            .map_err(|error| format!("代理配置无效：{error:#}"))?;
+    }
     // 前端可能传来任意值（含 0）：统一夹到 1..=100 再落盘。
     config.backup_keep = config::clamp_backup_keep(config.backup_keep);
 
@@ -336,6 +351,27 @@ fn cmd_set_config(
         push_log(&state.0, "密码已写入系统密码后端");
     }
 
+    // 代理密码：与 WebDAV 同一套语义——前端只拿得到空字段，空 = 沿用后端已有值。
+    let typed_proxy_password = std::mem::take(&mut config.proxy.password);
+    if typed_proxy_password.is_empty() {
+        if config.proxy.password_ref != config::PasswordRef::None {
+            if let Ok(Some(secret)) = selection.store.get(PROXY_PASSWORD_ACCOUNT) {
+                config.proxy.password = secret;
+            }
+        }
+    } else {
+        config
+            .proxy
+            .store_password(selection.store.as_ref(), &typed_proxy_password)
+            .map_err(|error| format!("保存代理密码失败：{error:#}"))?;
+        push_log(&state.0, "代理密码已写入系统密码后端");
+    }
+    // 拿到「最终生效」的密码后再校验一次（用户名缺失时密码不会被发出去）。
+    config
+        .proxy
+        .validate()
+        .map_err(|error| format!("代理配置无效：{error:#}"))?;
+
     config
         .save(&path)
         .map_err(|error| format!("写入配置失败：{error:#}"))?;
@@ -389,11 +425,12 @@ fn cmd_test_connection(
     if config.webdav.url.trim().is_empty() {
         return Err("请先填写 WebDAV 地址".to_string());
     }
-    let client = DavClient::new(
+    let client = DavClient::with_proxy(
         &config.webdav.url,
         &config.webdav.username,
         &config.webdav.password,
         &config.webdav.remote_dir,
+        Some(&config.proxy),
     )
     .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
     // SPEC-3 §A3：远端目录不存在是正常状态，只有连不上/认证失败才 ok=false。

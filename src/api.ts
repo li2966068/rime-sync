@@ -7,6 +7,16 @@ export interface WebDavConfig {
   remote_dir: string;
 }
 
+/** 出站代理（0.6.8）：不做绕过列表，启用后所有 WebDAV 请求统一走它。 */
+export interface ProxyConfig {
+  enabled: boolean;
+  url: string;
+  username: string;
+  /** 后端序列化时跳过；留空 = 沿用后端已保存的密码。 */
+  password?: string;
+  password_ref: "keyring" | "file" | "none";
+}
+
 export interface SyncKinds {
   userdict: boolean;
   custom_yaml: boolean;
@@ -29,6 +39,7 @@ export interface AutostartState {
 
 export interface Config {
   webdav: WebDavConfig;
+  proxy: ProxyConfig;
   password_ref: "keyring" | "file" | "none";
   rime_dir: string | null;
   device_id: string;

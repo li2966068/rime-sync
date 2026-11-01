@@ -483,11 +483,12 @@ pub fn cmd_check_device_id(
             remote_error: None,
         });
     }
-    let client = DavClient::new(
+    let client = DavClient::with_proxy(
         &config.webdav.url,
         &config.webdav.username,
         &config.webdav.password,
         &config.webdav.remote_dir,
+        Some(&config.proxy),
     )
     .map_err(|error| format!("WebDAV 配置无效：{error:#}"))?;
     match client.propfind(&format!("sync/{id}"), 0) {

@@ -16,3 +16,7 @@ node_modules/
 .cache/
 *.7z
 .DS_Store
+
+# Keep the vendored rimesync-extra plugin: upstream ignores plugins/*/
+# because it expects third-party plugins to be symlinked checkouts.
+!plugins/rimesync-extra/

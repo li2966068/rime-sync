@@ -1,0 +1,100 @@
+# 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
+# schema: terra_pinyin
+# 引擎顺序抄自 third_party/rime-data/rime-terra-pinyin/terra_pinyin.schema.yaml（translators 首位加 rimesync_vnum；rimesync_punct 插在 key_binder/punctuator/selector 之前）
+# 关闭：删掉本文件后重新部署；或删掉下面 patch 里的 rimesync_vnum / rimesync_punct。
+patch:
+  engine/processors:
+    - ascii_composer
+    - recognizer
+    - rimesync_punct
+    - rimesync_vselect
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  engine/translators:
+    - rimesync_vnum
+    - punct_translator
+    - table_translator@custom_phrase
+    - reverse_lookup_translator
+    - script_translator
+  # vnum 需要 recognizer 把 v1234 当成一个片段（v 在拼音方案里不是合法音节）
+  recognizer/patterns/vnum: '^[vV][0-9.]*$'
+  # punctuator 整段内联（原 import_preset: default 已展开并去掉 import_preset）：
+  # librime 的 include 合并不能把 preset 里的候选 list 覆盖成 {commit: X}
+  # （实测报 incompatible node type / failed to merge tree），只能整体内联。
+  # 下面只改 half_shape 的主字符，其余键与方案/preset 完全一致。
+  punctuator:
+    full_shape:
+      ' ': {commit: 　}
+      ',': {commit: ，}
+      .: {commit: 。}
+      <: [《, 〈, «, ‹]
+      '>': [》, 〉, », ›]
+      /: [／, ÷]
+      '?': {commit: ？}
+      ;: {commit: ；}
+      ':': {commit: ：}
+      '''':
+        pair: [‘, ’]
+      '"':
+        pair: [“, ”]
+      \: [、, ＼]
+      '|': [·, ｜, §, ¦]
+      '`': ｀
+      '~': ～
+      '!': {commit: ！}
+      '@': [＠, ☯]
+      '#': [＃, ⌘]
+      '%': [％, °, ℃]
+      $: [￥, $, €, £, ¥, ¢, ¤]
+      ^: {commit: ……}
+      '&': ＆
+      '*': [＊, ·, ・, ×, ※, ❂]
+      (: （
+      ): ）
+      '-': －
+      _: ——
+      +: ＋
+      '=': ＝
+      '[': [「, 【, 〔, ［]
+      ']': [」, 】, 〕, ］]
+      '{': [『, 〖, ｛]
+      '}': [』, 〗, ｝]
+    half_shape:
+      ',': {commit: ，}
+      .: {commit: 。}
+      <: {commit: 《}
+      '>': {commit: 》}
+      /: [、, /, ／, ÷]
+      '?': {commit: ？}
+      ;: {commit: ；}
+      ':': {commit: ：}
+      '''':
+        pair: [‘, ’]
+      '"':
+        pair: [“, ”]
+      \: {commit: 、}
+      '|': {commit: ·}
+      '`': '`'
+      '~': {commit: ～}
+      '!': {commit: ！}
+      '@': '@'
+      '#': '#'
+      '%': {commit: ％}
+      $: {commit: ￥}
+      ^: {commit: ……}
+      '&': '&'
+      '*': {commit: ×}
+      (: （
+      ): ）
+      '-': '-'
+      _: ——
+      +: +
+      '=': '='
+      '[': {commit: 「}
+      ']': {commit: 」}
+      '{': {commit: 『}
+      '}': {commit: 』}

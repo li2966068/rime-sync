@@ -28,6 +28,9 @@
 # 选项：
 #   --payload DIR     指定安装包根目录
 #   --upgrade-vendor  全量包：允许把系统已装（ii）的依赖升级到内置版本（默认不动系统库）
+#   --with-schema-tweaks
+#                     升级场景也写入随包 schema 增强配置（v 数值转换 / 中文标点直出）；
+#                     默认只在首次安装（还没有 default.custom.yaml）时写，升级不动老配置
 #   --uninstall       交给统一卸载脚本（--yes/--keep-ime/--purge-data 见下）
 #
 # 非全量包（thin）离线时的行为：apt 失败即停止，打印手动步骤并提示改用全量包。
@@ -40,6 +43,7 @@ ASSUME_YES=0
 KEEP_IME=0
 PURGE_DATA=0
 UPGRADE_VENDOR=0
+WITH_SCHEMA_TWEAKS=0
 [ "${RIME_SYNC_UPGRADE_VENDOR:-0}" = "1" ] && UPGRADE_VENDOR=1
 
 usage() {
@@ -56,11 +60,17 @@ while [ $# -gt 0 ]; do
     --keep-ime) KEEP_IME=1 ;;
     --purge-data) PURGE_DATA=1 ;;
     --upgrade-vendor) UPGRADE_VENDOR=1 ;;
+    --with-schema-tweaks) WITH_SCHEMA_TWEAKS=1 ;;
     -h|--help) usage ;;
     *) echo "未知参数: $1（--help 查看用法）" >&2; exit 64 ;;
   esac
   shift
 done
+
+# postinst 会继承环境变量：升级场景要不要强制写 schema 增强配置由它决定。
+if [ "$WITH_SCHEMA_TWEAKS" -eq 1 ]; then
+  export RIMESYNC_WITH_SCHEMA_TWEAKS=1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "需要 root 权限。请用：sudo $0 $*" >&2
@@ -542,6 +552,38 @@ say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")（覆盖升级，�
 install_local_deb "$SYNC_DEB" "同步程序"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
 
+# ------------------------------------------------- schema 增强配置模板
+# /usr/share/rime-sync/defaults/schemas/ 里是随包 16 个方案的 <schema>.custom.yaml：
+# 给引擎加 rimesync_vnum / rimesync_punct，并把 punctuator 主字符改成单值 commit。
+# 规则与 default.custom.yaml 相同：用户目录里已有同名文件一律跳过，绝不覆盖。
+seed_schema_customs() { # $1=Rime 用户目录
+  local dir=$1 tpl base wrote=0 kept=0 no_data=0 names=""
+  [ -d /usr/share/rime-sync/defaults/schemas ] || return 0
+  for tpl in /usr/share/rime-sync/defaults/schemas/*.custom.yaml; do
+    [ -f "$tpl" ] || continue
+    base=$(basename "$tpl")
+    # 方案数据不在随包 rime-data 里时跳过：写了也没有对应 schema 可部署。
+    if [ ! -f "/usr/share/rime-data/${base%.custom.yaml}.schema.yaml" ]; then
+      no_data=$((no_data + 1))
+      continue
+    fi
+    if [ -f "$dir/$base" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if install -m 600 "$tpl" "$dir/$base" 2>/dev/null; then
+      chown "$TARGET_USER" "$dir/$base" 2>/dev/null || true
+      wrote=$((wrote + 1))
+      names="$names $base"
+    fi
+  done
+  say "schema 增强配置：写入 $wrote 个，已存在跳过 $kept 个，缺方案数据跳过 $no_data 个"
+  [ -n "$names" ] && say "  新写入：$names"
+  printf '%s wrote=%d kept=%d no_data=%d dir=%s\n' \
+    "$(date '+%F %T')" "$wrote" "$kept" "$no_data" "$dir" >>"$LOGDIR/schema-tweaks.log" 2>/dev/null || true
+  return 0
+}
+
 # --------------------------------------------------- recommended user config
 # 只在调用者自己的 Rime 目录缺文件时写入，不覆盖用户已有配置。
 TARGET_USER=${SUDO_USER:-}
@@ -555,12 +597,20 @@ if [ -n "$TARGET_USER" ] && [ -f /usr/share/rime-sync/defaults/default.custom.ya
       # 模板列了 16 个随包方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
       # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。
       say "跳过推荐输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 16 个方案会导致部署失败"
+      say "schema 增强配置同样跳过（没有随包方案数据）：v 数值转换 / 中文标点直出未启用"
     elif [ ! -f "$RIME_USER_DIR/default.custom.yaml" ]; then
       install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null &&
         chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
       say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
+      # 首次安装：16 个方案的 schema 增强配置随默认配置一起写入（缺文件才写）。
+      seed_schema_customs "$RIME_USER_DIR"
     else
       say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
+      if [ "$WITH_SCHEMA_TWEAKS" -eq 1 ]; then
+        seed_schema_customs "$RIME_USER_DIR"
+      else
+        say "schema 增强配置未写入（升级默认不动已有配置）；需要时重跑：sudo $0 --with-schema-tweaks"
+      fi
     fi
   fi
 fi
