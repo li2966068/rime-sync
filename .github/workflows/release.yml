@@ -567,7 +567,7 @@ jobs:
             third_party/librime/deps/opencc/build
             third_party/librime/build
           key: >-
-            ${{ runner.os }}-librime-1.17.0-glog-v0.6.0-leveldb-1.23-yamlcpp-0.8.0-marisa-v0.2.6-opencc-ver.1.1.7-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}
+            ${{ runner.os }}-librime-1.17.0-pins1-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}
           restore-keys: |
             ${{ runner.os }}-librime-1.17.0-
 

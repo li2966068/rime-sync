@@ -81,14 +81,17 @@ $ErrorActionPreference = 'Stop'
 # ---- deps pin：与 third_party/librime/.gitmodules 声明的 6 个路径一一对应 ----
 # tag 已按上游仓库的实际命名核对过（marisa-trie 是 v0.2.6、OpenCC 是 ver.1.1.7）。
 # googletest 只在 -WithTests 时真克隆；其余 5 个是 rime.dll 的必需依赖。
+# 版本 = librime 1.17.0 的 .gitmodules 里锁定的子模块提交（与上游完全一致）。
+# 用提交而不是 tag：marisa-trie 的 v0.2.6 没有 CMakeLists.txt（只有 autotools），
+# 上游锁定的提交才带 CMake 支持，build.bat 才能 cmake 它。
 $script:DepsPins = [ordered]@{
-    'glog'        = @{ Url = 'https://github.com/google/glog.git';        Tag = 'v0.6.0' }
-    'leveldb'     = @{ Url = 'https://github.com/google/leveldb.git';     Tag = '1.23' }
-    'yaml-cpp'    = @{ Url = 'https://github.com/jbeder/yaml-cpp.git';    Tag = '0.8.0' }
-    'marisa-trie' = @{ Url = 'https://github.com/s-yata/marisa-trie.git'; Tag = 'v0.2.6' }
-    'opencc'      = @{ Url = 'https://github.com/BYVoid/OpenCC.git';      Tag = 'ver.1.1.7' }
+    'glog'        = @{ Url = 'https://github.com/google/glog.git';        Tag = 'v0.6.0';      Commit = '7b134a5c82c0c0b5698bb6bf7a835b230c5638e4' }
+    'leveldb'     = @{ Url = 'https://github.com/google/leveldb.git';     Tag = '1.23';        Commit = '99b3c03b3284f5886f9ef9a4ef703d57373e61be' }
+    'yaml-cpp'    = @{ Url = 'https://github.com/jbeder/yaml-cpp.git';    Tag = '0.8.0';       Commit = '2f86d13775d119edbb69af52e5f566fd65c6953b' }
+    'marisa-trie' = @{ Url = 'https://github.com/s-yata/marisa-trie.git'; Tag = 'v0.2.6+cmake'; Commit = '3e87d53b78e15f2f43783d5e376561a8c9722051' }
+    'opencc'      = @{ Url = 'https://github.com/BYVoid/OpenCC.git';      Tag = 'ver.1.1.7';   Commit = '556ed22496d650bd0b13b6c163be9814637970ae' }
 }
-$script:GoogletestPin = @{ Url = 'https://github.com/google/googletest.git'; Tag = 'v1.14.0' }
+$script:GoogletestPin = @{ Url = 'https://github.com/google/googletest.git'; Tag = 'v1.14.0'; Commit = 'f8d7d77c06936315286eb55f8de22cd23c188571' }
 
 # 组件名 = plugins/rimesync-extra/rimesync_extra_module.cc 里 registry 注册的字符串
 $script:LibrimeComponents = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
@@ -315,7 +318,11 @@ function Get-DepDir {
 
 function Test-DepCloned {
     param([Parameter(Mandatory = $true)][string]$Name)
-    return (Test-Path -LiteralPath (Join-Path (Get-DepDir -Name $Name) 'CMakeLists.txt'))
+    $dir = Get-DepDir -Name $Name
+    if (Test-Path -LiteralPath (Join-Path $dir 'CMakeLists.txt')) { return $true }
+    # 少数依赖的某个历史 tag 只有 autotools；只要目录里有源码入口就算克隆成功，
+    # 真正的可用性由后面的 cmake configure 判断。
+    return (Test-Path -LiteralPath (Join-Path $dir 'configure.ac'))
 }
 
 function Get-GitHead {
@@ -379,10 +386,31 @@ function Ensure-DepSource {
     # 而两者都只在 LEVELDB_BUILD_TESTS / BENCHMARKS 打开时才 add_subdirectory，
     # 我们把两个都关掉，所以不需要 --recurse-submodules。
     $code = 0
-    & git clone --depth 1 --branch $pin.Tag $pin.Url $dir 2>&1 | Out-Host
-    try { $code = [int]$LASTEXITCODE } catch { $code = 0 }
+    if ($pin.Commit) {
+        # 按提交取：git init + fetch --depth 1 <sha> + checkout FETCH_HEAD（GitHub 支持按 SHA 浅取）。
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Push-Location -LiteralPath $dir
+        try {
+            & git init -q . 2>&1 | Out-Host
+            & git remote add origin $pin.Url 2>&1 | Out-Host
+            & git fetch --depth 1 origin $pin.Commit 2>&1 | Out-Host
+            try { $code = [int]$LASTEXITCODE } catch { $code = 0 }
+            if ($code -eq 0) { & git checkout -q FETCH_HEAD 2>&1 | Out-Host }
+        } finally { Pop-Location }
+    }
     if (($code -ne 0) -or (-not (Test-DepCloned -Name $Name))) {
-        throw ("deps/$Name 克隆失败（exit $code）：" + $pin.Url + ' @ ' + $pin.Tag + ' -> ' + $dir)
+        # 退路：整库克隆再切到目标提交。
+        Write-Warning ("[deps] $Name 按提交浅取失败（exit $code），改为完整克隆 " + $pin.Url)
+        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+        & git clone $pin.Url $dir 2>&1 | Out-Host
+        try { $code = [int]$LASTEXITCODE } catch { $code = 0 }
+        if ($code -eq 0 -and $pin.Commit) {
+            Push-Location -LiteralPath $dir
+            try { & git checkout -q $pin.Commit 2>&1 | Out-Host } finally { Pop-Location }
+        }
+        if (($code -ne 0) -or (-not (Test-DepCloned -Name $Name))) {
+            throw ("deps/$Name 克隆失败（exit $code）：" + $pin.Url + ' @ ' + $pin.Commit + ' -> ' + $dir)
+        }
     }
     Write-Host ("[deps] $Name = " + $pin.Tag + ' @ ' + (Get-GitHead -Dir $dir))
 }
