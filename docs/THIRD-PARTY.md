@@ -32,7 +32,8 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
 |---|---|---|
 | Visual Studio | 2022（v143 / msvc-14.3） | 上游 `weasel.sln` 用 MSBuild 构建 |
 | boost | 1.84.0 | b2 静态运行时（`stage\lib`） |
-| librime | 预编译 msvc 包，默认 pin `1.13.1` | 由上游 `get-rime.ps1 -use dev` 拉取 |
+| librime | **1.17.0 自建**（`third_party/librime` + 合并 `rimesync-extra`） | 由 `scripts/ime/build-librime-win.ps1` 从源码编，见第 6 节 |
+| librime（应急退路） | 预编译 msvc 包，pin `1.13.1` | 上游 `get-rime.ps1 -use dev`（`-LibrimeSource prebuilt`，**不含插件**） |
 | NSIS | 3.08 | 跑上游 `output/install.nsi` |
 
 > 注意：Weasel 0.17.4 在 Weasel 层**没有 CMake 构建**（CMake 只用于 librime 子模块）；
@@ -198,3 +199,55 @@ rime-sync 的界面是 WebView（Tauri v2），Windows 上需要 Microsoft Edge 
 
 - 图标：见 `packaging/assets/README.md`。
 - Rust / 前端依赖的许可证由 Cargo / pnpm 各自的元数据描述，未在此逐一列举。
+
+## 6. librime 1.17.0 与它的 Windows 构建依赖（0.6.9 起）
+
+0.6.9 起 Windows 版的输入法引擎不再用 rime/librime 的官方预编译包，而是由本仓库用 vendored
+源码自建 —— 只有把 `plugins/rimesync-extra` **合并进** `rime.dll`，v 模式 / 标点 Shift 备选 /
+a-h 选词 才能在 Weasel 里生效（官方预编译包里没有外部插件加载逻辑）。
+
+| 项 | 值 |
+|---|---|
+| 组件 | librime（Rime 输入法引擎，产物 `rime.dll` / `rime.lib`） |
+| 版本 | 1.17.0（pinned tag `1.17.0` / commit `33e78140250125871856cdc5b42ddc6a5fcd3cd4`，见 `third_party/librime/FORK.md`） |
+| 构建来源 | 本仓库 `third_party/librime`（vendored，含本仓库新增的 `plugins/rimesync-extra`） |
+| 构建脚本 | `scripts/ime/build-librime-win.ps1`（由 `build-weasel.ps1` 与 `release.yml` 调用） |
+| 上游源码 | <https://github.com/rime/librime/tree/1.17.0> |
+| 许可证 | BSD-3-Clause（`third_party/librime/LICENSE`） |
+| 本仓库改动 | 只新增 `plugins/rimesync-extra/`（不 patch 上游文件），见 `third_party/librime/FORK.md` |
+| 构建产物 | `third_party/weasel/output/rime.dll`、`output/Win32/rime.dll`（不入库） |
+
+### 6.1 依赖来源（`third_party/librime/deps/`，按 tag 浅克隆）
+
+`.gitmodules` 声明了 6 个目录，但 vendored 树里它们是空的（见 FORK.md）。Windows 自建时
+`build-librime-win.ps1` 按下列 tag 浅克隆，全部静态链接进 `rime.dll`：
+
+| deps 目录 | 上游仓库 | tag | 许可证 | 许可证文件（克隆后） |
+| --- | --- | --- | --- | --- |
+| `glog` | <https://github.com/google/glog> | `v0.6.0` | BSD-3-Clause | `COPYING` |
+| `leveldb` | <https://github.com/google/leveldb> | `1.23` | BSD-3-Clause | `LICENSE` |
+| `yaml-cpp` | <https://github.com/jbeder/yaml-cpp> | `0.8.0` | MIT | `LICENSE` |
+| `marisa-trie` | <https://github.com/s-yata/marisa-trie> | `v0.2.6` | BSD（含 LGPL 片段） | `COPYING` / `COPYING.LGPL` |
+| `opencc` | <https://github.com/BYVoid/OpenCC> | `ver.1.1.7` | Apache-2.0 | `LICENSE` |
+| `googletest` | <https://github.com/google/googletest> | `v1.14.0` | BSD-3-Clause | 仅 `-WithTests` 时克隆，不参与发布产物 |
+
+- Boost 1.84.0 来自 Weasel 的构建依赖（`third_party/weasel/deps/boost_1_84_0`，
+  Boost Software License 1.0）：两个项目共用同一份源码与 `stage\lib`。
+- 这些 deps 都不入库（`third_party/librime/deps/` 在 `.gitignore` 里）：源码按 tag 可复现，
+  许可证文本随克隆落在构建机本地。发布物是静态链接后的 `rime.dll`，不再分发 deps 的 DLL。
+- 合规要点：`rime.dll` 是 BSD-3-Clause / Apache-2.0 / MIT 等许可代码的**静态链接**产物，
+  各许可要求保留版权与许可声明。上游许可全文：`third_party/librime/LICENSE`
+  （BSD-3-Clause，含 librime 自身与 Rime 项目声明）；deps 的许可全文在构建机的
+  `third_party/librime/deps/<name>/LICENSE*`（不入库，按上表 tag 可随时复现）。
+  Apache-2.0（OpenCC）与 LGPL 片段（marisa-trie）都不要求公开本仓库源码，但要求保留声明
+  与（对 LGPL 部分）允许替换 —— 这里 deps 是静态链接，若需要替换请用
+  `scripts/ime/build-librime-win.ps1` 重编 `rime.dll`（源码与脚本都在仓库里）。
+
+### 6.2 与官方预编译包的区别（可验证）
+
+| 判据 | 自建（默认） | 官方预编译 1.13.1（应急） |
+| --- | --- | --- |
+| `rime.dll` 里 `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` | 有（UTF-8 明文） | 无 |
+| `RimeGetVersion()` | 1.17.0 | 1.13.1 |
+| 安装包里两个架构的 `rime.dll` | 都是自建 | 都是官方包 |
+| 断言位置 | `build-librime-win.ps1`、`build-weasel.ps1`、`release.yml` 的 `assert rime.dll carries rimesync components`、`.github/scripts/verify-artifacts.sh` | — |

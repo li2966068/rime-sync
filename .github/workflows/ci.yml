@@ -184,7 +184,9 @@ jobs:
             packaging/linux/postrm \
             packaging/linux/test/Dockerfile \
             packaging/linux/test/verify-in-container.sh \
-            packaging/windows/fetch-weasel.ps1; do
+            packaging/windows/fetch-weasel.ps1 \
+            scripts/ime/build-librime-win.ps1 \
+            scripts/ime/build-weasel.ps1; do
             [ -f "$f" ] || { echo "::error::缺少 $f"; missing=1; }
           done
           [ "$missing" -eq 0 ] || exit 1
@@ -192,7 +194,7 @@ jobs:
       - name: bash -n every packaging shell script
         run: |
           set -euo pipefail
-          mapfile -t files < <(find scripts/ime scripts/e2e packaging/linux -maxdepth 2 -type f -name '*.sh' | sort)
+          mapfile -t files < <(find scripts/ime scripts/e2e packaging/linux .github/scripts -maxdepth 2 -type f -name '*.sh' | sort)
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           echo "bash -n OK: ${#files[@]} 个脚本"
@@ -210,6 +212,69 @@ jobs:
             echo "::error::offline-verify.yml 未调用 packaging/linux/verify-offline.sh"
             exit 1
           }
+
+      # 0.6.9：Windows 版必须自建 librime（合并 plugins/rimesync-extra）。谁把它改回预编译包，
+      # 这里立刻红 —— 上游预编译包没有外部插件加载能力，v 模式 / 标点 Shift 备选 / a-h 选词
+      # 会静默失效（0.6.8 的 Windows 包就是这个状态，只有标点直出靠配置生效）。
+      - name: guard · windows builds librime from vendored source
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          ws=scripts/ime/build-weasel.ps1
+          lb=scripts/ime/build-librime-win.ps1
+
+          [ -f "$lb" ] || { echo "::error::缺少 $lb"; exit 1; }
+          grep -qF 'scripts/ime/build-librime-win.ps1' "$wf" ||
+            { echo "::error::$wf 没有调用 $lb（Windows 会退回不含插件的预编译 librime）"; exit 1; }
+          grep -qF -- '-LibrimeSource self' "$wf" ||
+            { echo "::error::$wf 编 Weasel 时没显式传 -LibrimeSource self"; exit 1; }
+          grep -qF 'assert rime.dll carries rimesync components' "$wf" ||
+            { echo "::error::$wf 没有「解出最终 rime.dll 查组件名」的断言步骤"; exit 1; }
+
+          # 静默回退：release.yml 不许再传 -LibrimeTag（那会拉官方 1.13.1，一个插件都没有）
+          if grep -qF -- '-LibrimeTag' "$wf"; then
+            echo "::error::$wf 仍传 -LibrimeTag：Windows 版会退回不含插件的预编译 librime"
+            exit 1
+          fi
+          # build-weasel.ps1 侧：默认必须是 self；预编译只能靠显式 -LibrimeSource prebuilt
+          grep -qF "[ValidateSet('self', 'prebuilt')]" "$ws" ||
+            { echo "::error::$ws 的 -LibrimeSource 没有 ValidateSet(self|prebuilt)"; exit 1; }
+          grep -qF "[string]\$LibrimeSource = 'self'" "$ws" ||
+            { echo "::error::$ws 的 -LibrimeSource 默认值不是 self"; exit 1; }
+          if grep -qE "LibrimeTag\s*=\s*'[0-9]" "$ws"; then
+            echo "::error::$ws 给 -LibrimeTag 设了默认值：预编译包会被静默使用"
+            exit 1
+          fi
+          for f in "$ws" "$lb"; do
+            grep -qF 'rimesync_vnum' "$f" || { echo "::error::$f 没有 rimesync_vnum 组件断言"; exit 1; }
+          done
+
+          # 产物侧：verify-artifacts 必须能从 setup.exe 解出的 rime.dll 里断言组件名
+          for n in rimesync_vnum rimesync_punct; do
+            grep -qF "$n" .github/scripts/verify-artifacts.sh ||
+              { echo "::error::verify-artifacts.sh 没有断言 $n"; exit 1; }
+          done
+          grep -qF 'check_rime_components' .github/scripts/verify-artifacts.sh ||
+            { echo "::error::verify-artifacts.sh 缺少 check_rime_components（Windows 断言入口）"; exit 1; }
+          echo "guard OK：release.yml -> build-librime-win.ps1 -> rime.dll 组件断言的链路完整"
+
+      # ps1 在 ubuntu runner 上不能执行，但可以解析：语法错误不必等 windows job 首跑才发现。
+      # 本机没有 pwsh（改脚本的人也不一定有），所以这一段是唯一的「改完就能验」的入口。
+      - name: parse Windows packaging ps1 (syntax only)
+        run: |
+          set -euo pipefail
+          files=$(find scripts/ime packaging/windows -maxdepth 1 -type f -name '*.ps1' | sort)
+          [ -n "$files" ] || { echo "::error::没找到任何 Windows 打包 ps1"; exit 1; }
+          printf '%s\n' "$files"
+          if ! command -v pwsh >/dev/null 2>&1; then
+            echo "pwsh 不在 PATH：跳过 ps1 解析（GitHub 的 ubuntu-22.04 镜像自带 PowerShell 7）"
+            exit 0
+          fi
+          for f in $files; do
+            pwsh -NoProfile -Command "\$e=\$null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '$f').Path, [ref]\$null, [ref]\$e) | Out-Null; if (\$e) { \$e | ForEach-Object { Write-Host ('  ' + \$_.Extent.StartLineNumber + ': ' + \$_.Message) }; exit 1 }" ||
+              { echo "::error::$f 语法解析失败"; exit 1; }
+            echo "  ok  $f"
+          done
 
       # buildkit 只接受 default/host/none：docker build 传 bridge 会直接失败（上一轮 CI 的真实炸点）。
       # docker run 的网络探测（DOCKER_NETWORK=bridge/host）不受影响。

@@ -7,20 +7,24 @@
   构建链（与上游 rime/weasel 的 .github/workflows/release-ci.yml 对齐）：
 
     boost 1.84.0  --(b2, static runtime)-->  deps/boost_1_84_0/stage/lib
-    librime       --(上游 get-rime.ps1) --->  lib/lib64/*.lib + output[rime.dll] + include/rime_*.h
+    librime       --(自建，合并插件) ------>  lib/lib64/*.lib + output[rime.dll] + include/rime_*.h
     weasel.sln    --(msbuild Release) ------>  output\*.dll|*.ime|*.exe + output\Win32\*
     install.nsi   --(makensis 3.08) -------->  output\archives\weasel-0.17.4.0-installer.exe
 
   为什么不是 CMake：Weasel 0.17.4 上游在 Weasel 层没有 CMakeLists.txt，官方构建脚本是
   build.bat（msbuild weasel.sln）或 xbuild.bat（xmake）；CMake 只出现在 librime 子模块。
-  本仓库 vendored 的 third_party/weasel 里 librime/ 与 plum/ 是空子模块（见 FORK.md），
-  因此这里采用上游发行 CI 的同一套组合：librime 用 rime/librime 官方预编译 msvc 包
-  （get-rime.ps1，x64 + x86 各一份），Weasel 本体用 msbuild 编译。
+
+  0.6.9 起 librime 改为自建（scripts/ime/build-librime-win.ps1）：上游预编译包没有外部插件
+  加载逻辑（librime 的 PluginManager 在 _WIN32 下是 TODO），所以 rimesync-extra 只有在
+  BUILD_MERGED_PLUGINS=ON 时直接编进 rime.dll 才对 Weasel 生效。自建链路：
+  third_party/librime（vendored 1.17.0）+ deps 按 pin 浅克隆 + build.bat，产物摆成
+  Weasel 期望的 lib64/lib/output/output\Win32/include 布局（与 get-rime.ps1 -use dev 一致）。
+  预编译包只剩应急退路（-LibrimeSource prebuilt -LibrimeTag 1.13.1），日志会给红字。
 
   依赖版本（上游 release-ci 的取值）：
     - Visual Studio 2022 + v143 工具集（env.vs2022.bat：PLATFORM_TOOLSET=v143 / BJAM_TOOLSET=msvc-14.3）
     - boost 1.84.0（b2 静态运行时；链接目录 $(BOOST_ROOT)\stage\lib）
-    - librime 预编译包（默认 pin 1.13.1；可用 -LibrimeTag 覆盖）
+    - librime 1.17.0 自建（third_party/librime + 合并 rimesync-extra）
     - NSIS 3.08（上游 install.nsi 就是用它）
 
 .PARAMETER BoostVersion
@@ -29,9 +33,18 @@
 .PARAMETER BoostRoot
   已有 boost 的根目录（含 boost/ 与 stage/lib）。默认 third_party/weasel/deps/boost_<ver>。
 
+.PARAMETER LibrimeSource
+  self（默认）= 用 third_party/librime 自建并合并 rimesync-extra（v 模式 / 标点 Shift 备选 /
+  a-h 选词 在 Windows 上生效）；prebuilt = 用上游 get-rime.ps1 拉预编译包（应急退路，
+  **不含**输入增强插件，日志红字，且必须显式传这个值）。
+
 .PARAMETER LibrimeTag
-  rime/librime 的 release tag，默认 1.13.1（weasel 0.17.4 发布前最近的版本）。
-  传 latest 表示跟随上游最新发布。
+  仅 -LibrimeSource prebuilt 生效：rime/librime 的 release tag，缺省 1.13.1。
+  传 latest 表示跟随上游最新发布。**不接受**「静默回退」：self 模式下这个参数被忽略。
+
+.PARAMETER BuildLibrime
+  强制重建自建 librime（转发成 build-librime-win.ps1 -Rebuild）：deps 与 librime 全部从零编。
+  布局已经就绪时默认直接复用，不会每次 CI 都重编。
 
 .PARAMETER SkipWin32
   只编译 x64。注意：上游 install.nsi 在编译期就会 File Win32\* 与 weasel.dll/weasel.ime
@@ -59,8 +72,11 @@ param(
     [string]$BoostVersion = '1.84.0',
     [string]$BoostRoot = '',
     [switch]$RebuildBoost,
-    [string]$LibrimeTag = '1.13.1',
+    [ValidateSet('self', 'prebuilt')]
+    [string]$LibrimeSource = 'self',
+    [string]$LibrimeTag = '',
     [string]$LibrimeBuildVariant = 'msvc',
+    [switch]$BuildLibrime,
     [switch]$SkipLibrimeDownload,
     [switch]$SkipWin32,
     [switch]$WithRimeData,
@@ -76,6 +92,8 @@ $ErrorActionPreference = 'Stop'
 $script:VsInstallation = $null
 $script:BoostSource = 'unknown'
 $script:B2Version = ''
+# 写进 WEASEL-SOURCE.json / summary 的 librime 来源描述（Ensure-Librime 填）
+$script:LibrimeSourceLabel = 'unknown'
 
 # ---- 固定版本（改版本时必须同步 packaging/nsis-hooks.nsh 的 RIMESYNC_WEASEL_*）----
 $WeaselVersion   = '0.17.4'
@@ -324,7 +342,6 @@ function Resolve-BuildContext {
 function Test-Scaffolding {
     Assert-File (Join-Path $script:WeaselDir 'weasel.sln') 'third_party/weasel 未入库或为空时 CI 无法自编译；另见 packaging/windows/README.md。'
     Assert-File (Join-Path $script:WeaselDir 'output\install.nsi')
-    Assert-File (Join-Path $script:WeaselDir 'get-rime.ps1')
     Assert-File (Join-Path $script:WeaselDir 'render.js')
     Assert-File (Join-Path $script:WeaselDir 'weasel.props.template')
     # install.nsi 在编译期 File 这些上游脚手架文件；它们被 third_party/weasel/.gitignore
@@ -538,8 +555,14 @@ function Ensure-Boost {
 }
 
 # ---------------------------------------------------------------------------
-# librime（预编译包，上游 get-rime.ps1）
+# librime（默认自建；预编译包只作显式退路）
 # ---------------------------------------------------------------------------
+# 布局（Test-LibrimeReady 断言的 5 处，与上游 get-rime.ps1 -use dev 的映射一致）：
+#   lib64\rime.lib           x64 导入库
+#   lib\rime.lib             Win32 导入库
+#   output\rime.dll          x64 运行库
+#   output\Win32\rime.dll    Win32 运行库
+#   include\rime_api.h       公共头
 function Test-LibrimeReady {
     $checks = @('lib64\rime.lib', 'output\rime.dll', 'include\rime_api.h')
     if (-not $SkipWin32) { $checks += @('lib\rime.lib', 'output\Win32\rime.dll') }
@@ -549,23 +572,115 @@ function Test-LibrimeReady {
     return $true
 }
 
+# 组件名断言：rimesync-extra 的 rimesync_vnum / rimesync_punct / rimesync_vselect 是
+# registry 注册时用的普通 string 常量，合并进 rime.dll 后是 UTF-8（= ASCII）明文。
+# 官方预编译包里搜不到（它没有外部插件加载能力），所以这条断言同时是「自建 vs 预编译」的判据。
+function Get-MissingLibrimeComponents {
+    $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
+    $dlls = @('output\rime.dll')
+    if (-not $SkipWin32) { $dlls += 'output\Win32\rime.dll' }
+    $missing = @()
+    foreach ($rel in $dlls) {
+        $dll = Join-Path $script:WeaselDir $rel
+        if (-not (Test-Path -LiteralPath $dll)) { $missing += ($rel + '（不存在）'); continue }
+        $bytes = [System.IO.File]::ReadAllBytes($dll)
+        # ISO-8859-1 = 字节到字符 1:1，二进制里搜 ASCII 明文就用它
+        $body = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        foreach ($name in $names) {
+            if ($body.IndexOf($name, [System.StringComparison]::Ordinal) -lt 0) { $missing += ($rel + ':' + $name) }
+        }
+    }
+    return $missing
+}
+
+function Test-LibrimeComponents {
+    return (@(Get-MissingLibrimeComponents).Count -eq 0)
+}
+
 function Ensure-Librime {
+    if ($LibrimeSource -eq 'prebuilt') {
+        Write-Host ''
+        Write-Host '!!!! librime 用的是上游预编译包（不含 rimesync-extra）' -ForegroundColor Red
+        Write-Host '!!!! v 模式 / 标点 Shift 备选 / a-h 选词 在 Windows 上不生效；标点直出靠配置，仍然生效。' -ForegroundColor Red
+        Write-Host '!!!! 此路径仅供本机应急：CI 的 ci.yml guard 禁止发布版走这里。' -ForegroundColor Red
+        Ensure-PrebuiltLibrime
+        return
+    }
+
+    if ((Test-LibrimeReady) -and (Test-LibrimeComponents)) {
+        $script:LibrimeSourceLabel = 'self-built ' + (Get-VendoredLibrimeVersion) + ' (merged rimesync-extra)'
+        Write-Host '[librime] 自建产物已就绪（lib / lib64 / output / include，且 rime.dll 含插件组件名）'
+        return
+    }
+
+    if (Test-LibrimeReady) {
+        Write-Host ('[librime] 现成的库缺组件（' + (@(Get-MissingLibrimeComponents) -join ', ') + '）：改为自建')
+    }
+    if ($SkipLibrimeDownload) {
+        throw '缺少自建 librime，且指定了 -SkipLibrimeDownload。请先跑 scripts/ime/build-librime-win.ps1（或去掉这个开关）。'
+    }
+
+    $builder = Join-Path $PSScriptRoot 'build-librime-win.ps1'
+    Assert-File $builder '自建 librime 的脚本不在，无法产出带 rimesync-extra 的 rime.dll。'
+    $builderArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $builder,
+        '-RepoRoot', $script:RepoRoot,
+        '-WeaselRoot', $script:WeaselDir,
+        '-BoostRoot', $script:BoostDir
+    )
+    if ($SkipWin32) { $builderArgs += '-SkipWin32' }
+    if ($BuildLibrime) { $builderArgs += '-Rebuild' }
+
+    Write-Step ('自建 librime（vendored ' + (Get-VendoredLibrimeVersion) + ' + 合并 rimesync-extra）')
+    $code = Invoke-Native -FilePath (Get-HostExePath) -Arguments $builderArgs -WorkDir $script:RepoRoot -AllowFailure
+    if (($code -ne 0) -or (-not (Test-LibrimeReady)) -or (-not (Test-LibrimeComponents))) {
+        $missing = @(Get-MissingLibrimeComponents)
+        throw ("build-librime-win.ps1 未能产出带插件的 librime（exit $code）。" +
+               '缺失：' + ($missing -join ', ') +
+               '。常见原因：deps 浅克隆失败（网络）、boost 与工具集不匹配、googletest 占位工程在 VS 生成器下报错（用 -BuildLibrime 转发 -Rebuild，或手工跑 build-librime-win.ps1 -Check 看状态）。')
+    }
+    $script:LibrimeSourceLabel = 'self-built ' + (Get-VendoredLibrimeVersion) + ' (merged rimesync-extra)'
+}
+
+function Get-VendoredLibrimeVersion {
+    $cml = Join-Path (Join-Path $script:RepoRoot 'third_party\librime') 'CMakeLists.txt'
+    if (Test-Path -LiteralPath $cml) {
+        $raw = Get-Content -LiteralPath $cml -Raw -Encoding UTF8
+        $m = [regex]::Match($raw, '(?m)^\s*set\(rime_version\s+([0-9][0-9A-Za-z.\-]*)\s*\)')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    return 'unknown'
+}
+
+# 应急退路：上游 get-rime.ps1 拉预编译 msvc 包。只有显式 -LibrimeSource prebuilt 才会走到。
+function Ensure-PrebuiltLibrime {
+    $tag = $LibrimeTag
+    if (-not $tag) { $tag = '1.13.1' }
+    $script:LibrimeSourceLabel = 'prebuilt ' + $tag + ' (no plugins)'
+
     if (Test-LibrimeReady) {
         Write-Host '[librime] 预编译包已就绪（lib / lib64 / output / include）'
+        $missing = @(Get-MissingLibrimeComponents)
+        if ($missing.Count -gt 0) {
+            Write-Warning ('[librime] 预编译包缺组件：' + ($missing -join ', ') + '（预期行为：官方包不带 rimesync-extra）')
+        }
         return
     }
     if ($SkipLibrimeDownload) {
         throw '缺少 librime 预编译包，且指定了 -SkipLibrimeDownload。请先跑一次 get-rime.ps1 -use dev。'
     }
 
+    Assert-File (Join-Path $script:WeaselDir 'get-rime.ps1') '预编译路径需要 third_party/weasel/get-rime.ps1。'
+
     # get-rime.ps1 解压时要求 PATH 里有 7z；优先用 vendored 的 output\7z.exe
-    $env:PATH = (Join-Path $script:WeaselDir 'output') + ';' + ${env:PATH}
+    $env:PATH = (Join-Path $script:WeaselDir 'output') + ';' + $env:PATH
 
     # 限流时用 GitHub token：get-rime.ps1 从 ~/.get-rime.conf.ps1 读取 $global:authorization
-    if (${env:GITHUB_TOKEN}) {
-        $conf = Join-Path ${env:USERPROFILE} '.get-rime.conf.ps1'
+    if ($env:GITHUB_TOKEN) {
+        $conf = Join-Path $env:USERPROFILE '.get-rime.conf.ps1'
         if (-not (Test-Path -LiteralPath $conf)) {
-            Set-Content -LiteralPath $conf -Value ('$global:authorization = "' + ${env:GITHUB_TOKEN} + '"') -Encoding utf8
+            Set-Content -LiteralPath $conf -Value ('$global:authorization = "' + $env:GITHUB_TOKEN + '"') -Encoding utf8
             Write-Host '[librime] 已写入 ~/.get-rime.conf.ps1（GitHub token，仅本次 runner）'
         }
     }
@@ -575,10 +690,10 @@ function Ensure-Librime {
         '-File', (Join-Path $script:WeaselDir 'get-rime.ps1'),
         '-use', 'dev'
     )
-    if ($LibrimeTag) { $getRimeArgs += @('-tag', $LibrimeTag) }
+    if ($tag) { $getRimeArgs += @('-tag', $tag) }
     if ($LibrimeBuildVariant) { $getRimeArgs += @('-build_variant', $LibrimeBuildVariant) }
 
-    Write-Step "拉取 librime 预编译包（tag=$LibrimeTag, variant=$LibrimeBuildVariant）"
+    Write-Step "拉取 librime 预编译包（tag=$tag, variant=$LibrimeBuildVariant；不含输入增强插件）"
     $code = Invoke-Native -FilePath (Get-HostExePath) -Arguments $getRimeArgs -WorkDir $script:WeaselDir -AllowFailure
     if (($code -ne 0) -or (-not (Test-LibrimeReady))) {
         throw ("get-rime.ps1 未能准备好 librime（exit $code）。" +
@@ -931,7 +1046,7 @@ function Publish-Artifact {
             '- 来源：third_party/weasel（rime/weasel 0.17.4，commit 9cc96e20）',
             "- 产物：$InstallerName（$($item.Length) 字节，$mib MiB）",
             "- SHA-256：$hash",
-            "- boost：$BoostVersion；librime：$LibrimeTag；工具集：$PlatformToolset",
+            "- boost：$BoostVersion；librime：$script:LibrimeSourceLabel；工具集：$PlatformToolset",
             "- Win32：$win32"
         )
         Add-Content -LiteralPath ${env:GITHUB_STEP_SUMMARY} -Value ($lines -join [Environment]::NewLine) -Encoding utf8
@@ -941,6 +1056,15 @@ function Publish-Artifact {
 # ---------------------------------------------------------------------------
 # 前置检查（-Check）
 # ---------------------------------------------------------------------------
+function Get-LibrimePlanLabel {
+    if ($LibrimeSource -eq 'prebuilt') {
+        $tag = $LibrimeTag
+        if (-not $tag) { $tag = '1.13.1' }
+        return ('prebuilt ' + $tag + '（不含插件）')
+    }
+    return ('self-built ' + (Get-VendoredLibrimeVersion) + '（合并 rimesync-extra）')
+}
+
 function Invoke-Preflight {
     $sevenZip = Get-SevenZip -WeaselDir $script:WeaselDir
     $makensis = Find-Makensis
@@ -971,7 +1095,9 @@ function Invoke-Preflight {
         [pscustomobject]@{ Name = 'boost root';       Value = $script:BoostDir },
         [pscustomobject]@{ Name = 'boost x64 ready';  Value = (Test-BoostReady -Bits '64') },
         [pscustomobject]@{ Name = 'boost x86 ready';  Value = (Test-BoostReady -Bits '32') },
+        [pscustomobject]@{ Name = 'librime source';   Value = (Get-LibrimePlanLabel) },
         [pscustomobject]@{ Name = 'librime ready';    Value = (Test-LibrimeReady) },
+        [pscustomobject]@{ Name = 'librime plugins';  Value = (Test-LibrimeComponents) },
         [pscustomobject]@{ Name = '7z';               Value = $sevenZipText },
         [pscustomobject]@{ Name = 'VS 安装';          Value = $vsPathText },
         [pscustomobject]@{ Name = 'VsDevCmd';         Value = $vsText },
@@ -982,7 +1108,7 @@ function Invoke-Preflight {
     $rows | Format-Table -AutoSize | Out-String | Write-Host
     $platforms = 'Release x64'
     if (-not $SkipWin32) { $platforms = 'Release x64 + Win32' }
-    Write-Host "计划：boost $BoostVersion -> librime $LibrimeTag -> msbuild $platforms -> makensis -> $InstallerName"
+    Write-Host "计划：boost $BoostVersion -> librime $(Get-LibrimePlanLabel) -> msbuild $platforms -> makensis -> $InstallerName"
 }
 
 # ---------------------------------------------------------------------------

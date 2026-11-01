@@ -37,7 +37,9 @@ v0.6.0 的 Windows 版发布显示成功，但「Rime 同步…」入口在安�
   `continue-on-error: ${{ steps.weasel_mode.outputs.mode != 'require' }}`（ci.yml 有守卫检查）。
 - **禁止**只写 `::warning::` 就算"已告知"。warning 在 Actions 界面上就是个黄点，会被折叠。
 - **回退产物必须能被识别**：发布流程要能回答"这一版到底带没带 Weasel 入口"。当前实现是
-  `WEASEL-SOURCE.json`（`mode` / `source` / `selfbuild_outcome` / `written_at`）。
+  `WEASEL-SOURCE.json`（`mode` / `source` / `selfbuild_outcome` / `librime` / `written_at`）。
+  0.6.9 起 `librime` 字段记录输入法引擎来源：`self-built 1.17.0 (merged rimesync-extra)` 或
+  `prebuilt 1.13.1 (no plugins)` —— 后者意味着 Windows 上没有 v 模式 / 标点 Shift 备选 / a-h 选词。
 
 ## 3. 现有回退登记表
 
@@ -45,6 +47,7 @@ v0.6.0 的 Windows 版发布显示成功，但「Rime 同步…」入口在安�
 |---|---|---|---|---|---|
 | `release.yml` · windows | 自编译 Weasel 失败 → 上游官方安装包 | 步骤日志 + `WEASEL-SOURCE.json` | job summary `> [!CAUTION]` + 发布说明顶部红字 | `weasel_mode=require`（tag 推送强制） | `verify-artifacts.sh` 解出 `WeaselServer.exe` 搜 UTF-16LE「Rime 同步」 |
 | `release.yml` · windows | `weasel_mode=fetch`（显式用上游包） | 同上 | 同上 | 选 `require` / `auto` | 同上（`build`/`fetch` 模式下降级为红字告警，`require` 直接失败） |
+| `scripts/ime/build-weasel.ps1` · `-LibrimeSource prebuilt` | 显式改用上游预编译 librime（1.13.1，**不含** rimesync-extra） | 红字 banner + job summary 的「librime」行 + `WEASEL-SOURCE.json` 的 `librime` 字段 | 日志红字 `librime 用的是上游预编译包`；summary / 发布说明记为 `prebuilt 1.13.1 (no plugins)` | 去掉该参数（默认 `self`），或直接跑 `build-librime-win.ps1` | `ci.yml` 禁止 release.yml 出现 `-LibrimeTag`（发布版必须自建）；`verify-artifacts.sh` 从 setup 解出 `rime.dll` 搜 `rimesync_vnum`/`rimesync_punct` |
 | `packaging/linux/postinst` + worker | 后台依赖安装最终失败（无网/包缺失） | `/var/log/rime-sync/vendor-install.log` | `~/.config/com.rimesync.app/install-warning.json` → 应用诊断页红条「离线依赖未安装完成，点击查看日志/重试」 | 手工 `apt-get install fcitx5 fcitx5-rime`，或点「重试」（pkexec 重跑 wrapper） | 告警文件存在即红条；依赖装好后后端自动清除 |
 | `packaging/linux/install-vendor-deps.sh` | 有网 apt 失败 → 用自带离线 .deb 闭包 | 同一日志 | 同上一行（最终失败才写告警） | 预装 fcitx5-rime（postinst 直接跳过） | 同上 |
 

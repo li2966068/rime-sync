@@ -452,8 +452,9 @@ jobs:
     # 迁移当天工具集/boost 探测会一起漂移）。要换 runner 请先跑一遍 build-weasel.ps1 -Check。
     runs-on: windows-2022
     # 0.6.5 起同一次 job 要打两遍 NSIS（在线包 + 内嵌 WebView2 的离线包），
-    # 离线包压缩一个 ~130 MiB 载荷很慢，超时给足。
-    timeout-minutes: 120
+    # 离线包压缩一个 ~130 MiB 载荷很慢；0.6.9 起还要先自建 librime（两个架构 × deps+librime），
+    # 冷缓存首跑大约多加 25-35 分钟。超时给足。
+    timeout-minutes: 150
     permissions:
       contents: write
     outputs:
@@ -548,6 +549,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-weasel-boost-1.84.0-
 
+      # 自建 librime（0.6.9）的缓存：
+      #   third_party/librime/deps/<name>/build  MSVC 增量编译目录（deps 静态库）
+      #   third_party/librime/build              librime 自己的 build\x64 与 build\win32
+      # 命中后 build-librime-win.ps1 只做 configure + install，不再重编 deps/源码；
+      # 不缓存 dist\（安装前缀）：它由 --target install 立刻重建，缓存它反而可能留下别的
+      # 架构/工具集的 DLL。key 含 deps pin 与脚本哈希，pin 或脚本一改就换 key。
+      - name: cache self-built librime (deps + build dirs)
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/librime/deps/glog/build
+            third_party/librime/deps/leveldb/build
+            third_party/librime/deps/yaml-cpp/build
+            third_party/librime/deps/marisa-trie/build
+            third_party/librime/deps/opencc/build
+            third_party/librime/build
+          key: >-
+            ${{ runner.os }}-librime-1.17.0-glog-v0.6.0-leveldb-1.23-yamlcpp-0.8.0-marisa-v0.2.6-opencc-ver.1.1.7-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-librime-1.17.0-
+
       # 先在 1 分钟内把工具链看清楚，再进 90 分钟的自编译。
       # -Check 不下载、不编译，只打印 repo root/VS/cl.exe/b2/boost 状态；
       # v0.6.1 的失败点（bootstrap 探测不到工具集）在这里就会以「cl.exe = ok」+ VS 路径暴露。
@@ -562,8 +585,34 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # 0.6.9：先自建 librime，再编 Weasel。
+      # 为什么必须自建：上游预编译包（1.13.1）里没有外部插件加载逻辑（librime 的
+      # plugins/PluginManager 在 _WIN32 下是 TODO），所以 rimesync-extra 只有在
+      # BUILD_MERGED_PLUGINS=ON 时直接编进 rime.dll 才对 Weasel 生效。脚本会把 deps 按 pin
+      # 浅克隆、编 x64 + Win32 两份、按 get-rime.ps1 的布局摆进 third_party/weasel，
+      # 并断言两个 rime.dll 里都有 rimesync_vnum / rimesync_punct / rimesync_vselect。
+      # require（tag 发布）：失败即本 job 失败；build/fetch（手动）：这里红了，后面 Weasel
+      # 那步也必然失败（布局不全），按既有规则回退上游官方安装包（红字标注，且
+      # verify-artifacts 会发现 rime.dll 里没有插件）。
+      - name: build librime from vendored source (merged rimesync-extra)
+        id: librime_selfbuild
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        continue-on-error: ${{ steps.weasel_mode.outputs.mode != 'require' }}
+        timeout-minutes: 50
+        shell: pwsh
+        env:
+          WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
+        run: |
+          pwsh -NoProfile -File scripts/ime/build-librime-win.ps1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::build-librime-win.ps1 失败（exit $LASTEXITCODE；模式 $env:WEASEL_MODE）：自建 librime 失败，Windows 版将没有输入增强插件"
+            exit $LASTEXITCODE
+          }
+          Get-Item -LiteralPath 'third_party/weasel/output/rime.dll' |
+            ForEach-Object { Write-Host ("self-built rime.dll: {0:N1} MiB" -f ($_.Length / 1MB)) }
+
       # 从 vendored 源码（third_party/weasel = rime/weasel 0.17.4）编译 Weasel 安装包。
-      # 依赖：VS2022/v143 + boost 1.84.0（脚本自建/缓存）+ librime 预编译包（get-rime.ps1）
+      # 依赖：VS2022/v143 + boost 1.84.0（脚本自建/缓存）+ 自建 librime（上一步）
       #       + NSIS 3.08（脚本自动安装）。脚本内部会做产物断言。
       #
       # boost 的取法（v0.6.1 就死在这一步）：
@@ -584,7 +633,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
         run: |
-          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -LibrimeTag 1.13.1
+          pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -LibrimeSource self
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::build-weasel.ps1 失败（exit $LASTEXITCODE；模式 $env:WEASEL_MODE）：require=本 job 失败，build/fetch=回退上游安装包"
             exit $LASTEXITCODE
@@ -596,7 +645,7 @@ jobs:
       # v0.6.1 的日志里只有 "unable to detect your toolset installation" 这一句猜谜；
       # 下一次失败应该能从日志直接读出「哪份 VS、有没有 cl、b2 在不在、boost 源码树齐不齐」。
       - name: dump toolchain diagnostics (self-build failed)
-        if: steps.weasel_selfbuild.outcome == 'failure'
+        if: steps.weasel_selfbuild.outcome == 'failure' || steps.librime_selfbuild.outcome == 'failure'
         shell: pwsh
         run: |
           Write-Host '==== vswhere installations ===='
@@ -617,6 +666,25 @@ jobs:
           if (Test-Path -LiteralPath $lib) {
             Get-ChildItem -LiteralPath $lib -Filter 'libboost_filesystem-*.lib' | Select-Object -ExpandProperty Name
           }
+          Write-Host '==== self-built librime ===='
+          $lr = 'third_party/librime'
+          foreach ($rel in @('build', 'build/deps-x64', 'build/deps-win32', 'dist/x64', 'dist/Win32')) {
+            $path = Join-Path $lr $rel
+            Write-Host ("{0} = {1}" -f $rel, (Test-Path -LiteralPath $path))
+          }
+          foreach ($rel in @('deps/glog/CMakeLists.txt', 'deps/leveldb/CMakeLists.txt', 'deps/yaml-cpp/CMakeLists.txt', 'deps/marisa-trie/CMakeLists.txt', 'deps/opencc/CMakeLists.txt')) {
+            $path = Join-Path $lr $rel
+            Write-Host ("{0} = {1}" -f $rel, (Test-Path -LiteralPath $path))
+          }
+          foreach ($rel in @('dist/x64/lib/rime.dll', 'dist/Win32/lib/rime.dll', 'output/rime.dll', 'output/Win32/rime.dll', 'lib64/rime.lib', 'lib/rime.lib')) {
+            $path = if ($rel -like 'dist/*') { Join-Path $lr $rel } else { Join-Path 'third_party/weasel' $rel }
+            Write-Host ("{0} = {1}" -f $rel, (Test-Path -LiteralPath $path))
+          }
+          if (Test-Path -LiteralPath (Join-Path $lr 'dist/LIBRIME-BUILD.json')) {
+            Get-Content -LiteralPath (Join-Path $lr 'dist/LIBRIME-BUILD.json') -Raw
+          }
+          Write-Host '==== librime preflight (-Check) ===='
+          pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -Check
           Write-Host '==== preflight (-Check) ===='
           pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -Check
           exit 0
@@ -684,19 +752,34 @@ jobs:
             exit 1
           }
 
+          # librime 来源（0.6.9）：自编译 Weasel 内嵌的是自建 librime（合并 rimesync-extra），
+          # 上游回退包内嵌的是官方预编译 1.13.1（没有插件加载能力）。
+          $librimeVersion = '1.17.0'
+          $cml = 'third_party/librime/CMakeLists.txt'
+          if (Test-Path -LiteralPath $cml) {
+            $raw = Get-Content -LiteralPath $cml -Raw -Encoding UTF8
+            $m = [regex]::Match($raw, 'set\(rime_version\s+([0-9][0-9A-Za-z.\-]*)\s*\)')
+            if ($m.Success) { $librimeVersion = $m.Groups[1].Value }
+          }
+          $librime = 'prebuilt 1.13.1 (no plugins)'
+          if ($source -eq 'self-built') {
+            $librime = 'self-built ' + $librimeVersion + ' (merged rimesync-extra)'
+          }
+
           $marker = 'packaging/out/WEASEL-SOURCE.json'
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marker) | Out-Null
           $payload = [ordered]@{
             mode              = $mode
             source            = $source
             selfbuild_outcome = $selfbuilt
+            librime           = $librime
             installer         = $exe.Name
             installer_bytes   = $exe.Length
             caption           = 'Rime 同步'
             written_at        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
           }
           $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $marker -Encoding utf8
-          Write-Host "weasel source: $source（mode=$mode）"
+          Write-Host "weasel source: $source（mode=$mode）；librime: $librime"
           Write-Host "marker: $marker"
           "source=$source" >> $env:GITHUB_OUTPUT
 
@@ -704,6 +787,7 @@ jobs:
             if ($source -eq 'self-built') {
               Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (
                 "- Weasel 安装器：{0}（{1} MiB，来源：自编译 third_party/weasel @ 0.17.4，模式 {2}）" -f $exe.Name, $mib, $mode)
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("- librime：{0}（rime.dll 含 rimesync_vnum / rimesync_punct / rimesync_vselect）" -f $librime)
             } else {
               Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @(
                 '> [!CAUTION]',
@@ -712,6 +796,62 @@ jobs:
               )
             }
           }
+
+      # 双保险（与 build-librime-win.ps1 / build-weasel.ps1 内部断言同一判据，但对象更靠后一环）：
+      # 把**真正要嵌进 NSIS setup.exe 的那个** weasel 安装包解开，确认每个 rime.dll 里都有
+      # rimesync_vnum / rimesync_punct / rimesync_vselect。组件名是 registry 注册用的普通
+      # 字符串常量，合进 rime.dll 后是 UTF-8（= ASCII）明文；预编译包一个都搜不到。
+      # 只在自编译 Weasel 成功时跑：上游回退包本来就不带插件（那种情况由 verify-artifacts 红字标注）。
+      - name: assert rime.dll carries rimesync components
+        if: steps.weasel_selfbuild.outcome == 'success'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $installer) {
+            Write-Host '::error::packaging/windows/vendor 下没有 weasel-*.exe，无从断言 rime.dll'
+            exit 1
+          }
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) {
+            $cmd = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+            if ($cmd) { $sevenZip = $cmd.Source }
+          }
+          if (-not $sevenZip) {
+            Write-Host '::error::找不到 7z.exe（windows-2022 runner 自带 C:\Program Files\7-Zip）'
+            exit 1
+          }
+          $tmp = Join-Path $env:RUNNER_TEMP 'rime-dll-assert'
+          if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          & $sevenZip x -y "-o$tmp" $installer.FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::7z 解不开 $($installer.Name)"
+            exit 1
+          }
+
+          $dlls = @(Get-ChildItem -LiteralPath $tmp -Recurse -File -Filter 'rime.dll')
+          if ($dlls.Count -eq 0) {
+            Write-Host "::error::weasel 安装包里没有 rime.dll（$($installer.Name)）"
+            exit 1
+          }
+          $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
+          $missing = @()
+          foreach ($dll in $dlls) {
+            $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($dll.FullName))
+            foreach ($name in $names) {
+              if ($text.IndexOf($name, [System.StringComparison]::Ordinal) -lt 0) {
+                $missing += ("{0}:{1}" -f $dll.FullName.Substring($tmp.Length).TrimStart('\'), $name)
+              }
+            }
+            Write-Host ("{0}  {1:N1} MiB" -f $dll.FullName.Substring($tmp.Length), ($dll.Length / 1MB))
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host ("::error title=librime 没带插件::weasel 安装包里的 rime.dll 缺组件：" + ($missing -join ', ') +
+              '（v 模式 / 标点 Shift 备选 / a-h 选词 不会生效）')
+            exit 1
+          }
+          Write-Host ("rime.dll 组件齐全：{0}（{1} 个架构）" -f ($names -join ' / '), $dlls.Count)
 
       - name: build nsis
         env:

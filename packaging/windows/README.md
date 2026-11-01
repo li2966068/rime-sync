@@ -7,6 +7,7 @@
 | 文件 | 作用 |
 |---|---|
 | `../../scripts/ime/build-weasel.ps1` | **主路径**：用 MSVC 从 `third_party/weasel` 编译 Weasel，产出安装包 |
+| `../../scripts/ime/build-librime-win.ps1` | **0.6.9 起**：从 `third_party/librime`（vendored 1.17.0）自建 librime，把 `plugins/rimesync-extra` 合并进 rime.dll，产出 `lib64/lib/output/output\\Win32/include` 布局 |
 | `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
 | `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
 | `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
@@ -21,10 +22,13 @@
 ## 2. 构建（CI 由 release.yml 的 windows job 执行）
 
 ```powershell
-# 自编译（主路径）
+# 自编译（主路径）：先自建 librime（合并 rimesync-extra），再编 Weasel
 pwsh -NoProfile -File scripts/ime/build-weasel.ps1
+# 只重建 librime（CI 在编 Weasel 之前单独跑这一步，见下文「自建 librime」）
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1
 # 只做前置检查，不下载/不编译
 pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -Check
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -Check
 
 # 然后是 Tauri 打包
 pnpm tauri build --bundles nsis
@@ -32,14 +36,18 @@ pnpm tauri build --bundles nsis
 
 脚本会依次做：
 
-1. **前置检查**：`weasel.sln`、`output/install.nsi`、`get-rime.ps1`、`render.js`、
-   `output/7z.exe`、`curl.exe`、`WinSparkle.dll`、`resource/weasel.ico` 等。
+1. **前置检查**：`weasel.sln`、`output/install.nsi`、`render.js`、`output/7z.exe`、
+   `curl.exe`、`WinSparkle.dll`、`resource/weasel.ico` 等（`get-rime.ps1` 只在
+   `-LibrimeSource prebuilt` 时才是必需项）。
 2. **boost 1.84.0**：下载源码（`archives.boost.io`，用 vendored 的 `output/7z.exe` 解压），
    `bootstrap.bat` + `b2` 静态运行时构建 x64 与 x86 两份 `stage\lib`。
    CI 用 `actions/cache` 缓存 `deps/boost_1_84_0/{boost,stage}`，命中则整体跳过。
-3. **librime**：跑上游 `get-rime.ps1 -use dev -tag 1.13.1`，把 rime/librime 的
-   Windows-msvc 预编译包（x64 + x86）落到 `lib64/`、`lib/`、`output/`、`output/Win32/`、
-   `include/`，并把 opencc 数据放进 `output/data/opencc/`。
+3. **librime（0.6.9 起默认自建）**：调 `build-librime-win.ps1` —— 按 pin 浅克隆 deps，
+   用 librime 自带的 `build.bat` 编 x64 与 Win32（`BUILD_MERGED_PLUGINS=ON` 把
+   `plugins/rimesync-extra` 合并进 rime.dll），再落到 `lib64/`、`lib/`、`output/`、
+   `output/Win32/`、`include/`，opencc 数据放进 `output/data/opencc/`。
+   布局已就绪且 rime.dll 含插件组件名时直接复用（`-BuildLibrime` 强制重编）。
+   应急退路：`-LibrimeSource prebuilt -LibrimeTag 1.13.1` 走原来的 `get-rime.ps1`。
 4. **数据脚手架**：复制 `LICENSE.txt`→`output/LICENSE.txt`、`README.md`→`output/README.txt`；
    plum 为空时生成一个只打印提示的 `output/rime-install.bat`（`install.nsi` 要求它存在）。
 5. **weasel.props**：`cscript render.js` 把 `BOOST_ROOT` / `PLATFORM_TOOLSET=v143` /
@@ -64,12 +72,106 @@ pnpm tauri build --bundles nsis
 |---|---|---|
 | Visual Studio | 2022 + v143（msvc-14.3） | windows-latest 自带 |
 | boost | 1.84.0 | 脚本下载源码 + b2 自建 |
-| librime | 1.13.1（预编译 msvc 包，可 `-LibrimeTag` 覆盖） | rime/librime releases |
+| librime | **1.17.0 自建**（`third_party/librime` + 合并 `rimesync-extra`） | 本仓库 vendored 源码 + 上游 deps（见下） |
+| librime（应急） | 1.13.1 预编译 msvc 包 | rime/librime releases（`-LibrimeSource prebuilt`） |
 | NSIS | 3.08 | 脚本自动安装 |
 
-**没有 CMake 步骤**：Weasel 0.17.4 上游没有 Weasel 层的 CMakeLists.txt（官方是
-`build.bat`/MSBuild 或 `xbuild.bat`/xmake）；CMake 只属于 librime 子模块，而这里用
-librime 的官方预编译包，因此不需要 CMake。
+**Weasel 层没有 CMake**：Weasel 0.17.4 上游没有 Weasel 层的 CMakeLists.txt（官方是
+`build.bat`/MSBuild 或 `xbuild.bat`/xmake）。CMake 只出现在 librime：0.6.9 起自建
+librime 用的是上游的 `third_party/librime/build.bat`，它内部就是用 CMake + MSBuild 编
+deps 与 librime，我们只负责喂 `env.bat` 与几个前缀变量（见下节）。
+
+### 自建 librime（0.6.9 起）
+
+**为什么必须自建**：上游预编译包里没有外部插件加载逻辑 —— librime 的
+`plugins/PluginManager` 在 `_WIN32` 下还是 TODO（`current_module_path()` 直接返回空路径），
+所以 `plugins/rimesync-extra`（v 模式数字转换、标点 Shift 备选、a-h 选词）只有以
+`BUILD_MERGED_PLUGINS=ON`（librime 默认值）**合并进 rime.dll** 才对 Weasel 生效。
+0.6.8 的 Windows 包用的是预编译 1.13.1，所以这三项在 Windows 上完全不生效（标点直出靠配置，
+仍然生效）。
+
+**deps pin**（`third_party/librime/.gitmodules` 声明但目录为空，脚本按 tag 浅克隆到
+`third_party/librime/deps/<name>`；tag 已核对上游实际命名）：
+
+| deps 目录 | 上游 | tag | 许可证 |
+|---|---|---|---|
+| `glog` | <https://github.com/google/glog> | `v0.6.0` | BSD-3-Clause |
+| `leveldb` | <https://github.com/google/leveldb> | `1.23` | BSD-3-Clause |
+| `yaml-cpp` | <https://github.com/jbeder/yaml-cpp> | `0.8.0` | MIT |
+| `marisa-trie` | <https://github.com/s-yata/marisa-trie> | `v0.2.6` | BSD-2-Clause / LGPL-2.1 |
+| `opencc` | <https://github.com/BYVoid/OpenCC> | `ver.1.1.7` | Apache-2.0 |
+| `googletest` | <https://github.com/google/googletest> | `v1.14.0` | BSD-3-Clause（**默认不克隆**，见下） |
+
+- `googletest` 只在 `-WithTests` 时真实克隆；`build.bat deps` 会无条件编它，所以默认给一个
+  最小占位工程（`project(... NONE)` + 一条 `install(FILES)`）让它空转，编完即删。
+- 只有 `leveldb` 声明了 submodule（gtest/benchmark），两者都在 `LEVELDB_BUILD_TESTS` /
+  `LEVELDB_BUILD_BENCHMARKS` 打开时才 `add_subdirectory`，脚本两个都关掉，
+  因此不需要 `--recurse-submodules`。
+
+**env.bat 是唯一定制点**：`build.bat` 会无条件 `call env.bat`，而仓库里的
+`env.bat.template` 把 `ARCH`/`CMAKE_GENERATOR`/`PLATFORM_TOOLSET` 硬编码成
+`Win32` + VS2019 + v142（普通 `set`，会覆盖外部环境变量）。所以脚本自己生成
+`third_party/librime/env.bat`：
+
+```bat
+set RIME_ROOT=%CD%
+set BOOST_ROOT=<third_party\weasel\deps\boost_1_84_0>
+set ARCH=x64            rem 或 Win32
+set CMAKE_GENERATOR="Visual Studio 17 2022"
+set PLATFORM_TOOLSET=v143
+set BJAM_TOOLSET=msvc-14.3
+```
+
+随后每次 `build.bat` 调用只额外喂三个前缀变量（它们用 `if not defined`，外部传入优先）：
+
+| 变量 | x64 | Win32 | 说明 |
+|---|---|---|---|
+| `build_dir` | `build\x64` | `build\win32` | 每个 deps 目录与 librime 根目录各一份 |
+| `deps_install_prefix` | `build\deps-x64` | `build\deps-win32` | 静态 deps 的安装前缀（MSVC CRT/架构不能混用） |
+| `rime_install_prefix` | `dist\x64` | `dist\Win32` | librime 的 `dist`（`lib\rime.dll`、`lib\rime.lib`、`include\*.h`） |
+
+`build` 与 `dist` 都在 `third_party/librime/.gitignore` 里，仓库工作区不会多出未跟踪文件。
+
+**断言（失败即 `throw`，不是 warning）**：
+
+1. 两个 `rime.dll` 都含 `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` 明文
+   （组件名是 registry 注册用的普通字符串常量，UTF-8 即 ASCII）；缺了就是插件没合进去 ——
+   这时 Windows 上的 v 模式 / 标点 Shift 备选 / a-h 选词 会静默失效，正是 0.6.8 的状态。
+2. 两个 `rime.dll` 的 PE 架构分别是 x64（`0x8664`）与 x86（`0x14c`）—— 防止 `ARCH` 被
+   模板覆盖后把 x64 DLL 摆进 `output\Win32`（msbuild 不会报错，装上才发现 32 位程序加载失败）。
+3. 摆进 Weasel 后重新断言一遍 5 个布局文件与两个 DLL 的组件名。
+4. 构建记录写到 `third_party/librime/dist/LIBRIME-BUILD.json`（版本、boost、工具集、
+   每个 dep 的 tag 与 commit、两个架构的 DLL 路径），并写进 job summary。
+
+**缓存与耗时**（`release.yml` 的 `cache self-built librime (deps + build dirs)`）：
+
+- 缓存 `third_party/librime/deps/*/build` 与 `third_party/librime/build`（MSVC 增量编译目录）；
+  **不缓存** `dist/`：`--target install` 会立刻重建它，缓存它反而可能留下别的架构的 DLL。
+- key 含 `librime-1.17.0` + 五个 deps 的 tag + `build-librime-win.ps1` 的哈希；
+  `restore-keys` 按 `<os>-librime-1.17.0-` 兜底，所以改脚本不会每次都从零编（但会重新 configure）。
+- 冷缓存（首跑 / deps pin 变更）：deps 两个架构约 18-25 分钟、librime 两个架构约 6-10 分钟；
+  热缓存：约 2-4 分钟。job 超时因此从 120 提到 150 分钟，librime 步骤单独给 50 分钟。
+
+**失败排查**：
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| `build.bat deps` 在 `deps\googletest` 报错 | 占位工程在 VS 生成器下没给出 install 目标；加 `-WithTests` 让它真实编 gtest，或手工 `cmake . -Bbuild` 看输出 |
+| `deps/xxx 克隆失败` | 网络 / 代理；tag 名变更（`marisa-trie` 是 `v0.2.6`、OpenCC 是 `ver.1.1.7`，不是 `0.2.6`/`1.1.7`） |
+| `PE 架构是 x64，期望 x86` | `env.bat` 被 `env.bat.template` 覆盖（`ARCH=Win32` 没生效）；删掉 `third_party/librime/env.bat` 重跑 |
+| `搜不到插件组件名` | `build.bat librime` 的 cmake 输出里应出现 `Found plugin: rimesync-extra`；检查 `BUILD_MERGED_PLUGINS` 没被关掉、`plugins/rimesync-extra` 还在 |
+| msbuild 链接 `rime.lib` 失败 | 布局没摆对（`lib64\rime.lib` 给 x64、`lib\rime.lib` 给 Win32）；跑 `build-librime-win.ps1 -Check` 看 `lib64/lib/output` 行 |
+| librime 1.17 头文件与 Weasel 0.17.4 不兼容 | 头文件是随包编的（`include/` 来自同一份源码），编译期就能暴露；不要混用预编译 include |
+
+**本地只编 librime（不编 Weasel）**：
+
+```powershell
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -Check        # 只看 pin/boost/VS 状态
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1              # 全量：deps + librime + 摆进 Weasel
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -SkipDeps     # 复用已编好的 deps
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -Rebuild      # 从零重编（deps 也重编）
+pwsh -NoProfile -File scripts/ime/build-librime-win.ps1 -NoDeploy     # 只编到 dist，不动 third_party/weasel
+```
 
 ### CI 前置：vendored 源码必须入库
 
@@ -132,10 +234,13 @@ File ...resources...
 |---|---|
 | `cache weasel build deps (boost 1.84.0)` | 缓存 `third_party/weasel/deps/boost_1_84_0/{boost,stage}` |
 | `resolve weasel mode` | 解析 `RIMESYNC_WEASEL_MODE`：tag 推送强制 `require`；手动按 `workflow_dispatch.weasel_mode` |
-| `build weasel installer from vendored source` | 调 `build-weasel.ps1`；`continue-on-error` 只在 `build`/`fetch` 模式为真，`require` 下失败即 job 失败 |
+| `cache self-built librime (deps + build dirs)` | 缓存 `third_party/librime/deps/*/build` 与 `third_party/librime/build`；不缓存 `dist/` |
+| `build librime from vendored source (merged rimesync-extra)` | 跑 `build-librime-win.ps1`（deps 浅克隆 → build.bat deps → build.bat librime ×2 → 断言组件名 → 摆进 Weasel）；`continue-on-error` 只在 `build`/`fetch` 为真，`require` 下失败即 job 失败 |
+| `build weasel installer from vendored source` | 调 `build-weasel.ps1 -LibrimeSource self`；`continue-on-error` 只在 `build`/`fetch` 模式为真，`require` 下失败即 job 失败 |
 | `fetch upstream weasel installer (fallback / offline mode)` | `build` 模式自编译失败、或 `fetch` 模式时走官方安装包；**绝不**在 `require` 下运行 |
 | `verify weasel vendor payload` | 必须有 `weasel-*.exe` 且 ≥ 10 MiB；`require` 下来源必须是自编译；写 `packaging/out/WEASEL-SOURCE.json` 并红字标注回退 |
-| `verify-artifacts`（独立 job） | 解 `*-setup.exe` → `WeaselServer.exe`，搜 UTF-16LE「Rime 同步」；`require` 下缺失即失败，publish 不会跑 |
+| `assert rime.dll carries rimesync components` | 解开 `packaging/windows/vendor/weasel-*.exe`，断言每个 `rime.dll` 都含 `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect`（与脚本内部断言双保险） |
+| `verify-artifacts`（独立 job） | 解 `*-setup.exe` → `WeaselServer.exe` 搜 UTF-16LE「Rime 同步」；再解出 `rime.dll` 断言三个 `rimesync_*` 组件名；`require` 下缺失即失败，publish 不会跑 |
 | `assert nsis setup embeds weasel` | 在线 setup ≥ 12 MiB（内嵌 Weasel） |
 | `stash online nsis artifacts` | 在线包先挪到 `packaging/out/nsis-online/`（第二遍构建会写回同名文件） |
 | `fetch WebView2 standalone payload` | `fetch-webview2.ps1`：3 次重试；< 100 MiB 或非 `MZ` 直接失败 |
@@ -146,12 +251,17 @@ File ...resources...
 
 在 CI 上确认自编译成功的检查项：
 
-1. `build weasel installer from vendored source` 步骤为绿色，日志末行有
+1. `build librime from vendored source (merged rimesync-extra)` 为绿色，日志里有
+   `[librime/x64] ... rimesync_vnum / rimesync_punct / rimesync_vselect 全部命中` 与
+   `[librime/Win32] ...` 各一条；
+2. `build weasel installer from vendored source` 步骤为绿色，日志末行有
    `[ok] ...\weasel-0.17.4.0-installer.exe` 与 `sha256=...`；
-2. `verify weasel vendor payload` 打印 `weasel source: self-built from third_party/weasel @ 0.17.4`；
-3. makensis 日志里**没有** `vendored weasel installer not found` 告警；
-4. `assert nsis setup embeds weasel` 打印的 MiB 数 ≥ 15；
-5. 真机静默安装后 `%ProgramFiles%\rime-sync\install-ime-order.log` 含
+3. `verify weasel vendor payload` 打印 `weasel source: self-built from third_party/weasel @ 0.17.4`，
+   且 `WEASEL-SOURCE.json` 的 `librime` 字段是 `self-built 1.17.0 (merged rimesync-extra)`；
+4. `assert rime.dll carries rimesync components` 打印 `rime.dll 组件齐全`；
+5. makensis 日志里**没有** `vendored weasel installer not found` 告警；
+6. `assert nsis setup embeds weasel` 打印的 MiB 数 ≥ 15；
+7. 真机静默安装后 `%ProgramFiles%\rime-sync\install-ime-order.log` 含
    `phase=PREINSTALL weasel installer exit=0`，且 `phase=POSTINSTALL` 在其后。
 
 ## 5. 回退方案（自编译失败）
@@ -171,17 +281,31 @@ File ...resources...
 - 手动触发：Actions → release → Run workflow → `weasel_mode` 选 `require` / `build` / `fetch`。
 - 本地等价：`pwsh -File packaging/windows/fetch-weasel.ps1` 后再 `pnpm tauri build --bundles nsis`
   （本地构建没有 summary，必须自己记得这一版没有入口）。
+- 只回退 librime（保留自编译 Weasel，本地应急）：
+  `pwsh -File scripts/ime/build-weasel.ps1 -LibrimeSource prebuilt -LibrimeTag 1.13.1`。
+  布局/头文件一致，能链接能装，但日志红字说明「不含输入增强插件」：v 模式 / 标点 Shift 备选 /
+  a-h 选词 不生效，`WEASEL-SOURCE.json` 的 `librime` 会记成 `prebuilt 1.13.1 (no plugins)`。
+  **CI 里这条路径被 `ci.yml` 的 guard 明令禁止**（release.yml 不许出现 `-LibrimeTag`）：发布版必须带插件。
 - 两条路径产出的文件名一致（`weasel-0.17.4.0-installer.exe`），钩子与 resources 布局不用改。
 - 产物验收：`bash .github/scripts/verify-artifacts.sh --dir dist`（严格）或
   `--weasel-mode build`（放行回退但红字告警）。
 
 ## 6. 无法在本机验证的点（必须靠 CI / 真机）
 
-- 本机（Linux 开发机）没有 MSVC / NSIS / pwsh：`build-weasel.ps1` 只做了人工审读，
-  **PowerShell 语法检查与整链验证在 CI**。本地可用的替代检查：
-  `pwsh -NoProfile -Command "[void][scriptblock]::Create((Get-Content -Raw scripts/ime/build-weasel.ps1))"`。
+- 本机（Linux 开发机）没有 MSVC / NSIS：`build-weasel.ps1` / `build-librime-win.ps1` 的
+  **编译链路**只能靠 CI 首跑验证（人工审读 + `-Check` 静态检查）。语法有 CI 守卫：
+  `ci.yml` 的 `packaging-scripts` job 里 `parse Windows packaging ps1 (syntax only)` 用
+  PowerShell 自带的 `[Parser]::ParseFile` 解析 `scripts/ime/*.ps1` 与
+  `packaging/windows/*.ps1`，`parse inline PowerShell in release.yml` 解析所有
+  `shell: pwsh` 步骤的内联脚本。
+- 自建 librime 的 `build.bat deps` 里 googletest 的占位工程只在 Linux 上验过 configure+install
+  （CMake 3.31 + Makefiles）；VS 生成器下的同一行为需要 CI 首跑确认（失败时用 `-WithTests` 绕过）。
+- 插件在 Windows 上**是否真的生效**（v 模式、标点 Shift 备选、a-h 选词）需要真机打字验证：
+  二进制里能搜到组件名只证明它被编进去了，不证明 Weasel 的 schema 配置引用到了它们。
 - Weasel 在无交互的 CI 会话里安装是否完整注册 TSF（可能需重启 explorer）未验证。
-- `get-rime.ps1` 依赖 `api.github.com`：限流/网络问题会失败（CI 传 `GITHUB_TOKEN` 缓解）。
+- `get-rime.ps1`（只在 `-LibrimeSource prebuilt` 时用到）依赖 `api.github.com`：
+  限流/网络问题会失败（CI 传 `GITHUB_TOKEN` 缓解）。自建路径不联网拉 release，
+  只做 5 个 deps 的 `git clone --depth 1`。
 - boost 源码下载（`archives.boost.io`，约 120MB）可能慢；缓存命中可跳过。
 - 自编译安装包不含输入方案（plum 为空子模块）；需要方案时用 `-WithRimeData`
   或走官方安装包，见 `docs/THIRD-PARTY.md`。

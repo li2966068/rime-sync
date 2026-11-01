@@ -245,6 +245,59 @@ print(data.count(sys.argv[2].encode('utf-16-le')))
 PY
 }
 
+# 组件名 / 版本号这类纯 ASCII 标记在二进制里是 UTF-8（= ASCII）明文，按字节出现次数算。
+count_ascii() { # $1=file $2=text
+  python3 - "$1" "$2" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+print(data.count(sys.argv[2].encode('utf-8')))
+PY
+}
+
+# 0.6.9 起 Windows 包里的 rime.dll 必须是自建 librime（合并 plugins/rimesync-extra）。
+# 三个组件名是 registry 注册用的普通字符串常量，合并进 rime.dll 后就是明文。
+# 判定分两种：
+#   - WeaselServer.exe 里命中「Rime 同步」= 自编译 Weasel → 它内嵌的 rime.dll 必须带组件名，
+#     缺了就是构建链断了（上游预编译包没有外部插件加载能力），直接红；
+#   - 上游官方 Weasel 回退 → 本来就带不出插件，按 --weasel-mode 的既有规则降级成红字告警。
+check_rime_components() { # $1=l2 解包目录 $2=caption 命中次数
+  local root=$1 caption_hits=$2
+  local dlls=() dll comp n
+  mapfile -t dlls < <(find "$root" -type f -iname 'rime.dll' 2>/dev/null | sort)
+
+  if [ "${#dlls[@]}" -eq 0 ]; then
+    if [ "${caption_hits:-0}" -gt 0 ]; then
+      bad "内嵌 weasel 安装包里没有 rime.dll：自编译 Weasel 必须带 librime"
+    else
+      warn "内嵌 weasel 安装包里没有 rime.dll（上游回退包结构变化？）"
+    fi
+    return
+  fi
+
+  local missing=()
+  for dll in "${dlls[@]}"; do
+    for comp in rimesync_vnum rimesync_punct rimesync_vselect; do
+      n=$(count_ascii "$dll" "$comp" 2>/dev/null || echo 0)
+      if [ "${n:-0}" -le 0 ]; then
+        missing+=("$(basename "$(dirname "$dll")")/$(basename "$dll"):$comp")
+      fi
+    done
+  done
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    ok "rime.dll 含 rimesync_vnum / rimesync_punct / rimesync_vselect（${#dlls[@]} 个架构，输入增强插件已编进 librime）"
+    return
+  fi
+
+  local msg="rime.dll 里搜不到插件组件名：${missing[*]}（librime 没有合并 plugins/rimesync-extra）"
+  if [ "${caption_hits:-0}" -gt 0 ]; then
+    bad "$msg —— 自编译 Weasel 却带着没有插件的 rime.dll：v 模式 / 标点 Shift 备选 / a-h 选词 在 Windows 上不生效"
+  else
+    warn "$msg（按 --weasel-mode=$WEASEL_MODE 放行：上游 Weasel 回退包不带插件）"
+    summary "> **Windows 版 rime.dll 不含 rimesync-extra**：本版没有输入增强插件（v 模式 / 标点 Shift 备选 / a-h 选词）。"
+  fi
+}
+
 check_windows_setup() { # $1=setup.exe $2=workdir
   local setup=$1 work=$2
   say "[windows] $(basename "$setup")"
@@ -282,6 +335,7 @@ check_windows_setup() { # $1=setup.exe $2=workdir
 
   local count
   count=$(count_utf16le "$server" "$WEASEL_CAPTION" 2>/dev/null || echo 0)
+  check_rime_components "$work/l2" "${count:-0}"
   if [ "${count:-0}" -gt 0 ] 2>/dev/null; then
     ok "WeaselServer.exe 内含 UTF-16LE「$WEASEL_CAPTION」×$count（Weasel 托盘入口存在）"
     return
@@ -475,7 +529,15 @@ caption = sys.argv[2]
 data = b'MZ' + b'\0' * 64 + caption.encode('utf-16-le') + b'\0' * 16
 open(sys.argv[1], 'wb').write(data)
 PY
-  (cd "$weasel_dir" && 7z a -bso0 -bsp0 "$base/good/weasel-0.17.4.0-installer.exe" WeaselServer.exe >/dev/null 2>&1)
+  # 0.6.9 起 rime.dll 必须带 rimesync-extra 的组件名，夹具里造两个架构的假 DLL
+  mkdir -p "$weasel_dir/Win32"
+  python3 - "$weasel_dir/rime.dll" "$weasel_dir/Win32/rime.dll" <<'PY'
+import sys
+payload = b'MZ' + b'\0' * 64 + b'rimesync_vnum' + b'rimesync_punct' + b'rimesync_vselect'
+for path in sys.argv[1:]:
+    open(path, 'wb').write(payload)
+PY
+  (cd "$weasel_dir" && 7z a -bso0 -bsp0 "$base/good/weasel-0.17.4.0-installer.exe" WeaselServer.exe rime.dll Win32 >/dev/null 2>&1)
   mkdir -p "$base/good/resources"
   mv "$base/good/weasel-0.17.4.0-installer.exe" "$base/good/resources/"
   (cd "$base/good" && 7z a -bso0 -bsp0 "$base/good/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
@@ -616,6 +678,20 @@ PY
   rm -f "$base/no-weasel-caption/dist/"*-setup.exe
   (cd "$base/no-weasel-caption" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
   expect_fail "Weasel 里没有「输入法自建同步」" "$base/no-weasel-caption" "搜不到 UTF-16LE"
+
+  # 0.6.9：自编译 Weasel 带着没有插件的 rime.dll（= 又退回预编译包）必须红
+  mutate no-rime-components
+  python3 - "$base/no-rime-components/weasel/rime.dll" "$base/no-rime-components/weasel/Win32/rime.dll" <<'PY'
+import sys
+# 只留 rimesync_vnum：模拟「预编译 rime.dll + 手工塞了个名字」，punct / vselect 仍然缺
+payload = b'MZ' + b'\0' * 64 + b'rimesync_vnum'
+for path in sys.argv[1:]:
+    open(path, 'wb').write(payload)
+PY
+  (cd "$base/no-rime-components/weasel" && 7z a -bso0 -bsp0 "$base/no-rime-components/resources/weasel-0.17.4.0-installer.exe" WeaselServer.exe rime.dll Win32 >/dev/null 2>&1)
+  rm -f "$base/no-rime-components/dist/"*-setup.exe
+  (cd "$base/no-rime-components" && 7z a -bso0 -bsp0 "$base/no-rime-components/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  expect_fail "rime.dll 没合并 rimesync-extra" "$base/no-rime-components" "rimesync_punct"
 
   printf '\n自检失败 %d 项\n' "$failures"
   rm -rf "$base"
