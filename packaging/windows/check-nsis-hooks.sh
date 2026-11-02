@@ -69,9 +69,9 @@ assert_has "旧输入法会被卸载（标记+卸载命令）"      'StrCpy $R9 
 assert_has "旧小狼毫仍在时给出警告标记"            'StrCpy $RimeSyncWeaselKept "1"'
 
 # POSTINSTALL：无条件写配置 + 覆盖前备份 + DONE 报数
-assert_has "备份名 <file>.bak-<版本>"             '.bak-$RimeSyncSeedVersion"'
-assert_has "同名备份追加 -1/-2…"                  '.bak-$RimeSyncSeedVersion-$4'
-assert_has "覆盖前先 Rename（不删用户文件）"       'Rename "$1\$2" "$5"'
+assert_has "已有配置一律复用（不覆盖不删除）"     'rimesync_wcfg_reuse'
+assert_has "复用计数 result=reuse"               'StrCpy $3 "reuse"'
+assert_has "复制失败记录 failed"                 'rimesync_wcfg_failed'
 assert_has "DONE 阶段报配置文件数/备份数"          "phase=DONE setup finished configs=\$RimeSyncSeedWritten backups=\$RimeSyncSeedBackups"
 assert_has "用户数据不动：只写三类 *.custom.yaml"   'seed skip schemas: no templates'
 

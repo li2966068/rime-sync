@@ -76,7 +76,7 @@ patch:
 
 Windows：NSIS 钩子（`packaging/nsis-hooks.nsh`）从 `$INSTDIR\resources\schemas\*.custom.yaml`
 复制到 `%APPDATA%\Rime\`（模板由 `src-tauri/tauri.conf.json` 的 `resources` 映射进包）。
-0.6.11 起**升级也写**，不再是「存在就跳过」：已存在的同名文件先改名成 `<file>.bak-<安装包版本>`
+0.6.12 起规则是「缺失就补、已存在就沿用」：已存在的同名文件原样保留（卸载旧版也不会删掉它们）
 （同名再追加 `-1`/`-2`），再写新版；写入前逐个模板检查 Weasel 的 `data` 里有对应
 `<schema>.schema.yaml`（`default.custom.yaml` 要求 `wubi86`），缺方案的跳过，以免 librime 部署失败。
 用户词典（`*.userdb*`、词表 `*.txt`）与 `%APPDATA%\com.rimesync.app` 一律不动。

@@ -517,36 +517,29 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 
 ### 10.2 配置文件：按新版无条件写，覆盖前备份
 
-`POSTINSTALL` 的 `RimeSyncSeedRimeConfig` 不再「存在就跳过」：
+`POSTINSTALL` 的 `RimeSyncSeedRimeConfig` 规则（0.6.12 起）：
 
 | 目标 | 规则 |
 |---|---|
-| `%APPDATA%\Rime\default.custom.yaml` | 目录不存在就创建；已存在 → 先改名备份再写新版。仍要求 Weasel 的 `data` 里有 `wubi86.schema.yaml`（模板的 `schema_list` 列了五笔，缺方案会让 librime 整次部署失败） |
-| `%APPDATA%\Rime\weasel.custom.yaml` | 无条件写（只影响外观：候选横向排列） |
-| `%APPDATA%\Rime\<schema>.custom.yaml` | 遍历 `$INSTDIR\resources\schemas\*.custom.yaml`，**逐个**要求 Weasel `data` 里有 `<schema>.schema.yaml`，否则跳过该文件 |
+| `%APPDATA%\Rime\default.custom.yaml` | 目录不存在就创建；**已存在就沿用**，不覆盖。仍要求 Weasel 的 `data` 里有 `wubi86.schema.yaml`（模板的 `schema_list` 列了五笔，缺方案会让 librime 整次部署失败） |
+| `%APPDATA%\Rime\weasel.custom.yaml` | 已存在就沿用；缺失才写（只影响外观：候选横向排列） |
+| `%APPDATA%\Rime\<schema>.custom.yaml` | 遍历 `$INSTDIR\resources\schemas\*.custom.yaml`，**逐个**要求 Weasel `data` 里有 `<schema>.schema.yaml`，否则跳过；已存在则沿用 |
 
-备份命名：
-
-* `<file>.bak-<版本>`，例如 `default.custom.yaml.bak-0.6.11`；
-* 版本取 `PRODUCTVERSION`（Tauri 模板的版本号 = `src-tauri/tauri.conf.json` 的 `version`）；
-  没有该宏的构建退回内嵌小狼毫版本（`RIMESYNC_WEASEL_DIRVER`，当前 `0.17.4`）；
-* 同名备份已存在则追加 `-1`/`-2`…（`default.custom.yaml.bak-0.6.11-1`）；
-* 备份改名失败（文件被占用/只读）→ **不覆盖**，日志记 `result=failed`：宁可不更新，也不毁掉
-  用户手改的配置；复制失败会把备份改回原名。
+**为什么改成「沿用」**：卸载旧版时不会删除 `%APPDATA%\Rime`，升级后用户自己的改造
+（以及同步下来的设置）必须原样保留；安装器只补缺失的文件。想强制刷新某个配置，删掉
+对应文件再装一次即可（安装器会重新写入新版）。
 
 日志（`%TEMP%\rime-sync-setup.log`，UTF-16LE）：
 
 ```text
 [rime-sync] 2026-11-02 20:00:00 phase=UNINSTALL-OLD target=rime-sync exit=0 ms=3120 source=(instdir)
 [rime-sync] 2026-11-02 20:00:03 phase=UNINSTALL-OLD target=weasel exit=0 ms=2410
-[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed begin version=0.6.11 policy=backup-overwrite
-[rime-sync] 2026-11-02 20:00:05 seed file=default.custom.yaml result=backup backup=C:\Users\me\AppData\Roaming\Rime\default.custom.yaml.bak-0.6.11
-[rime-sync] 2026-11-02 20:00:05 seed file=luna_pinyin.custom.yaml result=new backup=
-[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed done configs=16 backups=1 version=0.6.11
-[rime-sync] 2026-11-02 20:00:06 phase=DONE setup finished configs=16 backups=1 weasel-kept=0
+[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed begin version=0.6.12 policy=reuse-existing
+[rime-sync] 2026-11-02 20:00:05 seed file=default.custom.yaml result=reuse
+[rime-sync] 2026-11-02 20:00:05 seed file=luna_pinyin.custom.yaml result=new
+[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed done configs=1 reused=15 version=0.6.12
+[rime-sync] 2026-11-02 20:00:06 phase=DONE setup finished configs=1 reused=15 weasel-kept=0
 ```
-
-`阶段=DONE` 的 `DetailPrint` 与日志都会写「已按新版刷新 N 个配置文件（备份 N 个）」。
 
 ### 10.3 用户数据一律不动
 
@@ -560,21 +553,14 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 卸载器默认同样保留 `%APPDATA%\Rime`（只有交互卸载选「是」或静默卸载带 `/PURGEDATA`
 才删，见第 7 节）。
 
-### 10.4 怎么回滚备份
+### 10.4 想让它重新写一遍新版配置
 
 ```powershell
-# 看有哪些备份
-Get-ChildItem "$env:APPDATA\Rime" -Filter *.bak-*
-# 回滚单个文件：删掉新版，把备份改回原名
-Remove-Item "$env:APPDATA\Rime\default.custom.yaml"
-Rename-Item "$env:APPDATA\Rime\default.custom.yaml.bak-0.6.11" "default.custom.yaml"
-# 回滚本版本的全部备份
-Get-ChildItem "$env:APPDATA\Rime" -Filter *.bak-0.6.11* | ForEach-Object {
-  Move-Item -Force $_.FullName ($_.FullName -replace '\.bak-[^\\]+$', '')
-}
+# 只删要刷新的那几个文件，再装一次新版（安装器只补缺失，不会覆盖其它文件）
+Remove-Item "$env:APPDATA\Rime\luna_pinyin.custom.yaml","$env:APPDATA\Rime\default.custom.yaml" -ErrorAction SilentlyContinue
 ```
 
-回滚后让小狼毫重新部署（托盘「重新部署」或 `WeaselDeployer.exe /deploy`）才生效。
+装完让小狼毫重新部署（托盘「重新部署」或 `WeaselDeployer.exe /deploy`）即可。
 
 ### 10.5 本机能验到哪一步（真机仍需复核）
 
@@ -587,5 +573,5 @@ DONE 报数）。编译只能证明语法与结构，**运行期行为只能在�
 2. 旧版带自建小狼毫：`BundledWeasel=1` 分支命中，小狼毫被卸、新版重装后再写标记；
 3. 卸载器卡住（把 `uninstall.exe` 换成 `cmd /c pause`）→ 120 秒后 `timeout`，安装继续；
 4. `%APPDATA%\Rime` 里的 `*.userdb*`、`*.txt` 升级后原样还在；
-5. 手改过 `weasel.custom.yaml` → 升级后出现 `.bak-<版本>`，新版生效；
-6. 备份名冲突（已有 `.bak-0.6.11`）→ 生成 `.bak-0.6.11-1`。
+5. 手改过 `weasel.custom.yaml` → 升级后**原样保留**（日志 result=reuse），改动不被覆盖；
+6. 删掉 `luna_pinyin.custom.yaml` 再装 → 日志 result=new，新版被写入（只补缺失）。

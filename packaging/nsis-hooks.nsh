@@ -151,7 +151,8 @@
   Var /GLOBAL RimeSyncWeaselKept        ; 1 = 旧小狼毫仍在，本次跳过输入法安装
   Var /GLOBAL RimeSyncSeedVersion       ; 备份后缀用的版本号
   Var /GLOBAL RimeSyncSeedWritten       ; 本次写入的配置文件数
-  Var /GLOBAL RimeSyncSeedBackups       ; 本次生成的备份数
+  Var /GLOBAL RimeSyncSeedBackups       ; 本次生成的备份数（0.6.12 起恒为 0，保留字段兼容旧日志）
+  Var /GLOBAL RimeSyncSeedReused        ; 本次沿用的已有配置文件数
   Var /GLOBAL RimeSyncSeedWeaselRoot    ; 本次探测到的小狼毫根目录
   Var /GLOBAL RimeSyncSeedHandle        ; FindFirst/FindNext 句柄
   Var /GLOBAL RimeSyncSeedName          ; FindFirst/FindNext 文件名
@@ -262,46 +263,27 @@ FunctionEnd
 ; 出参：$3 = new | backup | failed，$5 = 备份路径（没备份则为空）
 ; 累加：$RimeSyncSeedWritten / $RimeSyncSeedBackups（调用方负责清零）
 Function RimeSyncWriteConfigFile
+  ; 0.6.12 起：用户目录里已有的配置**一律复用**，不覆盖、不改名。
+  ; 只有缺失的文件才写入新版内容——卸载旧版时也不会删掉这些配置，所以升级后
+  ; 用户的改造（含同步下来的设置）原样保留。
   StrCpy $3 "new"
   StrCpy $5 ""
   CreateDirectory "$1"
   IfFileExists "$1\*.*" 0 rimesync_wcfg_failed
 
-  IfFileExists "$1\$2" 0 rimesync_wcfg_copy
-    ; 找一个没被占用的备份名：<file>.bak-<ver>、<file>.bak-<ver>-1、-2…
-    StrCpy $4 0
-    StrCpy $5 "$1\$2.bak-$RimeSyncSeedVersion"
-    rimesync_wcfg_pick:
-      IfFileExists "$5" 0 rimesync_wcfg_rename
-      IntOp $4 $4 + 1
-      StrCpy $5 "$1\$2.bak-$RimeSyncSeedVersion-$4"
-      Goto rimesync_wcfg_pick
-    rimesync_wcfg_rename:
-      ClearErrors
-      Rename "$1\$2" "$5"
-      IfErrors rimesync_wcfg_rename_failed
-      IntOp $RimeSyncSeedBackups $RimeSyncSeedBackups + 1
-      StrCpy $3 "backup"
-      Goto rimesync_wcfg_copy
-    rimesync_wcfg_rename_failed:
-      ; 旧文件被占用/只读：不改名就绝不覆盖，交给调用方记 failed
-      StrCpy $5 ""
-      Goto rimesync_wcfg_failed
+  IfFileExists "$1\$2" rimesync_wcfg_reuse
 
-  rimesync_wcfg_copy:
   ClearErrors
   CopyFiles /SILENT "$0" "$1\$2"
-  IfFileExists "$1\$2" 0 rimesync_wcfg_copy_failed
+  IfFileExists "$1\$2" 0 rimesync_wcfg_failed
   IntOp $RimeSyncSeedWritten $RimeSyncSeedWritten + 1
   Return
 
-  rimesync_wcfg_copy_failed:
-  StrCmp $3 "backup" 0 rimesync_wcfg_failed
-    ; 新文件没落盘：把备份改回原名，用户配置保持原样（备份计数回退）
-    ClearErrors
-    Rename "$5" "$1\$2"
-    IntOp $RimeSyncSeedBackups $RimeSyncSeedBackups - 1
-    StrCpy $5 ""
+  rimesync_wcfg_reuse:
+    IntOp $RimeSyncSeedReused $RimeSyncSeedReused + 1
+    StrCpy $3 "reuse"
+    Return
+
   rimesync_wcfg_failed:
   StrCpy $3 "failed"
 FunctionEnd
@@ -309,12 +291,12 @@ FunctionEnd
 ; 记一行日志 + 进度面板提示
 ; 入参：$6 = 文件名，$3 = new|backup|failed，$5 = 备份路径（可空）
 Function RimeSyncLogSeedResult
-  StrCpy $R3 "[rime-sync] $R2 seed file=$6 result=$3 backup=$5"
+  StrCpy $R3 "[rime-sync] $R2 seed file=$6 result=$3"
   Call RimeSyncLog
-  StrCmp $3 "backup" 0 rimesync_seedlog_not_backup
-    DetailPrint "[rime-sync] 已备份 $6 → $5，写入新版"
+  StrCmp $3 "reuse" 0 rimesync_seedlog_not_reuse
+    DetailPrint "[rime-sync] $6 已存在，保留现有配置（沿用你的设置）"
     Return
-  rimesync_seedlog_not_backup:
+  rimesync_seedlog_not_reuse:
   StrCmp $3 "failed" 0 rimesync_seedlog_ok
     DetailPrint "[rime-sync] 写入 $6 失败（目标 $APPDATA\Rime）"
     Return
@@ -325,6 +307,7 @@ FunctionEnd
 Function RimeSyncSeedRimeConfig
   StrCpy $RimeSyncSeedWritten 0
   StrCpy $RimeSyncSeedBackups 0
+  StrCpy $RimeSyncSeedReused 0
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=POSTINSTALL 按新版刷新推荐配置（覆盖前备份为 .bak-$RimeSyncSeedVersion）"
   StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed begin version=$RimeSyncSeedVersion policy=backup-overwrite"
@@ -415,8 +398,8 @@ Function RimeSyncSeedRimeConfig
     Call RimeSyncLog
 
   rimesync_seed_summary:
-  DetailPrint "[rime-sync] 已按新版刷新 $RimeSyncSeedWritten 个配置文件（备份 $RimeSyncSeedBackups 个）"
-  StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed done configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups version=$RimeSyncSeedVersion"
+  DetailPrint "[rime-sync] 配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个"
+  StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed done configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused version=$RimeSyncSeedVersion"
   Call RimeSyncLog
 FunctionEnd
 
@@ -1572,7 +1555,7 @@ FunctionEnd
 
   ; 收尾标记：安装日志里必须有 phase=DONE（失败时不会有，便于区分「装完」与「中途退出」）
   Call RimeSyncStamp
-  DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；已按新版刷新 $RimeSyncSeedWritten 个配置文件（备份 $RimeSyncSeedBackups 个）；日志：$TEMP\rime-sync-setup.log"
+  DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个；日志：$TEMP\rime-sync-setup.log"
   StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept"
   Call RimeSyncLog
 !macroend
