@@ -228,9 +228,12 @@ FunctionEnd
 Function RimeSyncSeedRimeConfig
   StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed rime config"
   Call RimeSyncLog
+  ; 0.6.10：用户目录不存在时不再整体跳过——建出来再写（写进去的只是 *.custom.yaml，
+  ; 小狼毫首次部署会照常合并；旧行为会让“刚装完还没启动过输入法”的机器什么都拿不到）。
+  CreateDirectory "$APPDATA\Rime"
   IfFileExists "$APPDATA\Rime\*.*" rimesync_seed_dir_ready
-    DetailPrint "[rime-sync] $APPDATA\Rime 不存在（用户尚未初始化小狼毫），跳过推荐配置写入"
-    StrCpy $R3 "[rime-sync] $R2 seed skipped: no Rime user dir"
+    DetailPrint "[rime-sync] 无法创建 $APPDATA\Rime，跳过推荐配置写入"
+    StrCpy $R3 "[rime-sync] $R2 seed skipped: cannot create Rime user dir"
     Call RimeSyncLog
     Return
   rimesync_seed_dir_ready:
@@ -266,21 +269,38 @@ Function RimeSyncSeedRimeConfig
     Call RimeSyncLog
     Goto rimesync_schema_seed_done
   rimesync_schema_seed_root:
-  ; 模板引用的方案必须真在 Weasel 的 data 里，否则部署会失败（同 default.custom.yaml 的守卫）。
+  ; 模板引用的方案必须真在 Weasel 的 data 里，否则部署会失败。
+  ; 0.6.10：改成**逐个模板**判断（luna_pinyin.custom.yaml 只要求 data 里有 luna_pinyin.schema.yaml），
+  ; 不再一刀切要求 wubi86——否则老版本小狼毫（data 无五笔）上 v 模式/标点直出会被全部跳过。
   Call RimeSyncFindWeaselRoot
   StrCmp $R8 "" rimesync_schema_seed_done
-  IfFileExists "$R8\data\wubi86.schema.yaml" rimesync_schema_seed_begin rimesync_schema_seed_done
-  rimesync_schema_seed_begin:
   Push $R5
   Push $R6
-  FindFirst $R5 $R6 "$INSTDIR\\resources\schemas\*.custom.yaml"
+  Push $R4
+  FindFirst $R5 $R6 "$INSTDIR\resources\schemas\*.custom.yaml"
   rimesync_schema_seed_loop:
   StrCmp $R6 "" rimesync_schema_seed_end
     IfFileExists "$APPDATA\Rime\$R6" rimesync_schema_seed_next
-      CopyFiles /SILENT "$INSTDIR\\resources\schemas\$R6" "$APPDATA\Rime\$R6"
-      DetailPrint "[rime-sync] 写入 $R6（v 数值转换 / 中文标点直出）"
-      StrCpy $R3 "[rime-sync] $R2 seed $R6"
-      Call RimeSyncLog
+      ; <schema>.custom.yaml 只有在 Weasel data 里有 <schema>.schema.yaml 时才写，
+      ; 避免部署时找不到方案（老版本小狼毫没有五笔，但仍能吃到 luna 系的增强）。
+      StrCpy $R4 $R6 -12
+      IfFileExists "$R8\data\$R4.schema.yaml" rimesync_schema_seed_copy rimesync_schema_seed_missing
+      rimesync_schema_seed_copy:
+        CopyFiles /SILENT "$INSTDIR\resources\schemas\$R6" "$APPDATA\Rime\$R6"
+        IfFileExists "$APPDATA\Rime\$R6" rimesync_schema_seed_copied rimesync_schema_seed_copyfail
+        rimesync_schema_seed_copied:
+          DetailPrint "[rime-sync] 写入 $R6（v 数值转换 / 中文标点直出）"
+          StrCpy $R3 "[rime-sync] $R2 seed $R6 ok"
+          Call RimeSyncLog
+          Goto rimesync_schema_seed_next
+        rimesync_schema_seed_copyfail:
+          DetailPrint "[rime-sync] 复制 $R6 失败（目标 $APPDATA\Rime）"
+          StrCpy $R3 "[rime-sync] $R2 seed $R6 FAILED copy"
+          Call RimeSyncLog
+          Goto rimesync_schema_seed_next
+      rimesync_schema_seed_missing:
+        StrCpy $R3 "[rime-sync] $R2 seed skip $R6: no $R4.schema.yaml in data"
+        Call RimeSyncLog
     rimesync_schema_seed_next:
     FindNext $R5 $R6
     Goto rimesync_schema_seed_loop
