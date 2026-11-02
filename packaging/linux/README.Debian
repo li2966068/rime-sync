@@ -110,7 +110,29 @@ postinst 本身立即返回，绝不会卡住或让安装失败。日志在
   `dpkg --configure -a`；系统里与本安装无关的半配置包不会再被判成安装失败；
 * 确实需要把系统库升到离线包版本时才加 `--upgrade-vendor`（默认关闭）。
 
-四、故障排查：半配置包与多架构冲突
+四、升级 = 卸载旧版 + 全新安装（配置保留）
+------------------------------------------
+0.6.12 起，Linux 安装器与 Windows 安装器采用同一策略：每个新版本都先卸载旧版，
+再全新安装。安装日志里的阶段名是 UNINSTALL-OLD。
+
+* 卸载：`dpkg-query` 检测到 rime-inputmethod / rime-sync 已装（含 rc 残留）后，
+  用 `apt-get purge -y` 卸掉两个包（失败退回 `dpkg --purge --force-depends`）；
+  卸载失败只警告，继续安装新版。
+* 保留：两个包都**不拥有**用户数据目录，purge 不会删它们。安装器在 purge 前检查
+  两个包的文件清单里没有任何用户目录路径，purge 后再逐条确认这些路径仍在：
+      ~/rime
+      ~/.config/fcitx5/rime
+      ~/.local/share/fcitx5/rime
+      ~/.config/com.rimesync.app
+  用户词库、词表、自定义词典全程不动。
+* 配置模板：新版安装时**缺失才补**（`/usr/share/rime-sync/defaults/default.custom.yaml`
+  与 `defaults/schemas/*.custom.yaml`）。用户目录里已有同名文件一律沿用——不覆盖、
+  不改名、不备份；日志逐文件记 `seed file=<name> result=new|reuse|skip`。
+  想强制刷新某个模板：删掉用户目录里对应的文件再装一次。
+* 卸载后若 fcitx5 仍在运行，安装器会提示重新登录桌面，或在图形会话内执行
+  `systemctl --user restart fcitx5`。
+
+五、故障排查：半配置包与多架构冲突
 ----------------------------------
 安装失败时先看安装器自己打出来的三段信息（也在 /var/log/rime-sync/install.log）：
 
@@ -150,23 +172,22 @@ D. 只想确认系统当前还有什么没配好
     dpkg --audit
     dpkg -l | awk '$1 ~ /^.U|^.F/ {print $1, $2, $3}'
 
-修好后重新执行安装器即可：已经配置好的依赖不会重复处理，rime-inputmethod 与
-rime-sync 直接 `dpkg -i` 覆盖升级。
+修好后重新执行安装器即可：已经配置好的依赖不会重复处理，旧版 rime-inputmethod 与
+rime-sync 会先被卸载（UNINSTALL-OLD），再全新安装。
 
-升级语义（重复执行）：本安装器可以直接在旧版上重跑，不需要先卸载。0.6.0 起用
-`dpkg -i --force-confdef --force-confold` 覆盖安装，dpkg.log 里是 upgrade
-记录；用户数据（~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
-~/.config/rime-sync）不会被触碰。
+升级语义：0.6.12 起每个新版本都是「先卸载旧版，再全新安装」，dpkg.log 里是
+remove/install（不是原地 upgrade）；用户数据一律保留，配置模板只补缺失。
+详见第四节。
 
 容器化自测（离线、无需真机）：
 
     packaging/linux/test/install-matrix.sh                    # 全部 6 个用例
-    packaging/linux/test/install-matrix.sh upgrade            # 只跑升级用例
+    packaging/linux/test/install-matrix.sh upgrade-fresh      # 只跑升级用例
 
 覆盖：正常离线安装 / 无关半配置包不中止 / 多架构版本不一致不升级已有库 /
-已处于半配置多架构状态时的诊断输出 / 旧版覆盖升级 / 纯单架构系统。
+已处于半配置多架构状态时的诊断输出 / 旧版先卸载再全新安装（配置保留） / 纯单架构系统。
 
-五、卸载
+六、卸载
 --------
 应用菜单里的「卸载 Rime 同步与输入法」会经 pkexec 调用
 /usr/lib/rime-sync/uninstall.sh，一次卸掉 rime-sync 与 rime-inputmethod。
@@ -178,7 +199,9 @@ rime-sync 直接 `dpkg -i` 覆盖升级。
     sudo /usr/lib/rime-sync/uninstall.sh --purge-data # 连本地用户数据一起删（破坏性）
 
 只卸同步程序也可以用 apt remove rime-sync（输入法会留在系统里）。离线包
-install.sh --uninstall 调用的也是同一个脚本。
+install.sh --uninstall 调用的也是同一个脚本。升级安装器（见第四节）同样会 purge
+旧版的两个包，但它在 purge 前校验包的文件清单、purge 后确认用户目录仍在——
+升级不会删用户数据。
 
 卸载只会删掉包自己的文件（/usr/bin/rime-sync-app、/usr/share/rime-sync/、
 菜单项、autostart）。**用户数据默认一律保留**：

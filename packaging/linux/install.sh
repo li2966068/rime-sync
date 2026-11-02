@@ -23,14 +23,18 @@
 #     ~/.config/rime-sync）；只有显式加 --purge-data 才随卸载一起删除（破坏性、不可恢复）
 #   * 离线依赖只补缺失、不升级系统已装的包；失败判定只看本安装器解包的包，不把
 #     系统里已有的半配置/多架构不一致算成 rime-sync 的失败
-#   * 可重复执行：旧版已装时直接 dpkg -i 覆盖升级，不需要先卸载
+#   * 每个新版本都是「先卸载旧版（rime-inputmethod + rime-sync），再全新安装」
+#     （UNINSTALL-OLD 阶段，0.6.12 起；与 Windows 安装器一致）。卸载只删包自己的
+#     文件，用户配置与数据一律保留：~/rime、~/.config/fcitx5/rime、
+#     ~/.local/share/fcitx5/rime、~/.config/com.rimesync.app
+#   * 新版安装时配置模板只补缺失文件，已存在的一律沿用（不覆盖、不改名、不备份）；
+#     日志里每个文件记 seed file=<name> result=new|reuse
 #
 # 选项：
 #   --payload DIR     指定安装包根目录
 #   --upgrade-vendor  全量包：允许把系统已装（ii）的依赖升级到内置版本（默认不动系统库）
 #   --with-schema-tweaks
-#                     升级场景也写入随包 schema 增强配置（v 数值转换 / 中文标点直出）；
-#                     默认只在首次安装（还没有 default.custom.yaml）时写，升级不动老配置
+#                     兼容旧用法：0.6.12 起配置模板始终「缺失才补」，该参数不再改变行为
 #   --uninstall       交给统一卸载脚本（--yes/--keep-ime/--purge-data 见下）
 #
 # 非全量包（thin）离线时的行为：apt 失败即停止，打印手动步骤并提示改用全量包。
@@ -129,6 +133,34 @@ fi
 
 say "rime-sync 安装器（输入法本体 + 同步工具）"
 say "系统: $OS_PRETTY"
+
+# ------------------------------------------------------------ 目标桌面用户
+# 配置种子要落到"用桌面的那个人"的 home。安装器以 root 运行，依次看
+# SUDO_USER / PKEXEC_UID / logname / 唯一普通用户（与 postinst 的判定一致）。
+pick_target_user() {
+  local user="${RIMESYNC_TARGET_USER:-}" cand
+  if [ -n "$user" ]; then printf '%s' "$user"; return 0; fi
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then printf '%s' "$SUDO_USER"; return 0; fi
+  if [ -n "${PKEXEC_UID:-}" ]; then
+    user=$(id -nu "$PKEXEC_UID" 2>/dev/null || true)
+    if [ -n "$user" ] && [ "$user" != root ]; then printf '%s' "$user"; return 0; fi
+  fi
+  user=$(logname 2>/dev/null || true)
+  if [ -n "$user" ] && [ "$user" != root ]; then printf '%s' "$user"; return 0; fi
+  for cand in /home/*; do
+    [ -d "$cand" ] || continue
+    user=$(basename "$cand")
+    if id -u "$user" >/dev/null 2>&1; then printf '%s' "$user"; return 0; fi
+  done
+  printf ''
+}
+
+TARGET_USER=$(pick_target_user)
+TARGET_HOME=
+if [ -n "$TARGET_USER" ]; then
+  TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+  if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then TARGET_HOME=; fi
+fi
 
 case "$OS_ID:$OS_VER" in
   debian:13) DISTRO_KEY=debian-13 ;;
@@ -236,6 +268,90 @@ thin_dep_advice() {
   say "  sudo apt --fix-broken install   # 万一仍有未满足的依赖"
   say "日志：$LOG"
 }
+
+# ------------------------------------------------------------ UNINSTALL-OLD
+# 策略（0.6.12 起，与 Windows 安装器一致）：每个新版本都先卸载旧版，再全新安装。
+# 只 purge rime-inputmethod 与 rime-sync；两个包都**不拥有**用户数据目录
+# （~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、
+# ~/.config/com.rimesync.app），所以 purge 不会删它们。这里先查一遍包的文件清单
+# 做显式校验，再执行 purge；失败只警告，继续装新版（dpkg -i 会覆盖残留）。
+OLD_PKGS=()
+for p in rime-inputmethod rime-sync; do
+  st=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)
+  case "$st" in
+    ""|"unknown ok not-installed") ;;
+    *) OLD_PKGS+=("$p") ;;
+  esac
+done
+
+purge_old_packages() {
+  local p st ok=1
+  say "执行卸载：apt-get purge -y ${OLD_PKGS[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get purge -y --no-install-recommends "${OLD_PKGS[@]}" && ok=0
+  fi
+  if [ "$ok" -ne 0 ]; then
+    say "!! apt-get purge 未成功，改用 dpkg --purge --force-depends"
+    for p in "${OLD_PKGS[@]}"; do
+      st=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)
+      case "$st" in
+        ""|"unknown ok not-installed") continue ;;
+      esac
+      dpkg --purge --force-depends "$p" || say "!! 警告：$p 未能完全 purge（继续安装新版）"
+    done
+  fi
+  for p in "${OLD_PKGS[@]}"; do
+    st=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)
+    case "$st" in
+      ""|"unknown ok not-installed") say "OK: 旧版 $p 已卸载（dpkg 记录已清除）" ;;
+      *) say "!! 警告：$p 仍有残留状态（$st），继续安装新版" ;;
+    esac
+  done
+}
+
+if [ "${#OLD_PKGS[@]}" -eq 0 ]; then
+  step "UNINSTALL-OLD none"
+  say "步骤 0/3：dpkg 里没有已安装的旧版（全新安装）"
+else
+  say "步骤 0/3：卸载旧版 ${OLD_PKGS[*]}（用户配置与数据保留）"
+  owned_user_data=""
+  for p in "${OLD_PKGS[@]}"; do
+    refs=$(dpkg -L "$p" 2>/dev/null | grep -E '^/home/|/\.(config|local)/' || true)
+    [ -n "$refs" ] && owned_user_data="$owned_user_data
+$refs"
+  done
+  if [ -n "$owned_user_data" ]; then
+    say "注意：旧版包的文件清单里出现了用户目录路径（purge 只删包自己的文件，不动这些）："
+    printf '%s\n' "$owned_user_data" | sed 's/^/   /'
+  else
+    say "校验：旧版包的文件清单里没有任何用户目录路径"
+    say "      保留 ~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、~/.config/com.rimesync.app"
+  fi
+
+  purge_old_packages || true
+
+  # 旧版 postrm（<=0.6.11）在 purge 时会 rm -rf /var/log/rime-sync，而本安装器正把
+  # stdout 接到那个 install.log 上。日志目录消失后 tee 写的是已删除的 inode，这里
+  # 重建目录并重新接上 tee，保证 UNINSTALL-OLD 之后的记录完整落盘。
+  if [ ! -e "$LOG" ]; then
+    mkdir -p "$LOGDIR" 2>/dev/null || true
+    exec > >(tee -a "$LOG") 2>&1
+    say "注意：旧版 postrm 删除了 $LOGDIR，已重建日志（本阶段之前的内容见终端输出）"
+  fi
+  step "UNINSTALL-OLD ${OLD_PKGS[*]}"
+
+  if [ -n "$TARGET_HOME" ]; then
+    for d in "$TARGET_HOME/rime" "$TARGET_HOME/.config/fcitx5/rime" \
+             "$TARGET_HOME/.local/share/fcitx5/rime" "$TARGET_HOME/.config/com.rimesync.app"; do
+      [ -e "$d" ] && say "用户数据保留：$d"
+    done
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x fcitx5 >/dev/null 2>&1; then
+    say "提示：fcitx5 仍在运行（旧版输入法已卸载）。请重新登录桌面，或在图形会话内执行："
+    say "      systemctl --user restart fcitx5      # 让输入法重新加载新版"
+  fi
+fi
 
 # --------------------------------------------------- remove conflicting pkgs
 for p in fcitx5-rime librime1t64 librime1 librime-data; do
@@ -543,19 +659,27 @@ STEP_INSTALL="dpkg -i"
 [ "$VARIANT" = "thin" ] && STEP_INSTALL="apt install"
 
 step "$STEP_INSTALL $(basename "$IME_DEB")"
-say "步骤 1/2：安装输入法 $(basename "$IME_DEB")（已装旧版时直接覆盖升级，不需要先卸载）"
+say "步骤 1/2：安装输入法 $(basename "$IME_DEB")（旧版已在 UNINSTALL-OLD 阶段卸载）"
 install_local_deb "$IME_DEB" "输入法"
 verify_installed rime-inputmethod || fail "rime-inputmethod 未正确安装"
 
 step "$STEP_INSTALL $(basename "$SYNC_DEB")"
-say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")（覆盖升级，保留用户数据）"
+say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")（全新安装，用户数据已保留）"
 install_local_deb "$SYNC_DEB" "同步程序"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
 
 # ------------------------------------------------- schema 增强配置模板
 # /usr/share/rime-sync/defaults/schemas/ 里是随包 16 个方案的 <schema>.custom.yaml：
 # 给引擎加 rimesync_vnum / rimesync_punct，并把 punctuator 主字符改成单值 commit。
-# 规则与 default.custom.yaml 相同：用户目录里已有同名文件一律跳过，绝不覆盖。
+# 规则与 default.custom.yaml 相同：缺失才补，用户目录里已有同名文件一律沿用，
+# 绝不覆盖、不改名、不备份。每个模板的落盘结果都进日志：
+#   seed file=<name> result=new|reuse|skip
+seed_result() { # $1=文件名 $2=new|reuse|skip
+  say "seed file=$1 result=$2"
+  printf '%s seed file=%s result=%s\n' "$(date '+%F %T')" "$1" "$2" \
+    >>"$LOGDIR/schema-tweaks.log" 2>/dev/null || true
+}
+
 seed_schema_customs() { # $1=Rime 用户目录
   local dir=$1 tpl base wrote=0 kept=0 no_data=0 names=""
   [ -d /usr/share/rime-sync/defaults/schemas ] || return 0
@@ -565,19 +689,22 @@ seed_schema_customs() { # $1=Rime 用户目录
     # 方案数据不在随包 rime-data 里时跳过：写了也没有对应 schema 可部署。
     if [ ! -f "/usr/share/rime-data/${base%.custom.yaml}.schema.yaml" ]; then
       no_data=$((no_data + 1))
+      seed_result "$base" skip
       continue
     fi
     if [ -f "$dir/$base" ]; then
       kept=$((kept + 1))
+      seed_result "$base" reuse
       continue
     fi
     if install -m 600 "$tpl" "$dir/$base" 2>/dev/null; then
       chown "$TARGET_USER" "$dir/$base" 2>/dev/null || true
       wrote=$((wrote + 1))
       names="$names $base"
+      seed_result "$base" new
     fi
   done
-  say "schema 增强配置：写入 $wrote 个，已存在跳过 $kept 个，缺方案数据跳过 $no_data 个"
+  say "schema 增强配置：写入 $wrote 个，已存在沿用 $kept 个，缺方案数据跳过 $no_data 个"
   [ -n "$names" ] && say "  新写入：$names"
   printf '%s wrote=%d kept=%d no_data=%d dir=%s\n' \
     "$(date '+%F %T')" "$wrote" "$kept" "$no_data" "$dir" >>"$LOGDIR/schema-tweaks.log" 2>/dev/null || true
@@ -585,34 +712,29 @@ seed_schema_customs() { # $1=Rime 用户目录
 }
 
 # --------------------------------------------------- recommended user config
-# 只在调用者自己的 Rime 目录缺文件时写入，不覆盖用户已有配置。
-TARGET_USER=${SUDO_USER:-}
-if [ -n "$TARGET_USER" ] && [ -f /usr/share/rime-sync/defaults/default.custom.yaml ]; then
-  TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
-  if [ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ]; then
-    RIME_USER_DIR="$TARGET_HOME/.local/share/fcitx5/rime"
-    install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
-    chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
-    if [ ! -f /usr/share/rime-data/wubi86.schema.yaml ]; then
-      # 模板列了 16 个随包方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
-      # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。
-      say "跳过推荐输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 16 个方案会导致部署失败"
-      say "schema 增强配置同样跳过（没有随包方案数据）：v 数值转换 / 中文标点直出未启用"
-    elif [ ! -f "$RIME_USER_DIR/default.custom.yaml" ]; then
-      install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null &&
-        chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
-      say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
-      # 首次安装：16 个方案的 schema 增强配置随默认配置一起写入（缺文件才写）。
-      seed_schema_customs "$RIME_USER_DIR"
-    else
-      say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
-      if [ "$WITH_SCHEMA_TWEAKS" -eq 1 ]; then
-        seed_schema_customs "$RIME_USER_DIR"
-      else
-        say "schema 增强配置未写入（升级默认不动已有配置）；需要时重跑：sudo $0 --with-schema-tweaks"
-      fi
-    fi
+# 与 Windows 安装器一致：缺失才补，已存在的一律沿用（不覆盖、不改名、不备份）。
+# 每装一个版本都会走这一步——卸载旧版不会动用户目录，所以升级后仍是"沿用"。
+if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ] && [ -f /usr/share/rime-sync/defaults/default.custom.yaml ]; then
+  RIME_USER_DIR="$TARGET_HOME/.local/share/fcitx5/rime"
+  install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
+  chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
+  if [ ! -f /usr/share/rime-data/wubi86.schema.yaml ]; then
+    # 模板列了 16 个随包方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
+    # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。
+    say "跳过默认输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 16 个方案会导致部署失败"
+    seed_result default.custom.yaml skip
+  elif [ -f "$RIME_USER_DIR/default.custom.yaml" ]; then
+    say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
+    seed_result default.custom.yaml reuse
+  elif install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null; then
+    chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
+    say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
+    seed_result default.custom.yaml new
+  else
+    say "!! 无法写入 $RIME_USER_DIR/default.custom.yaml（权限或磁盘问题），继续安装"
   fi
+  # schema 增强配置逐文件判定：有方案数据的补缺失，已存在的一律沿用。
+  seed_schema_customs "$RIME_USER_DIR"
 fi
 
 say "输入法数据：/usr/share/rime-data（$(find /usr/share/rime-data -maxdepth 1 -type f 2>/dev/null | wc -l) 个文件）"

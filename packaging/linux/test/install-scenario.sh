@@ -12,7 +12,8 @@
 #   normal            正常离线安装（单架构，无历史状态）
 #   broken-unrelated  系统里有一个与本安装无关的半配置包，installer 不许中止
 #   multiarch         i386 已启用 + 同包多架构版本不一致（libbrotli1），installer 不许升级已有库
-#   upgrade           旧版已装（IME/sync）→ 直接 dpkg -i 覆盖升级，不要求先卸载
+#   upgrade-fresh     旧版已装（IME/sync）→ 先 purge 旧版，再全新安装；用户配置保留、
+#                     配置模板只补缺失（upgrade 是同一用例的旧名字，保留兼容）
 #   single-arch       没有 i386 的纯单架构系统（debian-12）仍要装成功
 set -u
 
@@ -58,10 +59,6 @@ run_installer_expect_fail() { # $1 = 期望的退出码，其余是参数
   ok "installer 退出码 $rc（符合预期，非 0 且措辞明确）"
 }
 
-deb_files() { # $1 = .deb -> 文件路径列表（去掉目录）
-  dpkg-deb -c "$1" | awk '{print $6}' | sed 's#^\./##' | grep -v '/$' | sort
-}
-
 setup_user_data() {
   useradd -m -s /bin/bash tester 2>/dev/null || true
   mkdir -p /home/tester/.local/share/fcitx5/rime /home/tester/.config/com.rimesync.app /home/tester/.config/rime-sync
@@ -70,13 +67,6 @@ setup_user_data() {
   printf '{"device_id":"test-device","last_sync":"2026-01-01T00:00:00Z"}\n' >/home/tester/.config/com.rimesync.app/config.json
   printf '{"cursor":42}\n' >/home/tester/.config/rime-sync/state.json
   chown -R tester:tester /home/tester 2>/dev/null || true
-  ( cd /home/tester && find . -type f -print0 | sort -z | xargs -0 sha256sum ) >/tmp/userdata.before
-}
-
-assert_user_data_intact() {
-  ( cd /home/tester && find . -type f -print0 | sort -z | xargs -0 sha256sum ) >/tmp/userdata.after
-  diff -u /tmp/userdata.before /tmp/userdata.after || fail "用户目录内容被安装器改动"
-  ok "用户目录未变：~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、~/.config/rime-sync（$(wc -l </tmp/userdata.before) 个文件）"
 }
 
 assert_rime_data() {
@@ -188,13 +178,18 @@ case_multiarch() {
   fi
 }
 
-case_upgrade() {
+# 升级 = 先卸载旧版，再全新安装（0.6.12 起，与 Windows 安装器一致）。
+# 断言：旧版被 purge（不是原地升级）、新版装好、用户配置原样保留、
+# 配置模板只补缺失（已存在的沿用）、安装日志有 UNINSTALL-OLD 阶段。
+case_upgrade_fresh() {
+  local rime=/home/tester/.local/share/fcitx5/rime
+  local old_ime_ver old_sync_ver new_ime_ver new_sync_ver seedmark f
   setup_user_data
+
   say "步骤 A：先装旧版（$(basename "$BUNDLE_OLD"/debian-13/rime-inputmethod_*.deb) / $(basename "$BUNDLE_OLD"/debian-13/rime-sync_*.deb)）"
   run_installer --payload "$BUNDLE_OLD"
   assert_installed rime-inputmethod
   assert_installed rime-sync
-  local old_ime_ver old_sync_ver new_ime_ver new_sync_ver
   old_ime_ver=$(pkg_version rime-inputmethod)
   old_sync_ver=$(pkg_version rime-sync)
   new_ime_ver=$(dpkg-deb -f "$BUNDLE"/debian-13/rime-inputmethod_*.deb Version)
@@ -204,55 +199,91 @@ case_upgrade() {
   dpkg --compare-versions "$new_ime_ver" gt "$old_ime_ver" || fail "测试前置无效：新 IME 版本不高于旧版"
   dpkg --compare-versions "$new_sync_ver" gt "$old_sync_ver" || fail "测试前置无效：新 sync 版本不高于旧版"
 
-  say "步骤 B：直接重跑同一个 installer（不卸载、不 purge）"
+  # 旧版已经种过一轮模板：把一个文件改成"用户自己编辑过"的内容，再删掉另一个，
+  # 用来验证新版只补缺失、已存在的一律沿用。
+  [ -f "$rime/luna_pinyin.custom.yaml" ] || fail "前置无效：旧版没有种入 luna_pinyin.custom.yaml"
+  printf 'patch:\n  schema_list:\n    - luna_pinyin\n  # user edited marker\n' >"$rime/luna_pinyin.custom.yaml"
+  rm -f "$rime/luna_pinyin_simp.custom.yaml"
+  chown -R tester:tester "$rime" 2>/dev/null || true
+  sha256sum "$rime/default.custom.yaml" "$rime/luna_pinyin.custom.yaml" \
+      "$rime/luna_pinyin.userdb.txt" \
+      /home/tester/.config/com.rimesync.app/config.json \
+      /home/tester/.config/rime-sync/state.json >/tmp/keep.before
+  seedmark=$(wc -l </var/log/rime-sync/schema-tweaks.log 2>/dev/null || echo 0)
+  say "改前用户文件：$(ls "$rime" | tr '\n' ' ')"
+
+  say "步骤 B：装新版（安装器先用 purge 卸掉旧版，再全新安装）"
   run_installer
   assert_installed rime-inputmethod
   assert_installed rime-sync
-  [ "$(pkg_version rime-inputmethod)" = "$new_ime_ver" ] || fail "IME 版本没升到 $new_ime_ver（$(pkg_version rime-inputmethod)）"
-  [ "$(pkg_version rime-sync)" = "$new_sync_ver" ] || fail "sync 版本没升到 $new_sync_ver（$(pkg_version rime-sync)）"
-  ok "版本已升级：rime-inputmethod $old_ime_ver -> $new_ime_ver，rime-sync $old_sync_ver -> $new_sync_ver"
+  [ "$(pkg_version rime-inputmethod)" = "$new_ime_ver" ] || fail "IME 版本不是 $new_ime_ver（$(pkg_version rime-inputmethod)）"
+  [ "$(pkg_version rime-sync)" = "$new_sync_ver" ] || fail "sync 版本不是 $new_sync_ver（$(pkg_version rime-sync)）"
+  ok "版本已换新：rime-inputmethod $old_ime_ver -> $new_ime_ver，rime-sync $old_sync_ver -> $new_sync_ver"
 
-  awk -v o="$old_ime_ver" -v n="$new_ime_ver" \
-      '$3 == "upgrade" && $4 ~ /^rime-inputmethod(:|$)/ && $5 == o && $6 == n { f = 1 } END { exit !f }' \
-      /var/log/dpkg.log \
-    || { grep 'rime-inputmethod' /var/log/dpkg.log | tail -5; fail "dpkg.log 里没有原地 upgrade 记录"; }
-  awk -v o="$old_sync_ver" -v n="$new_sync_ver" \
-      '$3 == "upgrade" && $4 ~ /^rime-sync(:|$)/ && $5 == o && $6 == n { f = 1 } END { exit !f }' \
-      /var/log/dpkg.log \
-    || { grep 'rime-sync' /var/log/dpkg.log | tail -5; fail "rime-sync 没有原地 upgrade 记录"; }
-  ok "dpkg.log 记录为 upgrade（不是 remove+install）"
+  # 1) dpkg.log：旧版被 purge（dpkg 记的是 remove <ver> <none>，没有单独的 purge 行），
+  #    新版是 install（不是 upgrade）。
+  assert_purged() { # $1=包名 $2=旧版本
+    awk -v v="$2" -v p="^$1(:|$)" \
+        '$3 == "remove" && $4 ~ p && $(NF-1) == v && $NF == "<none>" { f = 1 } END { exit !f }' \
+        /var/log/dpkg.log
+  }
+  assert_purged rime-inputmethod "$old_ime_ver" \
+    || { grep 'rime-inputmethod' /var/log/dpkg.log | tail -n 8; fail "dpkg.log 里没有 purge rime-inputmethod $old_ime_ver"; }
+  assert_purged rime-sync "$old_sync_ver" \
+    || { grep 'rime-sync' /var/log/dpkg.log | tail -n 8; fail "dpkg.log 里没有 purge rime-sync $old_sync_ver"; }
+  awk -v v="$old_ime_ver" '$3 == "status" && $4 == "not-installed" && $5 ~ /^rime-inputmethod(:|$)/ { f = 1 } END { exit !f }' \
+      /var/log/dpkg.log || fail "dpkg.log 里没有 rime-inputmethod 的 not-installed 记录"
+  ok "dpkg.log：旧版 $old_ime_ver / $old_sync_ver 被 purge（记录为 remove + not-installed）"
 
-  local old_deb new_deb removed=0
-  for pair in "rime-inputmethod" "rime-sync"; do
-    if [ "$pair" = "rime-inputmethod" ]; then
-      old_deb=$(ls "$BUNDLE_OLD"/debian-13/rime-inputmethod_*.deb)
-      new_deb=$(ls "$BUNDLE"/debian-13/rime-inputmethod_*.deb)
-    else
-      old_deb=$(ls "$BUNDLE_OLD"/debian-13/rime-sync_*.deb)
-      new_deb=$(ls "$BUNDLE"/debian-13/rime-sync_*.deb)
-    fi
-    deb_files "$old_deb" >/tmp/old.files
-    deb_files "$new_deb" >/tmp/new.files
-    comm -23 /tmp/old.files /tmp/new.files >/tmp/removed.files || true
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      removed=$((removed + 1))
-      [ -e "/$f" ] && fail "旧版已删除的路径仍在磁盘上：/$f"
-    done </tmp/removed.files
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      [ -e "/$f" ] || fail "新版应该装上的文件缺失：/$f"
-    done </tmp/new.files
-    ok "$(basename "$new_deb")：$(wc -l </tmp/new.files) 个文件全部就位，旧版独有路径 $(wc -l </tmp/removed.files) 个已清理"
+  awk -v v="$new_ime_ver" '$3 == "install" && $4 ~ /^rime-inputmethod(:|$)/ && $NF == v { f = 1 } END { exit !f }' \
+      /var/log/dpkg.log || fail "dpkg.log 里没有全新 install rime-inputmethod $new_ime_ver"
+  awk -v v="$new_sync_ver" '$3 == "install" && $4 ~ /^rime-sync(:|$)/ && $NF == v { f = 1 } END { exit !f }' \
+      /var/log/dpkg.log || fail "dpkg.log 里没有全新 install rime-sync $new_sync_ver"
+  ok "dpkg.log：新版 $new_ime_ver / $new_sync_ver 是 install（全新安装）"
+  if awk '$3 == "upgrade" && ($4 ~ /^rime-inputmethod(:|$)/ || $4 ~ /^rime-sync(:|$)/) { f = 1 } END { exit !f }' /var/log/dpkg.log; then
+    grep ' upgrade ' /var/log/dpkg.log | tail -n 5
+    fail "升级走了原地 upgrade，没有先卸载旧版"
+  fi
+  ok "没有原地 upgrade 记录（先卸载再装）"
+
+  # 2) 安装日志里有 UNINSTALL-OLD 阶段，且排在安装之前
+  grep -q 'UNINSTALL-OLD rime-inputmethod rime-sync' /var/log/rime-sync/install-steps.log \
+    || { tail -n 12 /var/log/rime-sync/install-steps.log; fail "install-steps.log 缺少 UNINSTALL-OLD 阶段"; }
+  grep -q 'UNINSTALL-OLD rime-inputmethod rime-sync' /var/log/rime-sync/install.log \
+    || fail "install.log 缺少 UNINSTALL-OLD 记录"
+  awk '/UNINSTALL-OLD rime-inputmethod/ { u = NR } /dpkg -i rime-inputmethod_/ { i = NR } END { exit !(u && i && u < i) }' \
+      /var/log/rime-sync/install-steps.log || fail "UNINSTALL-OLD 没有排在安装之前"
+  ok "install.log / install-steps.log：UNINSTALL-OLD 阶段存在且先于安装"
+
+  # 3) 卸载没有碰用户数据（安装器自己的显式校验 + 实际文件）
+  grep -q '校验：旧版包的文件清单里没有任何用户目录路径' /var/log/rime-sync/install.log \
+    || fail "install.log 缺少 purge 前的用户目录校验记录"
+  grep -q '用户数据保留：/home/tester/.local/share/fcitx5/rime' /var/log/rime-sync/install.log \
+    || fail "install.log 没有确认 rime 用户目录仍在"
+  grep -q '用户数据保留：/home/tester/.config/com.rimesync.app' /var/log/rime-sync/install.log \
+    || fail "install.log 没有确认同步配置目录仍在"
+  sha256sum -c --quiet /tmp/keep.before || fail "用户文件在升级过程中被改动/删除"
+  ok "用户配置与数据原样保留（5 个文件 sha256 未变）"
+
+  # 4) 配置种子：缺失的补回，已有的沿用（不覆盖、不备份）
+  [ -f "$rime/luna_pinyin_simp.custom.yaml" ] || fail "缺失的模板 luna_pinyin_simp.custom.yaml 没有被补回"
+  grep -q 'user edited marker' "$rime/luna_pinyin.custom.yaml" || fail "已存在的 luna_pinyin.custom.yaml 被覆盖"
+  for f in luna_pinyin luna_pinyin_fluency luna_pinyin_simp luna_pinyin_tw luna_quanpin; do
+    [ -f "$rime/$f.custom.yaml" ] || fail "缺少种子文件 $f.custom.yaml"
   done
-  [ "${removed:-0}" -ge 0 ] || true
+  tail -n +$((seedmark + 1)) /var/log/rime-sync/schema-tweaks.log >/tmp/seed.new
+  grep -q 'seed file=luna_pinyin_simp.custom.yaml result=new' /tmp/seed.new \
+    || { cat /tmp/seed.new; fail "日志里没有 luna_pinyin_simp.custom.yaml result=new"; }
+  grep -q 'seed file=luna_pinyin.custom.yaml result=reuse' /tmp/seed.new \
+    || { cat /tmp/seed.new; fail "日志里没有 luna_pinyin.custom.yaml result=reuse"; }
+  ok "配置种子：缺失的 result=new，已存在的 result=reuse"
 
-  local stale
-  stale=$(find /usr /etc -name '*.dpkg-old' -o -name '*.dpkg-dist' -o -name '*.dpkg-new' 2>/dev/null | head -5)
-  [ -z "$stale" ] || fail "升级留下了 conffile 残留：$stale"
-  ok "没有 .dpkg-old/.dpkg-dist/.dpkg-new 残留"
+  if [ -n "$(find "$rime" -maxdepth 1 \( -name '*.bak' -o -name '*.bak-*' \) -print -quit)" ]; then
+    find "$rime" -maxdepth 1 -name '*.bak*' -print
+    fail "配置种子留下了备份文件"
+  fi
+  ok "没有 .bak 备份文件（不覆盖、不备份）"
 
-  assert_user_data_intact
   assert_rime_data
 }
 
@@ -341,7 +372,7 @@ case "$CASE" in
   broken-unrelated)  case_broken_unrelated ;;
   multiarch)         case_multiarch ;;
   prebroken-multiarch) case_prebroken_multiarch ;;
-  upgrade)           case_upgrade ;;
+  upgrade|upgrade-fresh) case_upgrade_fresh ;;
   single-arch)       case_single_arch ;;
   *) fail "未知用例 $CASE" ;;
 esac

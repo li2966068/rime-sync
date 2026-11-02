@@ -163,8 +163,10 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librs
 
 6. 输入增强（v 数值转中文、中文标点直出 + Shift 备选）随包提供：安装器把
    `packaging/rime/schemas/<schema>.custom.yaml`（16 个随包方案各一份）复制进用户 Rime 目录。
-   **Linux**：`rime-inputmethod` 的 postinst 只在用户目录缺文件时写，升级默认不动已有配置，
-   需要时用安装器参数 `--with-schema-tweaks`（或 `RIMESYNC_WITH_SCHEMA_TWEAKS=1`）。
+   **Linux（0.6.12 起）**：与 Windows 同一策略——升级即「先卸载旧版，再全新安装」，
+   配置模板只在用户目录缺同名文件时写入，已存在的一律沿用（不覆盖、不改名、不备份），
+   卸载旧版也不删这些配置；日志逐文件记 `seed file=<name> result=new|reuse|skip`。
+   安装器参数 `--with-schema-tweaks` 仅为兼容保留，不再改变行为。
    **Windows（0.6.11 起）**：升级即全新安装，`POSTINSTALL` 按新版本**无条件**写这些模板 ——
    已存在的同名文件**原样沿用**（不覆盖、不改名；卸载旧版也不删这些配置），只有缺失的才写入新版，
    用户词典（`*.userdb*`、`*.txt` 词表）不动；见 `windows/README.md` 第 10 节。
@@ -227,7 +229,7 @@ pnpm tauri icon packaging/assets/source-icon.png   # 需要自备 1024x1024 源�
 | 多架构系统更保守 | `dpkg --print-foreign-architectures` 非空时，同名包任一架构已装且版本不同就不碰（避免 `libbrotli1:amd64` 与 `libbrotli1:i386` 版本不一致） |
 | 只配置自己解包的包 | `dpkg --configure <pkg:arch>...`，不再 `dpkg --configure -a`；无关的半配置包不影响判定 |
 | 失败判定 | 只看「安装前是 ii 或本来不存在、现在却不是 ii」的包；安装前就坏的包只提示 |
-| 可重复执行 | 旧版已装时直接 `dpkg -i --force-confdef --force-confold` 覆盖升级，不需要先卸载 |
+| 可重复执行 | 0.6.12 起先「卸载旧版（UNINSTALL-OLD，apt-get purge）→ 全新安装」；用户配置与数据保留，配置模板只补缺失 |
 | 需要升级系统库时 | `sudo ./install.sh --upgrade-vendor`（默认关闭） |
 
 失败时安装器会打印：未配置的包名与 dpkg 原文尾部、`dpkg --audit` 的系统范围
@@ -253,7 +255,7 @@ sudo dpkg --audit                      # 确认系统整体状态
 
 ```bash
 packaging/linux/test/install-matrix.sh                # 全部用例
-packaging/linux/test/install-matrix.sh upgrade        # 只跑升级用例
+packaging/linux/test/install-matrix.sh upgrade-fresh  # 只跑升级用例（upgrade 是旧名字别名）
 ```
 
 每个用例都是全新容器、`--network none` 真离线：
@@ -264,7 +266,7 @@ packaging/linux/test/install-matrix.sh upgrade        # 只跑升级用例
 | `broken-unrelated` | 预置一个无关的半配置包（postinst 返回 1） | 安装仍成功；那个包保持原状且不出现在 install.log |
 | `multiarch` | 启用 i386 + libbrotli1 两架构同版本，离线库里该包更高 | 不升级 `libbrotli1:amd64`、安装成功、0 次 upgrade |
 | `prebroken-multiarch` | 已处于"上次安装把 amd64 解包成新版、i386 仍是旧版"的坏状态 | 退出码 3 但措辞明确，输出 dpkg 原文 + 多架构说明 + 修复命令 + 责任归属 |
-| `upgrade` | 先装旧版（0.4.0 IME + 0.3.0 sync），再装当前产物 | 版本原地升级、旧版独有路径已清理、用户数据哈希不变 |
+| `upgrade-fresh` | 先装旧版（0.4.0 IME + 0.3.0 sync），再装当前产物 | 旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、新版装好、用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、日志有 UNINSTALL-OLD |
 | `single-arch` | debian-12（无任何外部架构） | 安装成功且不触发多架构分支 |
 
 产物默认取本地已有的 `.deb`（`build/deb/debian-*/`、`packaging/out/`），可用

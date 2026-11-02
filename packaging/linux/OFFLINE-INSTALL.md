@@ -10,7 +10,11 @@
 | `rime-sync-installer_<ver>.trixie.thin.run` | 非全量（thin） | 不打包，`apt-get` 从系统仓库装 | 先 `apt-get update` + fcitx5 运行库，再装 IME，再装 sync |
 
 两个包用**同一套安装脚本**（`install.sh`），安装顺序都写死为
-「先 IME，后 sync」，可重复执行（旧版直接覆盖升级，不需要先卸载）。
+「先卸载旧版 → 装 IME → 装 sync」，可重复执行。升级语义（0.6.12 起）：
+**先卸载旧版，再全新安装**——旧版 rime-inputmethod / rime-sync 被 `purge`，
+用户配置与数据（~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、
+~/.config/com.rimesync.app）一律保留；新版安装时配置模板只补缺失，已存在的一律沿用
+（不覆盖、不改名、不备份）。详见第 3 节。
 
 ## 1. 产物与目录
 
@@ -69,8 +73,16 @@ sudo packaging/linux/out/offline/install.sh --uninstall
 
 1. 检查 root（否则提示 sudo）。
 2. 读 /etc/os-release 选安装集；本包只支持 Debian 13（trixie），其他发行版会明确提示。
-3. 移除与自带 librime/数据冲突的发行版包（fcitx5-rime / librime1 / librime1t64 / librime-data）。
-4. 依赖层（两种包在这里分叉）：
+3. **UNINSTALL-OLD：先卸载旧版**（0.6.12 起，与 Windows 安装器一致）。
+   `dpkg-query` 检测到 rime-inputmethod / rime-sync 已装（含 rc 残留）时，用
+   `apt-get purge -y` 卸掉它们（失败退回 `dpkg --purge --force-depends`），再全新安装；
+   purge 失败只警告，不打断安装。两个包都**不拥有**用户数据目录——安装器会先检查
+   包的文件清单里没有任何用户目录路径，purge 后再逐条确认这些目录仍在：
+   ~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、~/.config/com.rimesync.app
+   日志里的阶段名为 `UNINSTALL-OLD`。fcitx5 若仍在运行，会提示重新登录桌面或
+   在图形会话内执行 `systemctl --user restart fcitx5`。
+4. 移除与自带 librime/数据冲突的发行版包（fcitx5-rime / librime1 / librime1t64 / librime-data）。
+5. 依赖层（两种包在这里分叉）：
    * **全量**：记录 dpkg 快照，校验 SHA256SUMS 后只解包「状态非 ii」的依赖；
      已配置（ii）的包不升级（多架构系统上同名包任一架构版本不同时连缺失架构也不补）；
      只 `dpkg --configure <pkg:arch>...` 自己解包的包，失败时打印 dpkg 原文、多架构
@@ -88,13 +100,20 @@ sudo packaging/linux/out/offline/install.sh --uninstall
        sudo apt-get install -y --no-install-recommends rime-sync_*.deb
        sudo apt --fix-broken install
      ~~~
-5. 严格顺序：先 IME，再 sync；任一步失败立即停止（全量用 `dpkg -i`，非全量用 `apt-get install`）。
-   旧版已装时直接覆盖升级，不需要先卸载。
-6. 不启动应用、不写 autostart；结束提示「安装完成，输入法设置或应用菜单里打开同步设置」。
-7. 日志：/var/log/rime-sync/install.log，安装顺序时间戳：/var/log/rime-sync/install-steps.log。
-   步骤名在两种包下分别是 `dpkg -i <deb>` / `apt install <deb>`，顺序断言只看先后。
+6. 严格顺序：先 IME，再 sync；任一步失败立即停止（全量用 `dpkg -i`，非全量用 `apt-get install`）。
+   因为旧版刚被卸载，这里一定走全新安装（dpkg.log 里是 install，不是 upgrade）。
+7. 配置模板**缺失才补**：`/usr/share/rime-sync/defaults/default.custom.yaml` 与
+   `defaults/schemas/*.custom.yaml` 只在用户目录缺同名文件时写入；已存在的一律沿用
+   （不覆盖、不改名、不备份）。日志逐文件记 `seed file=<name> result=new|reuse|skip`。
+   用户词库、词表、自定义词典全程不动。
+8. 不启动应用、不写 autostart；结束提示「安装完成，输入法设置或应用菜单里打开同步设置」。
+9. 日志：/var/log/rime-sync/install.log，安装顺序时间戳：/var/log/rime-sync/install-steps.log。
+   步骤名在两种包下分别是 `dpkg -i <deb>` / `apt install <deb>`；升级时还应有
+   `UNINSTALL-OLD rime-inputmethod rime-sync`，且排在安装步骤之前。
 
-卸载（--uninstall）先卸 rime-sync、再卸 rime-inputmethod，保留 ~/.local/share/fcitx5/rime 与 ~/.config/rime-sync。
+卸载（--uninstall）先卸 rime-sync、再卸 rime-inputmethod，默认保留全部用户数据
+（~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
+~/.config/rime-sync）；只有显式 `--purge-data` 才删除，且删除前会列出全部绝对路径。
 
 ## 4. 验收
 
@@ -105,7 +124,8 @@ packaging/linux/verify-offline.sh --variant full
 packaging/linux/verify-offline.sh --variant thin --skip-online
 # 安装器行为矩阵（每个用例一个全新容器，--network none 真离线）
 packaging/linux/test/install-matrix.sh        # normal / broken-unrelated / multiarch /
-                                              # prebroken-multiarch / upgrade / single-arch
+                                              # prebroken-multiarch / upgrade-fresh / single-arch
+packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装新版
 ~~~
 
 断言（每种变体各跑一遍）：
@@ -117,6 +137,9 @@ packaging/linux/test/install-matrix.sh        # normal / broken-unrelated / mult
 - rime-smoke 输出 deploy: success 与候选「你好」；
 - Xvfb + fcitx5 日志出现 Loaded addon rime，无 deploy failure，并生成 build/*.bin；
 - /var/log/rime-sync/install-steps.log 证明先 IME 后 sync；
+- 升级用例（upgrade-fresh）：旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、
+  用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、
+  日志有 UNINSTALL-OLD 阶段；
 - thin 断网安装：退出码非 0，日志含「非全量包（thin）需要系统仓库或联网」并指向全量包名。
 
 证据保存在 build/evidence/debian-13/{full-offline-install.log,thin-offline-install.log,
@@ -135,6 +158,10 @@ thin-online-install.log,sizes.txt}，体积汇总在 build/evidence/SIZES.txt。
   会排队用 apt 装发行版 fcitx5-rime，反过来把我们的 IME 卸掉。新版先检查 rime-inputmethod；
   只替换维护脚本，不改应用内容与版本号。
 - **不修改版本号**：IME 用 tauri.conf.json 的版本，只加 ~<suite> 后缀区分发行版。
+- **升级 = 卸载旧版 + 全新安装**（0.6.12 起）：每个新版本都先 purge 旧版
+  rime-inputmethod / rime-sync，再全新安装；用户配置与数据不在包的文件清单里，
+  所以 purge 不会删它们。新版只补缺失的配置模板（`seed file=<name> result=new|reuse`），
+  想强制刷新某个模板：删掉用户目录里对应文件再装一次。
 
 ## 6. 已知风险
 

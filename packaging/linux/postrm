@@ -5,7 +5,9 @@
 set -u
 
 if [ "${1:-}" = "purge" ]; then
-    rm -rf /var/log/rime-sync 2>/dev/null
+    # 保留 /var/log/rime-sync：安装器「先卸载旧版再全新安装」时正处于该目录里写
+    # install.log，删掉会让 tee 继续写一个已删除的 inode（日志丢失）。
+    # 日志由用户自行清理（卸载脚本结尾会提示路径）。
     # 只删空目录；vendor/ 里是 dpkg 管理的文件，正常情况下已被 dpkg 删掉
     rmdir /usr/share/rime-sync/vendor 2>/dev/null
     rmdir /usr/share/rime-sync/defaults 2>/dev/null

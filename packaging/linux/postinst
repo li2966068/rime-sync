@@ -217,13 +217,19 @@ fi
 # 随包 16 个方案的 <schema>.custom.yaml 由 rime-inputmethod 装到
 # /usr/share/rime-sync/defaults/schemas/：给引擎加 rimesync_vnum / rimesync_punct，
 # 并把 punctuator 半角主字符改成单值 commit（没装插件时的兜底）。
-# 写入规则：
-#   * 用户 Rime 目录里已有同名文件 -> 跳过，绝不覆盖；
-#   * 升级安装（dpkg 把旧版本号作为 $2 传进来）默认不写，避免默默改掉老用户的行为，
-#     RIMESYNC_WITH_SCHEMA_TWEAKS=1 时才写；
+# 写入规则（与 Windows 安装器一致）：
+#   * 用户 Rime 目录里已有同名文件 -> 沿用，绝不覆盖、不改名、不备份；
+#   * 缺失的才补；升级安装同样如此（卸载旧版不动用户目录，所以升级后仍是沿用）；
 #   * /usr/share/rime-data 里没有该方案数据时跳过（写了也没有对应 schema）。
+#   * 每个模板的结果都记日志：seed file=<name> result=new|reuse|skip
 SCHEMA_TEMPLATE_DIR=/usr/share/rime-sync/defaults/schemas
 SCHEMA_SEED_LOG=$LOGDIR/schema-tweaks.log
+
+seed_result() { # $1=文件名 $2=new|reuse|skip
+    say "seed file=$1 result=$2"
+    printf '%s seed file=%s result=%s\n' "$(date '+%F %T')" "$1" "$2" \
+        >>"$SCHEMA_SEED_LOG" 2>/dev/null || true
+}
 
 seed_schema_customs() { # $1=Rime 用户目录
     local rime_dir=$1 tpl base owner wrote=0 kept=0 no_data=0
@@ -238,35 +244,31 @@ seed_schema_customs() { # $1=Rime 用户目录
         base=${tpl##*/}
         if [ ! -f "/usr/share/rime-data/${base%.custom.yaml}.schema.yaml" ]; then
             no_data=$((no_data + 1))
+            seed_result "$base" skip
             continue
         fi
         if [ -f "$rime_dir/$base" ]; then
             kept=$((kept + 1))
+            seed_result "$base" reuse
             continue
         fi
         if install -m 600 "$tpl" "$rime_dir/$base" 2>/dev/null; then
             chown "$owner" "$rime_dir/$base" 2>/dev/null || true
             wrote=$((wrote + 1))
-            say "已写入 schema 增强配置：$rime_dir/$base"
+            seed_result "$base" new
         fi
     done
-    say "schema 增强配置：写入 $wrote 个，已存在跳过 $kept 个，缺方案数据跳过 $no_data 个"
+    say "schema 增强配置：写入 $wrote 个，已存在沿用 $kept 个，缺方案数据跳过 $no_data 个"
     printf '%s wrote=%d kept=%d no_data=%d dir=%s\n' \
         "$(date '+%F %T')" "$wrote" "$kept" "$no_data" "$rime_dir" >>"$SCHEMA_SEED_LOG" 2>/dev/null || true
 }
 
 if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     RIME_USER_DIR=$TARGET_HOME/.local/share/fcitx5/rime
-    if [ "${RIMESYNC_WITH_SCHEMA_TWEAKS:-0}" = "1" ]; then
-        seed_schema_customs "$RIME_USER_DIR"
-    elif [ -n "${2:-}" ]; then
-        # 升级：默认不动老用户的方案配置（要写就 RIMESYNC_WITH_SCHEMA_TWEAKS=1）。
-        say "升级安装（原版本 $2）：保留已有输入法配置，不写 schema 增强配置"
-        say "  需要 v 数值转换 / 中文标点直出时：sudo RIMESYNC_WITH_SCHEMA_TWEAKS=1 dpkg --configure rime-sync"
-        printf '%s skip upgrade from %s\n' "$(date '+%F %T')" "$2" >>"$SCHEMA_SEED_LOG" 2>/dev/null || true
-    else
-        seed_schema_customs "$RIME_USER_DIR"
-    fi
+    [ -n "${2:-}" ] && say "升级安装（原版本 $2）：只补缺失的输入法配置，已有文件一律沿用"
+    [ "${RIMESYNC_WITH_SCHEMA_TWEAKS:-0}" = "1" ] && \
+        say "（RIMESYNC_WITH_SCHEMA_TWEAKS=1：0.6.12 起始终只补缺失文件，该变量不再改变行为）"
+    seed_schema_customs "$RIME_USER_DIR"
 fi
 
 # 刷新菜单与图标缓存（没有这些工具就算了）
@@ -293,8 +295,9 @@ cat <<'EOM'
       照抄模板会让 rime 部署失败，请改列 /usr/share/rime-data 里实际存在的方案。
 
    v 数值转换（v123 / v12.5 出中文数字）与中文标点直出（Shift 取备选）由
-   /usr/share/rime-sync/defaults/schemas/*.custom.yaml 提供。安装器只在用户目录缺文件时
-   写入，升级不会动已有配置。手动补（或用安装器的 --with-schema-tweaks）：
+   /usr/share/rime-sync/defaults/schemas/*.custom.yaml 提供。缺失才补，用户目录里
+   已有同名文件一律沿用（不覆盖、不改名、不备份），升级同样如此
+   （日志里可见 seed file=<name> result=new|reuse）。手动补：
         cp /usr/share/rime-sync/defaults/schemas/*.custom.yaml ~/.local/share/fcitx5/rime/
         fcitx5-remote -r
    关闭：删掉用户目录里对应的 *.custom.yaml 再重新部署。

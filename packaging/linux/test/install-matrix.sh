@@ -164,6 +164,32 @@ say "  IME old:  $(basename "$IME_DEB_OLD")  ($(dpkg-deb -f "$IME_DEB_OLD" Versi
 say "  SYNC new: $(basename "$SYNC_DEB_NEW") ($(dpkg-deb -f "$SYNC_DEB_NEW" Version))"
 say "  SYNC old: $(basename "$SYNC_DEB_OLD") ($(dpkg-deb -f "$SYNC_DEB_OLD" Version))"
 
+# build/deb 里的 IME deb 可能早于 packaging/rime/schemas（真实打包由
+# scripts/ime/package-ime-deb.sh 装入 /usr/share/rime-sync/defaults/schemas）。
+# 升级用例要验证"配置模板只补缺失"，这里按同一路径把模板补进 deb，避免测试
+# 依赖过期的构建产物。只重建 deb，版本号与 Depends 原样保留。
+with_schema_templates() { # $1=in.deb $2=out.deb
+  local tmp
+  tmp=$(mktemp -d "$FIXDIR/ime-repack.XXXXXX") || die "无法创建 IME 重打包目录"
+  dpkg-deb -R "$1" "$tmp/root" || die "解包 $(basename "$1") 失败"
+  install -d "$tmp/root/usr/share/rime-sync/defaults/schemas"
+  cp -f "$REPO"/packaging/rime/schemas/*.custom.yaml \
+    "$tmp/root/usr/share/rime-sync/defaults/schemas/" || die "复制 schema 模板失败"
+  # 只修 DEBIAN 目录权限；不能动载荷文件的权限（/usr/bin/rime_deployer 必须可执行，
+  # 0.5.0 的 prepare-sync-deb.sh 曾被 0644 坑过）
+  chmod 0755 "$tmp/root" "$tmp/root/DEBIAN" 2>/dev/null || true
+  dpkg-deb --root-owner-group -Zxz --build "$tmp/root" "$2" >/dev/null \
+    || die "重建 $(basename "$1") 失败"
+  rm -rf "$tmp"
+  say "  重打包 $(basename "$2")：加入 $(ls "$REPO"/packaging/rime/schemas/*.custom.yaml | wc -l) 个 schema 模板"
+}
+# 文件名必须保持 rime-inputmethod_*.deb（install.sh 按这个 glob 找包）
+install -d "$WORK/repack"
+with_schema_templates "$IME_DEB_NEW" "$WORK/repack/$(basename "$IME_DEB_NEW")"
+with_schema_templates "$IME_DEB_OLD" "$WORK/repack/$(basename "$IME_DEB_OLD")"
+IME_DEB_NEW=$WORK/repack/$(basename "$IME_DEB_NEW")
+IME_DEB_OLD=$WORK/repack/$(basename "$IME_DEB_OLD")
+
 # ---------------------------------------------------------------- bundles
 say "组装离线包："
 stage_bundle "$WORK/bundle-new"    debian-13 "$IME_DEB_NEW"    "$SYNC_DEB_NEW" "$VENDOR13"
@@ -225,7 +251,7 @@ run_case() { # $1=case $2=image $3=bundle $4=bundle_old(optional)
 }
 
 declare -a PASSED=() FAILED=()
-ALL_CASES=(normal broken-unrelated multiarch prebroken-multiarch upgrade single-arch)
+ALL_CASES=(normal broken-unrelated multiarch prebroken-multiarch upgrade-fresh single-arch)
 CASES=("$@")
 [ "${#CASES[@]}" -gt 0 ] || CASES=("${ALL_CASES[@]}")
 
@@ -238,7 +264,7 @@ for c in "${CASES[@]}"; do
     broken-unrelated) run_case broken-unrelated "$BASE_13" "$WORK/bundle-new" ;;
     multiarch)        run_case multiarch        "$BASE_13" "$WORK/bundle-multiarch" ;;
     prebroken-multiarch) run_case prebroken-multiarch "$BASE_13" "$WORK/bundle-multiarch" ;;
-    upgrade)          run_case upgrade          "$BASE_13" "$WORK/bundle-new" "$WORK/bundle-old" ;;
+    upgrade|upgrade-fresh) run_case upgrade-fresh "$BASE_13" "$WORK/bundle-new" "$WORK/bundle-old" ;;
     single-arch)      run_case single-arch      "$BASE_12" "$WORK/bundle-single" ;;
     *) die "未知用例 $c（可选：${ALL_CASES[*]}）" ;;
   esac
