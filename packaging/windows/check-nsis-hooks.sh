@@ -19,6 +19,80 @@ PKG=$(cd "$HERE/.." && pwd)
 STRICT=0
 [ "${1:-}" = "--strict" ] && STRICT=1
 
+# ---------------------------------------------------------------------------
+# 1) 静态结构断言（不需要 makensis）
+#    编译只能证明「语法对」，证明不了「卸载命令长得对 / 超时在 / 失败不 Abort」。
+#    这里按函数体做文本断言，改坏了会直接指出是哪一条（--strict 与非 strict 都跑）。
+#    0.6.11 起：卸载旧版 → 全新安装，POSTINSTALL 按新版无条件写配置（覆盖前备份）。
+# ---------------------------------------------------------------------------
+HOOKS="$PKG/nsis-hooks.nsh"
+static_fail=0
+static_count=0
+
+assert_has() { # <说明> <固定字符串>
+  static_count=$((static_count + 1))
+  if ! grep -qF -- "$2" "$HOOKS"; then
+    printf 'FAIL static  %s\n           缺少：%s\n' "$1" "$2" >&2
+    static_fail=1
+  fi
+}
+
+fn_body() { # <函数名> → 该函数体（到同列 FunctionEnd 为止）
+  awk -v fn="$1" '
+    $0 == "Function " fn { inside = 1 }
+    inside { print }
+    inside && $0 == "FunctionEnd" { exit }
+  ' "$HOOKS"
+}
+
+assert_fn_no_abort() { # <函数名>
+  static_count=$((static_count + 1))
+  if fn_body "$1" | grep -qE '^[[:space:]]*Abort\b'; then
+    printf 'FAIL static  %s 里出现 Abort（卸载/写配置失败只许记日志）\n' "$1" >&2
+    static_fail=1
+  elif [ -z "$(fn_body "$1")" ]; then
+    printf 'FAIL static  找不到函数 %s\n' "$1" >&2
+    static_fail=1
+  fi
+}
+
+# 卸载旧版：抽成函数、静默 + 原地卸载（_?=）、120 秒超时、先停进程
+assert_has "PREINSTALL 第一步调用卸载旧版"        "Call RimeSyncUninstallOldVersion"
+assert_has "旧 rime-sync：路径带引号 + /S + 原地 _?=" '"$R9" /S _?=$0'
+assert_has "旧小狼毫：路径带引号 + /S"                    '"$R9" /S'
+assert_has "卸载前先 taskkill 同步程序"           "taskkill /IM rime-sync-app.exe /F"
+assert_has "卸载前先 taskkill 输入法服务"         "taskkill /IM WeaselServer.exe /F"
+assert_has "卸载等待有 120 秒超时"                '!define RIMESYNC_UNINSTALL_TIMEOUT_MS "120000"'
+assert_has "超时通过 nsExec /TIMEOUT 生效"        'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_UNINSTALL_TIMEOUT_MS}'
+assert_has "阶段日志 UNINSTALL-OLD"               "phase=UNINSTALL-OLD"
+assert_has "旧输入法会被卸载（标记+卸载命令）"      'StrCpy $R9 $RimeSyncOldWeaselCmd'
+assert_has "旧小狼毫仍在时给出警告标记"            'StrCpy $RimeSyncWeaselKept "1"'
+
+# POSTINSTALL：无条件写配置 + 覆盖前备份 + DONE 报数
+assert_has "备份名 <file>.bak-<版本>"             '.bak-$RimeSyncSeedVersion"'
+assert_has "同名备份追加 -1/-2…"                  '.bak-$RimeSyncSeedVersion-$4'
+assert_has "覆盖前先 Rename（不删用户文件）"       'Rename "$1\$2" "$5"'
+assert_has "DONE 阶段报配置文件数/备份数"          "phase=DONE setup finished configs=\$RimeSyncSeedWritten backups=\$RimeSyncSeedBackups"
+assert_has "用户数据不动：只写三类 *.custom.yaml"   'seed skip schemas: no templates'
+
+# 失败一律只记日志：这些函数体里不能有 Abort
+for fn in \
+  RimeSyncRunAndWait \
+  RimeSyncNormalizeUninstallPath \
+  RimeSyncUninstallOldRimeSync \
+  RimeSyncUninstallOldWeasel \
+  RimeSyncUninstallOldVersion \
+  RimeSyncWriteConfigFile \
+  RimeSyncSeedRimeConfig; do
+  assert_fn_no_abort "$fn"
+done
+
+if [ "$static_fail" -ne 0 ]; then
+  echo "check-nsis-hooks: 静态结构断言失败（见上）" >&2
+  exit 1
+fi
+printf 'ok   static  %s 条结构断言（卸载命令/120s 超时/失败不 Abort/备份命名）\n' "$static_count"
+
 if ! command -v makensis >/dev/null 2>&1; then
   if [ "$STRICT" -eq 1 ]; then
     echo "check-nsis-hooks: 缺少 makensis（apt-get install nsis / makensis.org），--strict 下视为失败" >&2

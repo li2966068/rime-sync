@@ -162,9 +162,12 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librs
 详细步骤与 AList 权限表见 [`../docs/USER-GUIDE.md`](../docs/USER-GUIDE.md)。
 
 6. 输入增强（v 数值转中文、中文标点直出 + Shift 备选）随包提供：安装器把
-   `packaging/rime/schemas/<schema>.custom.yaml`（16 个随包方案各一份）复制进用户 Rime 目录，
-   只在用户目录缺文件时写；**升级默认不动已有配置**，需要时用安装器参数
-   `--with-schema-tweaks`（或 `RIMESYNC_WITH_SCHEMA_TWEAKS=1`）。
+   `packaging/rime/schemas/<schema>.custom.yaml`（16 个随包方案各一份）复制进用户 Rime 目录。
+   **Linux**：`rime-inputmethod` 的 postinst 只在用户目录缺文件时写，升级默认不动已有配置，
+   需要时用安装器参数 `--with-schema-tweaks`（或 `RIMESYNC_WITH_SCHEMA_TWEAKS=1`）。
+   **Windows（0.6.11 起）**：升级即全新安装，`POSTINSTALL` 按新版本**无条件**写这些模板 ——
+   已存在的同名文件先改名成 `<file>.bak-<安装包版本>`（同名追加 `-1`/`-2`）再写新版，
+   用户词典（`*.userdb*`、`*.txt` 词表）不动；见 `windows/README.md` 第 10 节。
    列表由 `scripts/ime/gen-schema-custom.py` 从 vendored 方案解析后生成，随
    `rime-inputmethod` deb 装到 `/usr/share/rime-sync/defaults/schemas/`。
    细节、关闭方法与已知取舍见 [`../docs/INPUT-ENHANCEMENTS.md`](../docs/INPUT-ENHANCEMENTS.md)。

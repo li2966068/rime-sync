@@ -10,7 +10,7 @@
 | `../../scripts/ime/build-librime-win.ps1` | **0.6.9 起**：从 `third_party/librime`（vendored 1.17.0）自建 librime，把 `plugins/rimesync-extra` 合并进 rime.dll，产出 `lib64/lib/output/output\\Win32/include` 布局 |
 | `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
 | `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
-| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
+| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → **卸载旧版（同步程序 + 自建输入法）** → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式 + 按新版无条件写配置（覆盖前备份）；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
 | `../nsis-hooks-offline.nsh` | 离线变体：`!define RIMESYNC_EMBED_WEBVIEW` 后 include 主钩子（内嵌 WebView2 Standalone） |
 | `fetch-webview2.ps1` | 下载 WebView2 Evergreen **Standalone**（x64，约 130 MB）供离线包内嵌；3 次重试 + 体积/文件头校验 |
 | `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine`；`webviewInstallMode = skip` |
@@ -214,8 +214,10 @@ File ...resources...
 |---|---|
 | 编译期：内嵌缺失告警 | makensis 输出里的 `rime-sync: vendored weasel installer not found`（`!warning`） |
 | 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（单行记录，含 `phase=IME-INSTALL`、`exit=0`、`phase=POSTINSTALL`） |
-| 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，同一份内容 + 阶段名 `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径也写） |
+| 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，同一份内容 + 阶段名 `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径也写） |
 | 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=...` |
+| 运行期：卸载旧版（0.6.11） | `%TEMP%\rime-sync-setup.log` 里的 `phase=UNINSTALL-OLD target=rime-sync exit= ms=` / `target=weasel exit= ms=`（无卸载器时 `result=none`） |
+| 运行期：配置备份（0.6.11） | 同上日志里的 `seed file=<name> result=backup backup=<path>` 与 `phase=POSTINSTALL seed done configs= backups=` |
 | 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；内嵌的 Weasel 安装器约 12 MiB） |
 
 静默安装看不到 DetailPrint，所以顺序日志写文件；卸载时删除该文件。
@@ -370,7 +372,7 @@ shell 变量可能被映射到「所有用户」上下文。读不到 `%APPDATA%
 | Tauri `webviewInstallMode` | `embedBootstrapper`（静默联网下载） | `skip`（Tauri 完全不碰 WebView2） |
 | WebView2 检测 | 无 | PREINSTALL 第一步：`HKLM`/`HKCU` × 64/32 位视图读 `EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\pv`，另用 `EdgeWebView\Application\*\msedgewebview2.exe` 兜底 |
 | 未安装时 | 静默联网下载，无提示 | ① 离线包 → 内嵌 Standalone 静默安装；② 带 `/SKIPWEBVIEW` → 只写日志继续；③ 在线包 → 弹框（中英按 `$LANGUAGE`）给下载地址，继续或退出（退出 = Abort） |
-| 安装日志 | `$INSTDIR\install-ime-order.log` | 另加 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名 `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径同样写） |
+| 安装日志 | `$INSTDIR\install-ime-order.log` | 另加 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名 `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径同样写） |
 | Windows 版本门槛 | 无 | 低于 Windows 10 1803（10.0.17134）：弹框说明并 Abort |
 
 **任何路径都不再联网下载**：在线包只把地址打印在弹框里，离线包用内嵌的 Standalone 安装器。
@@ -473,6 +475,7 @@ bash packaging/windows/check-nsis-hooks.sh --strict   # 没有 makensis 视为�
 输出示例（0 warning 0 error；离线包体积比在线包正好大一个假载荷 = 确实内嵌了 Standalone）：
 
 ```text
+ok   static  22 条结构断言（卸载命令/120s 超时/失败不 Abort/备份命名）
 ok   online     144568 bytes  warnings=0
 ok   offline   1193178 bytes  warnings=0
 delta     1048610 bytes（离线包 - 在线包；假载荷 1048576 字节，应≈它）
@@ -486,3 +489,103 @@ check-nsis-hooks: 两套钩子均 0 warning 0 error
 Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默中止的退出码、
 `%TEMP%\rime-sync-setup.log` 的 UTF-16 BOM 只写一次。
 
+## 10. 升级即全新安装（0.6.11）
+
+每个新版本都按「先卸载旧版 → 全新安装」执行：升级不再沿用旧文件，也不再因为「检测到
+已存在」而跳过任何一步。输入法本体与同步程序都卸载，安装器按新版本无条件创建目录与文件，
+覆盖前保留备份。
+
+### 10.1 卸载顺序（`NSIS_HOOK_PREINSTALL`）
+
+| 步骤 | 动作 | 失败时 |
+|---|---|---|
+| 0 | `RimeSyncCheckWindows`：系统版本 ≥ Win10 1803 | 弹框 + `Abort`。**只读检查放在卸载之前**：先卸载再中止会把用户晾在「旧版没了、新版没装」的半路 |
+| 1 | `taskkill /IM rime-sync-app.exe /F`、`taskkill /IM WeaselServer.exe /F` | 忽略（进程本来就不在时 taskkill 返回 128），避免旧卸载器删不掉被占用的 exe/dll 而白等到超时 |
+| 2 | 跑旧版卸载器：`"<$INSTDIR>\uninstall.exe" /S _?=$INSTDIR`。`$INSTDIR\uninstall.exe` 不在时枚举 `HKLM\...\Uninstall`（32 位视图优先，再 64 位），`DisplayName` 以 `rime-sync` 开头或 `Publisher` 是 `rime-sync` 即命中 | 只写日志（`exit=` / `result=none` / `timeout`），继续安装 |
+| 3 | 跑小狼毫卸载器：仅当 `HKLM\Software\rime-sync` 的 `BundledWeasel=1`。命令依次取标记里的 `WeaselUninstall` → `WeaselRoot\uninstall.exe` → 现场探测 | 只写日志，继续安装 |
+| 4 | 清掉所有权标记（`BundledWeasel` / `WeaselRoot` / `WeaselUninstall` / `BundledAt`），新版装完再重新写 | 忽略 |
+
+* 等待用 `nsExec::ExecToStack /TIMEOUT=120000`（`RIMESYNC_UNINSTALL_TIMEOUT_MS`）。
+  `ExecWait` 没有超时参数，卸载器一卡住安装器就永远停在那儿；nsExec 到点结束进程并返回
+  `timeout`，退出码照样进日志。**任何一步失败都只记日志，绝不 Abort。**
+* 旧版卸载器自己也会跑 `PREUNINSTALL`（同样只卸「我们装的」小狼毫、默认保留用户数据），
+  所以步骤 3 通常空跑；它兜的是「`rime-sync` 目录被手删、标记还在」这种情况。
+* 卸载之后就是全新安装：Weasel 先（`RimeSyncInstallWeaselPre`）、同步程序后（Tauri 拷主程序）。
+  若步骤 2/3 失败、旧 Weasel 仍在，安装阶段**仍然跳过**输入法（硬装会覆盖用户正在用的输入法），
+  但会记 `phase=IME-INSTALL skip existing weasel root=... reason=still-present-after-uninstall`，
+  并在结束提示里弹框要求手动卸载（静默安装只写日志）。
+
+### 10.2 配置文件：按新版无条件写，覆盖前备份
+
+`POSTINSTALL` 的 `RimeSyncSeedRimeConfig` 不再「存在就跳过」：
+
+| 目标 | 规则 |
+|---|---|
+| `%APPDATA%\Rime\default.custom.yaml` | 目录不存在就创建；已存在 → 先改名备份再写新版。仍要求 Weasel 的 `data` 里有 `wubi86.schema.yaml`（模板的 `schema_list` 列了五笔，缺方案会让 librime 整次部署失败） |
+| `%APPDATA%\Rime\weasel.custom.yaml` | 无条件写（只影响外观：候选横向排列） |
+| `%APPDATA%\Rime\<schema>.custom.yaml` | 遍历 `$INSTDIR\resources\schemas\*.custom.yaml`，**逐个**要求 Weasel `data` 里有 `<schema>.schema.yaml`，否则跳过该文件 |
+
+备份命名：
+
+* `<file>.bak-<版本>`，例如 `default.custom.yaml.bak-0.6.11`；
+* 版本取 `PRODUCTVERSION`（Tauri 模板的版本号 = `src-tauri/tauri.conf.json` 的 `version`）；
+  没有该宏的构建退回内嵌小狼毫版本（`RIMESYNC_WEASEL_DIRVER`，当前 `0.17.4`）；
+* 同名备份已存在则追加 `-1`/`-2`…（`default.custom.yaml.bak-0.6.11-1`）；
+* 备份改名失败（文件被占用/只读）→ **不覆盖**，日志记 `result=failed`：宁可不更新，也不毁掉
+  用户手改的配置；复制失败会把备份改回原名。
+
+日志（`%TEMP%\rime-sync-setup.log`，UTF-16LE）：
+
+```text
+[rime-sync] 2026-11-02 20:00:00 phase=UNINSTALL-OLD target=rime-sync exit=0 ms=3120 source=(instdir)
+[rime-sync] 2026-11-02 20:00:03 phase=UNINSTALL-OLD target=weasel exit=0 ms=2410
+[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed begin version=0.6.11 policy=backup-overwrite
+[rime-sync] 2026-11-02 20:00:05 seed file=default.custom.yaml result=backup backup=C:\Users\me\AppData\Roaming\Rime\default.custom.yaml.bak-0.6.11
+[rime-sync] 2026-11-02 20:00:05 seed file=luna_pinyin.custom.yaml result=new backup=
+[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed done configs=16 backups=1 version=0.6.11
+[rime-sync] 2026-11-02 20:00:06 phase=DONE setup finished configs=16 backups=1 weasel-kept=0
+```
+
+`阶段=DONE` 的 `DetailPrint` 与日志都会写「已按新版刷新 N 个配置文件（备份 N 个）」。
+
+### 10.3 用户数据一律不动
+
+写入清单只有上面三类 `*.custom.yaml`。下列内容**既不读也不写、不改名、不删除**：
+
+* 用户词典：`*.userdb`、`*.userdb.txt`、`*.userdb.kct` 等；
+* 词表与状态：`*.txt`、`custom_phrase.txt`、`installation.yaml`、`user.yaml`；
+* `%APPDATA%\com.rimesync.app`（同步程序自己的配置与同步状态）；
+* 本次改动没有新增任何 `Delete` / `RMDir` / 通配删除动作。
+
+卸载器默认同样保留 `%APPDATA%\Rime`（只有交互卸载选「是」或静默卸载带 `/PURGEDATA`
+才删，见第 7 节）。
+
+### 10.4 怎么回滚备份
+
+```powershell
+# 看有哪些备份
+Get-ChildItem "$env:APPDATA\Rime" -Filter *.bak-*
+# 回滚单个文件：删掉新版，把备份改回原名
+Remove-Item "$env:APPDATA\Rime\default.custom.yaml"
+Rename-Item "$env:APPDATA\Rime\default.custom.yaml.bak-0.6.11" "default.custom.yaml"
+# 回滚本版本的全部备份
+Get-ChildItem "$env:APPDATA\Rime" -Filter *.bak-0.6.11* | ForEach-Object {
+  Move-Item -Force $_.FullName ($_.FullName -replace '\.bak-[^\\]+$', '')
+}
+```
+
+回滚后让小狼毫重新部署（托盘「重新部署」或 `WeaselDeployer.exe /deploy`）才生效。
+
+### 10.5 本机能验到哪一步（真机仍需复核）
+
+已验：`bash packaging/windows/check-nsis-hooks.sh --strict` —— 两套钩子 0 warning 0 error，
+外加 22 条静态结构断言（卸载命令带引号 + `_?=`、120 秒超时、失败不 `Abort`、备份命名、
+DONE 报数）。编译只能证明语法与结构，**运行期行为只能在真机复核**：
+
+1. 装 0.6.10 → 再装 0.6.11：旧 `uninstall.exe /S _?=` 静默跑完、`rime-sync-app.exe` 被
+   taskkill、日志里 `exit=0`；
+2. 旧版带自建小狼毫：`BundledWeasel=1` 分支命中，小狼毫被卸、新版重装后再写标记；
+3. 卸载器卡住（把 `uninstall.exe` 换成 `cmd /c pause`）→ 120 秒后 `timeout`，安装继续；
+4. `%APPDATA%\Rime` 里的 `*.userdb*`、`*.txt` 升级后原样还在；
+5. 手改过 `weasel.custom.yaml` → 升级后出现 `.bak-<版本>`，新版生效；
+6. 备份名冲突（已有 `.bak-0.6.11`）→ 生成 `.bak-0.6.11-1`。

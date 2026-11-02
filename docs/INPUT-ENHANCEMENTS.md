@@ -74,11 +74,13 @@ patch:
 写入了哪些文件会打印在安装输出里，同时记到 `/var/log/rime-sync/schema-tweaks.log`
 （每次安装一行 `wrote=/kept=/no_data=` 汇总）。
 
-Windows：NSIS 钩子（`packaging/nsis-hooks.nsh`）已经会从
-`$INSTDIR\resources\schemas\*.custom.yaml` 复制到 `%APPDATA%\Rime\`（存在即跳过，
-并且要求 Weasel 的 data 里有 `wubi86`，否则跳过以免部署失败）。**当前 Windows 安装包还没有
-这批模板**：`src-tauri/tauri.conf.json` 的 `resources` 还没映射
-`../packaging/rime/schemas`，补上映射后这段钩子自动生效。
+Windows：NSIS 钩子（`packaging/nsis-hooks.nsh`）从 `$INSTDIR\resources\schemas\*.custom.yaml`
+复制到 `%APPDATA%\Rime\`（模板由 `src-tauri/tauri.conf.json` 的 `resources` 映射进包）。
+0.6.11 起**升级也写**，不再是「存在就跳过」：已存在的同名文件先改名成 `<file>.bak-<安装包版本>`
+（同名再追加 `-1`/`-2`），再写新版；写入前逐个模板检查 Weasel 的 `data` 里有对应
+`<schema>.schema.yaml`（`default.custom.yaml` 要求 `wubi86`），缺方案的跳过，以免 librime 部署失败。
+用户词典（`*.userdb*`、词表 `*.txt`）与 `%APPDATA%\com.rimesync.app` 一律不动。
+卸载顺序、备份命名与回滚方式见 `packaging/windows/README.md` 第 10 节。
 
 ## 4. 怎么关闭
 

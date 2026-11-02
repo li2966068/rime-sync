@@ -61,11 +61,16 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
   `ExecWait ... /S` 等安装结束，然后 Tauri 才拷贝 rime-sync 自己的程序文件。
 - 安装器把带时间戳的顺序写入 `$INSTDIR\install-ime-order.log`（静默安装的可复核证据，
   卸载时删除），并**同时**追加到 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名
-  `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`，
+  `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`，
   安装结束后仍在，失败路径也写）。
 - 安装前先检查系统版本（≥ Windows 10 1803）与 WebView2 运行时（见第 3 节），
-  再装小狼毫；三步都在 Tauri 拷贝主程序之前。
-- 只有检测不到小狼毫时才静默安装，已安装则跳过（不覆盖用户版本）。
+  再卸载旧版、装小狼毫；全部在 Tauri 拷贝主程序之前。
+- 0.6.11 起每个新版本都「**先卸载旧版 → 全新安装**」：`PREINSTALL` 先 `taskkill`
+  `rime-sync-app.exe` / `WeaselServer.exe`，跑旧版 `uninstall.exe /S _?=$INSTDIR`
+  （找不到时枚举 Uninstall 注册项，32 位视图优先），再按所有权标记卸掉自建小狼毫；卸载器最多等
+  120 秒（`nsExec /TIMEOUT`），任何一步失败只写日志（**绝不 Abort**）并继续全新安装。
+  因此安装阶段不再有「检测到已存在就跳过」的正常路径；唯一例外是卸载失败、旧小狼毫仍在时
+  跳过输入法安装，并在日志与结束提示里要求用户手动卸载。
 - **卸载 rime-sync 默认连小狼毫一起卸载，但只卸「rime-sync 装的」那个**：
   - 安装前先探测小狼毫是否已存在。原本不存在、由本次安装装上时，安装器在
     `HKLM\Software\rime-sync`（64 位视图）记录所有权标记：
