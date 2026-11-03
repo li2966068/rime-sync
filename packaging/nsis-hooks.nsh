@@ -319,6 +319,7 @@ Function RimeSyncSeedRimeConfig
     DetailPrint "[rime-sync] 无法创建 $APPDATA\Rime，跳过推荐配置写入"
     StrCpy $R3 "[rime-sync] $R2 seed skipped: cannot create Rime user dir"
     Call RimeSyncLog
+    SetShellVarContext all
     Return
   rimesync_seed_dir_ready:
 
@@ -398,7 +399,8 @@ Function RimeSyncSeedRimeConfig
     Call RimeSyncLog
 
   rimesync_seed_summary:
-  DetailPrint "[rime-sync] 配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个"
+  DetailPrint "[rime-sync] 配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个（目标 $APPDATA\Rime）"
+  SetShellVarContext all
   StrCpy $R3 "[rime-sync] $R2 phase=POSTINSTALL seed done configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused version=$RimeSyncSeedVersion"
   Call RimeSyncLog
 FunctionEnd
