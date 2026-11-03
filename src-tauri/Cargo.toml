@@ -1,6 +1,6 @@
 [package]
 name = "rime-sync-app"
-version = "0.6.12"
+version = "0.6.13"
 description = "Rime 词库与配置 WebDAV 同步（桌面壳）"
 edition = "2021"
 rust-version = "1.77"
