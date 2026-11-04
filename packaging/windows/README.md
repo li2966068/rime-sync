@@ -216,7 +216,7 @@ File ...resources...
 | 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（单行记录，含 `phase=IME-INSTALL`、`exit=0`、`phase=POSTINSTALL`） |
 | 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，同一份内容 + 阶段名 `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径也写） |
 | 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=...` |
-| 运行期：卸载旧版（0.6.11） | `%TEMP%\rime-sync-setup.log` 里的 `phase=UNINSTALL-OLD target=rime-sync exit= ms=` / `target=weasel exit= ms=`（无卸载器时 `result=none`） |
+| 运行期：卸载旧版（0.6.11 / 0.6.14） | `%TEMP%\rime-sync-setup.log` 里的 `phase=UNINSTALL-OLD target=rime-sync exit= ms=`（无卸载器时 `result=none`）。0.6.14 起**不再有** `target=weasel`：输入法由 `phase=IME-CHECK` / `IME-REPAIR` / `WEASEL-ROLLBACK` 负责 |
 | 运行期：配置备份（0.6.11） | 同上日志里的 `seed file=<name> result=backup backup=<path>` 与 `phase=POSTINSTALL seed done configs= backups=` |
 | 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；内嵌的 Weasel 安装器约 12 MiB） |
 
@@ -492,7 +492,8 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 ## 10. 升级即全新安装（0.6.11）
 
 每个新版本都按「先卸载旧版 → 全新安装」执行：升级不再沿用旧文件，也不再因为「检测到
-已存在」而跳过任何一步。输入法本体与同步程序都卸载，安装器按新版本无条件创建目录与文件，
+已存在」而跳过任何一步。**0.6.14 起只卸载同步程序**：输入法本体不再「先卸再装」，而是先
+判就绪、未就绪才改名留证 + 重装（第 11 节）。安装器按新版本无条件创建目录与文件，
 覆盖前保留备份。
 
 ### 10.1 卸载顺序（`NSIS_HOOK_PREINSTALL`）
@@ -502,18 +503,21 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 | 0 | `RimeSyncCheckWindows`：系统版本 ≥ Win10 1803 | 弹框 + `Abort`。**只读检查放在卸载之前**：先卸载再中止会把用户晾在「旧版没了、新版没装」的半路 |
 | 1 | `taskkill /IM rime-sync-app.exe /F`、`taskkill /IM WeaselServer.exe /F` | 忽略（进程本来就不在时 taskkill 返回 128），避免旧卸载器删不掉被占用的 exe/dll 而白等到超时 |
 | 2 | 跑旧版卸载器：`"<$INSTDIR>\uninstall.exe" /S _?=$INSTDIR`。`$INSTDIR\uninstall.exe` 不在时枚举 `HKLM\...\Uninstall`（32 位视图优先，再 64 位），`DisplayName` 以 `rime-sync` 开头或 `Publisher` 是 `rime-sync` 即命中 | 只写日志（`exit=` / `result=none` / `timeout`），继续安装 |
-| 3 | 跑小狼毫卸载器：仅当 `HKLM\Software\rime-sync` 的 `BundledWeasel=1`。命令依次取标记里的 `WeaselUninstall` → `WeaselRoot\uninstall.exe` → 现场探测 | 只写日志，继续安装 |
-| 4 | 清掉所有权标记（`BundledWeasel` / `WeaselRoot` / `WeaselUninstall` / `BundledAt`），新版装完再重新写 | 忽略 |
+| 3 | 清掉所有权标记（`BundledWeasel` / `WeaselRoot` / `WeaselUninstall` / `BundledAt`），新版装完再重新写 | 忽略 |
+
+> **0.6.14 起这里不再卸小狼毫**（0.6.11 的「步骤 3 跑小狼毫卸载器」已删除）。原因见第 11 节：
+> 先把 Weasel 卸掉再判「是否就绪」，残留的 TSF/注册表会把判定骗成「已就绪」→ 跳过安装 →
+> 机器上最终没有输入法。Weasel 的替换统一由 `RimeSyncInstallWeaselPre` 的
+> 「判定 → 改名 → 重装 → 回滚」负责。
 
 * 等待用 `nsExec::ExecToStack /TIMEOUT=120000`（`RIMESYNC_UNINSTALL_TIMEOUT_MS`）。
   `ExecWait` 没有超时参数，卸载器一卡住安装器就永远停在那儿；nsExec 到点结束进程并返回
   `timeout`，退出码照样进日志。**任何一步失败都只记日志，绝不 Abort。**
-* 旧版卸载器自己也会跑 `PREUNINSTALL`（同样只卸「我们装的」小狼毫、默认保留用户数据），
-  所以步骤 3 通常空跑；它兜的是「`rime-sync` 目录被手删、标记还在」这种情况。
+* 旧版卸载器（0.6.13 及以前）自己的 `PREUNINSTALL` 会卸掉「我们装的」小狼毫 —— 那是已经
+  发出去的代码，改不了。所以 0.6.14 在卸载**之后**再判一次就绪：它真被删了 → 重装。
 * 卸载之后就是全新安装：Weasel 先（`RimeSyncInstallWeaselPre`）、同步程序后（Tauri 拷主程序）。
-  0.6.13 起输入法这一步改由「就绪判定」驱动：已就绪 → 跳过并写清依据；未就绪 → 自动修复，
-  修不好就**硬失败**（见第 11 节）。0.6.12 及以前那种「目录里有 exe 就算装了、然后永远跳过」
-  的假就绪路径已经删掉。
+  0.6.14 起输入法这一步由「唯一硬条件 + 先判定后动手」驱动（第 11 节）：已就绪 → 跳过安装
+  （`action=skip reason=exe-present`）；未就绪 → 改名留证 + 重装，复查失败**先回滚再硬失败**。
 
 ### 10.2 配置文件：按新版无条件写，覆盖前备份
 
@@ -565,74 +569,159 @@ Remove-Item "$env:APPDATA\Rime\luna_pinyin.custom.yaml","$env:APPDATA\Rime\defau
 ### 10.5 本机能验到哪一步（真机仍需复核）
 
 已验：`bash packaging/windows/check-nsis-hooks.sh --strict` —— 两套钩子 0 warning 0 error，
-外加 70 条静态结构断言（卸载命令带引号 + `_?=`、120 秒 / 300 秒超时、就绪判定读注册表、
-`Rime.bak-` 改名留证、`WEASEL-INSTALL failed` 硬失败、`SetShellVarContext current` 播种、
-POSTINSTALL 自检与 `/deploy`、失败不 `Abort`）。断言本身也做过反向验证：删掉对应代码行
-（例如 `SetShellVarContext current`、`Rename` 目标 `.bak-$R2`、`Call RimeSyncSelfCheck`）
-后脚本立即变红。编译只能证明语法与结构，**运行期行为只能在真机复核**：
+外加 98 条静态结构断言（卸载命令带引号 + `_?=`、120/300/20 秒超时、就绪判定只认 exe、
+`tsf=` 只许出现在 `phase=TSF-EVIDENCE`、先判定再卸/装、`Rime.bak-` 改名留证、回滚改回原名、
+UNINSTALL-OLD 不再卸 Weasel、自检硬失败退出码 5、`SetShellVarContext current` 播种、失败不 `Abort`）。
+断言本身做过反向验证（`RIMESYNC_HOOKS=<临时副本> bash … --strict`）：把 `tsf` 塞回判定行、去掉
+exe 判定、删掉回滚 `Rename`、让 UNINSTALL-OLD 又卸 Weasel、把 preflight 挪到卸载之后、删掉自检的
+`SetErrorLevel 5`、允许空目录改名 —— 每一条都让脚本立即变红（见第 11.6 节）。编译只能证明语法与结构，**运行期行为只能在真机复核**：
 
 1. 装 0.6.10 → 再装 0.6.11：旧 `uninstall.exe /S _?=` 静默跑完、`rime-sync-app.exe` 被
    taskkill、日志里 `exit=0`；
-2. 旧版带自建小狼毫：`BundledWeasel=1` 分支命中，小狼毫被卸、新版重装后再写标记；
+2. 旧版带自建小狼毫：升级时**不再**在 UNINSTALL-OLD 里卸它；就绪则只跳过安装
+   （`action=skip reason=exe-present`），旧卸载器真删了它就重装并重新写标记；
 3. 卸载器卡住（把 `uninstall.exe` 换成 `cmd /c pause`）→ 120 秒后 `timeout`，安装继续；
 4. `%APPDATA%\Rime` 里的 `*.userdb*`、`*.txt` 升级后原样还在；
 5. 手改过 `weasel.custom.yaml` → 升级后**原样保留**（日志 result=reuse），改动不被覆盖；
 6. 删掉 `luna_pinyin.custom.yaml` 再装 → 日志 result=new，新版被写入（只补缺失）；
-7. 0.6.13 假就绪场景（删掉 `HKLM\Software\Rime\Weasel` 但保留程序目录）→ 重装时日志
-   `phase=IME-CHECK ready=no reason=registry-missing`、旧目录被改名成 `Rime.bak-*`、
-   内嵌安装器重装后 `phase=IME-INSTALL ready=yes`、`phase=SELF-CHECK` 里 `build=updated`；
-8. 把内嵌安装器换成 `cmd /c exit 1`（桩构建）→ `WEASEL-INSTALL failed`、安装器退出码非 0
-   （静默安装不弹框，交互安装弹框）；
-9. `/SKIPIME` 安装 → 日志 `phase=IME-CHECK skip=1 switch=/SKIPIME`，结束提示说明本次没装输入法；
-10. 装完检查 `$env:APPDATA\Rime` 里有模板，而 `C:\ProgramData\Rime` 里没有（0.6.12 的 bug）。
+7. 0.6.14 回归场景（机 A：`C:\Program Files\Rime` 空目录、`HKLM\Software\WOW6432Node\Rime\Weasel`
+   缺失、TSF 残留）→ 日志 `phase=IME-CHECK stage=preflight ready=no reason=empty-dir`、
+   `phase=IME-REPAIR rename skipped`、安装器重装后 `phase=IME-INSTALL ready=yes`、
+   `phase=SELF-CHECK … build=updated`；`tsf=yes` 只出现在 `phase=TSF-EVIDENCE` 行；
+8. 删掉 `HKLM\Software\Rime\Weasel` 但保留非空程序目录 → `rename ok` 到 `Rime.bak-<ts>`、
+   重装成功；若安装器失败（换成 `cmd /c exit 1` 的桩构建）→ `WEASEL-INSTALL failed … rollback=ok`、
+   `Rime.bak-*` 被改回 `Rime`、安装器退出码 5（静默不弹框，交互弹框）；
+9. 桩构建 + 空目录 → `rollback=none`（没有备份就不假装回滚过），退出码照样 5；
+10. `/SKIPIME` 安装 → 日志 `phase=IME-CHECK skip=1 switch=/SKIPIME`，结束提示说明本次没装输入法；
+11. 装完把 `WeaselServer.exe` 删掉再手工跑一次自检（或直接跑安装包）→
+    `phase=SELF-CHECK weasel-ready=no … default-exe=no`、`phase=SETUP failed … exit=5`、
+    交互安装弹 STOP 框、`phase=DONE` 不出现；
+12. 装完检查 `$env:APPDATA\Rime` 里有模板，而 `C:\ProgramData\Rime` 里没有（0.6.12 的 bug）。
 
-## 11. Weasel 就绪判定与自动修复（0.6.13）
+## 11. Weasel 就绪判定、重装与回滚（0.6.14）
 
-0.6.12 在真机上出现过「Weasel 假就绪」：`C:\Program Files\Rime\weasel-0.17.4` 里文件齐全，
-但 `HKLM\Software\Rime\Weasel` 注册表项不存在、TSF 文本服务 0 处注册、`WeaselServer.exe`
-根本没在跑，`%APPDATA%\Rime\build\luna_pinyin.schema.yaml` 的时间戳还停在旧日期。
-旧代码只判断「目录里有 `WeaselServer.exe`」，于是永远走「已存在，跳过安装」，装出一个
-看起来装好了、实际不能用的输入法，而且没有任何提示。
+0.6.13 有两个连锁问题，合起来在真机上把输入法装没了（机 A：`C:\Program Files\Rime` 空目录、
+`HKLM\Software\WOW6432Node\Rime\Weasel` 不存在、没有 `WeaselServer` 进程、TSF 残留还在）：
+
+1. **顺序错**：`UNINSTALL-OLD` 先把自建 Weasel 卸掉，之后才判「是否就绪」；
+2. **判据太宽**：卸完之后 TSF 文本服务注册、注册表残留还在，判定把它们当成证据 →
+   `action=skip` → 内嵌安装器根本没跑 → 机器上没有输入法。
+   （机 B 是另一种形态：注册表在、`WeaselServer` 跑在 `SessionId=0`、部署从不生效。）
+
+0.6.14 的改法：
+
+* `UNINSTALL-OLD` **不再卸 Weasel**，只卸旧版 rime-sync（第 10.1 节）；
+* `RimeSyncWeaselReady` 只剩**一个硬条件**：注册表值指向的目录里真有 `WeaselServer.exe`；
+* TSF / 进程证据**只写日志**（`phase=TSF-EVIDENCE`），`tsf=` 不出现在任何判定行；
+* 未就绪才改名 + 重装；复查仍不就绪 → **回滚**把旧目录改回来，日志 `rollback=ok|failed`。
 
 ### 11.1 判定条件（`RimeSyncWeaselReady`）
 
 | 条件 | 怎么判 | 缺失时 |
 |---|---|---|
-| 注册表项存在 | `HKLM\Software\Rime\Weasel` 的 `InstallDir` **或** `WeaselRoot` 非空。Weasel 的安装器是 32 位 NSIS，值通常落在 `WOW6432Node`，所以 64 位与 32 位视图都读 | 未就绪，原因 `registry-missing` |
-| 程序目录里真有服务程序 | 该值指向的目录里存在 `WeaselServer.exe`。Weasel 0.17 的 `InstallDir` 写的是父目录 `<Program Files>\Rime`，真正的程序目录是它下面的 `weasel-<ver>`；直接指向程序目录、父目录 + 随包版本、父目录 + 任意 `weasel-*` 三种布局都认 | 未就绪，原因 `no-WeaselServer.exe` |
+| 注册表值存在 | `HKLM\Software\Rime\Weasel` 的 `InstallDir` **或** `WeaselRoot` 非空。Weasel 的安装器是 32 位 NSIS，值通常落在 `WOW6432Node`，所以 64 位与 32 位视图都读 | 未就绪，原因 `registry-missing` |
+| 程序目录里真有服务程序 | 该值指向的目录里存在 `WeaselServer.exe`。`InstallDir` 写的是父目录 `<Program Files>\Rime`，真正的程序目录是下面的 `weasel-<ver>`；直接指向程序目录、父目录 + 随包版本、父目录 + 任意 `weasel-*` 三种布局都认 | 未就绪，原因 `no-WeaselServer.exe` |
+| 目录不为空 | 注册表值指向的目录存在，但一个文件都没有 | 未就绪，原因 `empty-dir`（0.6.14 新增，专门识别机 A 的形态） |
 
-下面两条**只作证据**写进日志，不参与判定（避免误判成未就绪）：
+**绝不算证据的东西**（0.6.13 就是被它们骗的）：
 
-* TSF 注册：`HKLM\SOFTWARE\Microsoft\CTF\TIP\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}` 与
-  `HKLM\SOFTWARE\Classes\CLSID\{…}\InprocServer32`（CLSID 取自
-  `third_party/weasel/WeaselTSF/Globals.cpp` 的 `c_clsidTextService`）；
-* 进程：`tasklist /FI "IMAGENAME eq WeaselServer.exe" /FO CSV /NH` 的输出是不是被查进程行。
+* TSF 文本服务注册（`HKLM\SOFTWARE\Microsoft\CTF\TIP\{…}`、`HKLM\SOFTWARE\Classes\CLSID\{…}\InprocServer32`）；
+* `WeaselServer.exe` 是否在跑（`SessionId=0` 的僵尸进程也算「在跑」，不代表能用）。
 
-判定结果落在 `phase=IME-CHECK` 日志行里：
+这两项由 `RimeSyncWeaselLogEvidence` 写成一行
+`phase=TSF-EVIDENCE tsf= … proc= … note=log-only-not-used-for-readiness`，只供排查，
+**不参与任何分支**。静态断言 `assert_tsf_log_only` 保证 `tsf=` 只出现在这一行。
+
+判定结果落在 `phase=IME-CHECK`：
 
 ```text
-[rime-sync] 2026-11-03 12:00:05 phase=IME-CHECK ready=yes root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=running tsf=yes action=skip
-[rime-sync] 2026-11-03 12:00:05 phase=IME-CHECK ready=no reason=registry-missing root= regdir= proc=stopped tsf=no action=repair
+[rime-sync] 2026-11-04 10:00:02 phase=IME-CHECK stage=preflight ready=yes reason=ok root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) action=pending-decision
+[rime-sync] 2026-11-04 10:00:02 phase=TSF-EVIDENCE tsf=yes tsfdll=C:\Program Files\Rime\weasel-0.17.4\WeaselTSF.dll proc=running note=log-only-not-used-for-readiness
+[rime-sync] 2026-11-04 10:00:03 phase=IME-CHECK ready=no reason=empty-dir root= regdir=C:\Program Files\Rime action=repair
+[rime-sync] 2026-11-04 10:00:03 phase=IME-CHECK ready=yes root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=running action=skip reason=exe-present
 ```
 
-### 11.2 未就绪时的自动修复
+### 11.2 顺序（`NSIS_HOOK_PREINSTALL`）
+
+```text
+RimeSyncCheckWindows             只读：系统版本门槛
+RimeSyncWeaselPreflight          只读：判定就绪 → phase=IME-CHECK stage=preflight
+RimeSyncEnsureWebView2
+RimeSyncUninstallOldVersion      只卸旧 rime-sync（绝不碰 Weasel）
+CreateDirectory $INSTDIR\resources
+RimeSyncInstallWeaselPre         再判一次（旧卸载器可能删掉 Weasel）→ 决定 skip / repair
+  ├─ ready=1 → action=skip reason=exe-present     （不动现有 Weasel）
+  └─ ready=0 → taskkill → rename Rime.bak-<ts> → installer /S /NOREBOOT → 复查
+                 └─ 仍不就绪 → 回滚 → WEASEL-INSTALL failed + SetErrorLevel 5 + Abort
+（之后 Tauri 才 File 主程序与 resources）
+```
+
+为什么要判两次：第一次是「动手之前到底是什么状态」的证据；第二次才是决定 —— 旧版卸载器
+（0.6.13 及以前）会在自己的 `PREUNINSTALL` 里卸载 Weasel。第二次判定用的是**卸载之后**的
+真实状态，所以不可能再被「已卸掉、但残留还在」骗过。
+
+### 11.3 未就绪时的重装与回滚
 
 | 步骤 | 动作 | 失败时 |
 |---|---|---|
 | 1 | `taskkill /IM WeaselServer.exe /F` | 忽略（进程不在时 taskkill 返回非 0） |
-| 2 | 把残留目录改名成 `<原目录>.bak-YYYYMMDD-HHMMSS`（例：`C:\Program Files\Rime.bak-20261103-120005`）。候选顺序：注册表里读到的目录 → `%ProgramFiles%\Rime` → `%ProgramFiles(x86)%\Rime`。**只改名不删除**，留作取证 | 只记日志（`phase=IME-REPAIR rename failed`），继续装 |
-| 3 | 跑内嵌的 `weasel-0.17.4.0-installer.exe /S /NOREBOOT`，用 `nsExec::ExecToStack /TIMEOUT=300000`（`RIMESYNC_WEASEL_INSTALL_TIMEOUT_MS`）等待，退出码与耗时进日志。`/NOREBOOT` 防它自己 `SetRebootFlag` 后静默重启机器 | 继续下一步（退出码不是充分条件，就绪判定才是） |
-| 4 | 再判一次 `RimeSyncWeaselReady` | **仍不就绪 = 硬失败**：写 `WEASEL-INSTALL failed reason=…`、`SetErrorLevel 5`、`Abort`；交互安装额外弹框说明处理办法 |
+| 2 | 把残留目录改名成 `<原目录>.bak-YYYYMMDD-HHMMSS`。候选顺序：注册表里读到的目录 → `%ProgramFiles%\Rime` → `%ProgramFiles(x86)%\Rime`。**仅当目录非空且 `WeaselServer.exe` 真的在**才改名；空目录 / 缺 exe 只写 `phase=IME-REPAIR rename skipped dir=… reason=empty-or-no-WeaselServer.exe` | 只记日志（`rename failed`），继续装；这时没有备份，后面只能 `rollback=none` |
+| 3 | 跑内嵌的 `weasel-0.17.4.0-installer.exe /S /NOREBOOT`，`nsExec::ExecToStack /TIMEOUT=300000`；退出码与耗时进日志。`/NOREBOOT` 防它 `SetRebootFlag` 后静默重启机器 | 继续下一步（退出码不是充分条件，就绪判定才是） |
+| 4 | 再判一次 `RimeSyncWeaselReady`（注册表 + 真 exe） | 仍不就绪 → 第 5 步 |
+| 5 | **回滚**：`Rime.bak-<ts>` 改回 `Rime`。安装器若已建了同名目录，先把它改名成 `Rime.incomplete-<ts>` 留证，不覆盖新证据。日志 `phase=WEASEL-ROLLBACK result=ok\|failed`；`ok` 的判据是改回后目录里又能找到 `WeaselServer.exe` | 改名失败 → `result=failed`，照样继续硬失败 |
+| 6 | 硬失败：`WEASEL-INSTALL failed reason=… installer-exit=… rollback=ok\|failed`、`SetErrorLevel 5`、`Abort`；交互安装额外弹框 | — |
 
-硬失败的后果要提前知道：这时旧版已按「升级即全新安装」卸掉、新版本也没有装上，用户需要按
-弹框提示手动处理后再跑一次安装包。这是 0.6.13 的**有意取舍**——之前「静默继续」的结果是装出
-一个不能用的输入法，比明确失败更糟。唯一的逃生开关是 `/SKIPIME`（只装同步程序、不动
-输入法），此时 POSTINSTALL 会弹框说明本次没有装输入法。
+`rollback=ok` 只说明**文件回来了**：注册表可能仍然缺失（这时 `RimeSyncWeaselReady` 依旧是
+未就绪），下次安装会再走一遍修复。所以 `rollback=ok` 与「输入法可用」不是同义词。
 
-修复成功后仍会写 `HKLM\Software\rime-sync` 的所有权标记（`BundledWeasel=1` 等），
-卸载时据此决定是否连小狼毫一起卸。
+硬失败的后果：旧版 rime-sync 已按「升级即全新安装」卸掉、新版本也没装上，但 **Weasel 的旧目录
+已被改回原名**，所以机器至少回到装之前的状态（不会像 0.6.13 那样变成「什么都没有」）。
+唯一的逃生开关仍是 `/SKIPIME`（只装同步程序、不动输入法），此时 POSTINSTALL 会弹框说明。
 
-### 11.3 手工排查命令（PowerShell / cmd）
+修复成功后写 `HKLM\Software\rime-sync` 的所有权标记（`BundledWeasel=1` 等），卸载时据此决定
+是否连小狼毫一起卸。
+
+### 11.4 日志样例
+
+已就绪 → 跳过安装（`tsf` 只在证据行）：
+
+```text
+[rime-sync] 2026-11-04 10:00:02 phase=IME-CHECK stage=preflight ready=yes reason=ok root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) action=pending-decision
+[rime-sync] 2026-11-04 10:00:02 phase=TSF-EVIDENCE tsf=yes tsfdll=C:\Program Files\Rime\weasel-0.17.4\WeaselTSF.dll proc=running note=log-only-not-used-for-readiness
+[rime-sync] 2026-11-04 10:00:03 phase=UNINSTALL-OLD target=rime-sync exit=0 ms=3120 source=(instdir)
+[rime-sync] 2026-11-04 10:00:03 phase=IME-CHECK ready=yes root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=running action=skip reason=exe-present
+[rime-sync] 2026-11-04 10:00:05 phase=SELF-CHECK weasel-ready=1 root=C:\Program Files\Rime\weasel-0.17.4 install-dir=C:\Program Files\Rime default-exe=yes configdir=C:\Users\me\AppData\Roaming\Rime configs=2 reused=1 deploy=0 ran=1 build=updated warnings=0
+[rime-sync] 2026-11-04 10:00:05 phase=DONE setup finished configs=2 backups=0 weasel-kept=0 weasel-ready=1 install-dir=C:\Program Files\Rime default-exe=yes deploy=0 build=updated warnings=0
+```
+
+未就绪 → 改名 → 重装成功：
+
+```text
+[...] phase=IME-CHECK ready=no reason=registry-missing root= regdir=C:\Program Files\Rime action=repair
+[...] phase=IME-REPAIR rename ok from=C:\Program Files\Rime to=C:\Program Files\Rime.bak-20261104-100004 exe=C:\Program Files\Rime\weasel-0.17.4
+[...] phase=IME-INSTALL weasel installer exit=0 ms=41200 backup=C:\Program Files\Rime.bak-20261104-100004
+[...] phase=IME-INSTALL ready=yes root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=stopped backup=C:\Program Files\Rime.bak-20261104-100004
+```
+
+空目录（机 A 的形态）→ 不改名 → 重装；失败时 `rollback=none`：
+
+```text
+[...] phase=IME-CHECK ready=no reason=empty-dir root= regdir=C:\Program Files\Rime action=repair
+[...] phase=IME-REPAIR rename skipped dir=C:\Program Files\Rime reason=empty-or-no-WeaselServer.exe
+[...] phase=IME-INSTALL weasel installer exit=1603 ms=5120 backup=
+[...] WEASEL-INSTALL failed reason=registry-missing installer-exit=1603 rollback=none backup= orig= root= regdir=C:\Program Files\Rime proc=stopped
+```
+
+有备份但重装失败 → 回滚（`Rime.bak-<ts>` 改回 `Rime`）：
+
+```text
+[...] phase=IME-REPAIR rename ok from=C:\Program Files\Rime to=C:\Program Files\Rime.bak-20261104-100004 exe=C:\Program Files\Rime\weasel-0.17.4
+[...] phase=IME-INSTALL weasel installer exit=0 ms=3000 backup=C:\Program Files\Rime.bak-20261104-100004
+[...] phase=WEASEL-ROLLBACK result=ok from=C:\Program Files\Rime.bak-20261104-100004 to=C:\Program Files\Rime exe=C:\Program Files\Rime\weasel-0.17.4
+[...] WEASEL-INSTALL failed reason=no-WeaselServer.exe installer-exit=0 rollback=ok backup=C:\Program Files\Rime.bak-20261104-100004 orig=C:\Program Files\Rime root= regdir=C:\Program Files\Rime proc=stopped
+```
+
+### 11.5 手工排查命令（PowerShell / cmd）
 
 ```powershell
 # 1) 注册表到底有没有值（32/64 位视图都看一眼；Weasel 是 32 位安装器）
@@ -644,33 +733,74 @@ reg query "HKLM\SOFTWARE\Rime\Weasel" /v InstallDir /reg:64
 Test-Path "$env:ProgramFiles\Rime\weasel-0.17.4\WeaselServer.exe"
 Test-Path "$env:ProgramFiles\Rime\weasel-0.17.4\WeaselDeployer.exe"
 
-# 3) 服务在不在跑
-Get-Process WeaselServer -ErrorAction SilentlyContinue
+# 3) 服务在不在跑（SessionId=0 的那种「在跑」不代表能用）
+Get-Process WeaselServer -ErrorAction SilentlyContinue | Select-Object Id,SessionId
 
-# 4) TSF 文本服务有没有注册
+# 4) TSF 文本服务有没有注册（只作证据，不参与判定）
 reg query "HKLM\SOFTWARE\Microsoft\CTF\TIP\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}" /s
 
 # 5) 部署产物是不是新的
 Get-Item "$env:APPDATA\Rime\build\luna_pinyin.schema.yaml" | Select-Object LastWriteTime,Length
 
-# 6) 安装器留下的备份目录（改名留证的那一份）
+# 6) 安装器留下的备份 / 回滚残留
 Get-ChildItem "$env:ProgramFiles" -Filter "Rime.bak-*" | Select-Object Name,LastWriteTime
+Get-ChildItem "$env:ProgramFiles" -Filter "Rime.incomplete-*" | Select-Object Name,LastWriteTime
 
 # 7) 一把看全安装器日志里与输入法相关的行
-Get-Content "$env:TEMP\rime-sync-setup.log" | Select-String -Pattern "IME-CHECK|IME-REPAIR|WEASEL|SELF-CHECK"
+Get-Content "$env:TEMP\rime-sync-setup.log" | Select-String -Pattern "IME-CHECK|IME-REPAIR|IME-INSTALL|TSF-EVIDENCE|WEASEL|SELF-CHECK"
 ```
 
 想强制重来一次：删掉（或改回原名）`C:\Program Files\Rime`，再运行安装包；卸载残留输入法
 也可以直接走「控制面板 → 程序和功能 → 小狼毫输入法」。
 
-## 12. 安装自检输出（0.6.13）
+### 11.6 本机（Linux）能验到哪一步
 
-`POSTINSTALL` 末尾固定跑一次 `RimeSyncSelfCheck`（在写配置之后、`phase=DONE` 之前）：
+`bash packaging/windows/check-nsis-hooks.sh --strict` 会跑 98 条结构断言 + 编译两套钩子
+（0 warning 0 error）。反向验证的做法（不动工作区文件）：
 
-1. 再判一次 Weasel 是否就绪（`ready` / `root` / `source` / `proc` / `tsf` 一起进日志）；
-2. 报配置目标目录与写入数量（`configs=` 新写入、`reused=` 沿用）；
-3. 调一次 `WeaselDeployer.exe /deploy`（`nsExec`，最多等 20 秒 / `RIMESYNC_DEPLOY_TIMEOUT_MS`），
+```bash
+cp packaging/nsis-hooks.nsh /tmp/mut.nsh
+# 手工改坏一处，例如把 tsf 塞回判定行，或删掉 rollback 的 Rename，或去掉自检的 SetErrorLevel 5
+RIMESYNC_HOOKS=/tmp/mut.nsh bash packaging/windows/check-nsis-hooks.sh --strict   # 必须 rc=1
+```
+
+已逐条验过会变红的改动：`tsf` 混进判定行、就绪判定不再要求 exe、删掉回滚 `Rename`、
+UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorLevel 5`、允许空目录改名、
+回滚失败假报 `ok`。运行期行为（注册表、进程、弹框、真实安装器退出码）仍只能在真机复核。
+
+## 12. 安装自检输出（0.6.14）
+
+`POSTINSTALL` 末尾固定跑一次 `RimeSyncSelfCheck`（在写配置之后）：
+
+1. 再判一次 `RimeSyncWeaselReady`（注册表 + 真 exe）；TSF/进程证据另起一行 `phase=TSF-EVIDENCE`；
+2. **硬性检查 A**：`HKLM\Software\Rime\Weasel\InstallDir`（64 位或 32 位视图）必须有值；
+3. **硬性检查 B**：`<Program Files>\Rime\weasel-*\WeaselServer.exe` 必须存在
+   （`%ProgramFiles%` 与 `%ProgramFiles(x86)%` 两处都扫，命中一个就够）；
+4. 报配置目标目录与写入数量（`configs=` 新写入、`reused=` 沿用）；
+5. 调一次 `WeaselDeployer.exe /deploy`（`nsExec`，最多 20 秒 / `RIMESYNC_DEPLOY_TIMEOUT_MS`），
    然后比较 `%APPDATA%\Rime\build\luna_pinyin.schema.yaml` 的写入时间。
+
+`weasel-ready` 字段：
+
+| 值 | 含义 |
+|---|---|
+| `1` | 注册表 + `WeaselServer.exe` 都在（判定就绪） |
+| `0` | 未就绪（`reason=` 给出 `registry-missing` / `no-WeaselServer.exe` / `empty-dir`） |
+
+**自检不通过 = 安装失败**（0.6.14 起，第 2/3 项是硬性检查）：
+
+| 触发条件 | 日志 | 交互安装 | 退出码 |
+|---|---|---|---|
+| `weasel-ready=0` | `phase=SELF-CHECK weasel-ready=no ready=0 reason=…` | 弹 `MB_ICONSTOP` 说明 | 5 |
+| 注册表 `InstallDir` 为空（`install-dir=` 为空） | 同上，`install-dir=` 为空 | 同上 | 5 |
+| 默认布局没有 `weasel-*\WeaselServer.exe`（`default-exe=no`） | 同上，`default-exe=no` | 同上 | 5 |
+
+不 `Abort` 是刻意的：程序已经装好，用户要的是日志与提示；失败靠 **退出码 5 +
+`phase=SETUP failed`** 表达（这时不会写 `phase=DONE`）。静默安装只写日志，不弹框。
+
+`/SKIPIME` 是唯一例外：用户明确要求「本次不动输入法」，所以自检只写
+`phase=SELF-CHECK warning=weasel-not-ready-skipped … skip=1 switch=/SKIPIME`，
+不改退出码（否则逃生开关本身就会被判失败）。
 
 `build` 字段的取值：
 
@@ -683,44 +813,40 @@ Get-Content "$env:TEMP\rime-sync-setup.log" | Select-String -Pattern "IME-CHECK|
 | `unknown` | 没有调用部署（输入法未就绪等） |
 | `no-deployer` | 就绪目录里没有 `WeaselDeployer.exe`（记 `deploy=no-deployer` 并告警） |
 
-**自检只告警，绝不 Abort**：走到这一步程序已经装好，日志与弹框就是交付给用户的证据。
-静默安装只写日志，不弹框。
-
 日志样例（`%TEMP%\rime-sync-setup.log`）：
 
 ```text
-[rime-sync] 2026-11-03 12:00:07 phase=POSTINSTALL seed begin version=0.6.13 policy=reuse-existing dir=C:\Users\me\AppData\Roaming\Rime context=current
-[rime-sync] 2026-11-03 12:00:07 seed file=default.custom.yaml result=reuse
-[rime-sync] 2026-11-03 12:00:07 seed file=weasel.custom.yaml result=new
-[rime-sync] 2026-11-03 12:00:07 seed file=luna_pinyin.custom.yaml result=new
-[rime-sync] 2026-11-03 12:00:07 phase=POSTINSTALL seed done dir=C:\Users\me\AppData\Roaming\Rime configs=2 reused=1 version=0.6.13
-[rime-sync] 2026-11-03 12:00:08 phase=SELF-CHECK deploy exit=0
-[rime-sync] 2026-11-03 12:00:09 phase=SELF-CHECK weasel-ready=1 root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=running tsf=yes tsfdll=C:\Program Files\Rime\weasel-0.17.4\WeaselTSF.dll configdir=C:\Users\me\AppData\Roaming\Rime configs=2 reused=1 deploy=0 ran=1 build=updated warnings=0
-[rime-sync] 2026-11-03 12:00:09 phase=DONE setup finished configs=2 backups=0 weasel-kept=0 weasel-ready=1 deploy=0 build=updated warnings=0
+[rime-sync] 2026-11-04 10:00:07 phase=POSTINSTALL seed begin version=0.6.14 policy=reuse-existing dir=C:\Users\me\AppData\Roaming\Rime context=current
+[rime-sync] 2026-11-04 10:00:07 seed file=default.custom.yaml result=reuse
+[rime-sync] 2026-11-04 10:00:07 seed file=weasel.custom.yaml result=new
+[rime-sync] 2026-11-04 10:00:07 seed file=luna_pinyin.custom.yaml result=new
+[rime-sync] 2026-11-04 10:00:07 phase=POSTINSTALL seed done dir=C:\Users\me\AppData\Roaming\Rime configs=2 reused=1 version=0.6.14
+[rime-sync] 2026-11-04 10:00:08 phase=SELF-CHECK deploy exit=0
+[rime-sync] 2026-11-04 10:00:09 phase=SELF-CHECK weasel-ready=1 root=C:\Program Files\Rime\weasel-0.17.4 source=HKLM\Software\Rime\Weasel\InstallDir(view=32) proc=running install-dir=C:\Program Files\Rime default-exe=yes configdir=C:\Users\me\AppData\Roaming\Rime configs=2 reused=1 deploy=0 ran=1 build=updated warnings=0
+[rime-sync] 2026-11-04 10:00:09 phase=DONE setup finished configs=2 backups=0 weasel-kept=0 weasel-ready=1 install-dir=C:\Program Files\Rime default-exe=yes deploy=0 build=updated warnings=0
 ```
 
-非静默安装会额外弹一个信息框（内容就是上面这组数字，最后一行给出日志路径）：
+硬失败（自检没通过）：
 
 ```text
-rime-sync 安装完成，自检结果：
-
-输入法（小狼毫）：就绪（C:\Program Files\Rime\weasel-0.17.4）
-配置目录：C:\Users\me\AppData\Roaming\Rime
-　　新写入 2 个，沿用已有 1 个
-部署：exit=0；build\luna_pinyin.schema.yaml：updated
-
-日志：C:\Users\me\AppData\Local\Temp\rime-sync-setup.log
+[rime-sync] 2026-11-04 10:00:09 phase=SELF-CHECK weasel-ready=no ready=0 reason=empty-dir root= install-dir= default-exe=no expected=C:\Program Files\Rime\weasel-*\WeaselServer.exe
+[rime-sync] 2026-11-04 10:00:09 phase=SETUP failed stage=SELF-CHECK exit=5 weasel-ready=0 install-dir= default-exe=no root= warnings=1
 ```
 
-告警时的两种典型形态：
+非静默安装会额外弹框：
+
+* 自检通过 → 信息框（就绪目录、配置目录与数量、部署与 `build` 状态、日志路径）；
+* 自检硬失败 → `MB_ICONSTOP` 框（`ready` / `install-dir` / `default-exe` 三个值 + 日志路径 +
+  「安装已标记为失败（退出码 5）」）。
+
+非致命告警的形态：
 
 ```text
 [...] phase=SELF-CHECK warning=build-not-updated state=stale file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin.schema.yaml
-[...] phase=SELF-CHECK warning=weasel-not-ready reason=registry-missing regdir=
 ```
 
 * 判成 `stale` 不一定是坏事：没改任何配置时，部署产物的内容与时间戳本来就可能不变；
 * 但 `missing` 说明部署确实失败：先看 `WeaselDeployer.exe /deploy` 的退出码，再看
   `%APPDATA%\Rime\build` 是否可写；
-* 自检不修复任何东西：修复输入法在 PREINSTALL（第 11 节），这里只负责把状态说清楚。
-
+* 自检不修复任何东西：修复与回滚在 PREINSTALL（第 11 节），这里只负责把状态说清楚并把
+  失败变成可见的退出码。

@@ -27,7 +27,25 @@
 ;                   IME-INSTALL / IME-REPAIR / POSTINSTALL / SELF-CHECK / DONE；
 ;                   失败路径同样写日志。
 ;
-; 0.6.13：修 Weasel「假就绪」与「配置写错目录」两个坑。
+; 0.6.14：修 0.6.13 的致命回归 —— 就绪判定被 TSF/注册表残留骗过。
+;   真机 A：Weasel 已被卸掉（HKLM\Software\WOW6432Node\Rime\Weasel 不存在、
+;   C:\Program Files\Rime 是空目录、没有 WeaselServer 进程），但 TSF 残留还在；
+;   旧判定把残留当证据 → 判成就绪 → action=skip → 没有输入法。
+;   1) 就绪判定 RimeSyncWeaselReady 只剩唯一硬条件：注册表 InstallDir/WeaselRoot
+;      （32/64 视图都读）指向的目录里**真的有 WeaselServer.exe**。TSF 注册与进程状态
+;      只写日志（phase=TSF-EVIDENCE），绝不参与判定。
+;   2) 顺序改成「先判定 → 再决定卸/重装」：PREINSTALL 先判一次（IME-CHECK stage=preflight），
+;      卸旧 rime-sync 之后再判一次（决定权在 RimeSyncInstallWeaselPre）；已就绪只跳过安装
+;      （action=skip reason=exe-present），未就绪才 taskkill → 旧目录改名 Rime.bak-<ts>
+;      （仅当目录非空且 exe 在）→ 内嵌安装器 → 复查。
+;   3) 复查仍不就绪 → 回滚：Rime.bak-<ts> 改回 Rime，日志
+;      WEASEL-INSTALL failed ... rollback=ok|failed，SetErrorLevel 5 + Abort。
+;   4) 卸旧 rime-sync 不再连带卸 Weasel（UNINSTALL-OLD 只卸同步程序）：先卸 Weasel
+;      再判就绪，正是 0.6.13 那个「卸掉后没装回来」的根因。
+;   5) POSTINSTALL 自检加硬性检查（默认布局的 WeaselServer.exe +
+;      HKLM\Software\WOW6432Node\Rime\Weasel\InstallDir）：任一不满足 →
+;      phase=SELF-CHECK weasel-ready=no + 非静默弹框 + SetErrorLevel 5。
+; 0.6.13：修 Weasel「假就绪」与「配置写错目录」两个坑（判据与顺序已在 0.6.14 重做）。
 ;   1) 就绪判定换成组合条件 RimeSyncWeaselReady（见函数头）：注册表
 ;      HKLM\Software\Rime\Weasel 的 InstallDir/WeaselRoot 必须存在，且它指向的目录里
 ;      有 WeaselServer.exe；只凭「目录里有文件」不再算就绪。
@@ -168,8 +186,6 @@
   !define RIMESYNC_UPGRADE_VARS
   Var /GLOBAL RimeSyncOldUninstKey      ; 命中的 Uninstall 子键名（或 (instdir)）
   Var /GLOBAL RimeSyncOldUninstRaw      ; 该子键的 UninstallString（未归一化）
-  Var /GLOBAL RimeSyncOldWeaselCmd      ; 标记里的 WeaselUninstall
-  Var /GLOBAL RimeSyncOldWeaselRootDir  ; 标记里的 WeaselRoot
   Var /GLOBAL RimeSyncWeaselKept        ; 1 = 旧小狼毫仍在，本次跳过输入法安装
   Var /GLOBAL RimeSyncSeedVersion       ; 备份后缀用的版本号
   Var /GLOBAL RimeSyncSeedWritten       ; 本次写入的配置文件数
@@ -193,6 +209,11 @@
   Var /GLOBAL RimeSyncWeaselTsfDll      ; CLSID\InprocServer32（有就读出来写日志）
   Var /GLOBAL RimeSyncWeaselProcState   ; WeaselServer.exe：running / stopped / unknown
   Var /GLOBAL RimeSyncWeaselBackupDir   ; 残留目录改名后的路径（没改名则空）
+  Var /GLOBAL RimeSyncWeaselBackupOrig  ; 改名前的原目录（回滚要改回这里）
+  Var /GLOBAL RimeSyncWeaselRollback    ; 回滚结果：ok / failed / none
+  Var /GLOBAL RimeSyncWeaselRegInstallDir ; 自检：注册表 InstallDir 原值（32/64 任一视图）
+  Var /GLOBAL RimeSyncWeaselDefaultExe  ; 自检：默认布局里有 WeaselServer.exe（yes/no）
+  Var /GLOBAL RimeSyncWeaselSelfCheckFail ; 1 = 自检硬性检查不通过
   Var /GLOBAL RimeSyncRimeUserDir       ; 真实用户配置目录（%APPDATA%\Rime）
   Var /GLOBAL RimeSyncSelfCheckWarn     ; 自检告警条数
   Var /GLOBAL RimeSyncDeployExit        ; WeaselDeployer /deploy 的退出码
@@ -562,18 +583,18 @@ FunctionEnd
 !insertmacro RIMESYNC_FN_FIND_WEASEL_ROOT "un."
 
 ; ---------------------------------------------------------------------------
-; 0.6.13 就绪判定（安装前 / 安装后 / 自检三处共用）
-;   「就绪」= 下面两条同时成立，缺一即未就绪：
+; 0.6.14 就绪判定（安装前 / 安装后 / 自检三处共用）
+;   「就绪」只有一个硬条件，下面两条同时成立才算，缺一即未就绪：
 ;     1) HKLM\Software\Rime\Weasel 的 InstallDir 或 WeaselRoot 存在
 ;        （Weasel 的安装器是 32 位 NSIS，值通常落在 Wow6432Node；32/64 位视图都读）；
 ;     2) 该值指向的目录里真的有 WeaselServer.exe（Weasel 0.17 的 InstallDir 写的是
 ;        父目录 <Program Files>\Rime，真正的程序目录是它下面的 weasel-<ver>，两种都认）。
-;   只记日志、不参与判定的证据：TSF 文本服务注册、WeaselServer.exe 是否在跑。
-;   为什么不再只看目录：0.6.12 的实测机器上 <Program Files>\Rime\weasel-0.17.4 的 exe
-;   齐全，但注册表项根本不存在、TSF 一处没注册、WeaselServer 没起 —— 旧判定当成
-;   「已安装」，于是永远跳过安装器，装出一个假就绪的输入法。
+;   TSF 文本服务注册、WeaselServer.exe 是否在跑：**只写日志**（RimeSyncWeaselLogEvidence
+;   写 phase=TSF-EVIDENCE），绝不参与判定。0.6.13 的真机上 Weasel 已被卸掉，TSF 与注册表
+;   残留还在，判定被残留骗成「已就绪」→ 跳过安装 → 机器上没有输入法。0.6.14 只认
+;   「注册表指向的目录里真有 WeaselServer.exe」这一条：目录空 / exe 缺 / 注册表缺 = 未就绪。
 ;   出参：$RimeSyncWeaselReady / RootDir / ReadySrc / ReadyReason / RegDir，
-;         证据 $RimeSyncWeaselTsfState / TsfDll / ProcState。
+;         证据 $RimeSyncWeaselTsfState / TsfDll / ProcState（只读，不参与判定）。
 ; ---------------------------------------------------------------------------
 ; 单个候选目录：$R5 = 注册值里的目录，$1 = 依据描述；命中就写就绪状态（保留第一处命中）
 Function RimeSyncWeaselReadyFromDir
@@ -581,10 +602,12 @@ Function RimeSyncWeaselReadyFromDir
   StrCmp $RimeSyncWeaselReady "1" rimesync_wrfd_skip
   ; $1 是依据标签（要写进日志）。RootFromDir 扫 weasel-* 时会用 $0/$1 作 scratch，
   ; 所以这里先压栈，别让依据被冲掉。
+  Push $0
   Push $1
   StrCpy $R8 ""
   Call RimeSyncWeaselRootFromDir
   Pop $1
+  Pop $0
   StrCmp $R8 "" rimesync_wrfd_no_exe
   StrCpy $RimeSyncWeaselReady "1"
   StrCpy $RimeSyncWeaselRootDir "$R8"
@@ -595,6 +618,11 @@ Function RimeSyncWeaselReadyFromDir
     ; 注册表有值但目录里没有 WeaselServer.exe：记下原始目录，修复时整目录改名留证
     StrCpy $RimeSyncWeaselRegDir "$R5"
     StrCpy $RimeSyncWeaselReadyReason "no-WeaselServer.exe"
+    ; 目录不存在 / 空目录分开记原因：日志上一眼看出是「空目录残留」还是「缺 exe」
+    IfFileExists "$R5\*.*" rimesync_wrfd_reason_done
+    IfFileExists "$R5" 0 rimesync_wrfd_reason_done
+    StrCpy $RimeSyncWeaselReadyReason "empty-dir"
+  rimesync_wrfd_reason_done:
     Return
   rimesync_wrfd_skip:
 FunctionEnd
@@ -687,6 +715,17 @@ Function RimeSyncWeaselServerRunning
   rimesync_proc_done:
   Pop $1
   Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 0.6.14：把 TSF / 进程证据写进日志（只写日志，绝不参与判定）。
+;   入参：$R2 = 时间戳（调用方已 Call RimeSyncStamp）；$R3 临时占用后恢复。
+; ---------------------------------------------------------------------------
+Function RimeSyncWeaselLogEvidence
+  Push $R3
+  StrCpy $R3 "[rime-sync] $R2 phase=TSF-EVIDENCE tsf=$RimeSyncWeaselTsfState tsfdll=$RimeSyncWeaselTsfDll proc=$RimeSyncWeaselProcState note=log-only-not-used-for-readiness"
+  Call RimeSyncLog
+  Pop $R3
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
@@ -1160,47 +1199,125 @@ Function RimeSyncStampCompact
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; 0.6.13：不就绪时把残留的小狼毫目录改名留证（绝不删除，事后可对比取证）。
+; 0.6.14：不就绪时把「非空且真有 WeaselServer.exe」的残留目录改名留证（绝不删除，
+;   复查失败时按原名改回，见 RimeSyncRollbackWeasel）。
 ;   候选：注册表里读到的目录 → <Program Files>\Rime（64 位）→ <Program Files>\Rime
 ;   新名字：<原目录>.bak-YYYYMMDD-HHMMSS（时间戳保证不撞已有备份）
+;   改名前必须过 RimeSyncWeaselRootFromDir（目录里真有 exe）：空目录 / 缺 exe 的目录
+;   没有可恢复的程序，改名只会把证据藏起来 —— 直接跳过并记日志。
 ;   出参：$RimeSyncWeaselBackupDir = 改名后的路径（没改名则空）
-;   失败只记日志：文件被占用时也继续跑安装器，最终由安装后的复查决定成败。
+;         $RimeSyncWeaselBackupOrig = 改名前的原目录
+;   失败只记日志：文件被占用时也继续跑安装器，最终由复查/回滚决定成败。
 ; ---------------------------------------------------------------------------
 Function RimeSyncBackupLeftoverDir
+  Push $0
   Push $1
-  StrCmp $0 "" rimesync_bk_done
+  Push $R5
+  Push $R8
+  Push $9
+  StrCpy $9 "$0"
+  StrCmp $9 "" rimesync_bk_done
   StrCmp $RimeSyncWeaselBackupDir "" 0 rimesync_bk_done
-  IfFileExists "$0\*.*" rimesync_bk_try
-  IfFileExists "$0" rimesync_bk_try
-  Goto rimesync_bk_done
-  rimesync_bk_try:
-  StrCpy $1 "$0.bak-$R2"
-  Rename "$0" "$1"
+  IfFileExists "$9\*.*" 0 rimesync_bk_skip
+  ; 目录里必须真有 WeaselServer.exe（直接布局与 weasel-<ver> 子目录都认）
+  StrCpy $R5 "$9"
+  StrCpy $R8 ""
+  Call RimeSyncWeaselRootFromDir
+  StrCmp $R8 "" rimesync_bk_skip
+  StrCpy $1 "$9.bak-$R2"
+  ClearErrors
+  Rename "$9" "$1"
+  IfErrors rimesync_bk_failed
   IfFileExists "$1\*.*" rimesync_bk_ok
-  IfFileExists "$1" rimesync_bk_ok
-    DetailPrint "[rime-sync] 警告：无法把残留目录改名（$0 → $1），继续尝试安装"
-    StrCpy $R3 "[rime-sync] $R2 phase=IME-REPAIR rename failed from=$0 to=$1"
-    Call RimeSyncLog
-    Goto rimesync_bk_done
+  IfFileExists "$1" 0 rimesync_bk_failed
   rimesync_bk_ok:
     StrCpy $RimeSyncWeaselBackupDir "$1"
-    DetailPrint "[rime-sync] 已把残留的小狼毫目录改名留证：$0 → $1"
-    StrCpy $R3 "[rime-sync] $R2 phase=IME-REPAIR rename ok from=$0 to=$1"
+    StrCpy $RimeSyncWeaselBackupOrig "$9"
+    DetailPrint "[rime-sync] 已把残留的小狼毫目录改名留证：$9 → $1"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-REPAIR rename ok from=$9 to=$1 exe=$R8"
+    Call RimeSyncLog
+    Goto rimesync_bk_done
+  rimesync_bk_failed:
+    DetailPrint "[rime-sync] 警告：无法把残留目录改名（$9 → $1），继续尝试安装"
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-REPAIR rename failed from=$9 to=$1"
+    Call RimeSyncLog
+    Goto rimesync_bk_done
+  rimesync_bk_skip:
+    StrCpy $R3 "[rime-sync] $R2 phase=IME-REPAIR rename skipped dir=$9 reason=empty-or-no-WeaselServer.exe"
     Call RimeSyncLog
   rimesync_bk_done:
+  Pop $9
+  Pop $R8
+  Pop $R5
   Pop $1
+  Pop $0
 FunctionEnd
 
 Function RimeSyncBackupLeftoverWeasel
   Push $0
   Call RimeSyncStampCompact
   StrCpy $RimeSyncWeaselBackupDir ""
+  StrCpy $RimeSyncWeaselBackupOrig ""
   StrCpy $0 "$RimeSyncWeaselRegDir"
   Call RimeSyncBackupLeftoverDir
   StrCpy $0 "$PROGRAMFILES64\Rime"
   Call RimeSyncBackupLeftoverDir
   StrCpy $0 "$PROGRAMFILES\Rime"
   Call RimeSyncBackupLeftoverDir
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 0.6.14：复查仍不就绪 → 把改过名的目录改回原名（回滚），别把机器留在「没有输入法」。
+;   入参：$RimeSyncWeaselBackupDir / $RimeSyncWeaselBackupOrig（改名函数写的），
+;         $R2 = 紧凑时间戳（RimeSyncStampCompact 的产物，用来拼 .incomplete-<ts>）
+;   出参：$RimeSyncWeaselRollback = ok / failed / none
+;         ok     = 目录已改回原名，且里面能找到 WeaselServer.exe
+;                  （只代表文件回来了：注册表可能仍缺失，下次安装会再修）
+;         failed = 改名失败（文件被占用等），需要人工处理
+;         none   = 本次没改过名，没有可回滚的东西
+;   绝不 Abort：回滚失败也继续走硬失败路径，把原因写进日志。
+; ---------------------------------------------------------------------------
+Function RimeSyncRollbackWeasel
+  Push $0
+  Push $1
+  Push $R5
+  Push $R8
+  StrCpy $RimeSyncWeaselRollback "none"
+  StrCmp $RimeSyncWeaselBackupDir "" rimesync_rb_done
+  ; $R2 可能已被正常时间戳覆盖（含空格与冒号，不能进文件名）→ 重新取紧凑时间戳
+  Call RimeSyncStampCompact
+  IfFileExists "$RimeSyncWeaselBackupDir\*.*" rimesync_rb_have
+  IfFileExists "$RimeSyncWeaselBackupDir" 0 rimesync_rb_done
+  rimesync_rb_have:
+  ; 安装器可能已经建了同名目录：先挪到 <原目录>.incomplete-<ts> 留证，别覆盖新证据
+  IfFileExists "$RimeSyncWeaselBackupOrig\*.*" rimesync_rb_move
+  IfFileExists "$RimeSyncWeaselBackupOrig" rimesync_rb_move
+  Goto rimesync_rb_rename
+  rimesync_rb_move:
+    Rename "$RimeSyncWeaselBackupOrig" "$RimeSyncWeaselBackupOrig.incomplete-$R2"
+  rimesync_rb_rename:
+  ClearErrors
+  Rename "$RimeSyncWeaselBackupDir" "$RimeSyncWeaselBackupOrig"
+  IfErrors rimesync_rb_failed
+  ; 恢复成功的判据：原名目录里又能找到 WeaselServer.exe
+  StrCpy $R5 "$RimeSyncWeaselBackupOrig"
+  StrCpy $R8 ""
+  Call RimeSyncWeaselRootFromDir
+  StrCmp $R8 "" rimesync_rb_failed
+  StrCpy $RimeSyncWeaselRollback "ok"
+  StrCpy $RimeSyncWeaselRootDir "$R8"
+  Goto rimesync_rb_log
+  rimesync_rb_failed:
+    StrCpy $RimeSyncWeaselRollback "failed"
+  rimesync_rb_log:
+  DetailPrint "[rime-sync] 回滚：$RimeSyncWeaselBackupDir → $RimeSyncWeaselBackupOrig（$RimeSyncWeaselRollback）"
+  StrCpy $R3 "[rime-sync] $R2 phase=WEASEL-ROLLBACK result=$RimeSyncWeaselRollback from=$RimeSyncWeaselBackupDir to=$RimeSyncWeaselBackupOrig exe=$R8"
+  Call RimeSyncLog
+  rimesync_rb_done:
+  Pop $R8
+  Pop $R5
+  Pop $1
   Pop $0
 FunctionEnd
 
@@ -1265,13 +1382,49 @@ Function RimeSyncFileTimeGet
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; 0.6.13 安装结束自检（POSTINSTALL 末尾，只告警、绝不 Abort）
-;   1) 再判一次就绪（RimeSyncWeaselReady，顺带刷 TSF / 进程证据）
-;   2) 报配置目标目录与写入数量（new / reuse）
-;   3) 调一次 WeaselDeployer.exe /deploy（最多等 ${RIMESYNC_DEPLOY_TIMEOUT_MS}），
+; 0.6.14：自检硬性检查 B 的扫描器 —— 默认布局 <base>\Rime\weasel-*\WeaselServer.exe。
+;   入参：$R5 = 基目录（$PROGRAMFILES64 / $PROGRAMFILES）
+;   出参：$RimeSyncWeaselDefaultExe = yes / no；$9 = 命中的 exe 路径（写日志用）
+;   只读枚举，找不到就安静返回（判的是「有没有」，不抛错、不 Abort）。
+; ---------------------------------------------------------------------------
+Function RimeSyncScanDefaultLayout
+  Push $0
+  Push $1
+  Push $2
+  StrCmp $R5 "" rimesync_sdl_done
+  StrCmp $RimeSyncWeaselDefaultExe "yes" rimesync_sdl_done
+  StrCpy $2 "$R5\Rime"
+  ClearErrors
+  FindFirst $0 $1 "$2\weasel-*"
+  IfErrors rimesync_sdl_done
+  rimesync_sdl_loop:
+    StrCmp $1 "" rimesync_sdl_close
+    IfFileExists "$2\$1\WeaselServer.exe" rimesync_sdl_hit
+    FindNext $0 $1
+    Goto rimesync_sdl_loop
+  rimesync_sdl_hit:
+    StrCpy $RimeSyncWeaselDefaultExe "yes"
+    StrCpy $9 "$2\$1\WeaselServer.exe"
+  rimesync_sdl_close:
+  FindClose $0
+  rimesync_sdl_done:
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 0.6.14 安装结束自检（POSTINSTALL 末尾）
+;   1) 再判一次就绪（RimeSyncWeaselReady），TSF/进程证据另起一行只写日志
+;   2) 硬性检查 A：HKLM\Software\Rime\Weasel\InstallDir（32/64 视图任一）必须有值
+;   3) 硬性检查 B：<Program Files>\Rime\weasel-*\WeaselServer.exe 必须存在
+;      → 1)~3) 任一不满足：日志 phase=SELF-CHECK weasel-ready=no、非静默弹 STOP 框、
+;        SetErrorLevel 5（安装标记为失败）；这里仍然不 Abort（程序已经装好）
+;   4) 报配置目标目录与写入数量（new / reuse）
+;   5) 调一次 WeaselDeployer.exe /deploy（最多等 ${RIMESYNC_DEPLOY_TIMEOUT_MS}），
 ;      再检查 <用户目录>\Rime\build\luna_pinyin.schema.yaml 是否生成/更新
-;   日志关键字（验收用）：phase=SELF-CHECK / weasel-ready= / deploy= / build=
-;   非静默安装额外弹一个简短信息框；静默安装只写日志。
+;   日志关键字（验收用）：phase=SELF-CHECK / weasel-ready= / install-dir= / default-exe=
+;   / deploy= / build=
 ; ---------------------------------------------------------------------------
 Function RimeSyncSelfCheck
   Push $0
@@ -1282,6 +1435,7 @@ Function RimeSyncSelfCheck
   Push $R1
 
   StrCpy $RimeSyncSelfCheckWarn "0"
+  StrCpy $RimeSyncWeaselSelfCheckFail "0"
   StrCpy $RimeSyncDeployRan "0"
   StrCpy $RimeSyncDeployExit "skipped"
   StrCpy $RimeSyncBuildState "unknown"
@@ -1290,6 +1444,37 @@ Function RimeSyncSelfCheck
   StrCpy $RimeSyncBuildLoBefore ""
 
   Call RimeSyncWeaselReady
+  Call RimeSyncWeaselLogEvidence
+
+  ; 硬性检查 A：注册表 InstallDir 必须有值（32/64 视图任一；Weasel 是 32 位安装器）
+  StrCpy $RimeSyncWeaselRegInstallDir ""
+  SetRegView 64
+  ReadRegStr $0 HKLM "Software\Rime\Weasel" "InstallDir"
+  StrCmp $0 "" 0 rimesync_sc_reg_done
+  SetRegView 32
+  ReadRegStr $0 HKLM "Software\Rime\Weasel" "InstallDir"
+  rimesync_sc_reg_done:
+  SetRegView 64
+  StrCpy $RimeSyncWeaselRegInstallDir "$0"
+
+  ; 硬性检查 B：默认布局 $PROGRAMFILES64\Rime\weasel-*\WeaselServer.exe
+  StrCpy $RimeSyncWeaselDefaultExe "no"
+  StrCpy $9 ""
+  StrCpy $R5 "$PROGRAMFILES64"
+  Call RimeSyncScanDefaultLayout
+  StrCpy $R5 "$PROGRAMFILES"
+  Call RimeSyncScanDefaultLayout
+
+  ; 就绪 + InstallDir + 默认布局 exe：任一不满足 → 自检硬失败（下面统一记日志/弹框/退出码 5）
+  StrCmp $RimeSyncWeaselReady "1" rimesync_sc_hard_a
+    StrCpy $RimeSyncWeaselSelfCheckFail "1"
+  rimesync_sc_hard_a:
+  StrCmp $RimeSyncWeaselRegInstallDir "" 0 rimesync_sc_hard_b
+    StrCpy $RimeSyncWeaselSelfCheckFail "1"
+  rimesync_sc_hard_b:
+  StrCmp $RimeSyncWeaselDefaultExe "yes" rimesync_sc_hard_c
+    StrCpy $RimeSyncWeaselSelfCheckFail "1"
+  rimesync_sc_hard_c:
 
   ; 配置目录：播种阶段解析出来的真实用户目录优先，否则按进程环境兜底
   StrCpy $0 "$RimeSyncRimeUserDir"
@@ -1357,19 +1542,34 @@ Function RimeSyncSelfCheck
   rimesync_sc_build_ok:
 
   rimesync_sc_log:
-  ; 未就绪也只在自检里记告警：硬失败由 PREINSTALL 负责，走到这里说明是装完之后又掉了
-  StrCmp $RimeSyncWeaselReady "1" rimesync_sc_ready_ok
+  ; 0.6.14：自检不再「只告警」。就绪 / InstallDir / 默认布局 exe 任一不满足 =
+  ; 安装标记为失败（weasel-ready=no + 非静默弹 STOP 框 + SetErrorLevel 5）。
+  ; 这里不 Abort：程序已经装好，用户要的是日志与提示，而不是半路退出。
+  StrCmp $RimeSyncWeaselSelfCheckFail "0" rimesync_sc_hard_ok
+  ; /SKIPIME 是「明确要求不动输入法」的逃生开关：只记告警，不把安装判失败
+  StrCmp $RimeSyncWeaselKept "1" rimesync_sc_hard_skip
     IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
-    StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK warning=weasel-not-ready reason=$RimeSyncWeaselReadyReason regdir=$RimeSyncWeaselRegDir"
+    DetailPrint "[rime-sync] 错误：自检未通过（ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe），安装标记为失败"
+    StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK weasel-ready=no ready=$RimeSyncWeaselReady reason=$RimeSyncWeaselReadyReason root=$RimeSyncWeaselRootDir install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe expected=$PROGRAMFILES64\Rime\weasel-*\WeaselServer.exe"
     Call RimeSyncLog
-  rimesync_sc_ready_ok:
+    SetErrorLevel 5
+    IfSilent rimesync_sc_hard_failed
+      MessageBox MB_OK|MB_ICONSTOP "安装已完成，但输入法自检没有通过：$\r$\n$\r$\n就绪=$RimeSyncWeaselReady（$RimeSyncWeaselReadyReason）$\r$\n注册表 InstallDir=$RimeSyncWeaselRegInstallDir$\r$\n默认布局 weasel-*\WeaselServer.exe=$RimeSyncWeaselDefaultExe$\r$\n$\r$\n安装已标记为失败（退出码 5）。请把日志 $TEMP\rime-sync-setup.log 里的 phase=SELF-CHECK 行发给维护者。$\r$\n用户数据（%APPDATA%\Rime）不受影响。"
+  rimesync_sc_hard_failed:
+    Goto rimesync_sc_hard_ok
+  rimesync_sc_hard_skip:
+    IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
+    StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK warning=weasel-not-ready-skipped reason=$RimeSyncWeaselReadyReason skip=1 switch=/SKIPIME"
+    Call RimeSyncLog
+  rimesync_sc_hard_ok:
 
-  StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK weasel-ready=$RimeSyncWeaselReady root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState tsf=$RimeSyncWeaselTsfState tsfdll=$RimeSyncWeaselTsfDll configdir=$0 configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused deploy=$RimeSyncDeployExit ran=$RimeSyncDeployRan build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
+  StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK weasel-ready=$RimeSyncWeaselReady root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe configdir=$0 configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused deploy=$RimeSyncDeployExit ran=$RimeSyncDeployRan build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
   Call RimeSyncLog
-  DetailPrint "[rime-sync] 自检：就绪=$RimeSyncWeaselReady（$RimeSyncWeaselRootDir）；配置 $0：新写入 $RimeSyncSeedWritten / 沿用 $RimeSyncSeedReused；部署=$RimeSyncDeployExit；build=$RimeSyncBuildState；告警=$RimeSyncSelfCheckWarn"
+  DetailPrint "[rime-sync] 自检：就绪=$RimeSyncWeaselReady（$RimeSyncWeaselRootDir）；注册表 InstallDir=$RimeSyncWeaselRegInstallDir；默认布局 exe=$RimeSyncWeaselDefaultExe；配置 $0：新写入 $RimeSyncSeedWritten / 沿用 $RimeSyncSeedReused；部署=$RimeSyncDeployExit；build=$RimeSyncBuildState；告警=$RimeSyncSelfCheckWarn"
 
-  ; 非静默时给用户一份简报（静默安装只写日志）
+  ; 非静默时给用户一份简报（静默安装只写日志）；自检硬失败时前面已弹 STOP 框，不再弹
   IfSilent rimesync_sc_done
+  StrCmp $RimeSyncWeaselSelfCheckFail "1" rimesync_sc_done
   StrCpy $3 "输入法（小狼毫）：就绪（$RimeSyncWeaselRootDir）"
   StrCmp $RimeSyncWeaselReady "1" rimesync_sc_msg_ready
     StrCpy $3 "输入法（小狼毫）：未就绪（原因 $RimeSyncWeaselReadyReason），请查看日志"
@@ -1399,10 +1599,10 @@ Function RimeSyncAbortWeasel
   IfSilent rimesync_abortw_silent
   IntCmp $LANGUAGE 2052 rimesync_abortw_zh rimesync_abortw_en rimesync_abortw_en
   rimesync_abortw_zh:
-    MessageBox MB_OK|MB_ICONSTOP "小狼毫输入法安装后仍然不可用，安装已中止（0.6.13 起这是硬失败）。$\r$\n$\r$\n$R0$\r$\n$\r$\n处理办法：先在「控制面板 → 程序和功能」里卸载残留的「小狼毫输入法」，再重新运行本安装包。日志：$TEMP\rime-sync-setup.log（看 phase=IME-CHECK 与 WEASEL-INSTALL failed 行）。$\r$\n$\r$\n用户数据（%APPDATA%\Rime）不受影响。"
+    MessageBox MB_OK|MB_ICONSTOP "小狼毫输入法安装后仍然不可用，安装已中止（0.6.14 起这是硬失败，旧目录回滚结果见 $R0 与日志 rollback=）。$\r$\n$\r$\n$R0$\r$\n$\r$\n处理办法：先在「控制面板 → 程序和功能」里卸载残留的「小狼毫输入法」，再重新运行本安装包。日志：$TEMP\rime-sync-setup.log（看 phase=IME-CHECK 与 WEASEL-INSTALL failed 行）。$\r$\n$\r$\n用户数据（%APPDATA%\Rime）不受影响。"
     Goto rimesync_abortw_silent
   rimesync_abortw_en:
-    MessageBox MB_OK|MB_ICONSTOP "Weasel is still not usable after installation; setup was aborted (hard failure since 0.6.13).$\r$\n$\r$\n$R1$\r$\n$\r$\nFix: uninstall the leftover Weasel from Control Panel -> Programs, then run this installer again. Log: $TEMP\rime-sync-setup.log (look for phase=IME-CHECK and WEASEL-INSTALL failed).$\r$\n$\r$\nUser data (%APPDATA%\Rime) is untouched."
+    MessageBox MB_OK|MB_ICONSTOP "Weasel is still not usable after installation; setup was aborted (hard failure since 0.6.14; see the rollback= field in the log).$\r$\n$\r$\n$R1$\r$\n$\r$\nFix: uninstall the leftover Weasel from Control Panel -> Programs, then run this installer again. Log: $TEMP\rime-sync-setup.log (look for phase=IME-CHECK and WEASEL-INSTALL failed).$\r$\n$\r$\nUser data (%APPDATA%\Rime) is untouched."
   rimesync_abortw_silent:
   SetErrorLevel 5
   Abort
@@ -1455,60 +1655,12 @@ Function RimeSyncUninstallOldRimeSync
   Call RimeSyncLog
 FunctionEnd
 
-; ---------------------------------------------------------------------------
-; 卸载旧版自建小狼毫：只认 HKLM\Software\rime-sync 的 BundledWeasel=1。
-; 候选命令：标记里的 WeaselUninstall → 标记里的 WeaselRoot\uninstall.exe → 现场探测。
-; 与旧版 rime-sync 卸载器的关系：旧卸载器的 PREUNINSTALL 也会卸小狼毫并清标记，
-; 这里再查一次，覆盖「rime-sync 目录被手删、标记还在」的情况。
-; 失败只记日志（绝不 Abort）；装不装得上输入法由 RimeSyncInstallWeaselPre 现场判断。
-; ---------------------------------------------------------------------------
-Function RimeSyncUninstallOldWeasel
-  StrCpy $R9 ""
-  SetRegView 64
-  ReadRegStr $0 HKLM "${RIMESYNC_REG_KEY}" "BundledWeasel"
-  ReadRegStr $RimeSyncOldWeaselCmd HKLM "${RIMESYNC_REG_KEY}" "WeaselUninstall"
-  ReadRegStr $RimeSyncOldWeaselRootDir HKLM "${RIMESYNC_REG_KEY}" "WeaselRoot"
-  StrCmp $0 "1" rimesync_oldw_owned
-    ; 没有所有权标记 = 用户自己装的小狼毫（或旧版是 0.3.x，没写标记）；一律不碰
-    Call RimeSyncStamp
-    StrCpy $R3 "[rime-sync] $R2 phase=UNINSTALL-OLD target=weasel result=keep reason=no-ownership-marker"
-    Call RimeSyncLog
-    Return
-
-  rimesync_oldw_owned:
-  StrCpy $R9 $RimeSyncOldWeaselCmd
-  Call RimeSyncNormalizeUninstallPath
-  StrCmp $R9 "" 0 rimesync_oldw_build
-  StrCmp $RimeSyncOldWeaselRootDir "" 0 rimesync_oldw_have_root
-    Call RimeSyncFindWeaselRoot
-    StrCpy $RimeSyncOldWeaselRootDir $R8
-  rimesync_oldw_have_root:
-  StrCmp $RimeSyncOldWeaselRootDir "" rimesync_oldw_missing
-  IfFileExists "$RimeSyncOldWeaselRootDir\uninstall.exe" 0 rimesync_oldw_missing
-  StrCpy $R9 "$RimeSyncOldWeaselRootDir\uninstall.exe"
-
-  rimesync_oldw_build:
-  StrCpy $5 '"$R9" /S'
-  StrCpy $R9 $5
-  Call RimeSyncRunAndWait
-  StrCpy $R0 $0
-  StrCpy $R1 $1
-  Call RimeSyncStamp
-  DetailPrint "[rime-sync] [$R2] 阶段=UNINSTALL-OLD 小狼毫卸载器退出码 $R0（耗时 $R1 ms）"
-  StrCpy $R3 "[rime-sync] $R2 phase=UNINSTALL-OLD target=weasel exit=$R0 ms=$R1"
-  Call RimeSyncLog
-
-  Return
-  rimesync_oldw_missing:
-  Call RimeSyncStamp
-  DetailPrint "[rime-sync] [$R2] 阶段=UNINSTALL-OLD 标记说小狼毫是我们装的，但找不到卸载器（可能已被手动卸载）"
-  StrCpy $R3 "[rime-sync] $R2 phase=UNINSTALL-OLD target=weasel result=missing"
-  Call RimeSyncLog
-FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; PREINSTALL 第一步（破坏性动作的第一步）：把旧版清干净，后面就按全新安装走，
-; 不再有「检测到已存在就跳过」的分支。
+; PREINSTALL：把旧版同步程序清干净，后面就按全新安装走，不再有「检测到已存在就跳过」的分支。
+; 0.6.14 起**不在这里卸小狼毫**：先卸 Weasel 再判就绪，残留（TSF/注册表）能骗过判据，
+; 结果是「判成就绪 → 跳过安装 → Weasel 没装回来」。Weasel 的替换统一交给
+; RimeSyncInstallWeaselPre（判定 → 改名留证 → 重装 → 复查 → 失败回滚）。
 ; ---------------------------------------------------------------------------
 Function RimeSyncUninstallOldVersion
   StrCpy $RimeSyncWeaselKept "0"
@@ -1518,7 +1670,8 @@ Function RimeSyncUninstallOldVersion
 
   Call RimeSyncKillRunningProcesses
   Call RimeSyncUninstallOldRimeSync
-  Call RimeSyncUninstallOldWeasel
+  ; 0.6.14：这里不再调用 Weasel 的卸载器。Weasel 只在「判成未就绪」时由
+  ; RimeSyncInstallWeaselPre 改名 + 重装 + 回滚，绝不先卸再判。
 
   ; 标记只描述「还归 rime-sync 管的小狼毫」：旧卸载器通常已经清掉，这里兜底清一次；
   ; 新版装完由 RimeSyncMarkBundledWeasel 重新写。
@@ -1537,21 +1690,40 @@ Function RimeSyncUninstallOldVersion
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; PREINSTALL：先装/修好小狼毫（在 Tauri 拷主程序与 resources 之前）
-; 0.6.13 起由「就绪判定」驱动（RimeSyncWeaselReady，不再只看目录里有没有文件）：
-;   已就绪 → 跳过安装，日志写清依据（命中的注册值 + 进程状态）；
-;   未就绪 → taskkill → 残留目录改名 Rime.bak-<ts>（不删，留证据）→ 内嵌安装器 /S
-;            （nsExec，300 秒超时）→ 复查：仍不就绪 = 硬失败
-;            （日志 WEASEL-INSTALL failed + SetErrorLevel 5 + Abort）。
-; 0.6.12 及以前这里「目录里有 WeaselServer.exe 就算装了」：实测机器上 exe 齐全，
-; 但注册表项不存在、TSF 一处没注册、服务没起，于是永远跳过安装 → 假就绪。
+; 0.6.14：PREINSTALL 第一步（只读）—— 在任何破坏性动作之前先判一次就绪并留证据。
+;   日志行 phase=IME-CHECK stage=preflight：装之前到底就绪没就绪，事后可复核。
+;   TSF / 进程证据单独一行 phase=TSF-EVIDENCE，只写日志、不参与判定。
+;   真正的决定在 RimeSyncInstallWeaselPre：旧卸载器（0.6.13 及以前）可能顺手删掉
+;   Weasel，所以卸完旧程序必须再判一次。
+; ---------------------------------------------------------------------------
+Function RimeSyncWeaselPreflight
+  Call RimeSyncWeaselReady
+  Call RimeSyncStamp
+  Call RimeSyncWeaselLogEvidence
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK stage=preflight ready=$RimeSyncWeaselReady reason=$RimeSyncWeaselReadyReason root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc action=pending-decision"
+  Call RimeSyncLog
+FunctionEnd
+
+; ---------------------------------------------------------------------------
+; 0.6.14：安装/修复小狼毫（在 Tauri 拷主程序与 resources 之前）
+;   顺序：先判定 → 再决定卸/重装（判定绝不看 TSF/进程残留）：
+;     已就绪（注册表指向的目录里真有 WeaselServer.exe）→ 跳过安装，
+;        日志 phase=IME-CHECK ready=yes ... action=skip reason=exe-present；
+;     未就绪 → taskkill → 残留目录改名 Rime.bak-<ts>（仅当目录非空且 exe 在）→
+;        内嵌安装器 /S /NOREBOOT（nsExec，300 秒超时）→ 复查 →
+;        仍不就绪 = 回滚（Rime.bak-<ts> 改回 Rime）+ 硬失败
+;        （日志 WEASEL-INSTALL failed ... rollback=ok|failed + SetErrorLevel 5 + Abort）。
+; 0.6.13 的回归：判定曾被 TSF/注册表残留骗成「已就绪」→ 跳过安装 → 机器上没有输入法。
 ; ---------------------------------------------------------------------------
 Function RimeSyncInstallWeaselPre
+  ; ---- 0) 先判定（唯一硬条件：注册表值指向的目录里真有 WeaselServer.exe）----
+  Call RimeSyncWeaselReady
+  Call RimeSyncStamp
+  Call RimeSyncWeaselLogEvidence
+
   ; /SKIPIME：显式跳过（已装但探测不到 / 用户不想动输入法时的唯一出口）
   ${GetOptions} $CMDLINE "/SKIPIME" $R1
   IfErrors rimesync_pre_no_skipime
-    Call RimeSyncWeaselReady
-    Call RimeSyncStamp
     DetailPrint "[rime-sync] 收到 /SKIPIME：跳过内嵌小狼毫安装（当前就绪=$RimeSyncWeaselReady）"
     StrCpy $RimeSyncWeaselKept "1"
     StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK skip=1 switch=/SKIPIME ready=$RimeSyncWeaselReady root=$RimeSyncWeaselRootDir"
@@ -1559,34 +1731,32 @@ Function RimeSyncInstallWeaselPre
     Return
   rimesync_pre_no_skipime:
 
-  Call RimeSyncWeaselReady
   StrCmp $RimeSyncWeaselReady "1" rimesync_pre_already
   Goto rimesync_pre_repair
 
-  ; ---- 已就绪：保持「跳过安装」，但把依据写进日志 ----
+  ; ---- 已就绪：只跳过安装，绝不动现有 Weasel ----
   rimesync_pre_already:
-  Call RimeSyncStamp
   DetailPrint "[rime-sync] 小狼毫已就绪（$RimeSyncWeaselRootDir；依据 $RimeSyncWeaselReadySrc；进程 $RimeSyncWeaselProcState），跳过安装"
-  StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK ready=yes root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState tsf=$RimeSyncWeaselTsfState action=skip"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK ready=yes root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState action=skip reason=exe-present"
   Call RimeSyncLog
   Return
 
-  ; ---- 未就绪：先清残留再装 ----
+  ; ---- 未就绪：改名留证 → 装内嵌安装器 → 复查 → 失败回滚 ----
   rimesync_pre_repair:
-  Call RimeSyncStamp
   DetailPrint "[rime-sync] 小狼毫未就绪（$RimeSyncWeaselReadyReason），开始修复安装"
-  StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK ready=no reason=$RimeSyncWeaselReadyReason root=$RimeSyncWeaselRootDir regdir=$RimeSyncWeaselRegDir proc=$RimeSyncWeaselProcState tsf=$RimeSyncWeaselTsfState action=repair"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-CHECK ready=no reason=$RimeSyncWeaselReadyReason root=$RimeSyncWeaselRootDir regdir=$RimeSyncWeaselRegDir action=repair"
   Call RimeSyncLog
 
   ; 1) 停掉占用文件的进程（找不到进程时 taskkill 返回非 0，忽略）
   StrCpy $R9 'taskkill /IM WeaselServer.exe /F'
   Call RimeSyncRunAndWait
 
-  ; 2) 残留目录改名留证（不删除）
+  ; 2) 残留目录改名留证（只改「非空且 exe 在」的目录；时间戳进 $R2，回滚要用）
   Call RimeSyncBackupLeftoverWeasel
 
   ; 3) 解出内嵌安装器
   StrCpy $R0 ""
+  StrCpy $R4 ""
   !ifdef RIMESYNC_WEASEL_EMBEDDED
     ; $PLUGINSDIR 在安装器退出时由 NSIS 删除；这里只在还没初始化时初始化
     StrCmp $PLUGINSDIR "" 0 rimesync_pre_have_plugins
@@ -1605,14 +1775,12 @@ Function RimeSyncInstallWeaselPre
   !endif
 
   StrCmp $R0 "" 0 rimesync_pre_run
-  ; 没有载荷就无法修复 → 与「装了仍不就绪」一样是硬失败，不允许静默继续
-  Call RimeSyncStamp
-  DetailPrint "[rime-sync] 错误：未找到内嵌的小狼毫安装包，无法修复输入法"
-  StrCpy $R3 "[rime-sync] $R2 WEASEL-INSTALL failed reason=payload-missing installer=${RIMESYNC_WEASEL_INSTALLER}"
+  ; 没有载荷就无法修复：先把改过名的旧目录回滚，再按硬失败退出
+  StrCpy $R4 "payload-missing"
+  StrCpy $R7 "payload-missing"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL payload=missing installer=${RIMESYNC_WEASEL_INSTALLER}"
   Call RimeSyncLog
-  StrCpy $R0 "本安装包里没有内置小狼毫安装器（构建缺陷）：${RIMESYNC_WEASEL_INSTALLER}"
-  StrCpy $R1 "This package has no bundled Weasel installer (build error): ${RIMESYNC_WEASEL_INSTALLER}"
-  Call RimeSyncAbortWeasel
+  Goto rimesync_pre_fail
 
   rimesync_pre_run:
   ; /NOREBOOT：Weasel 的 .onInit 命中旧 UninstallString 时会 SetRebootFlag，
@@ -1623,24 +1791,33 @@ Function RimeSyncInstallWeaselPre
   StrCpy $R5 $1                              ; 耗时
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=PREINSTALL 小狼毫安装器退出码 $R4（耗时 $R5 ms）"
-  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL weasel installer exit=$R4 ms=$R5"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL weasel installer exit=$R4 ms=$R5 backup=$RimeSyncWeaselBackupDir"
   Call RimeSyncLog
 
-  ; 4) 装完复查：就绪判定必须过（注册表 + WeaselServer.exe），否则硬失败
+  ; 4) 装完复查：就绪判定必须过（注册表 + WeaselServer.exe），否则回滚 + 硬失败
   Call RimeSyncWeaselReady
   StrCmp $RimeSyncWeaselReady "1" rimesync_pre_ready
-    Call RimeSyncStamp
-    DetailPrint "[rime-sync] 错误：小狼毫安装后仍不就绪（$RimeSyncWeaselReadyReason），安装中止"
-    StrCpy $R3 "[rime-sync] $R2 WEASEL-INSTALL failed reason=$RimeSyncWeaselReadyReason installer-exit=$R4 root=$RimeSyncWeaselRootDir regdir=$RimeSyncWeaselRegDir proc=$RimeSyncWeaselProcState tsf=$RimeSyncWeaselTsfState backup=$RimeSyncWeaselBackupDir"
-    Call RimeSyncLog
-    StrCpy $R0 "内嵌安装器退出码：$R4；就绪判定：未就绪（$RimeSyncWeaselReadyReason）；程序目录：$RimeSyncWeaselRootDir；注册表 InstallDir：$RimeSyncWeaselRegDir；旧目录备份：$RimeSyncWeaselBackupDir"
-    StrCpy $R1 "Bundled installer exit code: $R4; readiness: not ready ($RimeSyncWeaselReadyReason); program dir: $RimeSyncWeaselRootDir; registry InstallDir: $RimeSyncWeaselRegDir; backup: $RimeSyncWeaselBackupDir"
-    Call RimeSyncAbortWeasel
+  StrCpy $R7 "$RimeSyncWeaselReadyReason"
+  Goto rimesync_pre_fail
+
+  ; 5) 失败：先把改过名的目录改回原名（回滚），再硬失败
+  rimesync_pre_fail:
+  StrCmp $R7 "" 0 rimesync_pre_fail_reason
+    StrCpy $R7 "$RimeSyncWeaselReadyReason"
+  rimesync_pre_fail_reason:
+  Call RimeSyncRollbackWeasel
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] 错误：小狼毫安装后仍不就绪（$R7），回滚=$RimeSyncWeaselRollback，安装中止"
+  StrCpy $R3 "[rime-sync] $R2 WEASEL-INSTALL failed reason=$R7 installer-exit=$R4 rollback=$RimeSyncWeaselRollback backup=$RimeSyncWeaselBackupDir orig=$RimeSyncWeaselBackupOrig root=$RimeSyncWeaselRootDir regdir=$RimeSyncWeaselRegDir proc=$RimeSyncWeaselProcState"
+  Call RimeSyncLog
+  StrCpy $R0 "内嵌安装器退出码：$R4；就绪判定：未就绪（$R7）；程序目录：$RimeSyncWeaselRootDir；注册表 InstallDir：$RimeSyncWeaselRegDir；旧目录备份：$RimeSyncWeaselBackupDir（回滚：$RimeSyncWeaselRollback）"
+  StrCpy $R1 "Bundled installer exit code: $R4; readiness: not ready ($R7); program dir: $RimeSyncWeaselRootDir; registry InstallDir: $RimeSyncWeaselRegDir; backup: $RimeSyncWeaselBackupDir (rollback: $RimeSyncWeaselRollback)"
+  Call RimeSyncAbortWeasel
 
   rimesync_pre_ready:
   Call RimeSyncStamp
   DetailPrint "[rime-sync] 小狼毫已就绪（$RimeSyncWeaselRootDir；依据 $RimeSyncWeaselReadySrc）"
-  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL ready=yes root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState tsf=$RimeSyncWeaselTsfState backup=$RimeSyncWeaselBackupDir"
+  StrCpy $R3 "[rime-sync] $R2 phase=IME-INSTALL ready=yes root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState backup=$RimeSyncWeaselBackupDir"
   Call RimeSyncLog
 
   ; 所有权标记（卸载时据此决定是否连小狼毫一起卸）
@@ -1654,7 +1831,6 @@ Function RimeSyncInstallWeaselPre
   ; 关键：Tauri 模板紧接着会 File 主程序，必须把输出目录恢复成 $INSTDIR
   SetOutPath "$INSTDIR"
 FunctionEnd
-
 ; ---------------------------------------------------------------------------
 ; 开始菜单「Rime 同步」：只放「Rime 同步」与「同步设置」（后者带 --setup）
 ; 入参：$R6 = 主程序完整路径；$R7 = Tauri 模板自己建的 rime-sync.lnk
@@ -2001,13 +2177,19 @@ FunctionEnd
 ; 宏：Tauri 插入点
 ; ---------------------------------------------------------------------------
 !macro NSIS_HOOK_PREINSTALL
-  ; 顺序：系统版本 →【卸载旧版】→ WebView2 → 输入法（就绪判定 + 修复）→ 交还 Tauri 拷主程序。
-  ; 全部在 Tauri File 主程序之前。系统版本检查放在卸载之前：它是只读判断，
-  ; 先卸载再 Abort 会把用户晾在「旧版没了、新版没装」的半路。
+  ; 0.6.14 顺序：系统版本 → 输入法就绪判定（只读）→ WebView2 → 卸旧同步程序 →
+  ;   输入法（再判一次；未就绪才改名重装 + 失败回滚）→ 交还 Tauri 拷主程序。
+  ; **判定必须在任何破坏性动作之前**：0.6.13 先卸 Weasel 再判，残留（TSF/注册表）
+  ; 能骗过判据，于是「判成就绪 → 跳过安装」，机器上最终没有输入法。
+  ; 全部在 Tauri File 主程序之前；系统版本是只读检查，放在最前面（先卸载再 Abort
+  ; 会把用户晾在「旧版没了、新版没装」的半路）。
   Call RimeSyncCheckWindows
+  Call RimeSyncWeaselPreflight
+  Call RimeSyncEnsureWebView2
   Call RimeSyncUninstallOldVersion
   CreateDirectory "$INSTDIR\\resources"
-  Call RimeSyncEnsureWebView2
+  ; 旧卸载器（0.6.13 及以前）可能在 PREUNINSTALL 里连带删掉 Weasel，所以这里必须
+  ; 再判一次：已就绪只跳过安装，未就绪就装回来（决定权在 RimeSyncInstallWeaselPre）。
   Call RimeSyncInstallWeaselPre
 !macroend
 
@@ -2038,8 +2220,9 @@ FunctionEnd
   Call RimeSyncCreateWeaselShortcut
   ; 3) 推荐输入法配置：缺失才补，写进真实用户目录（见 RimeSyncSeedRimeConfig）
   Call RimeSyncSeedRimeConfig
-  ; 4) 安装结束自检：就绪与否 / 配置目录与数量 / 调一次部署 / build 产物是否更新
-  ;    （0.6.13 起必须留证据；自检只告警，绝不 Abort）
+  ; 4) 安装结束自检：就绪 / 注册表 InstallDir / 默认布局 WeaselServer.exe 是硬性检查
+  ;    （0.6.14 起任一不满足 = 安装失败：weasel-ready=no + 弹框 + 退出码 5，但绝不 Abort）；
+  ;    另外报配置目录与数量 / 调一次部署 / build 产物是否更新
   Call RimeSyncSelfCheck
 
   Call RimeSyncStamp
@@ -2058,11 +2241,22 @@ FunctionEnd
     ${EndIf}
   rimesync_post_no_weasel_warning:
 
-  ; 收尾标记：安装日志里必须有 phase=DONE（失败时不会有，便于区分「装完」与「中途退出」）
+  ; 收尾标记：成功写 phase=DONE（失败时没有这一行，便于区分「装完」与「中途退出」）。
+  ; 0.6.14：自检硬性检查不通过 → 不写 DONE，改写 phase=SETUP failed，并再设一次退出码 5
+  ; （Tauri 模板后续语句可能覆盖 SetErrorLevel，这里补一次最稳妥）。
+  StrCmp $RimeSyncWeaselSelfCheckFail "1" rimesync_post_failed
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个；日志：$TEMP\rime-sync-setup.log"
-  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady deploy=$RimeSyncDeployExit build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
+  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe deploy=$RimeSyncDeployExit build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
   Call RimeSyncLog
+  Goto rimesync_post_done
+  rimesync_post_failed:
+  SetErrorLevel 5
+  Call RimeSyncStamp
+  DetailPrint "[rime-sync] [$R2] 阶段=SETUP failed：自检未通过（输入法不可用），退出码 5；日志：$TEMP\rime-sync-setup.log"
+  StrCpy $R3 "[rime-sync] $R2 phase=SETUP failed stage=SELF-CHECK exit=5 weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe root=$RimeSyncWeaselRootDir warnings=$RimeSyncSelfCheckWarn"
+  Call RimeSyncLog
+  rimesync_post_done:
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
