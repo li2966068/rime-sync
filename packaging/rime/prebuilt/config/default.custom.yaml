@@ -1,0 +1,34 @@
+# rime-sync 随包默认：每页 8 个候选词 + 随包方案（拼音/五笔/仓颉/笔画/地球拼音/注音）。
+# 安装器只在用户 Rime 目录里没有同名文件时写入，绝不覆盖用户已有配置。
+# 这里的方案必须都在 /usr/share/rime-data（Windows: data\）里随包提供，
+# 否则 librime 部署会因缺失 schema 失败（见 scripts/ime 的 schema_list 守卫）。
+patch:
+  "menu/page_size": 8
+# 由 scripts/ime/gen-prebuilt-build.py 生成的预编译包配置（不要手改）。
+# schema_list 已裁剪到预编译产物里的方案：luna_pinyin, wubi86；
+# 其余 patch 与 packaging/rime/default.custom.yaml 完全一致再部署。
+  schema_list:
+    - {schema: luna_pinyin}
+    - {schema: wubi86}
+
+  # 中文标点直出主字符表（参考用，不生效 —— 不要直接改成 punctuator/half_shape）。
+  # librime 读的 punctuator 是**方案**配置；6 个随包方案写的是
+  #   punctuator:import_preset: default
+  # 在 default.custom.yaml 里再写 punctuator/half_shape 会整体顶掉 preset 的键
+  # （实测：只剩写进去的键，逗号/问号直接不响应），所以真正生效的映射放在
+  # 每个方案自己的 custom 文件里：/usr/share/rime-sync/defaults/schemas/<schema>.custom.yaml
+  # 没装 rimesync_punct 插件时，就是靠那份内联的 punctuator 直出主字符。
+  rimesync/punctuator_primary:
+    "\\": '、'
+    '/': '、'
+    '<': '《'
+    '>': '》'
+    '[': '「'
+    ']': '」'
+    '{': '『'
+    '}': '』'
+    '|': '·'
+    '%': '％'
+    '$': '￥'
+    '*': '×'
+    '~': '～'

@@ -29,6 +29,8 @@ STRICT=0
 #    0.6.14 起：判定只认「目录里真有 WeaselServer.exe」（tsf 只写日志）、先判定再卸/装、
 #               未就绪改名留证 + 重装失败回滚（Rime.bak-<ts> 改回原名）、
 #               UNINSTALL-OLD 不再卸 Weasel、SELF-CHECK 硬性检查失败 → 退出码 5。
+#    0.6.15 起：预编译 build 产物兜底 —— 部署没产出（或产出的不是我们这套）时，
+#               把 $INSTDIR\resources\prebuilt 铺进用户目录，SELF-CHECK 增加 build-source=。
 # ---------------------------------------------------------------------------
 # RIMESYNC_HOOKS：给「反向验证」用（对临时改坏的副本跑同一套断言，不动工作区文件）
 HOOKS="${RIMESYNC_HOOKS:-$PKG/nsis-hooks.nsh}"
@@ -256,6 +258,33 @@ assert_count "POSTINSTALL 调用自检" 'Call RimeSyncSelfCheck' 1
 assert_has "自检失败不写 DONE、改写 SETUP failed" 'phase=SETUP failed stage=SELF-CHECK exit=5'
 assert_has "DONE 行带 install-dir / default-exe" 'install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe'
 
+# 0.6.15：预编译 build 产物兜底（某些机器上 WeaselDeployer /deploy 返回 0 但什么都不写）
+assert_has "预编译产物随安装包分发" 'resources\prebuilt'
+assert_has "兜底判据落在 build\luna_pinyin.schema.yaml" 'build\luna_pinyin.schema.yaml'
+assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_vnum" 'StrCpy $R8 "rimesync_vnum"'
+assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_punct" 'StrCpy $R8 "rimesync_punct"'
+assert_fn_has RimeSyncFileContains "真的逐行读文件内容" 'FileOpen $0 "$R9" r'
+assert_fn_count RimeSyncEnsurePrebuiltBuild "build 与 config 两个目录都要铺" 'Call RimeSyncCopyPrebuiltDir' 2
+assert_fn_has RimeSyncCopyPrebuiltDir "存在即跳过（不覆盖用户已生成的）" 'IfFileExists "$6\$2" 0 rimesync_cpd_copy'
+assert_fn_has RimeSyncCopyPrebuiltDir "RIMESYNC_PREBUILT=force 才覆盖" 'StrCmp $RimeSyncPrebuiltEffMode "force" rimesync_cpd_copy'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "第一遍铺完不可用 → 只对 build/ 覆盖重铺" 'scope=build-only'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "重铺结果写进日志" 'escalated=$RimeSyncPrebuiltRecopy'
+assert_fn_has RimeSyncCopyPrebuiltDir "复制失败逐个记日志" 'phase=PREBUILT copy failed file='
+assert_fn_has RimeSyncPrebuiltMode "关闭开关 RIMESYNC_PREBUILT=0" 'StrCpy $RimeSyncPrebuiltMode "off"'
+assert_fn_has RimeSyncPrebuiltMode "强制覆盖开关 RIMESYNC_PREBUILT=force" 'StrCpy $RimeSyncPrebuiltMode "force"'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "部署可用时记 source=deploy" 'PREBUILT ok source=deploy'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "铺制成功记 PREBUILT ok source=prebuilt" 'PREBUILT ok source=prebuilt'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "铺完必须复查" 'reason=probe-after-copy'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "复查失败记 PREBUILT failed" 'phase=PREBUILT failed'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "载荷缺失单独一个原因" 'reason=payload-missing'
+assert_fn_has RimeSyncEnsurePrebuiltBuild "复查失败要告警（加计数）" 'IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1'
+assert_fn_order RimeSyncSelfCheck 'WeaselDeployer.exe" /deploy' 'Call RimeSyncEnsurePrebuiltBuild' \
+  "先尝试 /deploy，再用预编译产物兜底"
+assert_fn_has RimeSyncSelfCheck "兜底成功不再报 build-not-updated" 'StrCmp $RimeSyncBuildSource "prebuilt" rimesync_sc_build_ok'
+assert_fn_has RimeSyncSelfCheck "SELF-CHECK 增加 build-source 字段" 'build-source=$RimeSyncBuildSource'
+assert_has "DONE 行也带 build-source" 'build=$RimeSyncBuildState build-source=$RimeSyncBuildSource'
+assert_has "卸载时清掉随包产物" 'RMDir /r "$INSTDIR\resources\prebuilt"'
+
 # 失败一律只记日志：这些函数体里不能有 Abort
 for fn in \
   RimeSyncRunAndWait \
@@ -272,7 +301,12 @@ for fn in \
   RimeSyncWeaselPreflight \
   RimeSyncWeaselLogEvidence \
   RimeSyncScanDefaultLayout \
-  RimeSyncWeaselReady; do
+  RimeSyncWeaselReady \
+  RimeSyncFileContains \
+  RimeSyncProbeBuild \
+  RimeSyncPrebuiltMode \
+  RimeSyncCopyPrebuiltDir \
+  RimeSyncEnsurePrebuiltBuild; do
   assert_fn_no_abort "$fn"
 done
 
@@ -280,7 +314,7 @@ if [ "$static_fail" -ne 0 ]; then
   echo "check-nsis-hooks: 静态结构断言失败（见上）" >&2
   exit 1
 fi
-printf 'ok   static  %s 条结构断言（就绪判定只认 exe/TSF 只写日志/先判定再卸装/改名留证/回滚/自检硬失败退出码 5/失败不 Abort）\n' "$static_count"
+printf 'ok   static  %s 条结构断言（就绪判定只认 exe/TSF 只写日志/先判定再卸装/改名留证/回滚/自检硬失败退出码 5/预编译产物兜底/失败不 Abort）\n' "$static_count"
 
 if ! command -v makensis >/dev/null 2>&1; then
   if [ "$STRICT" -eq 1 ]; then

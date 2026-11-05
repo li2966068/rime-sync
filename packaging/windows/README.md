@@ -850,3 +850,108 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
   `%APPDATA%\Rime\build` 是否可写；
 * 自检不修复任何东西：修复与回滚在 PREINSTALL（第 11 节），这里只负责把状态说清楚并把
   失败变成可见的退出码。
+
+---
+
+## 13. 预编译 build 产物兜底（0.6.15）
+
+### 13.1 什么时候才用得上
+
+实测机器 192.168.61.227（官方 Weasel 0.17.4 与我们自编译包都一样）：跑
+`WeaselDeployer.exe /deploy` 返回 0，但 `%APPDATA%\Rime\` 下的
+`user.yaml` / `installation.yaml` / `build\` 全停在旧日期，手动起
+`WeaselServer.exe` 也一样。这种机器上「本机部署」永远不产出 `build\`，
+装完官方安装器的结果是**有输入法、打不出字**。
+
+0.6.15 的兜底：安装包自带一份别处已经部署好的 `build\`，安装时直接铺进用户目录。
+先在**能部署的机器**（我们的构建容器）里生成，随安装包分发，不依赖目标机的部署能力。
+
+### 13.2 包内位置与判据
+
+| 位置 | 内容 |
+|---|---|
+| `$INSTDIR\resources\prebuilt\build\` | `luna_pinyin` / `wubi86` 的 `*.schema.yaml` + `*.prism.bin` + `*.table.bin` + `*.reverse.bin`，依赖方案的产物（`stroke`、`pinyin_simp`），以及 `default.yaml` |
+| `$INSTDIR\resources\prebuilt\config\` | 生成这套产物时用的 `default.custom.yaml`（`schema_list` 已裁剪到两套方案）+ 两个 `<schema>.custom.yaml` |
+| `$INSTDIR\resources\prebuilt\MANIFEST.json` | 文件清单（大小 / sha256）、方案表、体积、rime 版本 |
+
+体积：这套产物 `du -sh` 约 29 MB，安装包会相应增大（`.bin` 本身已是压缩过的
+字典/表，NSIS 再压收益很小）。预算 60 MB，超了生成脚本会自动退化成只带 `luna_pinyin`。
+
+判据与 Linux 侧完全一致：`%APPDATA%\Rime\build\luna_pinyin.schema.yaml`
+**存在**，且文件里同时出现 `rimesync_vnum` 与 `rimesync_punct`。
+只认「文件在」不行——官方部署出来的同名文件没有这两个插件标记，设备上跑的是别的配置。
+
+### 13.3 安装顺序（`RimeSyncSelfCheck`）
+
+1. `RimeSyncWeaselReady` + 硬性检查（注册表 `InstallDir`、默认布局 `WeaselServer.exe`）——不变；
+2. 调一次 `WeaselDeployer.exe /deploy`（20 秒超时）——不变；
+3. **新增** `RimeSyncEnsurePrebuiltBuild`：
+   - 判据满足 → `PREBUILT ok source=deploy`，什么都不做；
+   - 不满足且 `RIMESYNC_PREBUILT=0` → `PREBUILT skipped reason=disabled-by-env`；
+   - 不满足 → 逐个文件把 `prebuilt\build\*` 铺到 `%APPDATA%\Rime\build\`、
+     `prebuilt\config\*.yaml` 铺到 `%APPDATA%\Rime\`（**存在即跳过**，
+     `RIMESYNC_PREBUILT=force` 才覆盖）→ 复查判据：
+     - 满足 → `PREBUILT ok source=prebuilt copied=<n> kept=<m> escalated=0`；
+     - 仍不满足 → **只对 `build\` 升级成覆盖模式再铺一遍**（`phase=PREBUILT retry
+       reason=probe-after-skip-only scope=build-only`）。这一步是必须的：用户目录里
+       本来就有旧的 `build\luna_pinyin.schema.yaml`（没有插件标记、日期停在旧部署），
+       「存在即跳过」会把它留下，兜底就白做了。`build\` 是部署器随时重写的派生数据，
+       覆盖它是安全的；`config\*.yaml`（用户配置）**绝不参与这一遍**；
+     - 重铺后仍不满足 → `PREBUILT failed reason=probe-after-copy … escalated=1` +
+       告警（`warnings+1`），**不 Abort、不改退出码**；
+   - 安装包里没有 `prebuilt\build` → `PREBUILT failed reason=payload-missing` + 告警。
+4. 自检汇总行新增 `build-source=deploy|prebuilt|none`（`phase=SELF-CHECK` 与
+   `phase=DONE` 都有）。兜底成功时不再报 `warning=build-not-updated`。
+
+日志样例（部署坏掉的机器）：
+
+```text
+[rime-sync] 2026-11-05 10:00:08 phase=SELF-CHECK deploy exit=0
+[rime-sync] 2026-11-05 10:00:08 phase=PREBUILT begin mode=auto src=C:\Program Files\rime-sync\resources\prebuilt
+[rime-sync] 2026-11-05 10:00:09 phase=PREBUILT ok source=prebuilt copied=20 kept=0 mode=auto dir=C:\Users\me\AppData\Roaming\Rime\build
+[rime-sync] 2026-11-05 10:00:09 phase=SELF-CHECK weasel-ready=1 … build=missing build-source=prebuilt prebuilt=ok copied=20 kept=0 warnings=0
+[rime-sync] 2026-11-05 10:00:09 phase=DONE setup finished … deploy=0 build=missing build-source=prebuilt warnings=0
+```
+
+复查失败的形态（只告警）：
+
+```text
+[rime-sync] 2026-11-05 10:00:09 phase=PREBUILT failed reason=probe-after-copy copied=0 kept=0 file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin.schema.yaml
+```
+
+### 13.4 关闭 / 强制覆盖
+
+| 目的 | 做法 |
+|---|---|
+| 关闭兜底 | 装之前设环境变量 `RIMESYNC_PREBUILT=0`（`set RIMESYNC_PREBUILT=0` 后运行安装包；静默装用 `cmd /c "set RIMESYNC_PREBUILT=0 && rime-sync_*_x64-setup.exe /S"`） |
+| 强制覆盖用户目录里已有的产物 | `RIMESYNC_PREBUILT=force`（同上方式设置）；也可以直接手工覆盖，见下 |
+| 手工铺一次（不重装） | `Copy-Item "$env:ProgramFiles\rime-sync\resources\prebuilt\build\*" "$env:APPDATA\Rime\build\" -Force`，再把 `prebuilt\config\*.yaml` 拷到 `%APPDATA%\Rime\` |
+| 不要这份产物 | 从 `%APPDATA%\Rime\build\` 里删掉 `luna_pinyin.*` / `wubi86.*` 再重新部署 |
+
+默认行为是**只补不改**：用户目录里已经有的文件（用户自己的配置、他自己部署出来的
+产物）一律沿用，不覆盖、不备份、不改名。
+
+### 13.5 产物怎么来的（仓库内生成，已入库）
+
+```bash
+# 生成（容器里用 rime_deployer 真实部署；容器没有 deployer 时用 build/ime-staging 里的）
+scripts/ime/gen-prebuilt-build.py
+
+# CI 校验：清单 / sha256 / 插件标记 / 绝对路径泄漏 / 体积 / 打包接线（不需要 docker）
+scripts/ime/gen-prebuilt-build.py --check
+```
+
+* 输入：`third_party/rime-data`（平铺成共享数据目录）+ `packaging/rime/schemas/*.custom.yaml`
+  + 裁剪过 `schema_list` 的 `default.custom.yaml`；
+* 输出：`packaging/rime/prebuilt/`（随 `tauri.conf.json` 的 resources 映射进
+  `resources/prebuilt`）；
+* 体积：两套合计 **28.3 MB**（预算 60 MB；超了脚本会退化成只带 `luna_pinyin`）；
+* 自检：生成完会把产物当成「已铺好的用户目录」再跑一次 —— 不部署、只用产物建会话并
+  打出「你好」（`rime-smoke --no-deploy`）再跑一次 `rime_deployer`，两条都过才写出；
+* 什么时候要重新生成：动了 `third_party/rime-data` 或 `packaging/rime/schemas/*.custom.yaml`。
+  `--check` 会在 CI 里把「产物与 schema 不一致」当失败。
+
+> 产物由 librime 1.17.0 部署（`Rime::Table/4.0` 格式，librime 标注的最低兼容版本就是 4.0）。
+> 官方 Weasel 0.17.4 带的是 librime 1.13.1，理论上同一格式可直接加载，但**没有在
+> 1.13.1 的运行时上实测过**——真机验收时请确认「装完直接能打字」。
+

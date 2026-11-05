@@ -162,6 +162,40 @@ for schema in $schema_ids; do
     { echo "!! 缺少 $schema.custom.yaml" >&2; exit 1; }
 done
 echo "schema custom 模板: $templ_count 个 -> /usr/share/rime-sync/defaults/schemas"
+# ------------------------------------------------ 预编译 build 产物 --------
+# 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy
+# 返回 0 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。
+# packaging/rime/prebuilt 是构建期用 rime_deployer 真实部署出来的产物：
+#   build/   luna_pinyin / wubi86 及其依赖方案的 *.schema.yaml + *.bin
+#   config/  生成这套产物时用的 default.custom.yaml + <schema>.custom.yaml
+# 用户目录缺 build 时由 rime-sync 的 postinst / install.sh 铺过去。
+# 生成：scripts/ime/gen-prebuilt-build.py（--check 供 CI 校验）。
+PREBUILT_SRC=$REPO_ROOT/packaging/rime/prebuilt
+PREBUILT_DST=$PKGROOT/usr/share/rime-sync/prebuilt
+if [ -d "$PREBUILT_SRC/build" ]; then
+  install -d "$PREBUILT_DST"
+  cp -a "$PREBUILT_SRC/build" "$PREBUILT_SRC/config" "$PREBUILT_DST/"
+  cp -f "$PREBUILT_SRC/MANIFEST.json" "$PREBUILT_DST/" 2>/dev/null || true
+  prebuilt_schemas=$(sed -n 's/.*{schema:[[:space:]]*\([A-Za-z0-9_]*\)}.*/\1/p' \
+    "$PREBUILT_DST/config/default.custom.yaml")
+  [ -n "$prebuilt_schemas" ] ||
+    { echo "!! prebuilt 的 config/default.custom.yaml 没有 schema_list" >&2; exit 1; }
+  for pschema in $prebuilt_schemas; do
+    pfile="$PREBUILT_DST/build/$pschema.schema.yaml"
+    test -f "$pfile" || { echo "!! prebuilt 缺 $pschema.schema.yaml" >&2; exit 1; }
+    for pmarker in rimesync_vnum rimesync_punct; do
+      grep -q "$pmarker" "$pfile" ||
+        { echo "!! prebuilt 的 $pschema.schema.yaml 缺 $pmarker（重跑 scripts/ime/gen-prebuilt-build.py）" >&2; exit 1; }
+    done
+    test -f "$DATA_DST/$pschema.schema.yaml" ||
+      { echo "!! /usr/share/rime-data 里没有 $pschema.schema.yaml（prebuilt 与随包数据不一致）" >&2; exit 1; }
+  done
+  echo "prebuilt: $(find "$PREBUILT_DST" -type f | wc -l) 个文件 / $(du -sh "$PREBUILT_DST" | cut -f1) -> /usr/share/rime-sync/prebuilt"
+else
+  echo "!! 缺少 packaging/rime/prebuilt（先跑 scripts/ime/gen-prebuilt-build.py）" >&2
+  [ "${ALLOW_NO_PREBUILT:-0}" = "1" ] ||
+    { echo "!! 拒绝构建不带预编译产物的包；确实要这样构建请设 ALLOW_NO_PREBUILT=1" >&2; exit 1; }
+fi
 cp "$REPO_ROOT/third_party/librime/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.librime" 2>/dev/null || true
 cp "$REPO_ROOT/third_party/fcitx5-rime/LICENSES/LGPL-2.1-or-later.txt" \
    "$PKGROOT/usr/share/doc/$PKG/copyright.fcitx5-rime" 2>/dev/null || true
@@ -256,6 +290,8 @@ deb_assert "$ADDON_SO_REL" -rw-r--r-- "rimesync.so (fcitx5 config page addon)"
 deb_assert usr/share/fcitx5/addon/rimesync.conf -rw-r--r-- "rimesync.conf (addon metadata)"
 deb_assert usr/bin/rime-sync-open-setup -rwxr-xr-x "rime-sync-open-setup (action button target)"
 deb_assert usr/share/rime-sync/defaults/schemas/luna_pinyin.custom.yaml -rw-r--r--   "schema custom 模板（luna_pinyin：rimesync_vnum / rimesync_punct）"
+deb_assert usr/share/rime-sync/prebuilt/build/luna_pinyin.schema.yaml -rw-r--r-- \
+  "预编译 build 产物（部署不产出的机器上直接铺到用户目录）"
 # Without this .mo every option of the rime addon (including the new
 # UserDataDirPath) is displayed in English even under LANG=zh_CN.UTF-8.
 deb_assert usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo -rw-r--r-- \

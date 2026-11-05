@@ -218,3 +218,72 @@ full + thin 组装约 30–60 s（闭包拷贝占大头）。
 - 关闭开关会删除该文件（同时清理旧版本可能留下的 `rime-sync-app.desktop`）。
 - `rime-sync-uninstall.desktop` 不清理用户目录里的自启条目，需要时删掉上面的文件即可。
 - **AppImage 移动/改名后必须重新开启一次**，否则条目指向不存在的旧路径；设置页会给出提示。
+
+---
+
+## 9. 预编译 build 产物兜底（0.6.15）
+
+### 9.1 什么时候才用得上
+
+有些机器上 rime 部署永远不产出 `build/`：Windows 上实测
+`WeaselDeployer /deploy` 返回 0 但什么都不写；Linux 上同样会被用户目录权限、
+librime 版本、插件缺失搞成「部署静默失败」。这种机器上用户目录里没有
+`build/luna_pinyin.schema.yaml`，输入法装好了也打不出字。
+
+0.6.15 起 `rime-inputmethod` 直接带一份**别处已经部署好的** `build/`：
+
+| 位置 | 内容 |
+|---|---|
+| `/usr/share/rime-sync/prebuilt/build/` | `luna_pinyin` / `wubi86` 的 `*.schema.yaml` + `*.bin`、依赖方案（`stroke`、`pinyin_simp`）的产物、`default.yaml` |
+| `/usr/share/rime-sync/prebuilt/config/` | 生成时用的 `default.custom.yaml`（`schema_list` = 这两套）+ 两个 `<schema>.custom.yaml` |
+| `/usr/share/rime-sync/prebuilt/MANIFEST.json` | 清单（大小 / sha256 / 体积 / rime 版本） |
+
+判据（与 Windows 安装器一致）：`~/.local/share/fcitx5/rime/build/luna_pinyin.schema.yaml`
+存在，且文件里同时有 `rimesync_vnum` 与 `rimesync_punct`。
+
+### 9.2 谁在什么时候铺
+
+* `rime-sync` 的 `postinst`（`dpkg --configure` 阶段，`install.sh` 装两个 deb 时也会走到）；
+* 离线 `.run` 安装器的 `install.sh`（两个 deb 装完之后再兜一次底）。
+
+两边逻辑相同：
+
+1. 判据已满足 → 沿用用户目录里的产物（不覆盖、不备份、不改名）；
+2. 否则把 `prebuilt/build/*` 拷到 `~/.local/share/fcitx5/rime/build/`，
+   `prebuilt/config/*.yaml` 拷到 `~/.local/share/fcitx5/rime/` —— **逐个文件，存在即跳过**；
+3. 复查判据；仍不满足时**只对 build/ 覆盖重铺一遍**——用户目录里可能本来就有旧的
+   `build/luna_pinyin.schema.yaml`（没有插件标记），「存在即跳过」会把它留下，
+   兜底就白做了。`build/` 是部署器随时重写的派生数据，覆盖它安全；
+   `config/*.yaml` 是用户配置，**绝不参与这一遍**。日志里记 `escalated=1`；
+4. 复查仍失败只告警、不影响安装退出码；
+5. 结果写 `/var/log/rime-sync/prebuilt.log`（`ok source=prebuilt copied= kept= escalated=`），
+   屏幕上也有一行 `预编译产物：…`。
+
+文件属主会 chown 给真实登录用户（`RIMESYNC_TARGET_USER` / `SUDO_USER` / `PKEXEC_UID` /
+`logname` / 唯一普通用户，与 `install-warning.json` 用的是同一套解析）。
+
+### 9.3 关闭 / 强制覆盖
+
+| 目的 | 做法 |
+|---|---|
+| 关闭兜底 | `sudo RIMESYNC_PREBUILT=0 bash install.sh …` 或 `sudo RIMESYNC_PREBUILT=0 dpkg -i rime-inputmethod_*.deb rime-sync_*.deb` |
+| 强制覆盖已有产物 | `sudo RIMESYNC_PREBUILT=force bash install.sh …` |
+| 手工铺一次（不重装） | 用桌面账号：`mkdir -p ~/.local/share/fcitx5/rime/build && cp -a /usr/share/rime-sync/prebuilt/build/. ~/.local/share/fcitx5/rime/build/`，需要配置再 `cp -n /usr/share/rime-sync/prebuilt/config/*.yaml ~/.local/share/fcitx5/rime/`，然后 `fcitx5-remote -r` |
+| 不要这份产物 | `rm -rf ~/.local/share/fcitx5/rime/build/luna_pinyin.* ~/.local/share/fcitx5/rime/build/wubi86.*` 后重新部署 |
+
+### 9.4 构建期校验
+
+`scripts/ime/package-ime-deb.sh` 会把 `packaging/rime/prebuilt` 打进 IME deb，并在打包时断言：
+
+* `prebuilt/build/<schema>.schema.yaml` 存在且含 `rimesync_vnum` / `rimesync_punct`；
+* `config/default.custom.yaml` 里列的方案都在 `/usr/share/rime-data` 里（否则部署必失败）；
+* 缺产物直接 `exit 1`（确实要构建不带产物的包才设 `ALLOW_NO_PREBUILT=1`）。
+
+产物由 `scripts/ime/gen-prebuilt-build.py` 在构建期用 `rime_deployer` 真实部署生成，
+体积 28.3 MB（预算 60 MB，超了只带 `luna_pinyin`）。
+校验：`scripts/ime/gen-prebuilt-build.py --check`（清单 / 标记 / 绝对路径 / 体积 / 打包接线，
+不需要 docker；在 CI 里当门禁用）。
+
+PC 上（Windows 安装包）用的是同一份产物，两边的判据与复制规则刻意保持一致，
+改一边必须同时改另一边。
+

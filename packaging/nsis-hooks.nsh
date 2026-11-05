@@ -225,6 +225,16 @@
   Var /GLOBAL RimeSyncBuildExistsBefore ; 部署前 build 文件是否存在
   Var /GLOBAL RimeSyncBuildHiBefore     ; 部署前 FILETIME 高 32 位
   Var /GLOBAL RimeSyncBuildLoBefore     ; 部署前 FILETIME 低 32 位
+  ; 0.6.15：预编译 build 产物兜底（某些机器上 WeaselDeployer /deploy 返回 0 但什么都不写）
+  Var /GLOBAL RimeSyncBuildSource        ; deploy / prebuilt / none
+  Var /GLOBAL RimeSyncBuildProbe         ; yes = build\luna_pinyin.schema.yaml 存在且含插件标记
+  Var /GLOBAL RimeSyncPrebuiltMode       ; auto / force / off（RIMESYNC_PREBUILT 环境变量）
+  Var /GLOBAL RimeSyncPrebuiltState      ; ok / failed / payload-missing / skipped / none
+  Var /GLOBAL RimeSyncPrebuiltCopied     ; 本次新铺的文件数
+  Var /GLOBAL RimeSyncPrebuiltKept       ; 已存在而沿用的文件数
+  Var /GLOBAL RimeSyncPrebuiltEffMode    ; 当前这一遍用的模式（auto / force）
+  Var /GLOBAL RimeSyncPrebuiltRecopy     ; 1 = 第一遍铺完仍不可用，只对 build/ 覆盖重铺过
+  Var /GLOBAL RimeSyncContains           ; RimeSyncFileContains 的结果：yes / no
 !endif
 
 ; 构建期由 scripts/ime/build-weasel.ps1 放到 packaging/windows/vendor/。
@@ -1414,6 +1424,277 @@ Function RimeSyncScanDefaultLayout
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
+; 0.6.15：预编译 build 产物兜底
+;
+; 为什么：测试机 192.168.61.227 上 WeaselDeployer.exe /deploy 返回 0 但什么都不写
+; （%APPDATA%\Rime\{user.yaml,installation.yaml,build} 一直停在旧日期），手动起
+; WeaselServer 也一样。这种机器上「本机部署」永远不生效，只能把别处部署好的 build/
+; 产物随安装包带过来，安装时直接铺进用户目录。
+;
+; 判据（与 Windows 安装器 / Linux postinst 完全一致）：
+;   <用户目录>\Rime\build\luna_pinyin.schema.yaml 存在，且文件里同时出现
+;   rimesync_vnum 与 rimesync_punct（这是随包 *.custom.yaml 才有的插件标记；
+;   官方部署出来的没有，所以「有文件」不等于「是我们这套」）。
+;
+; 开关（安装包与静默安装都认，不弹额外界面）：
+;   RIMESYNC_PREBUILT=0      关闭兜底
+;   RIMESYNC_PREBUILT=force  已存在的文件也覆盖（用户要强制刷新时用）
+; ---------------------------------------------------------------------------
+
+; 文件里是否含某个子串（大小写敏感，够用）
+; 入参：$R9 = 文件路径，$R8 = 子串
+; 出参：$RimeSyncContains = yes / no
+; 用 shlwapi!StrStrW 逐行找，不额外 !include（Tauri 模板不一定带 StrFunc.nsh）
+Function RimeSyncFileContains
+  Push $0
+  Push $1
+  Push $2
+
+  StrCpy $RimeSyncContains "no"
+  IfFileExists "$R9" 0 rimesync_fc_done
+  ClearErrors
+  FileOpen $0 "$R9" r
+  IfErrors rimesync_fc_done
+  rimesync_fc_loop:
+    FileRead $0 $1
+    IfErrors rimesync_fc_close
+    System::Call 'shlwapi::StrStrW(w "$1", w "$R8") p .r2'
+    StrCmp $2 "0" rimesync_fc_loop
+      StrCpy $RimeSyncContains "yes"
+  rimesync_fc_close:
+  FileClose $0
+
+  rimesync_fc_done:
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; 判「用户目录里的 build 产物可用」
+; 入参：$9 = 用户 Rime 目录（%APPDATA%\Rime）
+; 出参：$RimeSyncBuildProbe = yes / no
+Function RimeSyncProbeBuild
+  Push $0
+
+  StrCpy $RimeSyncBuildProbe "no"
+  StrCmp $9 "" rimesync_pb_done
+  StrCpy $R9 "$9\build\luna_pinyin.schema.yaml"
+  StrCpy $R8 "rimesync_vnum"
+  Call RimeSyncFileContains
+  StrCmp $RimeSyncContains "yes" 0 rimesync_pb_done
+  StrCpy $R8 "rimesync_punct"
+  Call RimeSyncFileContains
+  StrCmp $RimeSyncContains "yes" 0 rimesync_pb_done
+  StrCpy $RimeSyncBuildProbe "yes"
+
+  rimesync_pb_done:
+  Pop $0
+FunctionEnd
+
+; 读 RIMESYNC_PREBUILT 环境变量
+; 出参：$RimeSyncPrebuiltMode = auto（缺省） / force / off
+Function RimeSyncPrebuiltMode
+  Push $0
+
+  StrCpy $RimeSyncPrebuiltMode "auto"
+  ReadEnvStr $0 "RIMESYNC_PREBUILT"
+  StrCmp $0 "" rimesync_pm_done
+  StrCmp $0 "0" 0 rimesync_pm_force
+    StrCpy $RimeSyncPrebuiltMode "off"
+    Goto rimesync_pm_done
+  rimesync_pm_force:
+  StrCmp $0 "force" 0 rimesync_pm_done
+    StrCpy $RimeSyncPrebuiltMode "force"
+
+  rimesync_pm_done:
+  Pop $0
+FunctionEnd
+
+; 逐个文件复制一个目录：存在即跳过（$RimeSyncPrebuiltEffMode=force 才覆盖）
+; 入参：$4 = 源目录，$6 = 目标目录
+; 累加：$RimeSyncPrebuiltCopied / $RimeSyncPrebuiltKept；有文件复制失败 → $RimeSyncPrebuiltState=failed
+Function RimeSyncCopyPrebuiltDir
+  Push $0
+  Push $1
+  Push $2
+
+  StrCmp $4 "" rimesync_cpd_done
+  StrCmp $6 "" rimesync_cpd_done
+  CreateDirectory "$6"
+  ClearErrors
+  FindFirst $1 $2 "$4\*.*"
+  IfErrors rimesync_cpd_done
+
+  rimesync_cpd_loop:
+    StrCmp $2 "" rimesync_cpd_close
+    StrCmp $2 "." rimesync_cpd_next
+    StrCmp $2 ".." rimesync_cpd_next
+    IfFileExists "$6\$2" 0 rimesync_cpd_copy
+      StrCmp $RimeSyncPrebuiltEffMode "force" rimesync_cpd_copy
+      IntOp $RimeSyncPrebuiltKept $RimeSyncPrebuiltKept + 1
+      Goto rimesync_cpd_next
+    rimesync_cpd_copy:
+      ClearErrors
+      CopyFiles /SILENT "$4\$2" "$6\$2"
+      IfFileExists "$6\$2" 0 rimesync_cpd_failed
+      IntOp $RimeSyncPrebuiltCopied $RimeSyncPrebuiltCopied + 1
+      Goto rimesync_cpd_next
+    rimesync_cpd_failed:
+      StrCpy $RimeSyncPrebuiltState "failed"
+      StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT copy failed file=$2"
+      Call RimeSyncLog
+    rimesync_cpd_next:
+    FindNext $1 $2
+    Goto rimesync_cpd_loop
+
+  rimesync_cpd_close:
+  FindClose $1
+
+  rimesync_cpd_done:
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; 兜底主流程：部署 → 判定 → （不满足时）铺预编译产物 → 复查
+; 出参：$RimeSyncBuildSource = deploy / prebuilt / none
+;       $RimeSyncPrebuiltState = ok / failed / payload-missing / skipped / none
+; 失败只记日志 + 告警，绝不 Abort（程序已经装好，用户要的是能用的输入法和日志）
+Function RimeSyncEnsurePrebuiltBuild
+  Push $0
+  Push $1
+  Push $4
+  Push $5
+  Push $6
+
+  StrCpy $RimeSyncBuildSource "none"
+  StrCpy $RimeSyncPrebuiltState "none"
+  StrCpy $RimeSyncPrebuiltCopied "0"
+  StrCpy $RimeSyncPrebuiltKept "0"
+  StrCpy $RimeSyncPrebuiltRecopy "0"
+  StrCpy $RimeSyncPrebuiltEffMode "auto"
+
+  ; 用户配置目录：播种阶段解析出来的优先，否则按进程环境兜底
+  StrCpy $5 "$RimeSyncRimeUserDir"
+  StrCmp $5 "" 0 rimesync_epb_have_dir
+    ReadEnvStr $5 "APPDATA"
+    StrCmp $5 "" rimesync_epb_no_userdir
+    StrCpy $5 "$5\Rime"
+  rimesync_epb_have_dir:
+
+  ; 1) 部署真的产出了我们这套可用文件 → 什么都不用做
+  StrCpy $9 "$5"
+  Call RimeSyncProbeBuild
+  StrCmp $RimeSyncBuildProbe "yes" 0 rimesync_epb_deploy_miss
+    StrCpy $RimeSyncBuildSource "deploy"
+    StrCpy $RimeSyncPrebuiltState "skipped"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT ok source=deploy reason=deploy-produced-usable-build"
+    Call RimeSyncLog
+    Goto rimesync_epb_end
+  rimesync_epb_deploy_miss:
+
+  ; 2) 开关：RIMESYNC_PREBUILT=0 关闭
+  Call RimeSyncPrebuiltMode
+  StrCmp $RimeSyncPrebuiltMode "off" 0 rimesync_epb_seed
+    StrCpy $RimeSyncPrebuiltState "skipped"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT skipped reason=disabled-by-env RIMESYNC_PREBUILT=0"
+    Call RimeSyncLog
+    Goto rimesync_epb_end
+  rimesync_epb_seed:
+
+  ; 3) 载荷在不在（$INSTDIR\resources\prebuilt，由 tauri resources 铺进来）
+  Call RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT begin mode=$RimeSyncPrebuiltMode src=$INSTDIR\resources\prebuilt"
+  Call RimeSyncLog
+  ClearErrors
+  FindFirst $0 $1 "$INSTDIR\resources\prebuilt\build\*.*"
+  IfErrors rimesync_epb_payload_missing
+  FindClose $0
+  Goto rimesync_epb_copy
+
+  rimesync_epb_payload_missing:
+    StrCpy $RimeSyncPrebuiltState "payload-missing"
+    IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT failed reason=payload-missing dir=$INSTDIR\resources\prebuilt"
+    Call RimeSyncLog
+    DetailPrint "[rime-sync] 警告：安装包里没有预编译 build 产物（$INSTDIR\resources\prebuilt），部署又不产出时输入法可能打不出字"
+    Goto rimesync_epb_end
+
+  rimesync_epb_copy:
+  ; 4) 第一遍：先铺 build（*.yaml / *.bin）到 <用户目录>\Rime\build，
+  ;    再铺 config 里的 *.yaml 到 <用户目录>\Rime；都是「存在即跳过」。
+  StrCpy $RimeSyncPrebuiltRecopy "0"
+  StrCpy $RimeSyncPrebuiltEffMode "$RimeSyncPrebuiltMode"
+  StrCpy $4 "$INSTDIR\resources\prebuilt\build"
+  StrCpy $6 "$5\build"
+  Call RimeSyncCopyPrebuiltDir
+  StrCpy $4 "$INSTDIR\resources\prebuilt\config"
+  StrCpy $6 "$5"
+  Call RimeSyncCopyPrebuiltDir
+
+  StrCpy $9 "$5"
+  Call RimeSyncProbeBuild
+  StrCmp $RimeSyncBuildProbe "yes" rimesync_epb_ok
+  ; force 已经把 build/ 全覆盖过，再铺一遍没有意义
+  StrCmp $RimeSyncPrebuiltMode "force" rimesync_epb_failed
+
+  ; 4b) 第二遍（只在第一遍没解决问题时）：用户目录里本来就有旧的 build 产物
+  ;     （例如 10 月那次部署留下的、没有 rimesync_ 插件标记），「存在即跳过」
+  ;     把它们跳过去了，现在还是不可用。build/ 是部署器随时会重写的派生数据，
+  ;     不是用户数据，所以只对 build/ 升级成覆盖模式再铺一遍；config/*.yaml
+  ;     是用户配置，绝不参与这一遍。
+  StrCpy $RimeSyncPrebuiltRecopy "1"
+  StrCpy $RimeSyncPrebuiltEffMode "force"
+  Call RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT retry reason=probe-after-skip-only scope=build-only"
+  Call RimeSyncLog
+  StrCpy $4 "$INSTDIR\resources\prebuilt\build"
+  StrCpy $6 "$5\build"
+  Call RimeSyncCopyPrebuiltDir
+  StrCpy $9 "$5"
+  Call RimeSyncProbeBuild
+  StrCmp $RimeSyncBuildProbe "yes" rimesync_epb_ok
+  Goto rimesync_epb_failed
+
+  rimesync_epb_ok:
+    StrCpy $RimeSyncBuildSource "prebuilt"
+    StrCpy $RimeSyncPrebuiltState "ok"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT ok source=prebuilt copied=$RimeSyncPrebuiltCopied kept=$RimeSyncPrebuiltKept mode=$RimeSyncPrebuiltMode escalated=$RimeSyncPrebuiltRecopy dir=$5\build"
+    Call RimeSyncLog
+    DetailPrint "[rime-sync] 部署没有产出 build 产物，已铺入随包的预编译产物（新铺 $RimeSyncPrebuiltCopied 个，沿用 $RimeSyncPrebuiltKept 个）"
+    Goto rimesync_epb_end
+
+  rimesync_epb_failed:
+    StrCpy $RimeSyncPrebuiltState "failed"
+    StrCpy $RimeSyncBuildSource "none"
+    IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT failed reason=probe-after-copy copied=$RimeSyncPrebuiltCopied kept=$RimeSyncPrebuiltKept escalated=$RimeSyncPrebuiltRecopy file=$5\build\luna_pinyin.schema.yaml"
+    Call RimeSyncLog
+    DetailPrint "[rime-sync] 错误：预编译产物铺完仍没有可用的 build\luna_pinyin.schema.yaml（只告警，不中止安装）"
+    IfSilent rimesync_epb_end
+      MessageBox MB_OK|MB_ICONEXCLAMATION "rime-sync 安装完成，但输入法数据没能铺好：本机部署没有生成 build 产物，随包的预编译产物复查也没通过。$\r$\n$\r$\n请把日志 $TEMP\rime-sync-setup.log 里的 phase=PREBUILT 行发给维护者。$\r$\n用户数据（%APPDATA%\Rime）不受影响。"
+    Goto rimesync_epb_end
+
+  rimesync_epb_no_userdir:
+    StrCpy $RimeSyncPrebuiltState "skipped"
+    Call RimeSyncStamp
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT skipped reason=no-userdir（解析不到 %APPDATA%）"
+    Call RimeSyncLog
+
+  rimesync_epb_end:
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------------------------
 ; 0.6.14 安装结束自检（POSTINSTALL 末尾）
 ;   1) 再判一次就绪（RimeSyncWeaselReady），TSF/进程证据另起一行只写日志
 ;   2) 硬性检查 A：HKLM\Software\Rime\Weasel\InstallDir（32/64 视图任一）必须有值
@@ -1442,6 +1723,12 @@ Function RimeSyncSelfCheck
   StrCpy $RimeSyncBuildExistsBefore "0"
   StrCpy $RimeSyncBuildHiBefore ""
   StrCpy $RimeSyncBuildLoBefore ""
+  StrCpy $RimeSyncBuildSource "none"
+  StrCpy $RimeSyncBuildProbe "no"
+  StrCpy $RimeSyncPrebuiltMode "auto"
+  StrCpy $RimeSyncPrebuiltState "none"
+  StrCpy $RimeSyncPrebuiltCopied "0"
+  StrCpy $RimeSyncPrebuiltKept "0"
 
   Call RimeSyncWeaselReady
   Call RimeSyncWeaselLogEvidence
@@ -1496,7 +1783,8 @@ Function RimeSyncSelfCheck
     IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
     StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK warning=no-weasel-deployer root=$RimeSyncWeaselRootDir"
     Call RimeSyncLog
-    Goto rimesync_sc_log
+    ; 没有部署器就部署不了，正是预编译产物该上场的时候（跳过 build 状态判定，直接兜底）
+    Goto rimesync_sc_build_done
 
   rimesync_sc_deploy:
   StrCpy $R9 '"$RimeSyncWeaselRootDir\WeaselDeployer.exe" /deploy'
@@ -1533,6 +1821,12 @@ Function RimeSyncSelfCheck
     StrCpy $RimeSyncBuildState "updated"
   rimesync_sc_build_done:
 
+  ; 0.6.15：部署没有产出（或产出的不是我们这套）时，铺随包的预编译 build 产物。
+  ; 该函数自己写 phase=PREBUILT 日志；失败只加告警，绝不 Abort。
+  Call RimeSyncEnsurePrebuiltBuild
+
+  ; 兜底成功（build-source=prebuilt）就不再报 build-not-updated：产物确实可用。
+  StrCmp $RimeSyncBuildSource "prebuilt" rimesync_sc_build_ok
   StrCmp $RimeSyncBuildState "updated" rimesync_sc_build_ok
   StrCmp $RimeSyncBuildState "generated" rimesync_sc_build_ok
     IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
@@ -1563,9 +1857,9 @@ Function RimeSyncSelfCheck
     Call RimeSyncLog
   rimesync_sc_hard_ok:
 
-  StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK weasel-ready=$RimeSyncWeaselReady root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe configdir=$0 configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused deploy=$RimeSyncDeployExit ran=$RimeSyncDeployRan build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
+  StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK weasel-ready=$RimeSyncWeaselReady root=$RimeSyncWeaselRootDir source=$RimeSyncWeaselReadySrc proc=$RimeSyncWeaselProcState install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe configdir=$0 configs=$RimeSyncSeedWritten reused=$RimeSyncSeedReused deploy=$RimeSyncDeployExit ran=$RimeSyncDeployRan build=$RimeSyncBuildState build-source=$RimeSyncBuildSource prebuilt=$RimeSyncPrebuiltState copied=$RimeSyncPrebuiltCopied kept=$RimeSyncPrebuiltKept warnings=$RimeSyncSelfCheckWarn"
   Call RimeSyncLog
-  DetailPrint "[rime-sync] 自检：就绪=$RimeSyncWeaselReady（$RimeSyncWeaselRootDir）；注册表 InstallDir=$RimeSyncWeaselRegInstallDir；默认布局 exe=$RimeSyncWeaselDefaultExe；配置 $0：新写入 $RimeSyncSeedWritten / 沿用 $RimeSyncSeedReused；部署=$RimeSyncDeployExit；build=$RimeSyncBuildState；告警=$RimeSyncSelfCheckWarn"
+  DetailPrint "[rime-sync] 自检：就绪=$RimeSyncWeaselReady（$RimeSyncWeaselRootDir）；注册表 InstallDir=$RimeSyncWeaselRegInstallDir；默认布局 exe=$RimeSyncWeaselDefaultExe；配置 $0：新写入 $RimeSyncSeedWritten / 沿用 $RimeSyncSeedReused；部署=$RimeSyncDeployExit；build=$RimeSyncBuildState；build 来源=$RimeSyncBuildSource（预编译 $RimeSyncPrebuiltState：新铺 $RimeSyncPrebuiltCopied / 沿用 $RimeSyncPrebuiltKept）；告警=$RimeSyncSelfCheckWarn"
 
   ; 非静默时给用户一份简报（静默安装只写日志）；自检硬失败时前面已弹 STOP 框，不再弹
   IfSilent rimesync_sc_done
@@ -2247,7 +2541,7 @@ FunctionEnd
   StrCmp $RimeSyncWeaselSelfCheckFail "1" rimesync_post_failed
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个；日志：$TEMP\rime-sync-setup.log"
-  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe deploy=$RimeSyncDeployExit build=$RimeSyncBuildState warnings=$RimeSyncSelfCheckWarn"
+  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe deploy=$RimeSyncDeployExit build=$RimeSyncBuildState build-source=$RimeSyncBuildSource warnings=$RimeSyncSelfCheckWarn"
   Call RimeSyncLog
   Goto rimesync_post_done
   rimesync_post_failed:
@@ -2285,6 +2579,9 @@ FunctionEnd
 
   ; 安装顺序日志（静默安装的验收证据）
   Delete "${RIMESYNC_ORDER_LOG}"
+
+  ; 0.6.15：预编译 build 产物是安装包带进来的，卸载时一并清掉（用户目录里的那份不动）
+  RMDir /r "$INSTDIR\resources\prebuilt"
 
   ; 旧版内嵌的小狼毫安装包与许可证文本（Tauri 也会清理 resources，这里显式兜底）
   Delete "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}"

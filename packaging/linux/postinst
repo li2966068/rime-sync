@@ -263,12 +263,107 @@ seed_schema_customs() { # $1=Rime 用户目录
         "$(date '+%F %T')" "$wrote" "$kept" "$no_data" "$rime_dir" >>"$SCHEMA_SEED_LOG" 2>/dev/null || true
 }
 
+# ---------------------------------------------------- 预编译 build 产物兜底
+# 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy 返回 0
+# 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。随 IME 包带的
+# /usr/share/rime-sync/prebuilt 是别处已经部署好的产物：用户目录缺 build 时铺过去。
+# 判据与 Windows 安装器一致：build/luna_pinyin.schema.yaml 存在，且里面有
+# rimesync_vnum / rimesync_punct 插件标记（官方部署出来的没有）。
+# 开关：RIMESYNC_PREBUILT=0 关闭；RIMESYNC_PREBUILT=force 覆盖已存在的文件。
+PREBUILT_DIR=/usr/share/rime-sync/prebuilt
+PREBUILT_LOG=$LOGDIR/prebuilt.log
+
+prebuilt_usable() { # $1=Rime 用户目录
+    local f=$1/build/luna_pinyin.schema.yaml
+    [ -f "$f" ] || return 1
+    grep -q rimesync_vnum "$f" 2>/dev/null || return 1
+    grep -q rimesync_punct "$f" 2>/dev/null || return 1
+}
+
+# 逐个文件复制：存在即跳过；mode=force 才覆盖。输出 "copied kept failed"
+prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组
+    local src=$1 dst=$2 mode=$3 owner=$4 f copied=0 kept=0 failed=0
+    if ! mkdir -p "$dst" 2>/dev/null; then printf '0 0 1\n'; return 0; fi
+    for f in "$src"/*; do
+        [ -f "$f" ] || continue
+        if [ -e "$dst/${f##*/}" ] && [ "$mode" != force ]; then
+            kept=$((kept + 1)); continue
+        fi
+        if install -D -m 644 "$f" "$dst/${f##*/}" 2>/dev/null; then
+            chown "$owner" "$dst/${f##*/}" 2>/dev/null || true
+            copied=$((copied + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+    printf '%s %s %s\n' "$copied" "$kept" "$failed"
+}
+
+seed_prebuilt_build() { # $1=Rime 用户目录
+    local rime_dir=$1 mode=${RIMESYNC_PREBUILT:-auto} owner=${TARGET_USER:-root}
+    local ogroup copied=0 kept=0 failed=0 c k f escalated=0
+    ogroup=$(id -gn "$owner" 2>/dev/null || echo "$owner")
+
+    case "$mode" in
+        0|no|off|false)
+            say "预编译产物：已按 RIMESYNC_PREBUILT=0 关闭"
+            printf '%s skip reason=disabled-by-env\n' "$(date '+%F %T')" >>"$PREBUILT_LOG" 2>/dev/null || true
+            return 0 ;;
+    esac
+    if [ ! -d "$PREBUILT_DIR/build" ]; then
+        say "预编译产物：包里没有 $PREBUILT_DIR/build，跳过"
+        printf '%s skip reason=payload-missing\n' "$(date '+%F %T')" >>"$PREBUILT_LOG" 2>/dev/null || true
+        return 0
+    fi
+    if [ "$mode" != "force" ] && prebuilt_usable "$rime_dir"; then
+        say "预编译产物：$rime_dir/build 已可用，沿用（未覆盖）"
+        printf '%s skip reason=build-usable dir=%s\n' "$(date '+%F %T')" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+        return 0
+    fi
+    if ! mkdir -p "$rime_dir/build" 2>/dev/null; then
+        say "!! 无法创建 $rime_dir/build，跳过预编译产物"
+        printf '%s failed reason=no-dir dir=%s\n' "$(date '+%F %T')" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+        return 0
+    fi
+    chown "$owner:$ogroup" "$rime_dir/build" 2>/dev/null || true
+
+    # 第一遍：build/* -> <rime_dir>/build/，config/*.yaml -> <rime_dir>/（都是存在即跳过）
+    read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" "${mode}" "$owner:$ogroup")"
+    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+    read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/config" "$rime_dir" "${mode}" "$owner:$ogroup")"
+    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+
+    # 第二遍（只在第一遍没解决问题时）：用户目录里本来就有旧的 build 产物（没有插件标记，
+    # 例如上次部署留下的），「存在即跳过」把它们跳过去了。build/ 是部署器随时重写的派生
+    # 数据、不是用户数据，所以只对 build/ 强制覆盖重铺一遍；config/*.yaml 是用户配置，
+    # 绝不参与这一遍。
+    if ! prebuilt_usable "$rime_dir" && [ "$mode" != "force" ]; then
+        escalated=1
+        say "预编译产物：用户目录里的旧 build 产物不可用，只对 build/ 覆盖重铺一遍（配置不动）"
+        read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" force "$owner:$ogroup")"
+        copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+    fi
+
+    if prebuilt_usable "$rime_dir"; then
+        say "预编译产物：已铺入 $copied 个，沿用 $kept 个（build 判定通过）"
+        printf '%s ok source=prebuilt copied=%d kept=%d failed=%d escalated=%d dir=%s\n' \
+            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+    else
+        say "!! 预编译产物铺完仍不满足判据（copied=$copied kept=$kept failed=$failed），只告警不中止"
+        printf '%s failed source=prebuilt copied=%d kept=%d failed=%d escalated=%d dir=%s\n' \
+            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+    fi
+    return 0
+}
+
 if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     RIME_USER_DIR=$TARGET_HOME/.local/share/fcitx5/rime
     [ -n "${2:-}" ] && say "升级安装（原版本 $2）：只补缺失的输入法配置，已有文件一律沿用"
     [ "${RIMESYNC_WITH_SCHEMA_TWEAKS:-0}" = "1" ] && \
         say "（RIMESYNC_WITH_SCHEMA_TWEAKS=1：0.6.12 起始终只补缺失文件，该变量不再改变行为）"
     seed_schema_customs "$RIME_USER_DIR"
+    # 0.6.15：部署不产出 build 时用随包的预编译产物兜底（缺文件才铺，失败只告警）
+    seed_prebuilt_build "$RIME_USER_DIR"
 fi
 
 # 刷新菜单与图标缓存（没有这些工具就算了）
