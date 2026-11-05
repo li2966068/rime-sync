@@ -107,10 +107,11 @@ pub fn install_prebuilt_with(
 
 * **后台线程**，`setup` 立即返回 —— 磁盘拷贝绝不阻塞窗口出现；
 * 读配置 → 定位 Rime 用户目录 → `probe_build`；
-  * `prebuilt`：什么也不做，也不写日志（每次启动都写会淹没日志）；
-  * `none` / `deploy`：`install_prebuilt`，结果写应用日志 `[bootstrap] …`；
+  * `prebuilt`：不铺文件，但**每一步仍然写日志**（0.6.17 起，见第 8 节）；
+  * `none` / `deploy`：`install_prebuilt`，结果写应用日志 `[bootstrap] …` 与
+    `bootstrap.log`；
 * 任何失败（读配置、定位目录、payload 缺失、复制失败）都只记日志：
-  **不弹窗、不退出、不影响同步功能**；
+  **不弹窗、不退出、不影响同步功能**，并且失败原因一定落在 `bootstrap.log` 里；
 * 开关与安装器一致：`RIMESYNC_PREBUILT=0` 关闭自举；`RIMESYNC_PREBUILT=force`
   覆盖 `build/`。
 
@@ -127,6 +128,10 @@ pub fn install_prebuilt_with(
 与日志路径。
 
 ### 7.2 CLI
+
+Windows 安装版从 0.6.17 起随包带 `rime-sync-cli.exe`（`<安装目录>\rime-sync-cli.exe`，
+与主程序同级）；便携版解压目录里也是同一份。Linux deb 在 `/usr/bin/rime-sync-cli`，
+AppImage 在 `$APPDIR/usr/bin/rime-sync-cli`。
 
 ```bash
 # 自动定位 payload（安装目录 / deb / AppImage）
@@ -148,11 +153,76 @@ rime-sync-cli fix-ime --payload /path/to/prebuilt --rime-dir /path/to/Rime
 
 ## 8. 日志
 
-* 应用日志：`[bootstrap] …` / `[fix-ime] …`（设置页「日志」可见）；
-* 每次自举的明细追加到 `<Rime 用户目录>/.rimesync-prebuilt.log`：
-  开始行（payload / rime / force / probe_before）、覆盖与失败明细、结束行（计数 / probe_after）。
+有两条独立的日志，排查时先看 `bootstrap.log`——它证明「自举到底跑没跑」。
 
-该文件不在同步范围内（只同步 `*.custom.yaml`、词库快照与词典源）。
+### 8.1 启动自举日志 `bootstrap.log`（0.6.17）
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\com.rimesync.app\bootstrap.log` |
+| Linux | `~/.config/com.rimesync.app/bootstrap.log` |
+
+（即 Tauri 的 `app_config_dir`；目录不存在会自动创建，日志文件本身写不进去时
+降级成只写应用日志，不影响自举。）
+
+每一步单独一行，先落盘再执行下一步；失败也写。格式：
+
+```text
+[2026-11-06 07:12:33] bootstrap begin version=0.6.17 exe=C:\Program Files\rime-sync\rime-sync-app.exe RIMESYNC_PREBUILT=<unset>
+[2026-11-06 07:12:33] rime_dir=C:\Users\me\AppData\Roaming\Rime source=config
+[2026-11-06 07:12:33] probe_before=none
+[2026-11-06 07:12:33] payload hit path=C:\Program Files\rime-sync\resources\prebuilt source=exe:resources/prebuilt
+[2026-11-06 07:12:33] install start force=false
+[2026-11-06 07:12:34] install done copied=20 kept=0 overwritten=0 config_copied=2 config_kept=0 failed=0 probe_after=prebuilt build_ok=true escalated=false core_log=C:\Users\me\AppData\Roaming\Rime\.rimesync-prebuilt.log
+[2026-11-06 07:12:34] bootstrap end result=ok
+```
+
+字段与取值：
+
+| 行 | 说明 |
+|---|---|
+| `bootstrap begin` | 版本、exe 路径、进程启动时的 `RIMESYNC_PREBUILT` |
+| `rime_dir=` | 命中的 Rime 用户目录与来源（`source=config` / 自动探测） |
+| `probe_before=` | `none` / `deploy` / `prebuilt` |
+| `payload hit` | 命中的 payload 目录与候选来源（`exe:resources/prebuilt`、`appimage:…`、`env:RIMESYNC_PREBUILT_DIR`） |
+| `payload failed` | 所有候选都没命中；`error=` 里列出检查过的路径 |
+| `install done` | `copied` / `kept` / `overwritten` / `config_copied` / `config_kept` / `failed` / `probe_after` / `build_ok` / `escalated` |
+| `bootstrap end` | `result=ok` / `degraded`（铺了但仍不可用）/ `skip`（附 `reason=`）/ `failed`（附 `stage=`） |
+| `config failed` / `rime_dir failed` / `install failed` | 异常原文，失败路径也有结束行 |
+
+文件超过 1 MiB 时轮转成 `bootstrap.log.1`（只留一份），不会无限增长。
+
+排查顺序（PowerShell）：
+
+```powershell
+# 1) 自举到底跑没跑（没有这个文件 = 进程没启动到这里 / 配置目录不可写）
+Get-Content "$env:APPDATA\com.rimesync.app\bootstrap.log" -ErrorAction SilentlyContinue
+
+# 2) 只看失败与结束行
+Get-Content "$env:APPDATA\com.rimesync.app\bootstrap.log" -ErrorAction SilentlyContinue |
+  Select-String -Pattern "failed|bootstrap end|payload"
+
+# 3) 安装目录里到底有没有随包产物与 CLI
+Get-ChildItem "$env:ProgramFiles\rime-sync\resources\prebuilt\build" -Filter *.schema.yaml
+Test-Path "$env:ProgramFiles\rime-sync\rime-sync-cli.exe"
+
+# 4) 同一条路径手工重跑（会写同样的计数，另有 CLI 自己的输出）
+& "$env:ProgramFiles\rime-sync\rime-sync-cli.exe" fix-ime
+```
+
+### 8.2 铺入明细 `<Rime 用户目录>/.rimesync-prebuilt.log`
+
+每次自举的明细追加到这里（由 `crates/core/src/prebuilt.rs` 写）：
+开始行（payload / rime / force / probe_before）、覆盖与失败明细、结束行
+（计数 / probe_after）。`bootstrap.log` 里的 `core_log=` 就是它的路径。
+
+### 8.3 应用日志
+
+设置页「日志」可见的 `[bootstrap] …` / `[fix-ime] …`：与 `bootstrap.log` 同一批事件，
+但只保留最近若干条，且进程退出就没了。
+
+`.rimesync-prebuilt.log` 与 `bootstrap.log` 都不在同步范围内（只同步
+`*.custom.yaml`、词库快照与词典源）。
 
 ## 9. 测试
 
@@ -168,6 +238,8 @@ rime-sync-cli fix-ime --payload /path/to/prebuilt --rime-dir /path/to/Rime
 ## 10. 已知限制 / 未验证
 
 * 真机（Windows 227）上的启动自举还没有跑过：本地只验证了编译、单测与 CLI 集成测试；
+  0.6.17 起 `%APPDATA%\com.rimesync.app\bootstrap.log` 会逐行记录每一步，
+  真机复测时先看它就能区分「没跑」与「跑了但失败」；
 * AppImage 的 payload 路径按 Tauri 资源布局与 `$APPDIR` 双路探测，未在真实
   AppImage 里验证；
 * `/usr/share/rime-sync/prebuilt` 目前由 `packaging/linux/postinst` 引用，但 deb 的

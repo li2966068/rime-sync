@@ -162,13 +162,19 @@ jobs:
       # ~170 MiB。闭包只在 ime-<distro> 的 .run 里按发行版单份使用。
       # fcitx5 配置页的「立即同步」按钮调用 /usr/bin/rime-sync-cli；CLI 不在 tauri 产物里，
       # 必须在打包前编译好并放到 deb.files 指定的位置，否则该按钮会静默 no-op。
+      # 0.6.17 起 CLI 还是 tauri 的 externalBin sidecar：Tauri 按 <路径>-<target-triple>
+      # 找源文件，所以同一份产物还要按 host triple 再放一份，否则 tauri build 直接失败
+      # （deb 会因此多带一份 /usr/bin/rime-sync-cli，AppImage 也能拿到 CLI）。
       - name: build CLI for the deb
         timeout-minutes: 15
         run: |
           set -euo pipefail
           cargo build -p rime-sync-cli --release --locked
           install -Dm755 target/release/rime-sync-cli packaging/linux/rime-sync-cli
-          file packaging/linux/rime-sync-cli
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          [ -n "$triple" ] || { echo "::error::rustc -vV 里没有 host triple"; exit 1; }
+          install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
+          file packaging/linux/rime-sync-cli "target/release/rime-sync-cli-$triple"
 
       - name: build bundles (deb + AppImage)
         timeout-minutes: 45
@@ -867,6 +873,30 @@ jobs:
           }
           Write-Host ("rime.dll 组件齐全：{0}（{1} 个架构）" -f ($names -join ' / '), $dlls.Count)
 
+      # 0.6.17：rime-sync-cli 作为 sidecar 进安装包（bundle.externalBin），装完位于
+      # <安装目录>\rime-sync-cli.exe。Tauri 的源文件命名约定是 <路径>-<target-triple>.exe，
+      # 所以先按 x86_64-pc-windows-msvc 编好，再复制成约定名字。
+      - name: build CLI sidecar for the bundle
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build -p rime-sync-cli --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::cargo build -p rime-sync-cli 失败（exit $LASTEXITCODE）"
+            exit $LASTEXITCODE
+          }
+          $src = 'target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe'
+          if (-not (Test-Path -LiteralPath $src)) {
+            Write-Host "::error::没有生成 $src"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path 'target/release' | Out-Null
+          $dst = 'target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe'
+          Copy-Item -LiteralPath $src -Destination $dst -Force
+          $item = Get-Item -LiteralPath $dst
+          Write-Host ("CLI sidecar: {0} ({1:N1} MiB)" -f $item.FullName, ($item.Length / 1MB))
+
       - name: build nsis
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -891,6 +921,43 @@ jobs:
             Write-Host "是否有 'NSIS_HOOK_PREINSTALL' 相关告警（packaging/nsis-hooks.nsh 的 !warning）。"
             exit 1
           }
+
+      # 配置写对了不等于产物里有：再用 7z 列一遍 setup.exe 的目录做产物级断言。
+      #   - rime-sync-cli.exe：bundle.externalBin 的 sidecar（0.6.17）
+      #   - resources/prebuilt/**/*.schema.yaml：随包的部署兜底产物（0.6.15）
+      - name: assert nsis setup carries CLI and prebuilt schemas
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $setup) {
+            Write-Host '::error::没找到 NSIS 安装包（src-tauri/target/release/bundle/nsis/*-setup.exe）'
+            exit 1
+          }
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path -LiteralPath $sevenZip)) {
+            $cmd = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+            if ($cmd) { $sevenZip = $cmd.Source }
+          }
+          if (-not $sevenZip) {
+            Write-Host '::error::找不到 7z.exe（windows-2022 runner 自带 C:\Program Files\7-Zip）'
+            exit 1
+          }
+          $listing = (& $sevenZip l -ba $setup.FullName 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::7z 列不开 $($setup.Name)（exit $LASTEXITCODE）"
+            exit 1
+          }
+          if ($listing -notmatch '(?i)rime-sync-cli\.exe') {
+            Write-Host '::error::setup.exe 里没有 rime-sync-cli.exe：检查 bundle.externalBin 与 target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe'
+            exit 1
+          }
+          $schemas = [regex]::Matches($listing, '(?i)resources[\\/]prebuilt[\\/].*?\.schema\.yaml')
+          if ($schemas.Count -eq 0) {
+            Write-Host '::error::setup.exe 里没有 resources/prebuilt/**/*.schema.yaml：检查 bundle.resources 里 ../packaging/rime/prebuilt/ 的映射'
+            exit 1
+          }
+          Write-Host ("setup payload ok: rime-sync-cli.exe + {0} 个 prebuilt schema" -f $schemas.Count)
 
       # ---- 离线包（0.6.5）：内嵌 WebView2 Standalone，受限代理/内网也能装 ----
       # 1) 先把刚打好的在线包挪走：离线包会写回同一个文件名，不挪就被覆盖。

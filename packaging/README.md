@@ -40,6 +40,28 @@ pnpm tauri build --bundles nsis
 pwsh -File packaging/portable-zip.ps1 -TargetDir src-tauri/target/release -OutDir packaging/out
 ```
 
+CLI（`rime-sync-cli`）从 0.6.17 起通过 `bundle.externalBin` 作为 sidecar 随包分发。
+Tauri 按 `target/release/rime-sync-cli-<target-triple>[.exe]` 找源文件，**缺了
+`tauri build` 会直接失败**。本机打包前先准备：
+
+```bash
+# Linux
+cargo build -p rime-sync-cli --release --locked
+triple=$(rustc -vV | sed -n 's/^host: //p')
+install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
+```
+
+```powershell
+# Windows
+cargo build -p rime-sync-cli --release --locked --target x86_64-pc-windows-msvc
+New-Item -ItemType Directory -Force -Path target/release | Out-Null
+Copy-Item target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe `
+  target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe -Force
+```
+
+装完 CLI 与主程序同级：Windows `<安装目录>\rime-sync-cli.exe`（便携 zip 同名），
+Linux deb `/usr/bin/rime-sync-cli`，AppImage `$APPDIR/usr/bin/rime-sync-cli`。
+
 ## 2. CI 分工
 
 | 工作流 | 触发 | 产物 |
@@ -59,7 +81,8 @@ release 的两个构建 job：
 
 - `verify-artifacts` job：`.github/scripts/verify-artifacts.sh`——解 deb 检查
   `rime.so` 里的 `/usr/bin/rime-sync-status`、`zh_CN` 译文、可执行位；解 `*-setup.exe` 检查
-  `WeaselServer.exe` 里有没有「Rime 同步」。`ci.yml` 每次 push/PR 跑它的 `--selftest`。
+  `WeaselServer.exe` 里有没有「Rime 同步」，以及 **`rime-sync-cli.exe` 与
+  `resources/prebuilt/**/*.schema.yaml`**（0.6.17）。`ci.yml` 每次 push/PR 跑它的 `--selftest`。
 - `windows` job 的 `verify weasel vendor payload`：来源必须是自编译（`require` 模式），
   否则写 `WEASEL-SOURCE.json` 并在 summary / 发布说明红字标注。
 

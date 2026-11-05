@@ -55,6 +55,16 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 Copy-Item $exe (Join-Path $stage "rime-sync.exe") -Force
 
+# 0.6.17：CLI 由 bundle.externalBin 打进安装包，tauri-build 会同时把它复制到
+# <TargetDir>\rime-sync-cli.exe。便携版保持同一布局：解压后可直接跑
+# .\rime-sync-cli.exe fix-ime 排查输入法产物。缺了就说明 sidecar 构建没做，
+# 便携包会与安装包不一致 —— 直接失败，不要静默发一个残缺包。
+$cli = Join-Path $TargetDir "rime-sync-cli.exe"
+if (-not (Test-Path -LiteralPath $cli)) {
+  throw "缺少 $cli：先 cargo build -p rime-sync-cli --release 并按 target triple 命名（见 packaging/windows/README.md）"
+}
+Copy-Item -LiteralPath $cli -Destination (Join-Path $stage "rime-sync-cli.exe") -Force
+
 # WebView2 运行时是系统组件：便携包不内嵌，缺失时提示用户安装。
 $readme = @"
 rime-sync $Version · Windows 便携版
@@ -65,6 +75,8 @@ rime-sync $Version · Windows 便携版
 3. 若提示缺少 WebView2 Runtime：安装微软的 "Evergreen Bootstrapper"
    （https://developer.microsoft.com/microsoft-edge/webview2/），Win11 一般已自带。
 4. 卸载 = 删除本目录；配置与备份在 %APPDATA%\rime-sync，需要彻底清理时一并删除。
+5. 输入法产物异常时，在本目录运行：rime-sync-cli.exe fix-ime
+   （排查日志：%APPDATA%\com.rimesync.app\bootstrap.log）。
 
 注意：便携版与 NSIS 安装版共用同一份配置目录，请不要同时运行两个实例。
 "@

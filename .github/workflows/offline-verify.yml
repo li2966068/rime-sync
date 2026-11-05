@@ -104,6 +104,18 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # bundle.externalBin 需要 <路径>-<host triple> 的源文件；离线回归只出 deb，
+      # 但 tauri build 仍会检查 sidecar，缺了直接失败（与 release.yml 的 linux-app 一致）。
+      - name: build CLI sidecar
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo build -p rime-sync-cli --release --locked
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          [ -n "$triple" ] || { echo "::error::rustc -vV 里没有 host triple"; exit 1; }
+          install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
+          file "target/release/rime-sync-cli-$triple"
+
       # 只出 deb（回归只关心离线安装器），且必须先于 fetch-vendor-deps.sh：
       # 否则 deb 会把 packaging/linux/vendor/ 整个吞进 /usr/share/rime-sync/vendor/。
       - name: build rime-sync deb

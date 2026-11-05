@@ -13,7 +13,7 @@
 | `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → **卸载旧版（同步程序 + 自建输入法）** → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式 + 按新版无条件写配置（覆盖前备份）；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
 | `../nsis-hooks-offline.nsh` | 离线变体：`!define RIMESYNC_EMBED_WEBVIEW` 后 include 主钩子（内嵌 WebView2 Standalone） |
 | `fetch-webview2.ps1` | 下载 WebView2 Evergreen **Standalone**（x64，约 130 MB）供离线包内嵌；3 次重试 + 体积/文件头校验 |
-| `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；`installMode = perMachine`；`webviewInstallMode = skip` |
+| `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；**`bundle.externalBin` 带 `rime-sync-cli`（0.6.17，见第 14 节）**；`installMode = perMachine`；`webviewInstallMode = skip` |
 | `../../src-tauri/tauri.offline.conf.json` | 离线包覆盖项：只改 `bundle.windows.nsis.installerHooks` 指向离线钩子 |
 
 > 为什么 resources 里没有 `weasel-*.exe`：安装器用 NSIS 的 `File` 指令在**构建期**把
@@ -962,13 +962,85 @@ scripts/ime/gen-prebuilt-build.py --check
 逻辑搬进程序：**安装器钩子不跑时由程序自举兜底**。
 
 * 应用启动（tauri `setup`）后在后台线程 `probe_build`：`none` / `deploy`（有文件但没
-  插件标记）→ `install_prebuilt` 铺一遍；`prebuilt` 直接跳过。失败只写应用日志
-  （`[bootstrap] …`），不弹窗、不阻塞启动；
+  插件标记）→ `install_prebuilt` 铺一遍；`prebuilt` 直接跳过。失败只写日志，
+  不弹窗、不阻塞启动；
 * 设置页「修复输入法 / 强制覆盖」= `cmd_fix_ime`，与启动自举同一套
   `crates/core/src/prebuilt.rs`；
 * CLI：`rime-sync-cli fix-ime [--force] [--json] [--payload <DIR>]`；
 * 判据与铺入规则（缺才铺 / build 第二次机会 / config 永不覆盖）与安装器完全一致；
-* 日志：应用日志 + `<Rime 用户目录>\.rimesync-prebuilt.log`。
+* 日志（0.6.17 起）：`%APPDATA%\com.rimesync.app\bootstrap.log` 逐步记录，
+  另有应用日志与 `<Rime 用户目录>\.rimesync-prebuilt.log`。
 
 详见 `docs/PREBUILT-BOOTSTRAP.md`。
+
+## 14. CLI 打包与启动自举日志（0.6.17）
+
+### 14.1 CLI 从哪里进包
+
+`rime-sync-cli` 通过 Tauri 的 **sidecar** 机制随包分发：
+
+| 环节 | 约定 |
+|---|---|
+| 配置 | `src-tauri/tauri.conf.json` → `bundle.externalBin = ["../target/release/rime-sync-cli"]` |
+| 源文件名 | Tauri 会补 target triple 与扩展名，所以构建机必须准备 `target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe`（Linux：`…-x86_64-unknown-linux-gnu`） |
+| 构建 | Windows：`cargo build -p rime-sync-cli --release --locked --target x86_64-pc-windows-msvc`，再把 `target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe` 复制成上面的名字（release.yml 的 `build CLI sidecar for the bundle`） |
+| 安装位置 | `<安装目录>\rime-sync-cli.exe`（与 `rime-sync-app.exe` 同级）；便携 zip 里同名 |
+| Linux | deb 里是 `/usr/bin/rime-sync-cli`（既有 `bundle.linux.deb.files` 映射）；同一份 sidecar 也让 AppImage 带上 `$APPDIR/usr/bin/rime-sync-cli` |
+| 产物断言 | release.yml 的 `assert nsis setup carries CLI and prebuilt schemas` 用 `7z l` 列 setup.exe；`.github/scripts/verify-artifacts.sh` 对在线/离线包各断言一次 |
+
+本机只打安装包时的等价操作：
+
+```powershell
+cargo build -p rime-sync-cli --release --locked --target x86_64-pc-windows-msvc
+New-Item -ItemType Directory -Force -Path target/release | Out-Null
+Copy-Item target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe `
+  target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe -Force
+pnpm tauri build --bundles nsis
+```
+
+缺少 sidecar 时 `tauri build` 会直接失败（不会静默发一个不带 CLI 的包）。
+安装后可以直接跑：
+
+```powershell
+& "$env:ProgramFiles\rime-sync\rime-sync-cli.exe" fix-ime
+```
+
+### 14.2 启动自举日志与排查
+
+程序每次启动都会把预编译产物自举的每一步写到：
+
+```text
+%APPDATA%\com.rimesync.app\bootstrap.log
+```
+
+（目录不存在会自动创建；超过 1 MiB 轮转成 `bootstrap.log.1`。）
+
+格式（一行一步，失败也写）：
+
+```text
+[2026-11-06 07:12:33] bootstrap begin version=0.6.17 exe=C:\Program Files\rime-sync\rime-sync-app.exe RIMESYNC_PREBUILT=<unset>
+[2026-11-06 07:12:33] rime_dir=C:\Users\me\AppData\Roaming\Rime source=config
+[2026-11-06 07:12:33] probe_before=none
+[2026-11-06 07:12:33] payload hit path=C:\Program Files\rime-sync\resources\prebuilt source=exe:resources/prebuilt
+[2026-11-06 07:12:33] install start force=false
+[2026-11-06 07:12:34] install done copied=20 kept=0 overwritten=0 config_copied=2 config_kept=0 failed=0 probe_after=prebuilt build_ok=true escalated=false core_log=C:\Users\me\AppData\Roaming\Rime\.rimesync-prebuilt.log
+[2026-11-06 07:12:34] bootstrap end result=ok
+```
+
+排查顺序：
+
+1. **文件不存在**：程序没启动到 `setup`（或配置目录不可写，此时应用日志里有
+   `[bootstrap] 无法创建自举日志`）。先确认 `rime-sync-app.exe` 真的跑起来过；
+2. **有 `begin` 没有 `bootstrap end`**：进程在自举途中被关掉；重开一次再看；
+3. `probe_before=prebuilt` + `end result=skip reason=probe-prebuilt`：本机产物已可用，
+   不用兜底；
+4. `payload failed`：`error=` 里列出所有候选路径。安装版第一个候选就是
+   `<安装目录>\resources\prebuilt`，先看 `Test-Path`；
+5. `install done … build_ok=false` 或 `install failed`：看 `failed=` 计数与同一行的
+   `core_log=`（`<Rime 用户目录>\.rimesync-prebuilt.log` 有逐文件明细）；
+6. `probe_after=deploy`：旧部署产物没被覆盖（`escalated=true` 会再覆盖一次
+   `build/`）；仍不行就 `rime-sync-cli.exe fix-ime --force`。
+
+应用日志（设置页）里同时有 `[bootstrap] …` / `[fix-ime] …` 摘要行；
+安装器自己的日志仍是 `%TEMP%\rime-sync-setup.log`（两者互不替代）。
 

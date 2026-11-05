@@ -298,6 +298,26 @@ check_rime_components() { # $1=l2 解包目录 $2=caption 命中次数
   fi
 }
 
+# 0.6.17：CLI sidecar 与随包预编译产物必须真的在安装包里。
+# 只断言 tauri.conf.json 的 externalBin / resources 配置没有意义：配置对了产物也可能漏。
+check_windows_payload() { # $1=解包后的安装包根目录
+  local root=$1 cli
+  cli=$(find "$root" -type f -iname 'rime-sync-cli.exe' -print -quit 2>/dev/null)
+  if [ -n "$cli" ]; then
+    ok "setup.exe 带 rime-sync-cli.exe（安装后位于 <安装目录>\\rime-sync-cli.exe）"
+  else
+    bad "setup.exe 里没有 rime-sync-cli.exe：Windows 版缺 CLI，fix-ime 只能走 GUI"
+  fi
+
+  local schemas=()
+  mapfile -t schemas < <(find "$root" -type f -path '*/resources/prebuilt/*' -name '*.schema.yaml' 2>/dev/null | sort)
+  if [ "${#schemas[@]}" -gt 0 ]; then
+    ok "setup.exe 带 ${#schemas[@]} 个 resources/prebuilt/**/*.schema.yaml（部署兜底产物在包里）"
+  else
+    bad "setup.exe 里没有 resources/prebuilt/**/*.schema.yaml：0.6.15 起的预编译产物兜底没打进安装包"
+  fi
+}
+
 check_windows_setup() { # $1=setup.exe $2=workdir
   local setup=$1 work=$2
   say "[windows] $(basename "$setup")"
@@ -311,6 +331,8 @@ check_windows_setup() { # $1=setup.exe $2=workdir
     bad "7z 解不开 $(basename "$setup")（NSIS 安装包）"
     return
   fi
+
+  check_windows_payload "$work/l1"
 
   local inner
   inner=$(find "$work/l1" -type f -iname 'weasel-*-installer.exe' -print -quit 2>/dev/null)
@@ -376,6 +398,8 @@ check_windows_offline_setup() { # $1=离线 setup.exe $2=workdir
     bad "7z 解不开 $(basename "$setup")（离线 NSIS 安装包）"
     return
   fi
+
+  check_windows_payload "$work/l1"
 
   local wv weasel
   wv=$(find "$work/l1" -type f -iname 'MicrosoftEdgeWebView2RuntimeInstaller*.exe' -print -quit 2>/dev/null)
@@ -538,9 +562,15 @@ for path in sys.argv[1:]:
     open(path, 'wb').write(payload)
 PY
   (cd "$weasel_dir" && 7z a -bso0 -bsp0 "$base/good/weasel-0.17.4.0-installer.exe" WeaselServer.exe rime.dll Win32 >/dev/null 2>&1)
+  # 0.6.17：安装包里还必须真的有 CLI sidecar 与随包 prebuilt schema。
+  mkdir -p "$base/good/resources/prebuilt/build"
+  printf 'MZ mock rime-sync-cli' >"$base/good/rime-sync-cli.exe"
+  printf 'schema_list: []\n' >"$base/good/resources/prebuilt/build/luna_pinyin.schema.yaml"
   mkdir -p "$base/good/resources"
   mv "$base/good/weasel-0.17.4.0-installer.exe" "$base/good/resources/"
-  (cd "$base/good" && 7z a -bso0 -bsp0 "$base/good/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  (cd "$base/good" && 7z a -bso0 -bsp0 "$base/good/dist/rime-sync_0.0.0_x64-setup.exe" \
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
 
   SELFTEST_ARGS=(--strict-ime-bundle)
   expect_ok() { # $1=label $2=dir
@@ -608,7 +638,9 @@ import sys
 open(sys.argv[1], 'wb').write(b'MZ' + b'\0' * 64)
 PY
   (cd "$off" && 7z a -bso0 -bsp0 "$off/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
-    resources/weasel-0.17.4.0-installer.exe webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe >/dev/null 2>&1)
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml \
+    webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe >/dev/null 2>&1)
 
   expect_fail_with "缺离线包" "$base/good" "没有找到离线包" \
     --strict-ime-bundle --require-offline-setup --min-offline-mib 0
@@ -622,7 +654,8 @@ PY
   rm -rf "$offbad"
   cp -a "$base/good" "$offbad"
   (cd "$offbad" && 7z a -bso0 -bsp0 "$offbad/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
-    resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
   expect_fail_with "离线包缺 WebView2 载荷" "$offbad" "没有内嵌 MicrosoftEdgeWebView2RuntimeInstallerX64.exe" \
     --strict-ime-bundle --require-offline-setup --min-offline-mib 0
 
@@ -676,7 +709,9 @@ open(path, 'wb').write(data)
 PY
   (cd "$base/no-weasel-caption/weasel" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/resources/weasel-0.17.4.0-installer.exe" WeaselServer.exe >/dev/null 2>&1)
   rm -f "$base/no-weasel-caption/dist/"*-setup.exe
-  (cd "$base/no-weasel-caption" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  (cd "$base/no-weasel-caption" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/dist/rime-sync_0.0.0_x64-setup.exe" \
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
   expect_fail "Weasel 里没有「输入法自建同步」" "$base/no-weasel-caption" "搜不到 UTF-16LE"
 
   # 0.6.9：自编译 Weasel 带着没有插件的 rime.dll（= 又退回预编译包）必须红
@@ -690,8 +725,26 @@ for path in sys.argv[1:]:
 PY
   (cd "$base/no-rime-components/weasel" && 7z a -bso0 -bsp0 "$base/no-rime-components/resources/weasel-0.17.4.0-installer.exe" WeaselServer.exe rime.dll Win32 >/dev/null 2>&1)
   rm -f "$base/no-rime-components/dist/"*-setup.exe
-  (cd "$base/no-rime-components" && 7z a -bso0 -bsp0 "$base/no-rime-components/dist/rime-sync_0.0.0_x64-setup.exe" resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  (cd "$base/no-rime-components" && 7z a -bso0 -bsp0 "$base/no-rime-components/dist/rime-sync_0.0.0_x64-setup.exe" \
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
   expect_fail "rime.dll 没合并 rimesync-extra" "$base/no-rime-components" "rimesync_punct"
+
+  # 0.6.17：CLI sidecar / prebuilt 产物缺失必须红（证明新断言不是摆设）
+  mutate no-cli
+  rm -f "$base/no-cli/rime-sync-cli.exe"
+  rm -f "$base/no-cli/dist/"*-setup.exe
+  (cd "$base/no-cli" && 7z a -bso0 -bsp0 "$base/no-cli/dist/rime-sync_0.0.0_x64-setup.exe" \
+    resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+  expect_fail "setup.exe 缺 rime-sync-cli.exe" "$base/no-cli" "没有 rime-sync-cli.exe"
+
+  mutate no-prebuilt
+  rm -rf "$base/no-prebuilt/resources/prebuilt"
+  rm -f "$base/no-prebuilt/dist/"*-setup.exe
+  (cd "$base/no-prebuilt" && 7z a -bso0 -bsp0 "$base/no-prebuilt/dist/rime-sync_0.0.0_x64-setup.exe" \
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
+  expect_fail "setup.exe 缺 resources/prebuilt schema" "$base/no-prebuilt" "没有 resources/prebuilt"
 
   printf '\n自检失败 %d 项\n' "$failures"
   rm -rf "$base"
