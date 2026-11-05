@@ -361,6 +361,21 @@
             <p class="hint" id="schema-status"></p>
           </div>
 
+          <!-- 输入法产物自举（0.6.16）：安装器钩子不跑（/S 静默安装实测不执行）、
+               WeaselDeployer 返回 0 却不写 build 时，由程序自己把随包的预编译产物
+               铺进 Rime 用户目录。启动时也会自动跑一次，这里只是手动重试入口。 -->
+          <div class="card" id="fix-ime-card">
+            <div class="card-head">
+              <h3 data-i18n="fixIme.title">修复输入法</h3>
+              <div class="card-actions">
+                <button class="ghost small" id="btn-fix-ime-force" type="button" data-i18n="fixIme.force">强制覆盖</button>
+                <button class="small" id="btn-fix-ime" type="button" data-i18n="fixIme.run">修复输入法</button>
+              </div>
+            </div>
+            <p class="hint" data-i18n="fixIme.desc"></p>
+            <p class="hint" id="fix-ime-status" role="status"></p>
+          </div>
+
           <!-- 设备本地键：这些 patch 键只存本机、不上传（默认 schema_list），
                这样各设备能保留自己的默认方案，同时共享 page_size 这类键。 -->
           <div class="card" id="device-local-card">

@@ -14,6 +14,7 @@ use rime_sync_core::log;
 use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::plan;
 use rime_sync_core::platform;
+use rime_sync_core::prebuilt;
 use rime_sync_core::presets::Preset;
 use rime_sync_core::retry::RetryState;
 use rime_sync_core::rime_dir;
@@ -97,6 +98,16 @@ enum Command {
         /// 只显示最近 N 条
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// 铺入随包的预编译 build 产物（安装器钩子没跑 / WeaselDeployer 不产出时的兜底）
+    #[command(name = "fix-ime")]
+    FixIme {
+        /// 覆盖已存在的 build/ 文件（config/*.yaml 永不覆盖）
+        #[arg(long)]
+        force: bool,
+        /// 预编译产物目录；缺省按 exe / AppImage / deb 路径自动定位
+        #[arg(long, value_name = "DIR")]
+        payload: Option<PathBuf>,
     },
 }
 
@@ -215,6 +226,18 @@ struct RollbackReport {
 #[derive(Debug)]
 struct ProbeFailed;
 
+/// fix-ime 铺完仍不可用：报告已经打印过，main 只负责退出码。
+#[derive(Debug)]
+struct FixImeFailed;
+
+impl std::fmt::Display for FixImeFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("prebuilt build is not usable")
+    }
+}
+
+impl std::error::Error for FixImeFailed {}
+
 impl std::fmt::Display for ProbeFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("write probe failed")
@@ -227,7 +250,9 @@ fn main() {
     let cli = Cli::parse();
     let wants_json = cli.json;
     if let Err(error) = run(cli) {
-        if error.downcast_ref::<ProbeFailed>().is_some() {
+        if error.downcast_ref::<ProbeFailed>().is_some()
+            || error.downcast_ref::<FixImeFailed>().is_some()
+        {
             std::process::exit(1);
         }
         if wants_json {
@@ -595,6 +620,52 @@ fn run(cli: Cli) -> Result<()> {
                 Err(anyhow::Error::new(ProbeFailed))
             }
         }
+        Command::FixIme { force, payload } => {
+            let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let location = match payload {
+                Some(dir) => prebuilt::PayloadLocation {
+                    path: dir,
+                    source: "argument:--payload".to_string(),
+                },
+                None => prebuilt::resolve_payload(exe_dir().as_deref())?,
+            };
+            let report = prebuilt::install_prebuilt_with(
+                &location.path,
+                &rime_dir,
+                prebuilt::InstallOptions { force },
+            )?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("rime_dir={}", rime_dir.display());
+                println!(
+                    "payload={} source={}",
+                    location.path.display(),
+                    location.source
+                );
+                println!(
+                    "copied={} kept={} overwritten={} config_copied={} failed={} escalated={}",
+                    report.copied,
+                    report.kept,
+                    report.overwritten,
+                    report.config_copied,
+                    report.failed,
+                    report.escalated
+                );
+                println!(
+                    "build_ok={} probe_after={}",
+                    report.build_ok, report.probe_after
+                );
+                if let Some(log) = &report.log_path {
+                    println!("log={log}");
+                }
+            }
+            if report.build_ok {
+                Ok(())
+            } else {
+                Err(anyhow::Error::new(FixImeFailed))
+            }
+        }
         Command::History { limit } => {
             let entries = history::read(&state_dir(&config_path).join("history.jsonl"), limit)?;
             if cli.json {
@@ -755,6 +826,13 @@ fn dav_client(config: &Config) -> Result<DavClient> {
             config.proxy.describe()
         )
     })
+}
+
+/// 当前可执行文件所在目录：安装器把预编译产物放在它下面的 resources/prebuilt。
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 fn resolve_rime_dir(explicit: Option<&Path>, config: &Config) -> Result<PathBuf> {

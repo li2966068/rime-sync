@@ -31,6 +31,7 @@ mod dedupe_cmds;
 mod device_cmds;
 mod diagnostics;
 mod platform_prefs;
+mod prebuilt_cmds;
 mod preset_cmds;
 mod remote_tree;
 mod schema_cmds;
@@ -974,6 +975,10 @@ pub fn run() {
                 push_log(&state.0, "检测到 --setup：强制进入同步设置向导");
                 eprintln!("[rime-sync] setup wizard: --setup detected; forcing sync setup dialog");
             }
+            // 0.6.16：预编译产物自举。安装器钩子没跑（/S 静默安装实测不执行）、
+            // WeaselDeployer 返回 0 却不写 build 时，由程序自己把随包产物铺进用户目录。
+            // 后台线程 + 失败只记日志：绝不阻塞启动。
+            prebuilt_cmds::bootstrap(&handle);
             // 托盘在 headless / 缺 appindicator 时会创建失败：只降级记日志，不 panic。
             match tray::setup(&handle) {
                 Ok(()) => push_log(&state.0, "托盘已就绪（关闭窗口默认隐藏到托盘）"),
@@ -1035,6 +1040,7 @@ pub fn run() {
             cmd_pick_folder,
             cmd_secret_status,
             cmd_first_transport,
+            prebuilt_cmds::cmd_fix_ime,
             conflict_cmds::cmd_list_conflicts,
             conflict_cmds::cmd_resolve_conflict,
             conflict_cmds::cmd_conflict_remote_sizes,

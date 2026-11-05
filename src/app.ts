@@ -25,6 +25,7 @@ import { applyAppVersion, renderUpdate, checkUpdate, installUpdate } from "./ui/
 import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui/watch";
 import { loadPresets, applyPresetTo } from "./ui/presets";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
+import { runFixIme } from "./ui/fix_ime";
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
 import { addDeviceLocalKey, removeDeviceLocalKey } from "./ui/device_keys";
 import { refreshLanguageDependent } from "./ui/language";
@@ -129,6 +130,12 @@ export function bindEvents(): void {
   });
   el.schemaSave.addEventListener("click", () => {
     void saveSchemas();
+  });
+  el.fixIme.addEventListener("click", () => {
+    void runFixIme(false);
+  });
+  el.fixImeForce.addEventListener("click", () => {
+    void runFixIme(true);
   });
   el.schemaList.addEventListener("change", (event) => {
     const input = event.target as HTMLInputElement;

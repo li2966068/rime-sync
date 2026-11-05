@@ -17,6 +17,7 @@ pub mod merge3;
 pub mod network;
 pub mod plan;
 pub mod platform;
+pub mod prebuilt;
 pub mod presets;
 pub mod process;
 pub mod profile;
@@ -40,6 +41,11 @@ pub use lock::{acquire as acquire_lock, inspect as inspect_lock, LockGuard, Lock
 pub use log::{LogWriter, RotatingLog, DEFAULT_KEEP, DEFAULT_MAX_BYTES};
 pub use network::{NetworkPolicy, NetworkProbe, NetworkState};
 pub use platform::RimeTrigger;
+pub use prebuilt::{
+    install_prebuilt, install_prebuilt_with, probe_build, resolve_payload, BuildProbe,
+    InstallOptions, PayloadLocation, PrebuiltReport, ENV_MODE, ENV_PAYLOAD_DIR, MARKERS,
+    PROBE_FILE,
+};
 pub use presets::Preset;
 pub use proxy::{ProxyConfig, ProxyKind, ProxySpec, PROXY_PASSWORD_ACCOUNT};
 pub use retry::RetryState;

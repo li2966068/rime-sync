@@ -955,3 +955,20 @@ scripts/ime/gen-prebuilt-build.py --check
 > 官方 Weasel 0.17.4 带的是 librime 1.13.1，理论上同一格式可直接加载，但**没有在
 > 1.13.1 的运行时上实测过**——真机验收时请确认「装完直接能打字」。
 
+### 13.6 程序自举兜底（0.6.16）
+
+0.6.15 的实测还发现：`/S` 静默安装时 NSIS 钩子**根本没执行**（`%TEMP%\rime-sync-setup.log`
+里连 `phase=DONE` 都没有），所以「安装器负责铺产物」这条路本身不可靠。0.6.16 起把同样的
+逻辑搬进程序：**安装器钩子不跑时由程序自举兜底**。
+
+* 应用启动（tauri `setup`）后在后台线程 `probe_build`：`none` / `deploy`（有文件但没
+  插件标记）→ `install_prebuilt` 铺一遍；`prebuilt` 直接跳过。失败只写应用日志
+  （`[bootstrap] …`），不弹窗、不阻塞启动；
+* 设置页「修复输入法 / 强制覆盖」= `cmd_fix_ime`，与启动自举同一套
+  `crates/core/src/prebuilt.rs`；
+* CLI：`rime-sync-cli fix-ime [--force] [--json] [--payload <DIR>]`；
+* 判据与铺入规则（缺才铺 / build 第二次机会 / config 永不覆盖）与安装器完全一致；
+* 日志：应用日志 + `<Rime 用户目录>\.rimesync-prebuilt.log`。
+
+详见 `docs/PREBUILT-BOOTSTRAP.md`。
+

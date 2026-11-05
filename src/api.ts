@@ -459,6 +459,31 @@ export interface SetSchemasResult {
   deploy_error: string | null;
 }
 
+/// build/ 产物状态：none = 没有判据文件；deploy = 有文件但没插件标记（官方部署）；
+/// prebuilt = 含 rimesync_vnum / rimesync_punct，可用。
+export type BuildProbe = "none" | "deploy" | "prebuilt";
+
+/// 预编译产物自举报告（cmd_fix_ime）。
+/// copied / kept / overwritten 只统计 build/；config_* 是 Rime 用户目录根下的 *.yaml。
+export interface FixImeReport {
+  rime_dir: string;
+  payload: string;
+  payload_source: string;
+  probe_before: BuildProbe;
+  probe_after: BuildProbe;
+  copied: number;
+  kept: number;
+  overwritten: number;
+  config_copied: number;
+  config_kept: number;
+  failed: number;
+  source: string;
+  build_ok: boolean;
+  escalated: boolean;
+  log_path: string | null;
+  message: string;
+}
+
 export const api = {
   getConfig: () => invoke<Config>("cmd_get_config"),
   setConfig: (config: Config) => invoke<Config>("cmd_set_config", { config }),
@@ -513,6 +538,8 @@ export const api = {
 
   listSchemas: () => invoke<SchemaEntry[]>("cmd_list_schemas"),
   setSchemas: (ids: string[]) => invoke<SetSchemasResult>("cmd_set_schemas", { ids }),
+  // 输入法产物自举：force = 覆盖已有 build/（config/*.yaml 永不覆盖）。
+  fixIme: (force = false) => invoke<FixImeReport>("cmd_fix_ime", { force }),
 
   pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
 
