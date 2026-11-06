@@ -1,26 +1,16 @@
-# rime-sync 随包默认：每页 8 个候选词 + 随包方案（拼音/五笔/仓颉/笔画/地球拼音/注音）。
+# rime-sync 随包默认：每页 8 个候选词 + 随包 3 个方案（朙月拼音·简化字 / 五笔拼音 / 五笔86）。
 # 安装器只在用户 Rime 目录里没有同名文件时写入，绝不覆盖用户已有配置。
+# 保留清单的单一真相源是 packaging/rime/retained-schemas.txt；这里的顺序必须与它
+# 逐项一致（gen-schema-custom.py --check 会断言）。其余方案在安装/自举期由
+# rime-sync-cli prune-schemas 清理（RIMESYNC_PRUNE_SCHEMAS=0 可关闭）。
 # 这里的方案必须都在 /usr/share/rime-data（Windows: data\）里随包提供，
 # 否则 librime 部署会因缺失 schema 失败（见 scripts/ime 的 schema_list 守卫）。
 patch:
   "menu/page_size": 8
   schema_list:
-    - {schema: luna_pinyin}
     - {schema: luna_pinyin_simp}
-    - {schema: luna_pinyin_fluency}
-    - {schema: luna_pinyin_tw}
-    - {schema: luna_quanpin}
-    - {schema: wubi86}
     - {schema: wubi_pinyin}
-    - {schema: wubi_trad}
-    - {schema: cangjie5}
-    - {schema: cangjie5_express}
-    - {schema: stroke}
-    - {schema: terra_pinyin}
-    - {schema: terra_pinyin_12345}
-    - {schema: bopomofo}
-    - {schema: bopomofo_tw}
-    - {schema: bopomofo_express}
+    - {schema: wubi86}
 
   # 中文标点直出主字符表（参考用，不生效 —— 不要直接改成 punctuator/half_shape）。
   # librime 读的 punctuator 是**方案**配置；6 个随包方案写的是

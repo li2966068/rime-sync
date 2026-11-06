@@ -138,7 +138,8 @@ rimesync:
     "}": "』"
     "~": "～"
 schema_list:
-  - schema: luna_pinyin
+  - schema: luna_pinyin_simp
+  - schema: wubi_pinyin
   - schema: wubi86
 selector:
   bindings:

@@ -54,7 +54,7 @@
 ;   3) 配置播种在 SetShellVarContext current 下解析真实用户目录（%APPDATA%\Rime），
 ;      不再写进 C:\ProgramData\Rime。
 ;   4) POSTINSTALL 末尾自检 phase=SELF-CHECK：就绪与否 / 配置目录与数量 /
-;      调一次 WeaselDeployer.exe /deploy / build\luna_pinyin.schema.yaml 是否生成或更新。
+;      调一次 WeaselDeployer.exe /deploy / build\luna_pinyin_simp.schema.yaml 是否生成或更新。
 ; （静默安装看不到 DetailPrint，这两个文件是唯一可复核的证据；前者卸载时删除）
 ;
 ; WebView2（0.6.5）：tauri.conf.json 的 webviewInstallMode 已改为 skip。
@@ -227,7 +227,7 @@
   Var /GLOBAL RimeSyncBuildLoBefore     ; 部署前 FILETIME 低 32 位
   ; 0.6.15：预编译 build 产物兜底（某些机器上 WeaselDeployer /deploy 返回 0 但什么都不写）
   Var /GLOBAL RimeSyncBuildSource        ; deploy / prebuilt / none
-  Var /GLOBAL RimeSyncBuildProbe         ; yes = build\luna_pinyin.schema.yaml 存在且含插件标记
+  Var /GLOBAL RimeSyncBuildProbe         ; yes = build\luna_pinyin_simp.schema.yaml 存在且含插件标记
   Var /GLOBAL RimeSyncPrebuiltMode       ; auto / force / off（RIMESYNC_PREBUILT 环境变量）
   Var /GLOBAL RimeSyncPrebuiltState      ; ok / failed / payload-missing / skipped / none
   Var /GLOBAL RimeSyncPrebuiltCopied     ; 本次新铺的文件数
@@ -235,6 +235,8 @@
   Var /GLOBAL RimeSyncPrebuiltEffMode    ; 当前这一遍用的模式（auto / force）
   Var /GLOBAL RimeSyncPrebuiltRecopy     ; 1 = 第一遍铺完仍不可用，只对 build/ 覆盖重铺过
   Var /GLOBAL RimeSyncContains           ; RimeSyncFileContains 的结果：yes / no
+  ; 0.6.21：非保留方案清理（实现只有 rime-sync-cli prune-schemas 一份）
+  Var /GLOBAL RimeSyncPruneState         ; ok / failed / no-cli / skipped
 !endif
 
 ; 构建期由 scripts/ime/build-weasel.ps1 放到 packaging/windows/vendor/。
@@ -1352,7 +1354,7 @@ Function RimeSyncRunWeaselInstaller
 FunctionEnd
 
 ; ---------------------------------------------------------------------------
-; 0.6.13：读文件时间（自检判断 build\luna_pinyin.schema.yaml 是「更新」还是「没动」）
+; 0.6.13：读文件时间（自检判断 build\luna_pinyin_simp.schema.yaml 是「更新」还是「没动」）
 ; 入参：$R9 = 文件路径
 ; 出参：$RimeSyncFileExists = 1/0；$RimeSyncFileHi / Lo = FILETIME 高/低 32 位（十进制）
 ;       读不到就留空，调用方按「判不出来」处理（只告警，绝不据此中止安装）。
@@ -1432,7 +1434,7 @@ FunctionEnd
 ; 产物随安装包带过来，安装时直接铺进用户目录。
 ;
 ; 判据（与 Windows 安装器 / Linux postinst 完全一致）：
-;   <用户目录>\Rime\build\luna_pinyin.schema.yaml 存在，且文件里同时出现
+;   <用户目录>\Rime\build\luna_pinyin_simp.schema.yaml 存在，且文件里同时出现
 ;   rimesync_vnum 与 rimesync_punct（这是随包 *.custom.yaml 才有的插件标记；
 ;   官方部署出来的没有，所以「有文件」不等于「是我们这套」）。
 ;
@@ -1478,7 +1480,7 @@ Function RimeSyncProbeBuild
 
   StrCpy $RimeSyncBuildProbe "no"
   StrCmp $9 "" rimesync_pb_done
-  StrCpy $R9 "$9\build\luna_pinyin.schema.yaml"
+  StrCpy $R9 "$9\build\luna_pinyin_simp.schema.yaml"
   StrCpy $R8 "rimesync_vnum"
   Call RimeSyncFileContains
   StrCmp $RimeSyncContains "yes" 0 rimesync_pb_done
@@ -1673,9 +1675,9 @@ Function RimeSyncEnsurePrebuiltBuild
     StrCpy $RimeSyncBuildSource "none"
     IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
     Call RimeSyncStamp
-    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT failed reason=probe-after-copy copied=$RimeSyncPrebuiltCopied kept=$RimeSyncPrebuiltKept escalated=$RimeSyncPrebuiltRecopy file=$5\build\luna_pinyin.schema.yaml"
+    StrCpy $R3 "[rime-sync] $R2 phase=PREBUILT failed reason=probe-after-copy copied=$RimeSyncPrebuiltCopied kept=$RimeSyncPrebuiltKept escalated=$RimeSyncPrebuiltRecopy file=$5\build\luna_pinyin_simp.schema.yaml"
     Call RimeSyncLog
-    DetailPrint "[rime-sync] 错误：预编译产物铺完仍没有可用的 build\luna_pinyin.schema.yaml（只告警，不中止安装）"
+    DetailPrint "[rime-sync] 错误：预编译产物铺完仍没有可用的 build\luna_pinyin_simp.schema.yaml（只告警，不中止安装）"
     IfSilent rimesync_epb_end
       MessageBox MB_OK|MB_ICONEXCLAMATION "rime-sync 安装完成，但输入法数据没能铺好：本机部署没有生成 build 产物，随包的预编译产物复查也没通过。$\r$\n$\r$\n请把日志 $TEMP\rime-sync-setup.log 里的 phase=PREBUILT 行发给维护者。$\r$\n用户数据（%APPDATA%\Rime）不受影响。"
     Goto rimesync_epb_end
@@ -1703,7 +1705,7 @@ FunctionEnd
 ;        SetErrorLevel 5（安装标记为失败）；这里仍然不 Abort（程序已经装好）
 ;   4) 报配置目标目录与写入数量（new / reuse）
 ;   5) 调一次 WeaselDeployer.exe /deploy（最多等 ${RIMESYNC_DEPLOY_TIMEOUT_MS}），
-;      再检查 <用户目录>\Rime\build\luna_pinyin.schema.yaml 是否生成/更新
+;      再检查 <用户目录>\Rime\build\luna_pinyin_simp.schema.yaml 是否生成/更新
 ;   日志关键字（验收用）：phase=SELF-CHECK / weasel-ready= / install-dir= / default-exe=
 ;   / deploy= / build=
 ; ---------------------------------------------------------------------------
@@ -1771,7 +1773,7 @@ Function RimeSyncSelfCheck
   rimesync_sc_have_dir:
 
   ; 部署前先记一次 build 文件时间（判断「更新」而不只是「存在」）
-  StrCpy $R9 "$0\build\luna_pinyin.schema.yaml"
+  StrCpy $R9 "$0\build\luna_pinyin_simp.schema.yaml"
   Call RimeSyncFileTimeGet
   StrCpy $RimeSyncBuildExistsBefore "$RimeSyncFileExists"
   StrCpy $RimeSyncBuildHiBefore "$RimeSyncFileHi"
@@ -1798,7 +1800,7 @@ Function RimeSyncSelfCheck
 
   ; 部署后再读一次：不存在 → missing；部署前不存在 → generated；
   ; 高 32 位变化或低 32 位前进 → updated；没动 → stale
-  StrCpy $R9 "$0\build\luna_pinyin.schema.yaml"
+  StrCpy $R9 "$0\build\luna_pinyin_simp.schema.yaml"
   Call RimeSyncFileTimeGet
   StrCmp $RimeSyncFileExists "1" rimesync_sc_build_present
     StrCpy $RimeSyncBuildState "missing"
@@ -1830,8 +1832,8 @@ Function RimeSyncSelfCheck
   StrCmp $RimeSyncBuildState "updated" rimesync_sc_build_ok
   StrCmp $RimeSyncBuildState "generated" rimesync_sc_build_ok
     IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1
-    DetailPrint "[rime-sync] 警告：部署后 build\luna_pinyin.schema.yaml 没有生成/更新（$RimeSyncBuildState），只告警不中止"
-    StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK warning=build-not-updated state=$RimeSyncBuildState file=$0\build\luna_pinyin.schema.yaml"
+    DetailPrint "[rime-sync] 警告：部署后 build\luna_pinyin_simp.schema.yaml 没有生成/更新（$RimeSyncBuildState），只告警不中止"
+    StrCpy $R3 "[rime-sync] $R2 phase=SELF-CHECK warning=build-not-updated state=$RimeSyncBuildState file=$0\build\luna_pinyin_simp.schema.yaml"
     Call RimeSyncLog
   rimesync_sc_build_ok:
 
@@ -1868,7 +1870,7 @@ Function RimeSyncSelfCheck
   StrCmp $RimeSyncWeaselReady "1" rimesync_sc_msg_ready
     StrCpy $3 "输入法（小狼毫）：未就绪（原因 $RimeSyncWeaselReadyReason），请查看日志"
   rimesync_sc_msg_ready:
-  StrCpy $4 "部署：exit=$RimeSyncDeployExit；build\luna_pinyin.schema.yaml：$RimeSyncBuildState"
+  StrCpy $4 "部署：exit=$RimeSyncDeployExit；build\luna_pinyin_simp.schema.yaml：$RimeSyncBuildState"
   StrCmp $RimeSyncSelfCheckWarn "0" rimesync_sc_msg_ok
     StrCpy $4 "$4（告警 $RimeSyncSelfCheckWarn 条）"
   rimesync_sc_msg_ok:
@@ -2061,8 +2063,13 @@ Function RimeSyncInstallWeaselPre
     StrCpy $R0 "$PLUGINSDIR\rime-sync-weasel\${RIMESYNC_WEASEL_INSTALLER}"
     SetOutPath "$INSTDIR"
   !else
-    ; 兜底：旧布局（resources 里带安装包）只在 POSTINSTALL 之后才存在，
+    ; 兜底：0.6.20 起安装包把安装器放在 resources\weasel\（Tauri resources），
+    ; 旧布局 resources\<安装器> 也认。两者都只在 POSTINSTALL 之后才存在，
     ; 但这里仍检查一次，便于“自定义模板先解压 resources”的场景。
+    IfFileExists "$INSTDIR\resources\weasel\${RIMESYNC_WEASEL_INSTALLER}" 0 rimesync_pre_legacy
+      StrCpy $R0 "$INSTDIR\resources\weasel\${RIMESYNC_WEASEL_INSTALLER}"
+      Goto rimesync_pre_checked
+    rimesync_pre_legacy:
     IfFileExists "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}" 0 rimesync_pre_checked
       StrCpy $R0 "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}"
     rimesync_pre_checked:
@@ -2487,6 +2494,47 @@ FunctionEnd
   Call RimeSyncInstallWeaselPre
 !macroend
 
+; ---------------------------------------------------------------------------
+; 0.6.21：把非保留方案从 data / 用户目录 / build 里清掉（幂等、可回滚）
+;   * 随包只保留 3 个方案（朙月拼音·简化字 / 五笔拼音 / 五笔86），清单的单一来源是
+;     packaging/rime/retained-schemas.txt —— 它编译进 rime-sync-cli，钩子不另抄一份；
+;   * 删除前由 CLI 同目录备份为 <原文件名>.rimesync-removed-<时间戳>；
+;   * RIMESYNC_PRUNE_SCHEMAS=0 由 CLI 自己识别；
+;   * 失败只记日志，绝不 Abort（清理失败不该让已经装好的输入法回滚）。
+Function RimeSyncPruneSchemas
+  Push $0
+  Push $1
+
+  StrCpy $RimeSyncPruneState "skipped"
+  IfFileExists "$INSTDIR\rime-sync-cli.exe" 0 rimesync_prune_no_cli
+
+  StrCpy $RimeSyncPruneState "running"
+  ; 用户目录用播种阶段解析出来的真实路径（提权后 %APPDATA% 未必还是当前用户）；
+  ; 为空时交给 CLI 自己按平台探测。
+  StrCpy $1 ""
+  StrCmp $RimeSyncRimeUserDir "" rimesync_prune_cmd
+    StrCpy $1 '--user-dir "$RimeSyncRimeUserDir"'
+  rimesync_prune_cmd:
+  nsExec::ExecToStack /TIMEOUT=120000 '"$INSTDIR\rime-sync-cli.exe" prune-schemas $1'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" 0 rimesync_prune_failed
+    StrCpy $RimeSyncPruneState "ok"
+    Goto rimesync_prune_log
+  rimesync_prune_failed:
+    StrCpy $RimeSyncPruneState "failed exit=$0"
+    Goto rimesync_prune_log
+  rimesync_prune_no_cli:
+    StrCpy $RimeSyncPruneState "no-cli"
+  rimesync_prune_log:
+  Call RimeSyncStamp
+  StrCpy $R3 "[rime-sync] $R2 phase=PRUNE state=$RimeSyncPruneState"
+  Call RimeSyncLog
+  DetailPrint "[rime-sync] [$R2] 阶段=PRUNE 非保留方案清理：$RimeSyncPruneState"
+  Pop $1
+  Pop $0
+FunctionEnd
+
 !macro NSIS_HOOK_POSTINSTALL
   ; 宏在安装段插入时才展开，此时 Tauri 已定义 MAINBINARYNAME / PRODUCTNAME / PRODUCTVERSION
   StrCpy $R6 "$INSTDIR\${MAINBINARYNAME}.exe"
@@ -2514,6 +2562,9 @@ FunctionEnd
   Call RimeSyncCreateWeaselShortcut
   ; 3) 推荐输入法配置：缺失才补，写进真实用户目录（见 RimeSyncSeedRimeConfig）
   Call RimeSyncSeedRimeConfig
+  ; 3b) 0.6.21：清掉非保留方案（datadefault.yaml 的 schema_list 也在里面裁）。
+  ;     必须在 SELF-CHECK 的部署之前：否则部署会按残留的 16 个方案重建 build。
+  Call RimeSyncPruneSchemas
   ; 4) 安装结束自检：就绪 / 注册表 InstallDir / 默认布局 WeaselServer.exe 是硬性检查
   ;    （0.6.14 起任一不满足 = 安装失败：weasel-ready=no + 弹框 + 退出码 5，但绝不 Abort）；
   ;    另外报配置目录与数量 / 调一次部署 / build 产物是否更新
@@ -2541,7 +2592,7 @@ FunctionEnd
   StrCmp $RimeSyncWeaselSelfCheckFail "1" rimesync_post_failed
   Call RimeSyncStamp
   DetailPrint "[rime-sync] [$R2] 阶段=DONE 安装完成；配置：新写入 $RimeSyncSeedWritten 个，沿用已有 $RimeSyncSeedReused 个；日志：$TEMP\rime-sync-setup.log"
-  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe deploy=$RimeSyncDeployExit build=$RimeSyncBuildState build-source=$RimeSyncBuildSource warnings=$RimeSyncSelfCheckWarn"
+  StrCpy $R3 "[rime-sync] $R2 phase=DONE setup finished configs=$RimeSyncSeedWritten backups=$RimeSyncSeedBackups weasel-kept=$RimeSyncWeaselKept weasel-ready=$RimeSyncWeaselReady install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe deploy=$RimeSyncDeployExit build=$RimeSyncBuildState build-source=$RimeSyncBuildSource prune=$RimeSyncPruneState warnings=$RimeSyncSelfCheckWarn"
   Call RimeSyncLog
   Goto rimesync_post_done
   rimesync_post_failed:
@@ -2582,6 +2633,9 @@ FunctionEnd
 
   ; 0.6.15：预编译 build 产物是安装包带进来的，卸载时一并清掉（用户目录里的那份不动）
   RMDir /r "$INSTDIR\resources\prebuilt"
+
+  ; 0.6.20：随包输入法安装器（resources\weasel\，程序自己修复输入法时要用）
+  RMDir /r "$INSTDIR\resources\weasel"
 
   ; 旧版内嵌的小狼毫安装包与许可证文本（Tauri 也会清理 resources，这里显式兜底）
   Delete "$INSTDIR\\resources\${RIMESYNC_WEASEL_INSTALLER}"

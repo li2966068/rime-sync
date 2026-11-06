@@ -8,14 +8,19 @@
 手动起 WeaselServer 也一样。这种机器上「本机部署」永远不生效，安装器只能把
 别处已经部署好的 build/ 产物直接铺进用户目录。
 
-产物内容（默认两套方案）
-------------------------
-  build/    luna_pinyin / wubi86 的 *.schema.yaml + *.prism.bin + *.table.bin
-            + *.reverse.bin，以及它们 schema 里 dependencies 声明所必需的
-            依赖方案产物（luna_pinyin -> stroke，wubi86 -> pinyin_simp）；
+产物内容（3 个保留方案 + 自动解析的依赖）
+-----------------------------------------
+  build/    保留方案（packaging/rime/retained-schemas.txt：luna_pinyin_simp /
+            wubi_pinyin / wubi86）的 *.schema.yaml + *.prism.bin + *.table.bin
+            + *.reverse.bin，以及 schema 里 dependencies 声明所必需的依赖方案
+            产物（自动递归解析，当前为 luna_pinyin / pinyin_simp / stroke）；
             另加部署器写出的 build/default.yaml。
-  config/   生成这套产物时用的 default.custom.yaml（schema_list 已裁剪到
-            产物里的方案）+ 各方案的 <schema>.custom.yaml。
+  config/   生成这套产物时用的 default.custom.yaml（schema_list 已裁剪到保留
+            方案）+ 各保留方案的 <schema>.custom.yaml。
+
+依赖闭包只有一份实现（scripts/ime/rime_common.py），deb 打包
+（scripts/ime/gen-rime-data.py）用的是同一个函数——预编译生成成功就证明安装包
+里那份 data 集合是自足的。
   MANIFEST.json   文件清单（大小 / sha256）+ 方案表 + 体积 + 生成器版本。
 
 用法
@@ -42,9 +47,12 @@ import tempfile
 import time
 from pathlib import Path
 
+import rime_common
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = REPO_ROOT / "packaging" / "rime" / "prebuilt"
-DEFAULT_SCHEMAS = ("luna_pinyin", "wubi86")
+# 单一真相源：packaging/rime/retained-schemas.txt（Rust 侧 include_str! 同一份）。
+DEFAULT_SCHEMAS = tuple(rime_common.retained_schemas())
 DEFAULT_BUDGET_MB = 60.0
 DEFAULT_IMAGE = "rime-ime-builder:debian_13"
 
@@ -56,6 +64,17 @@ STAGING_ROOT = REPO_ROOT / "build" / "ime-staging"
 # 2021-01-01T00:00:00Z：把输入文件的 mtime 钉死，重复生成得到逐字节相同的产物
 # （__build_info.timestamps 记的就是源文件 mtime，不钉死每次都不一样）。
 FIXED_MTIME = 1609459200
+
+# 这层必须自带 .gitignore：仓库根的 `build/` 会把预编译产物整个吞掉，而产物必须入库。
+# 以前它是手工维护的文件，生成器 rmtree(out_dir) 时会连它一起删掉（--check 也发现不了），
+# 0.6.21 起由生成器自己写、--check 自己断言。
+GITIGNORE = """# 仓库根的 .gitignore 有 `build/`（匹配任意层级的 build 目录，用于忽略构建产物），
+# 它会把这里的预编译产物目录一起吞掉。这份产物**必须入库**（随安装包分发，
+# 见 scripts/ime/gen-prebuilt-build.py），所以在这一层显式反选。
+#
+# 反选的是目录本身；只要目录被重新纳入，里面的文件就不再受根的 build/ 规则影响。
+!build/
+"""
 
 # 装到用户目录后必须能在 build/*.schema.yaml 里找到的插件标记（0.6.15 的验收点）。
 MARKERS = ("rimesync_vnum", "rimesync_punct")
@@ -127,19 +146,21 @@ def guess_libdir(deployer: Path) -> Path | None:
 
 
 def prepare_shared(dest: Path) -> int:
-    """把 third_party/rime-data/*/ 的 *.yaml / *.txt 平铺进共享数据目录。"""
+    """把保留方案（含依赖闭包）需要的 *.yaml / *.txt 平铺进共享数据目录。
+
+    与 deb 打包（scripts/ime/gen-rime-data.py）共用 rime_common 的闭包实现；
+    default.yaml 的 schema_list 同步裁剪到保留清单——部署器把缺失 schema 当失败，
+    上游那份 16 方案的清单不能原样带进来。
+    """
     if not RIME_DATA_DIR.is_dir():
         die(f"缺少 {RIME_DATA_DIR}（随包的 rime 数据）")
-    dest.mkdir(parents=True, exist_ok=True)
-    count = 0
-    for recipe in sorted(p for p in RIME_DATA_DIR.iterdir() if p.is_dir()):
-        for f in sorted(recipe.iterdir()):
-            if f.is_file() and f.suffix in (".yaml", ".txt"):
-                shutil.copyfile(f, dest / f.name)
-                count += 1
-    if count == 0:
-        die(f"{RIME_DATA_DIR} 里没有 *.yaml/*.txt")
-    return count
+    try:
+        files = rime_common.install_data(dest, list(DEFAULT_SCHEMAS), RIME_DATA_DIR)
+    except SystemExit as exc:
+        die(str(exc))
+    if not files:
+        die(f"{RIME_DATA_DIR} 里没有保留方案需要的数据")
+    return len(files)
 
 
 def reduced_default_custom(schemas: tuple[str, ...]) -> str:
@@ -308,15 +329,28 @@ def generate(args: argparse.Namespace) -> int:
             log(f"产物：{len(products)} 个文件，{human(total)}")
             if total <= budget:
                 break
-            if len(attempt) > 1:
-                log(f"!! {human(total)} 超过预算 {human(budget)}：只带 {attempt[0]}")
-                attempt = attempt[:1]
-                continue
-            die(f"{human(total)} 超过预算 {human(budget)}，单套方案也放不下")
+            # 保留清单是发布契约：不许为了过预算偷偷砍掉清单里的方案。
+            die(f"{human(total)} 超过预算 {human(budget)}：提高 --budget-mb，"
+                "或先评估是否真的需要这么多方案（清单在 packaging/rime/retained-schemas.txt）")
 
-        missing = [s for s in attempt if not (build_dir / f"{s}.schema.yaml").is_file()]
+        # 产物 = 保留方案 + dependencies 闭包（部署器会为依赖方案也产出 build 文件）；
+        # 多一个都算错——预编译包必须只剩保留清单与它的依赖。
+        closure = rime_common.dependencies_closure(list(attempt))
+        # 部署器只为保留方案 + 它们**直接**声明的依赖产出 build 文件（深层依赖
+        # 只保证源码在 shared 里，供 __include/资源加载），所以这里断言到直接依赖层。
+        direct = rime_common.direct_dependencies(list(attempt))
+        missing = [s for s in list(attempt) + direct
+                   if not (build_dir / f"{s}.schema.yaml").is_file()]
         if missing:
-            die(f"缺少方案产物：{missing}")
+            die(f"缺少方案产物：{missing}（保留 {list(attempt)}，直接依赖 {direct}）")
+        extra = sorted(
+            name[: -len(".schema.yaml")]
+            for name in os.listdir(build_dir)
+            if name.endswith(".schema.yaml")
+            and name[: -len(".schema.yaml")] not in closure
+        )
+        if extra:
+            die(f"产物里有多余方案：{extra}（只允许 {closure}）")
         markers = probe_markers(build_dir)
         for schema in attempt:
             name = f"{schema}.schema.yaml"
@@ -464,6 +498,7 @@ def write_payload(out_dir: Path, build_dir: Path, user_src: Path, schemas: list[
         shutil.rmtree(out_dir)
     (out_dir / "build").mkdir(parents=True)
     (out_dir / "config").mkdir(parents=True)
+    (out_dir / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     files = []
     for src in collect_products(build_dir):
         dst = out_dir / "build" / src.name
@@ -494,6 +529,10 @@ def write_payload(out_dir: Path, build_dir: Path, user_src: Path, schemas: list[
         "deployer": str(deployer.relative_to(REPO_ROOT)) if deployer.is_relative_to(REPO_ROOT) else str(deployer),
         "docker_image": DEFAULT_IMAGE if use_docker else None,
         "schemas": list(schemas),
+        "retained_schemas": list(schemas),
+        "dependencies": sorted(
+            set(rime_common.dependencies_closure(list(schemas))) - set(schemas)
+        ),
         "markers": markers,
         "budget_bytes": budget,
         "total_bytes": total,
@@ -536,9 +575,40 @@ def check_payload(out_dir: Path, budget: int) -> list[str]:
             rel = str(path.relative_to(out_dir))
             if rel not in listed:
                 fail.append(f"未登记的文件：{rel}")
+    if not (out_dir / ".gitignore").is_file():
+        fail.append("缺少 .gitignore（仓库根的 build/ 规则会把预编译产物忽略掉，文件进不了仓库）")
     schemas = manifest.get("schemas") or []
     if not schemas:
         fail.append("清单里没有 schemas")
+    retained = rime_common.retained_schemas()
+    if schemas != retained:
+        fail.append(f"清单方案 {schemas} 与 retained-schemas.txt {retained} 不一致"
+                    "（改清单后要重新生成 prebuilt）")
+    try:
+        closure = rime_common.dependencies_closure(list(schemas))
+    except SystemExit as exc:
+        closure = []
+        fail.append(str(exc))
+    try:
+        direct = rime_common.direct_dependencies(list(schemas))
+    except SystemExit as exc:
+        direct = []
+        fail.append(str(exc))
+    for schema in list(schemas) + direct:
+        if not (out_dir / "build" / f"{schema}.schema.yaml").is_file():
+            fail.append(f"缺少方案产物 build/{schema}.schema.yaml")
+    build_dir = out_dir / "build"
+    if build_dir.is_dir():
+        for path in sorted(build_dir.glob("*.schema.yaml")):
+            stem = path.name[: -len(".schema.yaml")]
+            if closure and stem not in closure:
+                fail.append(f"多余方案产物 build/{path.name}（只允许保留方案与依赖 {closure}）")
+    config_dir = out_dir / "config"
+    if config_dir.is_dir():
+        for path in sorted(config_dir.glob("*.custom.yaml")):
+            stem = path.name[: -len(".custom.yaml")]
+            if stem != "default" and stem not in schemas:
+                fail.append(f"多余配置模板 config/{path.name}（只允许保留方案 {schemas}）")
     for schema in schemas:
         name = f"build/{schema}.schema.yaml"
         path = out_dir / name
@@ -581,7 +651,8 @@ def check_git_ignore(out_dir: Path) -> list[str]:
     （packaging/rime/prebuilt/.gitignore 里的 `!build/` 就是为此存在的；
     改坏了要在这里立刻发现，否则 CI 构建出来的包会静默缺少兜底产物。）
     """
-    sample = next(iter(sorted(out_dir.glob("build/*.table.bin"))), None)
+    # 直接测目录本身：只测文件测不出「目录被 build/ 规则忽略」，那正是最容易回归的情形。
+    sample = next(iter(sorted(out_dir.glob("build"))), None)
     if sample is None:
         return []
     try:
@@ -618,7 +689,13 @@ def check_wiring() -> list[str]:
         has(REPO_ROOT / "packaging" / "linux" / script,
             ["/usr/share/rime-sync/prebuilt", "RIMESYNC_PREBUILT", "seed_prebuilt_build"])
     has(REPO_ROOT / "scripts" / "ime" / "package-ime-deb.sh",
-        ["/usr/share/rime-sync/prebuilt"])
+        ["/usr/share/rime-sync/prebuilt", "retained-schemas.txt", "gen-rime-data.py"])
+    # 0.6.21：保留清单的清理必须真的接进两端安装器（并且只调同一份 Rust 实现）。
+    for script in ("postinst", "install.sh"):
+        has(REPO_ROOT / "packaging" / "linux" / script,
+            ["prune_extra_schemas", "rime-sync-cli", "retained-schemas.txt"])
+    has(REPO_ROOT / "packaging" / "nsis-hooks.nsh",
+        ["RimeSyncPruneSchemas", "prune-schemas", "phase=PRUNE"])
     return fail
 
 

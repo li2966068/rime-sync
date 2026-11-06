@@ -565,12 +565,12 @@ PY
   # 0.6.17：安装包里还必须真的有 CLI sidecar 与随包 prebuilt schema。
   mkdir -p "$base/good/resources/prebuilt/build"
   printf 'MZ mock rime-sync-cli' >"$base/good/rime-sync-cli.exe"
-  printf 'schema_list: []\n' >"$base/good/resources/prebuilt/build/luna_pinyin.schema.yaml"
+  printf 'schema_list: []\n' >"$base/good/resources/prebuilt/build/luna_pinyin_simp.schema.yaml"
   mkdir -p "$base/good/resources"
   mv "$base/good/weasel-0.17.4.0-installer.exe" "$base/good/resources/"
   (cd "$base/good" && 7z a -bso0 -bsp0 "$base/good/dist/rime-sync_0.0.0_x64-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
 
   SELFTEST_ARGS=(--strict-ime-bundle)
   expect_ok() { # $1=label $2=dir
@@ -639,7 +639,7 @@ open(sys.argv[1], 'wb').write(b'MZ' + b'\0' * 64)
 PY
   (cd "$off" && 7z a -bso0 -bsp0 "$off/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml \
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml \
     webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe >/dev/null 2>&1)
 
   expect_fail_with "缺离线包" "$base/good" "没有找到离线包" \
@@ -655,7 +655,7 @@ PY
   cp -a "$base/good" "$offbad"
   (cd "$offbad" && 7z a -bso0 -bsp0 "$offbad/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
   expect_fail_with "离线包缺 WebView2 载荷" "$offbad" "没有内嵌 MicrosoftEdgeWebView2RuntimeInstallerX64.exe" \
     --strict-ime-bundle --require-offline-setup --min-offline-mib 0
 
@@ -711,7 +711,7 @@ PY
   rm -f "$base/no-weasel-caption/dist/"*-setup.exe
   (cd "$base/no-weasel-caption" && 7z a -bso0 -bsp0 "$base/no-weasel-caption/dist/rime-sync_0.0.0_x64-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
   expect_fail "Weasel 里没有「输入法自建同步」" "$base/no-weasel-caption" "搜不到 UTF-16LE"
 
   # 0.6.9：自编译 Weasel 带着没有插件的 rime.dll（= 又退回预编译包）必须红
@@ -727,7 +727,7 @@ PY
   rm -f "$base/no-rime-components/dist/"*-setup.exe
   (cd "$base/no-rime-components" && 7z a -bso0 -bsp0 "$base/no-rime-components/dist/rime-sync_0.0.0_x64-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
   expect_fail "rime.dll 没合并 rimesync-extra" "$base/no-rime-components" "rimesync_punct"
 
   # 0.6.17：CLI sidecar / prebuilt 产物缺失必须红（证明新断言不是摆设）
@@ -736,7 +736,7 @@ PY
   rm -f "$base/no-cli/dist/"*-setup.exe
   (cd "$base/no-cli" && 7z a -bso0 -bsp0 "$base/no-cli/dist/rime-sync_0.0.0_x64-setup.exe" \
     resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
   expect_fail "setup.exe 缺 rime-sync-cli.exe" "$base/no-cli" "没有 rime-sync-cli.exe"
 
   mutate no-prebuilt

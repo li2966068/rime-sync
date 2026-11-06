@@ -20,8 +20,10 @@
   并去掉 import_preset，避免二次 include。代价是文件大一些，好处是自足：
   不依赖 data 目录里的额外 preset 文件，跨设备同步 custom.yaml 也不会缺依赖。
 
-列表一律从 vendored 方案（third_party/rime-data/**/<schema>.schema.yaml）解析，包括
-"__include: <base>.schema:/" 继承来的方案（luna_pinyin_simp 等），不写死。
+目标方案 = packaging/rime/retained-schemas.txt（0.6.21 起 3 个；Rust 清理逻辑与安装
+脚本读同一份文件，避免两处漂移）。每个方案的内容仍然从 vendored 方案
+（third_party/rime-data/**/<schema>.schema.yaml）解析，包括
+"__include: <base>.schema:/" 继承来的配置（luna_pinyin_simp 继承 luna_pinyin），不写死。
 
 用法：
   scripts/ime/gen-schema-custom.py              # 写 packaging/rime/schemas/
@@ -36,6 +38,8 @@ import sys
 from pathlib import Path
 
 import yaml
+
+import rime_common
 
 REPO = Path(__file__).resolve().parents[2]
 RIME_DATA = REPO / "third_party" / "rime-data"
@@ -107,15 +111,17 @@ def schema_index(rime_data=RIME_DATA):
 
 
 def schema_ids(rime_data=RIME_DATA, user_default=USER_DEFAULT):
-    """随包方案的权威列表 = 随包 default.yaml 的 schema_list。
+    """随包方案的权威列表 = packaging/rime/retained-schemas.txt（单一真相源）。
 
-    安装器写进用户目录的 default.custom.yaml 是同一份列表的手工副本，两边不一致
-    会造成「装了模板但没数据」或反之，直接在生成阶段报错。
+    0.6.21 起只保留 luna_pinyin_simp / wubi_pinyin / wubi86，其余方案在安装/自举期
+    由 `rime-sync-cli prune-schemas` 清理。安装器写进用户目录的 default.custom.yaml
+    必须与清单逐项一致（顺序也一致）；vendored rime-prelude/default.yaml 仍列着全部
+    上游方案，只作为 schema 数据来源，不再是权威列表。
     """
-    prelude = load_yaml(rime_data / "rime-prelude" / "default.yaml")
-    ids = [item["schema"] for item in prelude.get("schema_list") or []]
-    if not ids:
-        raise SystemExit("随包 default.yaml 没有 schema_list")
+    ids = rime_common.retained_schemas()
+    for sid in ids:
+        if not list(Path(rime_data).glob("**/%s.schema.yaml" % sid)):
+            raise SystemExit("保留清单里的 %s 没有随包 schema 文件" % sid)
     if user_default.exists():
         template = load_yaml(user_default)
         tids = [
@@ -124,7 +130,8 @@ def schema_ids(rime_data=RIME_DATA, user_default=USER_DEFAULT):
         ]
         if tids != ids:
             raise SystemExit(
-                "schema_list 不一致：default.yaml=%s / default.custom.yaml=%s" % (ids, tids)
+                "schema_list 不一致：retained-schemas.txt=%s / default.custom.yaml=%s"
+                % (ids, tids)
             )
     return ids
 

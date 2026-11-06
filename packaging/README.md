@@ -185,7 +185,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librs
 详细步骤与 AList 权限表见 [`../docs/USER-GUIDE.md`](../docs/USER-GUIDE.md)。
 
 6. 输入增强（v 数值转中文、中文标点直出 + Shift 备选）随包提供：安装器把
-   `packaging/rime/schemas/<schema>.custom.yaml`（16 个随包方案各一份）复制进用户 Rime 目录。
+   `packaging/rime/schemas/<schema>.custom.yaml`（3 个保留方案各一份：`luna_pinyin_simp` / `wubi_pinyin` / `wubi86`）复制进用户 Rime 目录；非保留方案由 `rime-sync-cli prune-schemas` 清理（见 `docs/SCHEMA-RETENTION.md`）。
    **Linux（0.6.12 起）**：与 Windows 同一策略——升级即「先卸载旧版，再全新安装」，
    配置模板只在用户目录缺同名文件时写入，已存在的一律沿用（不覆盖、不改名、不备份），
    卸载旧版也不删这些配置；日志逐文件记 `seed file=<name> result=new|reuse|skip`。

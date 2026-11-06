@@ -497,7 +497,7 @@ export const zh = {
   "schemas.needOne": "至少保留一个启用的输入方案",
 
   "fixIme.title": "修复输入法",
-  "fixIme.desc": "把安装包里的预编译 build 产物铺进 Rime 用户目录（缺才铺；旧产物没有插件标记时只对 build/ 覆盖一次）。程序每次启动也会自动检查，这里用于手动重试；已存在的 *.custom.yaml 用户配置永不覆盖。铺完需重启输入法（或重新选择方案）才生效。",
+  "fixIme.desc": "把安装包里的预编译 build 产物铺进 Rime 用户目录（缺才铺；旧产物没有插件标记时只对 build/ 覆盖一次），并检查输入法本体：Windows 上发现小狼毫缺失或不是我们的构建时，会用随包安装器一键装回来（/S /NOREBOOT，需要管理员权限）。程序每次启动也会自动检查，这里用于手动重试；已存在的 *.custom.yaml 用户配置永不覆盖。铺完需重启输入法（或重新选择方案）才生效。",
   "fixIme.run": "修复输入法",
   "fixIme.force": "强制覆盖",
   "fixIme.running": "正在铺入预编译产物…",
@@ -508,6 +508,12 @@ export const zh = {
   "fixIme.sourceLine": "来源 {source}",
   "fixIme.escalated": "已对 build/ 覆盖一次（旧产物缺插件标记）",
   "fixIme.log": "日志 {path}",
+  "fixIme.weaselInstalled": "已装回输入法（Weasel {version}）",
+  "fixIme.weaselPresent": "输入法已就绪（Weasel {version}）",
+  "fixIme.weaselSkipped": "输入法安装：Linux 由包管理器负责，跳过",
+  "fixIme.weaselDisabled": "输入法未就绪，自动安装已关闭（RIMESYNC_INSTALL_IME=0）",
+  "fixIme.weaselFailed": "输入法安装失败：{error}",
+  "fixIme.needsElevation": "需要管理员权限：以管理员身份重启 rime-sync 后再点「修复输入法」",
 
   "deviceLocal.title": "设备本地键",
   "deviceLocal.desc": "这些键在同步时只保留在本机，不会上传，也不会被其它设备的修改覆盖。默认只有 schema_list（输入方案列表 / Schema list），这样每台设备都能保留自己的默认方案，而 menu/page_size 这类键仍然共享。",

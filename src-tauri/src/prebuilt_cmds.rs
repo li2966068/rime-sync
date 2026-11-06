@@ -14,7 +14,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rime_sync_core::data_patch::{self, DataPatchReport};
+use rime_sync_core::ime::{self, ImeReport};
 use rime_sync_core::prebuilt::{self, BuildProbe, InstallOptions, PayloadLocation, PrebuiltReport};
+use rime_sync_core::prune;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
@@ -57,7 +59,17 @@ fn perform(rime_dir: &Path, force: bool) -> Result<(PayloadLocation, PrebuiltRep
 /// 「、」、v1234 没候选），部署链又不可用——只能把补丁写进 data。
 /// 每次启动都跑（幂等：没变化就一个字节都不写）。
 fn patch_data(version: &str) -> DataPatchReport {
-    data_patch::patch_dirs(&data_patch::data_dirs(), version)
+    // 0.6.20：data 目录按 WeaselRoot → weasel-* → InstallDir → %ProgramFiles%\Rime
+    // 逐项探测，报告里带全部候选（227 的目录不存在问题就出在这里）。
+    data_patch::patch_auto(version)
+}
+
+/// 输入法健康检查 + 缺失时用随包安装器装回去（0.6.20）。
+///
+/// Linux 返回 skipped(platform)（由包管理器负责）；Windows 缺失时会跑随包
+/// weasel-*-installer.exe /S /NOREBOOT，最多等 300 秒。
+fn ensure_ime() -> ImeReport {
+    ime::ensure(exe_dir().as_deref())
 }
 
 /// 一句话结论；界面与日志共用。
@@ -89,6 +101,20 @@ pub struct FixImeReport {
     /// 是否需要提示用户以管理员身份重试。
     pub needs_elevation: bool,
     pub data: DataPatchReport,
+    /// 输入法（Weasel）检查与自举结果（0.6.20）。
+    pub weasel_present: bool,
+    /// 本次是否真的把输入法装回来。
+    pub weasel_installed: bool,
+    pub weasel_version: String,
+    /// 随包安装器路径；空 = 没找到。
+    pub weasel_installer: String,
+    pub weasel_installer_source: String,
+    /// installed / already-present / skipped(platform) / disabled / failed。
+    pub weasel_install: String,
+    pub weasel_error: Option<String>,
+    pub weasel_needs_elevation: bool,
+    pub weasel_log: String,
+    pub weasel_message: String,
     #[serde(flatten)]
     pub report: PrebuiltReport,
 }
@@ -102,17 +128,64 @@ pub fn cmd_fix_ime(
 ) -> Result<FixImeReport, String> {
     let config = ensure_config_meta(&app, &state.0)?;
     let rime_dir = detect_rime(&config)?.path;
+    // 0.6.20：先修输入法本体——它和 build/ 无关；即使后面的 payload 缺失，
+    // 也不能让「机器上没有输入法」这件事被跳过。
+    let weasel = ensure_ime();
     let probe_before = prebuilt::probe_build(&rime_dir);
     let (location, report) = perform(&rime_dir, force.unwrap_or(false))?;
     let data = patch_data(&app_version(&app));
-    let message = format!("{}；{}", summary(&report), data.summary());
+    let weasel_message = weasel.summary();
+    let message = format!(
+        "{}；{}；{}",
+        summary(&report),
+        data.summary(),
+        weasel_message
+    );
+    let candidates: Vec<&str> = data
+        .data_candidates
+        .iter()
+        .map(|candidate| candidate.path.as_str())
+        .collect();
     let mut log = format!(
-        "[fix-ime] {message} payload={} source={} probe_before={} data_patched={}",
+        "[fix-ime] {message} payload={} source={} probe_before={} data_patched={} punctuator_patched={} punctuator_skipped={} data_dir={} data_candidates=[{}] weasel_present={} weasel_installed={} weasel_version={} weasel_install={} weasel_installer={}",
         location.path.display(),
         location.source,
         probe_before,
-        data.patched()
+        data.patched(),
+        data.punctuator_patched,
+        data.punctuator_skipped.len(),
+        if data.data_dir.is_empty() {
+            "-"
+        } else {
+            data.data_dir.as_str()
+        },
+        candidates.join(", "),
+        weasel.present,
+        weasel.installed,
+        if weasel.version.is_empty() {
+            "-"
+        } else {
+            weasel.version.as_str()
+        },
+        weasel.install,
+        if weasel.installer.is_empty() {
+            "-"
+        } else {
+            weasel.installer.as_str()
+        },
     );
+    if let Some(error) = &data.data_error {
+        log.push_str(&format!(" data_error={error}"));
+    }
+    for skipped in &data.punctuator_skipped {
+        log.push_str(&format!(" punctuator_skip={skipped}"));
+    }
+    if let Some(error) = &weasel.error {
+        log.push_str(&format!(" weasel_error={error}"));
+    }
+    if weasel.needs_elevation {
+        log.push_str("（输入法安装需要管理员权限：请以管理员身份重启 rime-sync 后重试）");
+    }
     if data.needs_elevation() {
         log.push_str("（data 目录需要管理员权限：请以管理员身份重启 rime-sync 后重试）");
     }
@@ -124,8 +197,18 @@ pub fn cmd_fix_ime(
         probe_before: probe_before.as_str().to_string(),
         message,
         data_patched: data.patched(),
-        needs_elevation: data.needs_elevation(),
+        needs_elevation: data.needs_elevation() || weasel.needs_elevation,
         data,
+        weasel_present: weasel.present,
+        weasel_installed: weasel.installed,
+        weasel_version: weasel.version,
+        weasel_installer: weasel.installer,
+        weasel_installer_source: weasel.installer_source,
+        weasel_install: weasel.install,
+        weasel_error: weasel.error,
+        weasel_needs_elevation: weasel.needs_elevation,
+        weasel_log: weasel.log,
+        weasel_message,
         report,
     })
 }
@@ -206,6 +289,39 @@ pub(crate) fn bootstrap(app: &AppHandle) {
             app_version(&handle),
             std::env::var(prebuilt::ENV_MODE).unwrap_or_else(|_| "<unset>".to_string())
         ));
+
+        // 0.6.20：先保证输入法本体在。0.6.19 的 /S 静默安装里 NSIS 钩子没执行，
+        // 旧 Weasel 又已被卸载器卸掉，机器上一台输入法都没有——必须启动时自愈。
+        let weasel = ensure_ime();
+        log(format!(
+            "ime check present={} installed={} version={} install={} installer={}",
+            weasel.present,
+            weasel.installed,
+            if weasel.version.is_empty() {
+                "-"
+            } else {
+                weasel.version.as_str()
+            },
+            weasel.install,
+            if weasel.installer.is_empty() {
+                "-"
+            } else {
+                weasel.installer.as_str()
+            },
+        ));
+        for line in weasel.log.lines() {
+            log(format!("ime {line}"));
+        }
+        if let Some(error) = &weasel.error {
+            log(format!("ime error={error}"));
+        }
+        if weasel.installed || !weasel.ok() {
+            // 装回来了要说一声；装不上更不能静默（GUI 日志与设置页都能看到）。
+            push_log(&state.0, format!("[bootstrap] {}", weasel.summary()));
+        }
+        if weasel.needs_elevation {
+            log("ime needs elevation: 以管理员身份重启 rime-sync 后点「修复输入法」".to_string());
+        }
 
         let config = match ensure_config_meta(&handle, &state.0) {
             Ok(config) => config,
@@ -352,6 +468,33 @@ pub(crate) fn bootstrap(app: &AppHandle) {
             }
         } else {
             log("skip stage=data reason=env-disabled".to_string());
+        }
+
+        // 方案裁剪（0.6.21）：随包只保留 retained-schemas.txt 里的 3 个方案，其余
+        // data/用户/build 文件在安装后清掉（幂等、带 .rimesync-removed-<时间戳> 备份，
+        // RIMESYNC_PRUNE_SCHEMAS=0 关闭）。启动时静默跑；权限不足只记日志。
+        let pruned = prune::prune_auto();
+        if pruned.disabled {
+            log("skip stage=prune reason=env-disabled".to_string());
+        } else {
+            log(format!(
+                "prune keep={} removed={} backups={} failed={} dirs={} user={}",
+                pruned.keep.join(";"),
+                pruned.removed(),
+                pruned.backups.len(),
+                pruned.failures.len(),
+                pruned.data_dirs.join(";"),
+                pruned.user_dir,
+            ));
+            for path in &pruned.removed {
+                log(format!("prune removed={path}"));
+            }
+            for error in &pruned.failures {
+                log(format!("prune error={error}"));
+            }
+            if pruned.removed() > 0 {
+                push_log(&state.0, format!("[bootstrap] {}", pruned.summary()));
+            }
         }
         log(format!("bootstrap end result={end}"));
     });

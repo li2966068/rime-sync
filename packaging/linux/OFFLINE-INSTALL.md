@@ -228,17 +228,17 @@ full + thin 组装约 30–60 s（闭包拷贝占大头）。
 有些机器上 rime 部署永远不产出 `build/`：Windows 上实测
 `WeaselDeployer /deploy` 返回 0 但什么都不写；Linux 上同样会被用户目录权限、
 librime 版本、插件缺失搞成「部署静默失败」。这种机器上用户目录里没有
-`build/luna_pinyin.schema.yaml`，输入法装好了也打不出字。
+`build/luna_pinyin_simp.schema.yaml`，输入法装好了也打不出字。
 
 0.6.15 起 `rime-inputmethod` 直接带一份**别处已经部署好的** `build/`：
 
 | 位置 | 内容 |
 |---|---|
-| `/usr/share/rime-sync/prebuilt/build/` | `luna_pinyin` / `wubi86` 的 `*.schema.yaml` + `*.bin`、依赖方案（`stroke`、`pinyin_simp`）的产物、`default.yaml` |
-| `/usr/share/rime-sync/prebuilt/config/` | 生成时用的 `default.custom.yaml`（`schema_list` = 这两套）+ 两个 `<schema>.custom.yaml` |
+| `/usr/share/rime-sync/prebuilt/build/` | 保留方案（`luna_pinyin_simp` / `wubi_pinyin` / `wubi86`）的 `*.schema.yaml` + `*.bin`、依赖方案（`luna_pinyin`、`stroke`、`pinyin_simp`）的产物、`default.yaml` |
+| `/usr/share/rime-sync/prebuilt/config/` | 生成时用的 `default.custom.yaml`（`schema_list` = 这 3 套）+ 3 个 `<schema>.custom.yaml` |
 | `/usr/share/rime-sync/prebuilt/MANIFEST.json` | 清单（大小 / sha256 / 体积 / rime 版本） |
 
-判据（与 Windows 安装器一致）：`~/.local/share/fcitx5/rime/build/luna_pinyin.schema.yaml`
+判据（与 Windows 安装器一致）：`~/.local/share/fcitx5/rime/build/luna_pinyin_simp.schema.yaml`
 存在，且文件里同时有 `rimesync_vnum` 与 `rimesync_punct`。
 
 ### 9.2 谁在什么时候铺
@@ -252,7 +252,7 @@ librime 版本、插件缺失搞成「部署静默失败」。这种机器上用
 2. 否则把 `prebuilt/build/*` 拷到 `~/.local/share/fcitx5/rime/build/`，
    `prebuilt/config/*.yaml` 拷到 `~/.local/share/fcitx5/rime/` —— **逐个文件，存在即跳过**；
 3. 复查判据；仍不满足时**只对 build/ 覆盖重铺一遍**——用户目录里可能本来就有旧的
-   `build/luna_pinyin.schema.yaml`（没有插件标记），「存在即跳过」会把它留下，
+   `build/luna_pinyin_simp.schema.yaml`（没有插件标记），「存在即跳过」会把它留下，
    兜底就白做了。`build/` 是部署器随时重写的派生数据，覆盖它安全；
    `config/*.yaml` 是用户配置，**绝不参与这一遍**。日志里记 `escalated=1`；
 4. 复查仍失败只告警、不影响安装退出码；
@@ -280,7 +280,7 @@ librime 版本、插件缺失搞成「部署静默失败」。这种机器上用
 * 缺产物直接 `exit 1`（确实要构建不带产物的包才设 `ALLOW_NO_PREBUILT=1`）。
 
 产物由 `scripts/ime/gen-prebuilt-build.py` 在构建期用 `rime_deployer` 真实部署生成，
-体积 28.3 MB（预算 60 MB，超了只带 `luna_pinyin`）。
+体积 29.1 MB（预算 60 MB；保留清单是发布契约，超预算会直接报错，不会偷偷少带方案）。
 校验：`scripts/ime/gen-prebuilt-build.py --check`（清单 / 标记 / 绝对路径 / 体积 / 打包接线，
 不需要 docker；在 CI 里当门禁用）。
 

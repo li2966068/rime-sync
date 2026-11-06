@@ -17,7 +17,7 @@ export async function runFixIme(force = false): Promise<void> {
   try {
     const report = await api.fixIme(force);
     el.fixImeStatus.textContent = describe(report);
-    const message = report.build_ok
+    const buildMessage = report.build_ok
       ? t("fixIme.ok", {
           copied: report.copied,
           kept: report.kept,
@@ -27,6 +27,12 @@ export async function runFixIme(force = false): Promise<void> {
           copied: report.copied + report.overwritten,
           probe: report.probe_after,
         });
+    // 输入法本体装回来 / 装不上都要单独提示：这才是用户最直接的感受。
+    const weaselMessage =
+      report.weasel_install === "installed" || report.weasel_install === "failed"
+        ? weaselLine(report)
+        : "";
+    const message = [buildMessage, weaselMessage].filter(Boolean).join("；");
     toast(message);
     localLog(message);
   } catch (error) {
@@ -54,8 +60,31 @@ function describe(report: FixImeReport): string {
   if (report.escalated) {
     parts.push(t("fixIme.escalated"));
   }
+  parts.push(weaselLine(report));
+  if (report.needs_elevation || report.weasel_needs_elevation) {
+    parts.push(t("fixIme.needsElevation"));
+  }
   if (report.log_path) {
     parts.push(t("fixIme.log", { path: report.log_path }));
   }
   return parts.join(" · ");
+}
+
+/// 输入法本体的状态行（与后端 ImeReport.install 一一对应）。
+function weaselLine(report: FixImeReport): string {
+  const version = report.weasel_version || "?";
+  switch (report.weasel_install) {
+    case "installed":
+      return t("fixIme.weaselInstalled", { version });
+    case "already-present":
+      return t("fixIme.weaselPresent", { version });
+    case "skipped(platform)":
+      return t("fixIme.weaselSkipped");
+    case "disabled":
+      return t("fixIme.weaselDisabled");
+    default:
+      return t("fixIme.weaselFailed", {
+        error: report.weasel_error || report.weasel_install,
+      });
+  }
 }

@@ -47,12 +47,13 @@ impl Fixture {
             fs::create_dir_all(tmp.path().join(dir)).expect("create dir");
         }
         fs::write(
-            tmp.path().join("payload/build/luna_pinyin.schema.yaml"),
+            tmp.path()
+                .join("payload/build/luna_pinyin_simp.schema.yaml"),
             MARKED,
         )
         .expect("write schema");
         fs::write(
-            tmp.path().join("payload/build/luna_pinyin.prism.bin"),
+            tmp.path().join("payload/build/luna_pinyin_simp.prism.bin"),
             "prism",
         )
         .expect("write prism");
@@ -93,10 +94,16 @@ impl Fixture {
         if no_data_patch {
             command.arg("--no-data-patch");
         }
-        command.env("RIMESYNC_PREBUILT_DIR", self.payload()).env(
-            "RIMESYNC_WEASEL_DATA",
-            data_dir.map(Path::as_os_str).unwrap_or_default(),
-        );
+        command
+            .env("RIMESYNC_PREBUILT_DIR", self.payload())
+            // 测试永远不允许真的跑输入法安装器（Windows CI 上会弹 UAC / 装真东西）。
+            .env("RIMESYNC_INSTALL_IME", "0")
+            .env(
+                "RIMESYNC_WEASEL_DATA",
+                data_dir.map(Path::as_os_str).unwrap_or_default(),
+            )
+            // 这些用例验证 data 补丁/铺制，不验证方案清理（prune 有独立用例）。
+            .env("RIMESYNC_PRUNE_SCHEMAS", "0");
         command.output().expect("run rime-sync-cli fix-ime")
     }
 }
@@ -119,11 +126,23 @@ fn fix_ime_json_copies_missing_files() {
     assert_eq!(report["config_copied"], 1);
     assert_eq!(report["build_ok"], true);
     assert_eq!(report["probe_after"], "prebuilt");
+    // 0.6.20：输入法状态在报告里；测试环境禁止自动安装，Linux 上直接跳过。
+    assert_eq!(report["weasel_installed"], false);
+    assert!(report["weasel_present"].is_boolean());
+    if cfg!(windows) {
+        assert_ne!(report["weasel_install"], "skipped(platform)");
+    } else {
+        assert_eq!(report["weasel_install"], "skipped(platform)");
+        assert_eq!(report["weasel_log"], "skip: Linux 输入法由包管理器（rime-inputmethod / fcitx5-rime）负责，不跑 Weasel 安装器");
+    }
     assert!(fixture
         .rime()
-        .join("build/luna_pinyin.schema.yaml")
+        .join("build/luna_pinyin_simp.schema.yaml")
         .is_file());
-    assert!(fixture.rime().join("build/luna_pinyin.prism.bin").is_file());
+    assert!(fixture
+        .rime()
+        .join("build/luna_pinyin_simp.prism.bin")
+        .is_file());
     assert!(fixture.rime().join("default.custom.yaml").is_file());
 }
 
@@ -131,8 +150,11 @@ fn fix_ime_json_copies_missing_files() {
 fn fix_ime_json_keeps_existing_files() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.rime().join("build")).expect("create build dir");
-    fs::write(fixture.rime().join("build/luna_pinyin.schema.yaml"), MARKED)
-        .expect("write local schema");
+    fs::write(
+        fixture.rime().join("build/luna_pinyin_simp.schema.yaml"),
+        MARKED,
+    )
+    .expect("write local schema");
     fs::write(
         fixture.rime().join("default.custom.yaml"),
         "patch:\n  keep: me\n",
@@ -197,6 +219,11 @@ fn fix_ime_patches_weasel_data_schemas() {
         1
     );
     assert_eq!(report["data"]["backup_dir"], data.display().to_string());
+    assert_eq!(report["data"]["data_dir"], data.display().to_string());
+    assert_eq!(
+        report["data"]["data_candidates"][0]["source"],
+        "env:RIMESYNC_WEASEL_DATA"
+    );
     assert_eq!(report["copied"], 2, "原有的 build 铺设不受影响");
 
     let schema = data.join("luna_pinyin.schema.yaml");

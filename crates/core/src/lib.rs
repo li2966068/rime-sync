@@ -11,6 +11,7 @@ pub mod data_patch;
 pub mod dedupe;
 pub mod engine;
 pub mod history;
+pub mod ime;
 pub mod index;
 pub mod lock;
 pub mod log;
@@ -23,6 +24,7 @@ pub mod presets;
 pub mod process;
 pub mod profile;
 pub mod proxy;
+pub mod prune;
 pub mod retry;
 pub mod rime_dir;
 pub mod secret;
@@ -33,12 +35,13 @@ pub mod webdav;
 pub use backup::{BackupInfo, BackupManager, BackupManifest, RestoreReport};
 pub use cancel::CancelToken;
 pub use config::{Config, FirstSyncPolicy, MigrationReport, PasswordRef, CONFIG_SCHEMA_VERSION};
-pub use data_patch::{DataPatchReport, PatchOutcome};
+pub use data_patch::{DataDirCandidate, DataPatchReport, PatchOutcome};
 pub use engine::{
     ConflictDetail, Engine, PlanAction, PlanCounts, PlanKind, PlanReport, Progress, ProgressSink,
     Report,
 };
 pub use history::{HistoryEntry, HISTORY_LIMIT};
+pub use ime::{ImeReport, WeaselHealth};
 pub use lock::{acquire as acquire_lock, inspect as inspect_lock, LockGuard, LockInfo, LockStatus};
 pub use log::{LogWriter, RotatingLog, DEFAULT_KEEP, DEFAULT_MAX_BYTES};
 pub use network::{NetworkPolicy, NetworkProbe, NetworkState};
@@ -50,6 +53,7 @@ pub use prebuilt::{
 };
 pub use presets::Preset;
 pub use proxy::{ProxyConfig, ProxyKind, ProxySpec, PROXY_PASSWORD_ACCOUNT};
+pub use prune::{PruneOptions, PruneReport};
 pub use retry::RetryState;
 pub use secret::{detect as detect_secret_store, SecretBackend, SecretSelection, SecretStore};
 pub use userdb::{diff_stats as userdb_diff_stats, UserdbStats};

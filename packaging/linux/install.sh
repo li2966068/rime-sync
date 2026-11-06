@@ -669,7 +669,7 @@ install_local_deb "$SYNC_DEB" "同步程序"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
 
 # ------------------------------------------------- schema 增强配置模板
-# /usr/share/rime-sync/defaults/schemas/ 里是随包 16 个方案的 <schema>.custom.yaml：
+# /usr/share/rime-sync/defaults/schemas/ 里是随包 3 个保留方案的 <schema>.custom.yaml：
 # 给引擎加 rimesync_vnum / rimesync_punct，并把 punctuator 主字符改成单值 commit。
 # 规则与 default.custom.yaml 相同：缺失才补，用户目录里已有同名文件一律沿用，
 # 绝不覆盖、不改名、不备份。每个模板的落盘结果都进日志：
@@ -715,14 +715,14 @@ seed_schema_customs() { # $1=Rime 用户目录
 # 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy 返回 0
 # 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。随 IME 包带的
 # /usr/share/rime-sync/prebuilt 是别处已经部署好的产物：用户目录缺 build 时铺过去。
-# 判据与 Windows 安装器、rime-sync 的 postinst 一致：build/luna_pinyin.schema.yaml
+# 判据与 Windows 安装器、rime-sync 的 postinst 一致：build/luna_pinyin_simp.schema.yaml
 # 存在，且里面有 rimesync_vnum / rimesync_punct 插件标记。
 # 开关：RIMESYNC_PREBUILT=0 关闭；RIMESYNC_PREBUILT=force 覆盖已存在的文件。
 PREBUILT_DIR=/usr/share/rime-sync/prebuilt
 PREBUILT_LOG=$LOGDIR/prebuilt.log
 
 prebuilt_usable() { # $1=Rime 用户目录
-  local f=$1/build/luna_pinyin.schema.yaml
+  local f=$1/build/luna_pinyin_simp.schema.yaml
   [ -f "$f" ] || return 1
   grep -q rimesync_vnum "$f" 2>/dev/null || return 1
   grep -q rimesync_punct "$f" 2>/dev/null || return 1
@@ -796,6 +796,43 @@ seed_prebuilt_build() { # $1=Rime 用户目录
   return 0
 }
 
+# ---------------------------------------------- 非保留方案清理（0.6.21）
+# 随包只保留 packaging/rime/retained-schemas.txt 里的 3 个方案（朙月拼音·简化字 /
+# 五笔拼音 / 五笔86）。旧版本 / 发行版数据 / 历史部署会在 data、用户目录与 build 里
+# 留下其余方案；这里在 root 期统一清掉（实现只有 rime-sync-cli prune-schemas 一份，
+# 与 Windows 自举共用 Rust 代码；删除前备份为 <原文件名>.rimesync-removed-<时间戳>；
+# 幂等；RIMESYNC_PRUNE_SCHEMAS=0 关闭）。失败只告警。
+PRUNE_LOG=$LOGDIR/prune-schemas.log
+prune_extra_schemas() { # 参数 1 = Rime 用户目录（可为空）
+  local rime_dir=${1:-} cli=/usr/bin/rime-sync-cli out removed backups failed disabled
+  if [ ! -x "$cli" ]; then
+    say "方案清理：缺少 $cli，跳过（只告警）"
+    printf '%s skip reason=no-cli\n' "$(date '+%F %T')" >>"$PRUNE_LOG" 2>/dev/null || true
+    return 0
+  fi
+  local args=(prune-schemas)
+  [ -d /usr/share/rime-data ] && args+=(--data-dir /usr/share/rime-data)
+  if [ -n "$rime_dir" ] && [ -d "$rime_dir" ]; then
+    args+=(--user-dir "$rime_dir")
+  fi
+  out=$("$cli" "${args[@]}" 2>&1 || true)
+  printf '%s\n' "$out" | while IFS= read -r line; do
+    [ -n "$line" ] && printf '%s prune %s\n' "$(date '+%F %T')" "$line" >>"$PRUNE_LOG" 2>/dev/null
+  done
+  disabled=$(printf '%s\n' "$out" | sed -n 's/^prune_disabled=//p' | head -1)
+  removed=$(printf '%s\n' "$out" | sed -n 's/^prune_removed=//p' | head -1)
+  backups=$(printf '%s\n' "$out" | sed -n 's/^prune_backups=//p' | head -1)
+  failed=$(printf '%s\n' "$out" | sed -n 's/^prune_failed=//p' | head -1)
+  if [ "${disabled:-0}" = "1" ]; then
+    say "方案清理：已按 RIMESYNC_PRUNE_SCHEMAS=0 关闭"
+  else
+    say "方案清理：删除 ${removed:-?} 个文件（备份 ${backups:-?}，失败 ${failed:-?}）；清单 /usr/share/rime-sync/retained-schemas.txt"
+    printf '%s done removed=%s backups=%s failed=%s dir=%s\n' \
+      "$(date '+%F %T')" "${removed:-0}" "${backups:-0}" "${failed:-0}" "${rime_dir:-}" >>"$PRUNE_LOG" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # --------------------------------------------------- recommended user config
 # 与 Windows 安装器一致：缺失才补，已存在的一律沿用（不覆盖、不改名、不备份）。
 # 每装一个版本都会走这一步——卸载旧版不会动用户目录，所以升级后仍是"沿用"。
@@ -804,16 +841,16 @@ if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ] && [ -f /usr/share/rime-sync/d
   install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
   chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
   if [ ! -f /usr/share/rime-data/wubi86.schema.yaml ]; then
-    # 模板列了 16 个随包方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
+    # 模板只列 3 个保留方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
     # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。
-    say "跳过默认输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 16 个方案会导致部署失败"
+    say "跳过默认输入法配置：/usr/share/rime-data 缺 wubi86.schema.yaml（不是随包方案），写入 3 个方案会导致部署失败"
     seed_result default.custom.yaml skip
   elif [ -f "$RIME_USER_DIR/default.custom.yaml" ]; then
     say "保留已有配置：$RIME_USER_DIR/default.custom.yaml（未覆盖）"
     seed_result default.custom.yaml reuse
   elif install -m 600 /usr/share/rime-sync/defaults/default.custom.yaml "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null; then
     chown "$TARGET_USER" "$RIME_USER_DIR/default.custom.yaml" 2>/dev/null || true
-    say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 16 个方案：拼音·五笔·仓颉·笔画·注音）"
+    say "已写入推荐输入法配置：$RIME_USER_DIR/default.custom.yaml（每页 8 个候选 / 3 个方案：朙月拼音·简化字·五笔拼音·五笔86）"
     seed_result default.custom.yaml new
   else
     say "!! 无法写入 $RIME_USER_DIR/default.custom.yaml（权限或磁盘问题），继续安装"
@@ -822,6 +859,12 @@ if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ] && [ -f /usr/share/rime-sync/d
   seed_schema_customs "$RIME_USER_DIR"
   # 0.6.15：部署不产出 build 时，用 /usr/share/rime-sync/prebuilt 的预编译产物兜底。
   seed_prebuilt_build "$RIME_USER_DIR"
+  # 0.6.21：清掉非保留方案的 data / 用户 custom.yaml / build 产物（幂等、带备份）。
+  prune_extra_schemas "$RIME_USER_DIR"
+fi
+# 用户目录不可用时只清 data（root 期；Linux 的 /usr/share/rime-data 属 root）。
+if [ -z "$TARGET_HOME" ]; then
+  prune_extra_schemas ""
 fi
 
 say "输入法数据：/usr/share/rime-data（$(find /usr/share/rime-data -maxdepth 1 -type f 2>/dev/null | wc -l) 个文件）"

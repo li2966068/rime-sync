@@ -384,3 +384,176 @@ recognizer:
         "没有 patterns 时要建一个"
     );
 }
+
+/* ------------------------- punctuator 深合并（0.6.20） ------------------------- */
+
+fn half_shape(doc: &serde_yaml::Value) -> &serde_yaml::Value {
+    doc.get("punctuator")
+        .expect("punctuator")
+        .get("half_shape")
+        .expect("half_shape")
+}
+
+fn commit_of<'a>(half: &'a serde_yaml::Value, key: &str) -> Option<&'a str> {
+    let entry = half.get(key)?;
+    // 我们注入的是标量；用户已有配置可能是 {commit: …}。
+    entry
+        .as_str()
+        .or_else(|| entry.get("commit").and_then(|value| value.as_str()))
+}
+
+#[test]
+fn punctuator_block_is_added_when_missing() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("luna_pinyin.schema.yaml");
+    write(&schema, STOCK);
+
+    let (outcome, patch) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+
+    assert_eq!(outcome, PatchOutcome::Patched);
+    assert_eq!(patch.patched, 2, "{patch:?}");
+    assert!(patch.skipped.is_empty(), "{patch:?}");
+
+    let text = read(&schema);
+    assert!(
+        text.contains(r#""\\": "、""#),
+        "反斜杠键要写成 YAML 的转义形式 + 标量直出：{text}"
+    );
+    assert!(text.contains(r#"":": "：""#), "{text}");
+    let doc = yaml(&text);
+    let punct = doc.get("punctuator").expect("punctuator");
+    assert_eq!(
+        punct.get("import_preset").and_then(|value| value.as_str()),
+        Some("default")
+    );
+    let half = half_shape(&doc);
+    assert_eq!(commit_of(half, "\\"), Some("、"));
+    assert_eq!(commit_of(half, ":"), Some("："));
+}
+
+#[test]
+fn punctuator_scalar_is_normalized_to_mapping() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("scalar.schema.yaml");
+    let text = format!("{STOCK}punctuator: my_preset\n");
+    write(&schema, &text);
+
+    let (outcome, patch) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+
+    assert_eq!(outcome, PatchOutcome::Patched);
+    assert_eq!(patch.patched, 2, "{patch:?}");
+    let patched = read(&schema);
+    assert!(
+        !patched.contains("punctuator: my_preset"),
+        "标量要变成映射：{patched}"
+    );
+    let doc = yaml(&patched);
+    let punct = doc.get("punctuator").expect("punctuator");
+    assert_eq!(
+        punct.get("import_preset").and_then(|value| value.as_str()),
+        Some("my_preset"),
+        "原 preset 名必须保留"
+    );
+    assert_eq!(commit_of(half_shape(&doc), "\\"), Some("、"));
+    assert_eq!(commit_of(half_shape(&doc), ":"), Some("："));
+}
+
+#[test]
+fn punctuator_mapping_gets_missing_half_shape() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("mapping.schema.yaml");
+    write(
+        &schema,
+        &format!("{STOCK}punctuator:\n  import_preset: default\n"),
+    );
+
+    let (outcome, patch) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+
+    assert_eq!(outcome, PatchOutcome::Patched);
+    assert_eq!(patch.patched, 2, "{patch:?}");
+    let text = read(&schema);
+    let doc = yaml(&text);
+    let punct = doc.get("punctuator").expect("punctuator");
+    assert_eq!(
+        punct.get("import_preset").and_then(|value| value.as_str()),
+        Some("default")
+    );
+    assert_eq!(commit_of(half_shape(&doc), "\\"), Some("、"));
+    assert_eq!(commit_of(half_shape(&doc), ":"), Some("："));
+}
+
+#[test]
+fn punctuator_existing_entries_are_never_overwritten() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("user.schema.yaml");
+    let user = "punctuator:\n  import_preset: default\n  half_shape:\n    \"\\\\\": {commit: \"X\"}\n    \":\": {commit: \"Y\"}\n";
+    write(&schema, &format!("{STOCK}{user}"));
+    let before = read(&schema);
+
+    let (_, patch) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+
+    assert_eq!(patch.patched, 0, "两个键都已存在：{patch:?}");
+    assert_eq!(patch.skipped.len(), 2, "{patch:?}");
+    assert!(
+        patch.skipped.iter().any(|item| item.contains("已存在")),
+        "{patch:?}"
+    );
+    let after = read(&schema);
+    for line in [r#"    "\\": {commit: "X"}"#, r#"    ":": {commit: "Y"}"#] {
+        assert!(before.contains(line), "夹具里应有用户配置：{before}");
+        assert!(after.contains(line), "用户那两行必须一字不改：{after}");
+    }
+    let doc = yaml(&after);
+    let half = half_shape(&doc);
+    assert_eq!(commit_of(half, "\\"), Some("X"), "用户配置绝不覆盖");
+    assert_eq!(commit_of(half, ":"), Some("Y"), "用户配置绝不覆盖");
+}
+
+#[test]
+fn punctuator_patch_is_idempotent() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("idempotent.schema.yaml");
+    write(&schema, STOCK);
+
+    let (_, first) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+    assert_eq!(first.patched, 2);
+    let once = read(&schema);
+
+    let (outcome, second) =
+        data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch again");
+
+    assert_eq!(outcome, PatchOutcome::Unchanged);
+    assert_eq!(second.patched, 0, "重复执行不再注入：{second:?}");
+    assert_eq!(read(&schema), once, "逐字节相同");
+    assert_eq!(
+        read(&data_patch::backup_path(&schema)),
+        STOCK,
+        "备份只做一次，还是原始内容"
+    );
+}
+
+#[test]
+fn punctuator_patch_keeps_crlf_and_no_bom() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("crlf.schema.yaml");
+    let crlf = format!("{}punctuator: default\r\n", STOCK.replace('\n', "\r\n"));
+    write(&schema, &crlf);
+
+    let (outcome, patch) = data_patch::patch_file_detailed(&schema, "0.6.20").expect("patch");
+
+    assert_eq!(outcome, PatchOutcome::Patched);
+    assert_eq!(patch.patched, 2);
+    let bytes = fs::read(&schema).expect("read bytes");
+    assert!(
+        !bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        "写回必须是 UTF-8 无 BOM"
+    );
+    let text = String::from_utf8(bytes).expect("utf8");
+    assert!(
+        !text.replace("\r\n", "").contains('\n'),
+        "换行风格必须保持 CRLF"
+    );
+    let doc = yaml(&text);
+    assert_eq!(commit_of(half_shape(&doc), "\\"), Some("、"));
+    assert_eq!(commit_of(half_shape(&doc), ":"), Some("："));
+}

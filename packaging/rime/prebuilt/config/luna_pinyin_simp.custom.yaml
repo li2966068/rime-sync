@@ -1,6 +1,6 @@
 # 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
-# schema: luna_pinyin_fluency
-# 引擎顺序抄自 third_party/rime-data/rime-luna-pinyin/luna_pinyin_fluency.schema.yaml（translators 首位加 rimesync_vnum；rimesync_punct 插在 key_binder/punctuator/selector 之前）
+# schema: luna_pinyin_simp
+# 引擎顺序抄自 third_party/rime-data/rime-luna-pinyin/luna_pinyin_simp.schema.yaml（translators 首位加 rimesync_vnum；rimesync_punct 插在 key_binder/punctuator/selector 之前）
 # 关闭：删掉本文件后重新部署；或删掉下面 patch 里的 rimesync_vnum / rimesync_punct。
 patch:
   engine/processors:
@@ -14,7 +14,7 @@ patch:
     - punctuator
     - selector
     - navigator
-    - fluency_editor
+    - express_editor
   engine/translators:
     - rimesync_vnum
     - punct_translator

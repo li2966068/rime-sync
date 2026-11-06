@@ -500,7 +500,7 @@ export const en: Record<keyof Dict, string> = {
   "schemas.needOne": "Keep at least one input schema enabled",
 
   "fixIme.title": "Repair input method",
-  "fixIme.desc": "Copy the bundled prebuilt build artifacts into the Rime user directory (missing files only; if an old build lacks our plugin markers, build/ is overwritten once). The app also runs this check at startup, so this button is the manual retry. Existing *.custom.yaml files are never overwritten. Restart the input method (or reselect the schema) afterwards.",
+  "fixIme.desc": "Copy the bundled prebuilt build artifacts into the Rime user directory (missing files only; if an old build lacks our plugin markers, build/ is overwritten once) and check the input method itself: on Windows, a missing Weasel (or a build without our plugins) is reinstalled from the bundled installer (/S /NOREBOOT, requires administrator rights). The app also runs this check at startup, so this button is the manual retry. Existing *.custom.yaml files are never overwritten. Restart the input method (or reselect the schema) afterwards.",
   "fixIme.run": "Repair input method",
   "fixIme.force": "Force overwrite",
   "fixIme.running": "Copying prebuilt artifacts…",
@@ -511,6 +511,12 @@ export const en: Record<keyof Dict, string> = {
   "fixIme.sourceLine": "Source {source}",
   "fixIme.escalated": "build/ overwritten once (old artifacts lacked plugin markers)",
   "fixIme.log": "Log {path}",
+  "fixIme.weaselInstalled": "Input method reinstalled (Weasel {version})",
+  "fixIme.weaselPresent": "Input method is ready (Weasel {version})",
+  "fixIme.weaselSkipped": "Input method install skipped: Linux uses the package manager",
+  "fixIme.weaselDisabled": "Input method is missing; auto-install disabled (RIMESYNC_INSTALL_IME=0)",
+  "fixIme.weaselFailed": "Installing the input method failed: {error}",
+  "fixIme.needsElevation": "Administrator rights required: restart rime-sync as administrator, then click Repair input method",
 
   "deviceLocal.title": "Device-local keys",
   "deviceLocal.desc": "These keys stay on this device during sync: never uploaded, never overwritten by other devices. Only schema_list (输入方案列表 / Schema list) by default, so each device keeps its own default schemas while keys such as menu/page_size are still shared.",

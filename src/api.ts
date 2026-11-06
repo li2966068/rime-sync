@@ -482,6 +482,20 @@ export interface FixImeReport {
   escalated: boolean;
   log_path: string | null;
   message: string;
+  /// data 补丁或输入法安装需要管理员权限。
+  needs_elevation: boolean;
+  /// 输入法（Weasel）本体状态与自举结果（0.6.20）。
+  weasel_present: boolean;
+  weasel_installed: boolean;
+  weasel_version: string;
+  weasel_installer: string;
+  weasel_installer_source: string;
+  /// installed / already-present / skipped(platform) / disabled / failed
+  weasel_install: string;
+  weasel_error: string | null;
+  weasel_needs_elevation: boolean;
+  weasel_log: string;
+  weasel_message: string;
 }
 
 export const api = {

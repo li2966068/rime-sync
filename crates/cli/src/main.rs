@@ -9,6 +9,7 @@ use rime_sync_core::config::{self, Config};
 use rime_sync_core::data_patch;
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::history;
+use rime_sync_core::ime;
 use rime_sync_core::index::FileIndex;
 use rime_sync_core::lock;
 use rime_sync_core::log;
@@ -17,6 +18,7 @@ use rime_sync_core::plan;
 use rime_sync_core::platform;
 use rime_sync_core::prebuilt;
 use rime_sync_core::presets::Preset;
+use rime_sync_core::prune;
 use rime_sync_core::retry::RetryState;
 use rime_sync_core::rime_dir;
 use rime_sync_core::secret;
@@ -112,6 +114,19 @@ enum Command {
         /// 只铺 build/，不给 Weasel/Linux 的 data 方案打补丁
         #[arg(long)]
         no_data_patch: bool,
+    },
+    /// 把 Rime 方案裁剪到随包保留清单（安装器/自举用；RIMESYNC_PRUNE_SCHEMAS=0 关闭）
+    #[command(name = "prune-schemas")]
+    PruneSchemas {
+        /// 只报告将删除什么，不落盘
+        #[arg(long)]
+        dry_run: bool,
+        /// data 目录（可重复；缺省按平台/注册表探测，Linux: /usr/share/rime-data）
+        #[arg(long = "data-dir", value_name = "DIR")]
+        data_dir: Vec<PathBuf>,
+        /// 用户 Rime 目录（缺省自动探测）
+        #[arg(long = "user-dir", value_name = "DIR")]
+        user_dir: Option<PathBuf>,
     },
 }
 
@@ -234,7 +249,7 @@ struct ProbeFailed;
 #[derive(Debug)]
 struct FixImeFailed;
 
-/// fix-ime 的 JSON 报告：PrebuiltReport 的字段平铺，再补 data 补丁结果。
+/// fix-ime 的 JSON 报告：PrebuiltReport 的字段平铺，再补 data 补丁与输入法结果。
 #[derive(Serialize)]
 struct FixImeJson<'a> {
     #[serde(flatten)]
@@ -242,11 +257,23 @@ struct FixImeJson<'a> {
     /// 本次真正写入的 data 方案个数（重复执行时为 0）。
     data_patched: usize,
     data: &'a data_patch::DataPatchReport,
+    /// 非保留方案的清理结果（0.6.21）。
+    prune: &'a prune::PruneReport,
+    /// 输入法（Weasel）健康检查与自举结果（0.6.20）。
+    weasel_present: bool,
+    weasel_installed: bool,
+    weasel_version: String,
+    weasel_installer: String,
+    weasel_installer_source: String,
+    weasel_install: String,
+    weasel_error: Option<String>,
+    weasel_needs_elevation: bool,
+    weasel_log: String,
 }
 
 impl std::fmt::Display for FixImeFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("prebuilt build is not usable")
+        formatter.write_str("fix-ime could not restore the input method")
     }
 }
 
@@ -657,13 +684,29 @@ fn run(cli: Cli) -> Result<()> {
             let data = if no_data_patch {
                 data_patch::DataPatchReport::default()
             } else {
-                data_patch::patch_dirs(&data_patch::data_dirs(), env!("CARGO_PKG_VERSION"))
+                // 0.6.20：data 目录按「WeaselRoot\data → weasel-*\data → InstallDir
+                // → %ProgramFiles%\Rime\data」逐项探测，报告里带全部候选。
+                data_patch::patch_auto(env!("CARGO_PKG_VERSION"))
             };
+            // 0.6.21：data/用户/build 里不属于保留清单的方案一并清理（幂等、带备份）。
+            let pruned = prune::prune_auto();
+            // 0.6.20：输入法本体不依赖 NSIS 钩子——缺失就用随包安装器装回去。
+            let weasel = ime::ensure(exe_dir().as_deref());
             if cli.json {
                 print_json(&FixImeJson {
                     prebuilt: &report,
                     data_patched: data.patched(),
                     data: &data,
+                    prune: &pruned,
+                    weasel_present: weasel.present,
+                    weasel_installed: weasel.installed,
+                    weasel_version: weasel.version.clone(),
+                    weasel_installer: weasel.installer.clone(),
+                    weasel_installer_source: weasel.installer_source.clone(),
+                    weasel_install: weasel.install.clone(),
+                    weasel_error: weasel.error.clone(),
+                    weasel_needs_elevation: weasel.needs_elevation,
+                    weasel_log: weasel.log.clone(),
                 })?;
             } else {
                 println!("rime_dir={}", rime_dir.display());
@@ -703,8 +746,32 @@ fn run(cli: Cli) -> Result<()> {
                             &data.backup_dir
                         }
                     );
-                    for dir in &data.data_dirs {
-                        println!("data_dir={dir}");
+                    println!(
+                        "punctuator_patched={} punctuator_skipped={}",
+                        data.punctuator_patched,
+                        data.punctuator_skipped.len()
+                    );
+                    for item in &data.punctuator_skipped {
+                        println!("punctuator_skipped_item={item}");
+                    }
+                    // 实际使用的目录（空 = 一个候选都不存在）
+                    println!(
+                        "data_dir={}",
+                        if data.data_dir.is_empty() {
+                            "-"
+                        } else {
+                            data.data_dir.as_str()
+                        }
+                    );
+                    let candidates: Vec<&str> = data
+                        .data_candidates
+                        .iter()
+                        .map(|candidate| candidate.path.as_str())
+                        .collect();
+                    println!("data_candidates=[{}]", candidates.join(", "));
+                    if let Some(reason) = &data.data_error {
+                        println!("data_error={reason}");
+                        eprintln!("warning: {reason}");
                     }
                     for file in &data.schemas_patched {
                         println!("data_file={file}");
@@ -721,11 +788,92 @@ fn run(cli: Cli) -> Result<()> {
                         );
                     }
                 }
+                println!("{}", pruned.summary());
+                // 一行一个键：安装脚本用 sed 's/^prune_removed=//p' 解析。
+                println!("prune_disabled={}", pruned.disabled);
+                println!("prune_removed={}", pruned.removed());
+                println!("prune_backups={}", pruned.backups.len());
+                println!("prune_failed={}", pruned.failures.len());
+                for path in &pruned.removed {
+                    println!("prune_removed_file={path}");
+                }
+                for path in &pruned.backups {
+                    println!("prune_backup={path}");
+                }
+                for error in &pruned.failures {
+                    eprintln!("warning: {error}");
+                }
+                println!(
+                    "weasel_present={} weasel_installed={} weasel_version={} weasel_install={}",
+                    weasel.present,
+                    weasel.installed,
+                    if weasel.version.is_empty() {
+                        "-"
+                    } else {
+                        weasel.version.as_str()
+                    },
+                    weasel.install
+                );
+                if !weasel.installer.is_empty() {
+                    println!(
+                        "weasel_installer={} source={}",
+                        weasel.installer, weasel.installer_source
+                    );
+                }
+                if let Some(error) = &weasel.error {
+                    eprintln!("warning: {error}");
+                }
+                if weasel.needs_elevation {
+                    eprintln!(
+                        "hint: 安装输入法需要管理员权限；请以管理员身份重新启动 rime-sync 后再点「修复输入法」，或手动运行随包安装器"
+                    );
+                }
             }
-            if report.build_ok {
+            if report.build_ok && weasel.ok() {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))
+            }
+        }
+        Command::PruneSchemas {
+            dry_run,
+            data_dir,
+            user_dir,
+        } => {
+            let report = prune::prune_auto_with(
+                if data_dir.is_empty() {
+                    None
+                } else {
+                    Some(data_dir.as_slice())
+                },
+                user_dir.as_deref(),
+                prune::PruneOptions { dry_run },
+            );
+            if cli.json {
+                print_json(&report)
+            } else {
+                println!("{}", report.summary());
+                println!("prune_disabled={}", report.disabled);
+                println!("prune_removed={}", report.removed());
+                println!("prune_backups={}", report.backups.len());
+                println!("prune_failed={}", report.failures.len());
+                println!("prune_dry_run={}", report.dry_run);
+                println!("keep={}", report.keep.join(","));
+                for path in &report.removed {
+                    println!("prune_removed_file={path}");
+                }
+                for path in &report.backups {
+                    println!("prune_backup={path}");
+                }
+                for error in &report.failures {
+                    eprintln!("warning: {error}");
+                }
+                if report.needs_elevation() {
+                    eprintln!(
+                        "hint: 清理 data 目录需要管理员权限；请以管理员/root 身份重新运行 rime-sync-cli prune-schemas"
+                    );
+                }
+                Ok(())
             }
         }
         Command::History { limit } => {

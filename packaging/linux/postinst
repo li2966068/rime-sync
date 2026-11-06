@@ -214,7 +214,7 @@ else
 fi
 
 # ---------------------------------------------------- schema 增强配置模板
-# 随包 16 个方案的 <schema>.custom.yaml 由 rime-inputmethod 装到
+# 随包 3 个保留方案的 <schema>.custom.yaml 由 rime-inputmethod 装到
 # /usr/share/rime-sync/defaults/schemas/：给引擎加 rimesync_vnum / rimesync_punct，
 # 并把 punctuator 半角主字符改成单值 commit（没装插件时的兜底）。
 # 写入规则（与 Windows 安装器一致）：
@@ -267,14 +267,14 @@ seed_schema_customs() { # $1=Rime 用户目录
 # 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy 返回 0
 # 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。随 IME 包带的
 # /usr/share/rime-sync/prebuilt 是别处已经部署好的产物：用户目录缺 build 时铺过去。
-# 判据与 Windows 安装器一致：build/luna_pinyin.schema.yaml 存在，且里面有
+# 判据与 Windows 安装器一致：build/luna_pinyin_simp.schema.yaml 存在，且里面有
 # rimesync_vnum / rimesync_punct 插件标记（官方部署出来的没有）。
 # 开关：RIMESYNC_PREBUILT=0 关闭；RIMESYNC_PREBUILT=force 覆盖已存在的文件。
 PREBUILT_DIR=/usr/share/rime-sync/prebuilt
 PREBUILT_LOG=$LOGDIR/prebuilt.log
 
 prebuilt_usable() { # $1=Rime 用户目录
-    local f=$1/build/luna_pinyin.schema.yaml
+    local f=$1/build/luna_pinyin_simp.schema.yaml
     [ -f "$f" ] || return 1
     grep -q rimesync_vnum "$f" 2>/dev/null || return 1
     grep -q rimesync_punct "$f" 2>/dev/null || return 1
@@ -356,6 +356,45 @@ seed_prebuilt_build() { # $1=Rime 用户目录
     return 0
 }
 
+# ---------------------------------------------- 非保留方案清理（0.6.21）
+# 随包只保留 packaging/rime/retained-schemas.txt 里的 3 个方案（朙月拼音·简化字 /
+# 五笔拼音 / 五笔86）。旧版本安装、发行版数据或历史部署会在 data / 用户目录 / build
+# 里留下其余方案，这里在 root 期清掉：
+#   * 实现只有一份（rime-sync-cli prune-schemas，与 Windows 自举共用 Rust 代码）；
+#   * 删除前同目录改名备份为 <原文件名>.rimesync-removed-<时间戳>，可回滚；
+#   * 幂等；开关 RIMESYNC_PRUNE_SCHEMAS=0 关闭。
+# 失败只告警，绝不让 postinst 中断安装。
+PRUNE_LOG=$LOGDIR/prune-schemas.log
+prune_extra_schemas() { # 参数 1 = Rime 用户目录（可为空）
+    local rime_dir=${1:-} cli=/usr/bin/rime-sync-cli out removed backups failed disabled
+    if [ ! -x "$cli" ]; then
+        say "方案清理：缺少 $cli，跳过（只告警）"
+        printf '%s skip reason=no-cli\n' "$(date '+%F %T')" >>"$PRUNE_LOG" 2>/dev/null || true
+        return 0
+    fi
+    local args=(prune-schemas)
+    [ -d /usr/share/rime-data ] && args+=(--data-dir /usr/share/rime-data)
+    if [ -n "$rime_dir" ] && [ -d "$rime_dir" ]; then
+        args+=(--user-dir "$rime_dir")
+    fi
+    out=$("$cli" "${args[@]}" 2>&1 || true)
+    printf '%s\n' "$out" | while IFS= read -r line; do
+        [ -n "$line" ] && printf '%s prune %s\n' "$(date '+%F %T')" "$line" >>"$PRUNE_LOG" 2>/dev/null
+    done
+    disabled=$(printf '%s\n' "$out" | sed -n 's/^prune_disabled=//p' | head -1)
+    removed=$(printf '%s\n' "$out" | sed -n 's/^prune_removed=//p' | head -1)
+    backups=$(printf '%s\n' "$out" | sed -n 's/^prune_backups=//p' | head -1)
+    failed=$(printf '%s\n' "$out" | sed -n 's/^prune_failed=//p' | head -1)
+    if [ "${disabled:-0}" = "1" ]; then
+        say "方案清理：已按 RIMESYNC_PRUNE_SCHEMAS=0 关闭"
+    else
+        say "方案清理：删除 ${removed:-?} 个文件（备份 ${backups:-?}，失败 ${failed:-?}）；清单 /usr/share/rime-sync/retained-schemas.txt"
+        printf '%s done removed=%s backups=%s failed=%s dir=%s\n' \
+            "$(date '+%F %T')" "${removed:-0}" "${backups:-0}" "${failed:-0}" "${rime_dir:-}" >>"$PRUNE_LOG" 2>/dev/null || true
+    fi
+    return 0
+}
+
 if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     RIME_USER_DIR=$TARGET_HOME/.local/share/fcitx5/rime
     [ -n "${2:-}" ] && say "升级安装（原版本 $2）：只补缺失的输入法配置，已有文件一律沿用"
@@ -364,6 +403,12 @@ if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     seed_schema_customs "$RIME_USER_DIR"
     # 0.6.15：部署不产出 build 时用随包的预编译产物兜底（缺文件才铺，失败只告警）
     seed_prebuilt_build "$RIME_USER_DIR"
+    # 0.6.21：清掉非保留方案的 data / 用户 custom.yaml / build 产物（幂等、带备份）
+    prune_extra_schemas "$RIME_USER_DIR"
+fi
+# 用户目录不可用时只清 data（root 期；Linux 的 /usr/share/rime-data 属 root）
+if [ "${1:-}" = "configure" ] && [ -z "$TARGET_HOME" ]; then
+    prune_extra_schemas ""
 fi
 
 # 刷新菜单与图标缓存（没有这些工具就算了）
@@ -385,8 +430,9 @@ cat <<'EOM'
         install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
             ~/.local/share/fcitx5/rime/default.custom.yaml
         fcitx5-remote -r
-      注意：模板列了 16 个随包方案（拼音/五笔/仓颉/笔画/注音）。只有 /usr/share/rime-data
-      来自随包 rime-inputmethod 时才有这些数据；若用的是发行版 librime-data（没有五笔等），
+      注意：模板只列 3 个保留方案（朙月拼音·简化字 / 五笔拼音 / 五笔86，见
+      /usr/share/rime-sync/retained-schemas.txt）。只有 /usr/share/rime-data 来自随包
+      rime-inputmethod 时才有这些数据；若用的是发行版 librime-data（没有五笔等），
       照抄模板会让 rime 部署失败，请改列 /usr/share/rime-data 里实际存在的方案。
 
    v 数值转换（v123 / v12.5 出中文数字）与中文标点直出（Shift 取备选）由

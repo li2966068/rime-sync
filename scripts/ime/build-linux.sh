@@ -7,6 +7,7 @@
 #   IMAGE=debian:13   scripts/ime/build-linux.sh
 #   ALL=1             scripts/ime/build-linux.sh     # trixie (kept as a driver)
 #   JOBS=8 STAGING=/tmp/stg scripts/ime/build-linux.sh
+#   CACHE_DIR=$PWD/build/ime-cache/debian-13 scripts/ime/build-linux.sh   # 复用 librime 构建
 #
 # Supported targets (each is a *separate* build; fcitx5 5.0 and 5.1 are not
 # ABI compatible, so an artifact built for one release must never be reused on
@@ -58,6 +59,14 @@ SUITE=${SUITE:-$DEF_SUITE}
 JOBS=${JOBS:-$(nproc)}
 STAGING=${STAGING:-$REPO_ROOT/build/ime-staging/$DISTRO_KEY}
 OUT=${OUT:-$REPO_ROOT/build/deb/$DISTRO_KEY}
+# 可选的 librime 构建缓存目录：空 = 关（本地默认关；CI 的 ime job 传 build/ime-cache/<distro>）。
+# 只缓存 librime 的安装前缀 + manifest.json，命中与否由 container-build.sh 里的
+# scripts/ime/librime-build-cache.sh 判定，判 invalid 就删掉重编。
+CACHE_DIR=${CACHE_DIR:-}
+if [ -n "$CACHE_DIR" ]; then
+  mkdir -p "$CACHE_DIR"
+  CACHE_DIR=$(cd "$CACHE_DIR" && pwd)
+fi
 
 # APT_MIRROR is a base URL used for both Ubuntu and Debian, e.g.
 #   http://mirrors.aliyun.com   (default: keep the image's official sources)
@@ -132,6 +141,11 @@ echo "==> distro key    : $DISTRO_KEY  (suite $SUITE)"
 echo "==> builder image : $BUILDER_IMAGE"
 echo "==> staging       : $STAGING"
 echo "==> deb output    : $OUT"
+if [ -n "$CACHE_DIR" ]; then
+  echo "==> librime cache : $CACHE_DIR"
+else
+  echo "==> librime cache : off"
+fi
 echo "==> jobs          : $JOBS"
 [ -n "$APT_MIRROR" ] && echo "==> apt mirror    : $APT_MIRROR"
 if [ -n "$BUILD_NETWORK" ]; then
@@ -153,10 +167,16 @@ tail -n 1 "$STAGING/docker-build.log"
 
 START=$(date +%s)
 echo "==> compiling in container"
+CACHE_ARGS=()
+if [ -n "$CACHE_DIR" ]; then
+  # 容器里是 root，写完缓存要把属主还给宿主用户，否则下一轮 cache action 删不掉。
+  CACHE_ARGS=(-e RIME_IME_CACHE=/cache -e CACHE_UID="$(id -u)" -e CACHE_GID="$(id -g)" -v "$CACHE_DIR":/cache)
+fi
 if ! docker run --rm --network "$DOCKER_NETWORK" \
       -e JOBS="$JOBS" \
       -e BASE_IMAGE="$IMAGE" \
       -e SRC=/src -e OUT=/out \
+      ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
       -v "$REPO_ROOT":/src:ro \
       -v "$STAGING":/out \
       -v "$HERE":/scripts:ro \

@@ -1,0 +1,16 @@
+# rime-sync 随包保留的输入方案（单一真相源）
+#
+# 顺序 = packaging/rime/default.custom.yaml 的 schema_list 顺序 = 安装器 seed 顺序。
+# 其它方案（模板、data 里的 *.schema.yaml/*.bin、用户目录 custom.yaml、build 产物）
+# 在安装/自举时会被清理：见 crates/core/src/prune.rs（同一个文件用 include_str! 编译进来）
+# 与 scripts/ime/rime_common.py（Python 生成器直接读这个文件）。
+#
+# 改这里之后必须跑：
+#   scripts/ime/gen-schema-custom.py --check
+#   scripts/ime/gen-prebuilt-build.py --check
+#   bash packaging/windows/check-nsis-hooks.sh --strict
+# 依赖方案（luna_pinyin / pinyin_simp / stroke 等）由生成器/清理逻辑自动解析
+# schema 的 __include 与 dependencies，不要写进这个清单。
+luna_pinyin_simp
+wubi_pinyin
+wubi86

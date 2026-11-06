@@ -249,7 +249,7 @@ assert_fn_has RimeSyncSelfCheck "非静默弹 STOP 框" 'MessageBox MB_OK|MB_ICO
 assert_fn_has RimeSyncSelfCheck "自检调用部署" 'WeaselDeployer.exe" /deploy'
 assert_has "部署等待上限 20 秒" '!define RIMESYNC_DEPLOY_TIMEOUT_MS "20000"'
 assert_has "20 秒超时真的传给 nsExec" 'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_DEPLOY_TIMEOUT_MS}'
-assert_fn_has RimeSyncSelfCheck "自检检查 build 里的 luna_pinyin" 'build\luna_pinyin.schema.yaml'
+assert_fn_has RimeSyncSelfCheck "自检检查 build 里的 luna_pinyin_simp" 'build\luna_pinyin_simp.schema.yaml'
 assert_fn_has RimeSyncSelfCheck "自检写 phase=SELF-CHECK" 'phase=SELF-CHECK'
 assert_fn_has RimeSyncSelfCheck "自检报配置目录与数量" 'configdir=$0 configs=$RimeSyncSeedWritten'
 assert_fn_has RimeSyncSelfCheck "自检未更新只告警" 'warning=build-not-updated'
@@ -260,7 +260,7 @@ assert_has "DONE 行带 install-dir / default-exe" 'install-dir=$RimeSyncWeaselR
 
 # 0.6.15：预编译 build 产物兜底（某些机器上 WeaselDeployer /deploy 返回 0 但什么都不写）
 assert_has "预编译产物随安装包分发" 'resources\prebuilt'
-assert_has "兜底判据落在 build\luna_pinyin.schema.yaml" 'build\luna_pinyin.schema.yaml'
+assert_has "兜底判据落在 build\luna_pinyin_simp.schema.yaml" 'build\luna_pinyin_simp.schema.yaml'
 assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_vnum" 'StrCpy $R8 "rimesync_vnum"'
 assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_punct" 'StrCpy $R8 "rimesync_punct"'
 assert_fn_has RimeSyncFileContains "真的逐行读文件内容" 'FileOpen $0 "$R9" r'
@@ -284,6 +284,99 @@ assert_fn_has RimeSyncSelfCheck "兜底成功不再报 build-not-updated" 'StrCm
 assert_fn_has RimeSyncSelfCheck "SELF-CHECK 增加 build-source 字段" 'build-source=$RimeSyncBuildSource'
 assert_has "DONE 行也带 build-source" 'build=$RimeSyncBuildState build-source=$RimeSyncBuildSource'
 assert_has "卸载时清掉随包产物" 'RMDir /r "$INSTDIR\resources\prebuilt"'
+
+# ---------------------------------------------------------------------------
+# 0.6.21：随包只保留 3 个方案（朙月拼音·简化字 / 五笔拼音 / 五笔86）
+#   * 模板目录必须与 packaging/rime/retained-schemas.txt 逐项一致（清单是单一真相源）；
+#   * POSTINSTALL 必须调用 rime-sync-cli prune-schemas（钩子不另抄一份清单）；
+#   * 钩子里不许出现已移除方案的名字（否则就是把清单抄进了 NSIS）。
+# ---------------------------------------------------------------------------
+RETAINED_LIST="$PKG/rime/retained-schemas.txt"
+static_count=$((static_count + 1))
+if [ ! -f "$RETAINED_LIST" ]; then
+  printf 'FAIL static  缺少保留清单 %s\n' "$RETAINED_LIST" >&2
+  static_fail=1
+else
+  want=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$RETAINED_LIST" | sed '/^$/d' | sort)
+  have=$(cd "$PKG/rime/schemas" 2>/dev/null && ls *.custom.yaml 2>/dev/null | sed 's/\.custom\.yaml$//' | sort)
+  if [ "$want" != "$have" ]; then
+    printf 'FAIL static  方案模板与保留清单不一致\n           清单：%s\n           模板：%s\n' \
+      "$(printf '%s' "$want" | tr '\n' ' ')" "$(printf '%s' "$have" | tr '\n' ' ')" >&2
+    static_fail=1
+  fi
+  count=$(printf '%s\n' "$want" | wc -l)
+  if [ "$count" -ne 3 ]; then
+    printf 'FAIL static  保留清单应为 3 个方案，实际 %s\n' "$count" >&2
+    static_fail=1
+  fi
+fi
+assert_has "POSTINSTALL 调用方案清理" 'Call RimeSyncPruneSchemas'
+assert_fn_has RimeSyncPruneSchemas "清理只调 CLI 子命令" 'prune-schemas'
+assert_fn_has RimeSyncPruneSchemas "CLI 不存在时只跳过" 'rimesync_prune_no_cli'
+assert_fn_no_abort RimeSyncPruneSchemas
+assert_has "清理阶段日志 phase=PRUNE" 'phase=PRUNE'
+assert_has "DONE 行带 prune 状态" 'prune=$RimeSyncPruneState'
+assert_fn_has RimeSyncSeedRimeConfig "模板只从 resources\schemas 读取" 'resources\schemas'
+assert_absent "钩子不把已移除方案写死" 'terra_pinyin'
+assert_absent "钩子不把已移除方案写死（仓颉）" 'cangjie5'
+
+# ---------------------------------------------------------------------------
+# 0.6.20：随包输入法安装器（程序自己修复输入法，不依赖 NSIS 钩子）
+#   227 实测：/S 静默安装时钩子不执行，旧 Weasel 又被卸载器卸掉，机器上没有输入法。
+#   所以安装器必须真的进 Tauri resources（Windows 平台配置），且与 NSIS 钩子内嵌的
+#   是同一个文件、同一个文件名；卸载时也要清掉。
+# ---------------------------------------------------------------------------
+REPO=$(cd "$PKG/.." && pwd)
+WIN_CONF="$REPO/src-tauri/tauri.windows.conf.json"
+CORE_IME="$REPO/crates/core/src/ime.rs"
+WEASEL_NAME="weasel-0.17.4.0-installer.exe"
+
+assert_file_has() { # <说明> <文件> <固定字符串>
+  static_count=$((static_count + 1))
+  if ! grep -qF -- "$3" "$2" 2>/dev/null; then
+    printf 'FAIL static  %s\n           文件 %s 里缺少：%s\n' "$1" "$2" "$3" >&2
+    static_fail=1
+  fi
+}
+
+assert_file_has "Tauri resources 带随包输入法安装器（Windows 平台配置）" "$WIN_CONF" \
+  '"../packaging/windows/vendor/weasel-0.17.4.0-installer.exe": "resources/weasel/weasel-0.17.4.0-installer.exe"'
+assert_file_has "core 运行时从 resources/weasel 找安装器" "$CORE_IME" \
+  'join("resources").join("weasel")'
+assert_file_has "core 里的安装器文件名与打包一致" "$CORE_IME" \
+  'pub const INSTALLER_FILE: &str = "weasel-0.17.4.0-installer.exe";'
+assert_has "NSIS 卸载清掉 resources\weasel" 'RMDir /r "$INSTDIR\resources\weasel"'
+assert_has "NSIS 兜底也认 resources\weasel" \
+  'IfFileExists "$INSTDIR\resources\weasel\${RIMESYNC_WEASEL_INSTALLER}"'
+
+# 12 MB 的 Windows 安装器不能塞进基础配置：Linux 的 deb/AppImage 会白白变大。
+if grep -qF -- "$WEASEL_NAME" "$REPO/src-tauri/tauri.conf.json"; then
+  printf 'FAIL static  基础 tauri.conf.json 不该引用 %s（放进 tauri.windows.conf.json，Linux 包不背这个体积）\n' \
+    "$WEASEL_NAME" >&2
+  static_fail=1
+fi
+
+# 工作区里已有 vendor 安装器时，顺带验证载荷本身（CI 的 windows job 还会再验一次）。
+vendor_exe="$PKG/windows/vendor/$WEASEL_NAME"
+if [ -f "$vendor_exe" ]; then
+  static_count=$((static_count + 1))
+  size=$(wc -c <"$vendor_exe")
+  magic=$(head -c 2 "$vendor_exe")
+  if [ "$size" -lt 8000000 ]; then
+    printf 'FAIL static  %s 只有 %s 字节（应 ≥ 8 MiB）：下载/编译出来的多半是错误页或占位文件\n' \
+      "$vendor_exe" "$size" >&2
+    static_fail=1
+  elif [ "$magic" != "MZ" ]; then
+    printf 'FAIL static  %s 不是 PE 文件（缺少 MZ 头）\n' "$vendor_exe" >&2
+    static_fail=1
+  else
+    printf 'ok   vendor  %s（%s 字节，MZ 头）\n' "$WEASEL_NAME" "$size"
+  fi
+else
+  # 没有本地载荷不算错（Linux 上本来就没有）；但 Tauri 的 Windows 打包需要它，
+  # 所以把「怎么来」写清楚，避免 CI 红了才去猜。
+  printf 'note vendor  %s 不在工作区（Windows 打包前需先跑 fetch-weasel.ps1 / 自编译）\n' "$vendor_exe"
+fi
 
 # 失败一律只记日志：这些函数体里不能有 Abort
 for fn in \

@@ -8,6 +8,10 @@
 //   * 0.6.19：KP_Decimal 在无组字时永远上屏 ASCII 句点 0x2E（中文态也不是「。」），
 //     英文态与主键盘 '.' 一样交给客户端；正在组字时仍作为 '.' 交回引擎；
 //     主键盘 '.' 中文态保持「。」。
+//   * 0.6.20（punctuator 深合并）：中文态 `\\` 直接上屏「、」且不弹候选列表、
+//     Shift+; 直接上屏「：」；`,` `;` `'` `[` `]` 行为不变、`/fh` 仍可用；
+//     英文态 `\\` 与 `;` 仍交给客户端（引擎不提交任何文本）。
+//     期望值来自 third_party/rime-data/rime-prelude/symbols.yaml。
 //
 // 用法：rime-vmode-smoke <shared_data_dir> <user_data_dir> [--no-deploy]
 //      --no-deploy 直接用 user_data_dir/build 里已有的产物。
@@ -79,6 +83,16 @@ void CheckText(const std::string& actual,
   Check(actual == expected, what,
         actual == expected ? std::string()
                            : (actual + " " + BytesOf(actual)));
+}
+
+// 当前会话有没有候选列表（用来断言标点直出而不是弹菜单）。
+bool HasCandidates(RimeApi* api, RimeSessionId session) {
+  RimeCandidateListIterator iterator{};  // 这个结构没有 data_size
+  if (!api->candidate_list_begin(session, &iterator))
+    return false;
+  const bool has = api->candidate_list_next(&iterator);
+  api->candidate_list_end(&iterator);
+  return has;
 }
 
 void Press(RimeApi* api, RimeSessionId session, int keycode) {
@@ -208,6 +222,65 @@ int main(int argc, char** argv) {
         Input(api, session));
   Reset(api, session);
 
+  // 4b. 0.6.20：中文态两个符号直出（data 方案的 punctuator/half_shape 深合并）
+  api->set_option(session, "ascii_mode", False);
+  Reset(api, session);
+  Press(api, session, '\\');
+  const std::string backslash_commit = TakeCommit(api, session);
+  CheckText(backslash_commit, u8"、",
+            "chinese: backslash commits 、 directly");
+  Check(!HasCandidates(api, session),
+        "chinese: backslash shows no candidate menu");
+  Check(Input(api, session).empty(),
+        "chinese: backslash leaves no composition", Input(api, session));
+
+  Reset(api, session);
+  Press(api, session, ':');
+  const std::string colon_commit = TakeCommit(api, session);
+  CheckText(colon_commit, u8"：", "chinese: Shift+; commits ： directly");
+  Check(!HasCandidates(api, session),
+        "chinese: colon shows no candidate menu");
+  Check(Input(api, session).empty(), "chinese: colon leaves no composition",
+        Input(api, session));
+
+  // 4c. 其余标点保持原样（期望值来自
+  //     third_party/rime-data/rime-prelude/symbols.yaml 的 half_shape）
+  Reset(api, session);
+  Press(api, session, ',');
+  CheckText(TakeCommit(api, session), u8"，", "chinese: ',' still commits ，");
+
+  Reset(api, session);
+  Press(api, session, ';');
+  CheckText(TakeCommit(api, session), u8"；", "chinese: ';' still commits ；");
+
+  Reset(api, session);
+  Press(api, session, '\'');
+  CheckText(TakeCommit(api, session), u8"‘",
+            "chinese: single quote still commits the opening quote");
+
+  Reset(api, session);
+  Press(api, session, '[');
+  Press(api, session, 0x20);
+  CheckText(TakeCommit(api, session), u8"「",
+            "chinese: '[' still commits its first candidate");
+
+  Reset(api, session);
+  Press(api, session, ']');
+  Press(api, session, 0x20);
+  CheckText(TakeCommit(api, session), u8"」",
+            "chinese: ']' still commits its first candidate");
+
+  // /fh 符号表（recognizer punct + symbols preset）仍然可用
+  Reset(api, session);
+  Press(api, session, '/');
+  Press(api, session, 'f');
+  Press(api, session, 'h');
+  Check(Input(api, session) == "/fh", "chinese: /fh types the symbol prefix",
+        Input(api, session));
+  Press(api, session, 0x20);
+  CheckText(TakeCommit(api, session), u8"©",
+            "chinese: /fh still commits its first symbol");
+
   // 5. 0.6.19：中文态、没有组字时，KP_Decimal 直接上屏 ASCII 句点。
   api->set_option(session, "ascii_mode", False);
   Reset(api, session);
@@ -240,6 +313,20 @@ int main(int argc, char** argv) {
   Check(dot_ascii_commit.empty(),
         "ascii: main '.' commits no IME text either",
         BytesOf(dot_ascii_commit));
+
+  // 6b. 英文态：\\ 与 ; 仍交给客户端（引擎不提交任何文本）
+  Reset(api, session);
+  const Bool backslash_ascii_handled = api->process_key(session, '\\', 0);
+  Check(!backslash_ascii_handled, "ascii: backslash is passed to the client",
+        std::string("process_key=") +
+            (backslash_ascii_handled ? "true" : "false"));
+  Check(TakeCommit(api, session).empty(),
+        "ascii: backslash commits no IME text");
+  const Bool semicolon_ascii_handled = api->process_key(session, ';', 0);
+  Check(!semicolon_ascii_handled, "ascii: ';' is passed to the client",
+        std::string("process_key=") +
+            (semicolon_ascii_handled ? "true" : "false"));
+  Check(TakeCommit(api, session).empty(), "ascii: ';' commits no IME text");
   api->set_option(session, "ascii_mode", False);
 
   // 7. v 模式：v12.34 + a —— 小数点参与编码，不被上屏。

@@ -6,11 +6,12 @@
 //! 该机的 WeaselDeployer /deploy 恒返回 0 且不产出，部署链不可用，所以只能直接改
 //! <WeaselRoot>\data\<schema>.schema.yaml（Linux 对应 /usr/share/rime-data/）。
 //!
-//! 四处补丁（全部幂等，重复执行产出同一份文本）：
+//! 五处补丁（全部幂等，重复执行产出同一份文本）：
 //! 1. engine/translators 首位插入 rimesync_vnum
 //! 2. engine/processors 在 recognizer 之后插入 rimesync_vselect，其后插入 numpad
 //! 3. recognizer/patterns 增加 vnum: '^[vV][0-9.]*$'
-//! 4. 文件顶部插入 # patched by rime-sync <version>
+//! 4. punctuator/half_shape 深合并 "\\" -> 、 与 ":" -> ：（0.6.20；只在缺失时注入）
+//! 5. 文件顶部插入 # patched by rime-sync <version>
 //!
 //! 写盘纪律：先备份 <file>.rimesync-orig（只做一次），补丁后用 serde_yaml 重新
 //! 解析确认合法、核对目标状态，再按原换行风格写成 UTF-8（不带 BOM）。权限不足时
@@ -34,13 +35,25 @@ pub const VNUM_TRANSLATOR: &str = "rimesync_vnum";
 pub const VSELECT_PROCESSOR: &str = "rimesync_vselect";
 /// 小键盘归一化处理器（third_party/librime/plugins/rimesync-extra）。
 pub const NUMPAD_PROCESSOR: &str = "numpad";
+/// punctuator 深合并（0.6.20）：中文态反斜杠与冒号直出。
+pub const PUNCTUATOR_KEY: &str = "punctuator";
+pub const HALF_SHAPE_KEY: &str = "half_shape";
+pub const IMPORT_PRESET_KEY: &str = "import_preset";
+pub const DEFAULT_PUNCTUATOR_PRESET: &str = "default";
+/// 反斜杠键（YAML 里写 "\\"）直出「、」。
+pub const PUNCT_BACKSLASH: &str = "\\";
+pub const PUNCT_BACKSLASH_COMMIT: &str = "、";
+/// Shift+; 的冒号键直出「：」。
+pub const PUNCT_COLON: &str = ":";
+pub const PUNCT_COLON_COMMIT: &str = "：";
 /// 显式指定 data 目录（多个用系统路径分隔符）；空串或 0 = 关闭补丁。测试靠它隔离。
 pub const ENV_DATA_DIR: &str = "RIMESYNC_WEASEL_DATA";
 /// Linux 的 data 目录。
 pub const LINUX_DATA_DIR: &str = "/usr/share/rime-data";
-/// Windows 注册表里的 Weasel 配置键。
+/// Windows 注册表里的 Weasel 配置键（32 位视图）。
 pub const REG_KEY: &str = r"HKLM\Software\WOW6432Node\Rime\Weasel";
-const REG_VALUES: [&str; 2] = ["WeaselRoot", "InstallDir"];
+/// 同一个键的 64 位视图（某些安装方式把值写在这里）。
+pub const REG_KEY_64: &str = r"HKLM\Software\Rime\Weasel";
 const BOM: char = '\u{feff}';
 
 /// 单文件的处理结果。
@@ -57,8 +70,18 @@ pub enum PatchOutcome {
 /// 一批 data 目录的补丁结果。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DataPatchReport {
-    /// 实际检查的 data 目录。
+    /// 实际打补丁的 data 目录（0 或 1 个；找不到就是空）。
     pub data_dirs: Vec<String>,
+    /// 实际使用的 data 目录；空串 = 没找到可用目录。
+    pub data_dir: String,
+    /// 本次探测过的全部候选（含不存在的），按探测顺序。
+    pub data_candidates: Vec<DataDirCandidate>,
+    /// 一个候选都不存在时的可读原因（列出探测过的路径）。
+    pub data_error: Option<String>,
+    /// 本次注入的 punctuator 条目个数（"\\" 与 ":" 各算一个）。
+    pub punctuator_patched: usize,
+    /// 跳过的 punctuator 条目与原因（已存在 / 结构不适用）。
+    pub punctuator_skipped: Vec<String>,
     /// 本次真正写入的方案文件。
     pub schemas_patched: Vec<String>,
     /// 已是目标状态、没有写入的方案文件。
@@ -85,11 +108,13 @@ impl DataPatchReport {
     /// 一句话结论（界面 / 日志共用）。
     pub fn summary(&self) -> String {
         let mut text = format!(
-            "data 方案补丁：写入 {}，无需改动 {}，跳过 {}，失败 {}",
+            "data 方案补丁：写入 {}，无需改动 {}，跳过 {}，失败 {}，punctuator 注入 {}（跳过 {}）",
             self.schemas_patched.len(),
             self.schemas_unchanged.len(),
             self.schemas_skipped.len(),
-            self.errors.len()
+            self.errors.len(),
+            self.punctuator_patched,
+            self.punctuator_skipped.len()
         );
         if let Some(first) = self.errors.first() {
             text.push_str(&format!("；首个错误：{first}"));
@@ -98,73 +123,246 @@ impl DataPatchReport {
     }
 }
 
-/// 定位引擎实际加载的 data 目录。
+/// 注册表里 Weasel 的两个目录值（原样，未拼 data 子目录）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WeaselRegistryValues {
+    /// 程序根目录，例：C:\Program Files\Rime。
+    pub weasel_root: Option<PathBuf>,
+    /// 实际安装目录，例：C:\Program Files\Rime\weasel-0.17.4。
+    pub install_dir: Option<PathBuf>,
+}
+
+/// 一个探测过的候选目录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DataDirCandidate {
+    pub path: String,
+    /// env / registry:WeaselRoot / glob:InstallDir\\weasel-* / fallback:…（来源便于排障）。
+    pub source: String,
+    pub exists: bool,
+}
+
+/// data 目录解析结果。
+#[derive(Debug, Clone, Default)]
+pub struct DataDirResolution {
+    /// 实际使用的目录（0 或 1 个；第一个命中的胜出）。
+    pub dirs: Vec<PathBuf>,
+    /// 探测过的全部候选，按顺序（含不存在的）。
+    pub candidates: Vec<DataDirCandidate>,
+    /// 一个候选都不存在时的可读原因。
+    pub error: Option<String>,
+}
+
+/// 定位引擎实际加载的 data 目录（0.6.20 重写）。
 ///
-/// * RIMESYNC_WEASEL_DATA 一旦设置就只用它（空串或 0 = 关闭补丁，测试靠它隔离）；
-/// * Windows：注册表 HKLM\Software\WOW6432Node\Rime\Weasel 的 WeaselRoot
-///   （没有就 InstallDir）下的 data 子目录；读不到时退回 %ProgramFiles%\Rime\data；
-/// * 其它平台：/usr/share/rime-data（不存在就返回空，由调用方报告跳过）。
-pub fn data_dirs() -> Vec<PathBuf> {
+/// 227 实测：注册表 WeaselRoot 指向 C:\Program Files\Rime，真正的 data 在
+/// C:\Program Files\Rime\weasel-0.17.4\data；0.6.19 只拼了 <WeaselRoot>\data，
+/// 目录不存在，一处补丁都没打。探测顺序（逐项判存在、全部记进候选）：
+///
+/// 1. RIMESYNC_WEASEL_DATA 一旦设置就只用它（空串或 0 = 关闭补丁，测试靠它隔离）；
+/// 2. 注册表 WeaselRoot → <WeaselRoot>\data；
+/// 3. <WeaselRoot>\weasel-*\data（取版本号最大的一个）；
+/// 4. 注册表 InstallDir → <InstallDir>\data，再试 <InstallDir>\weasel-*\data；
+/// 5. 两个注册值都缺失 → %ProgramFiles%\Rime 下的前两种布局；
+/// 6. 兜底 %ProgramFiles%\Rime\data（0.6.19 及以前的旧行为）；
+/// 7. 其它平台：/usr/share/rime-data。
+pub fn resolve_data_dirs() -> DataDirResolution {
     if let Some(raw) = env::var_os(ENV_DATA_DIR) {
-        return dirs_from_env(&raw);
+        return resolve_env(&raw);
     }
-    let mut dirs = Vec::new();
-    // 平台默认目录即使不存在也要留下：patch_dirs 会把它记进 schemas_skipped
-    // （「目录不存在」），这正是「不存在则跳过并报告」。
     #[cfg(windows)]
     {
-        if let Some(root) = weasel_root_from_registry() {
-            push_candidate(&mut dirs, root.join("data"));
-        }
-        if let Some(program_files) = env::var_os("ProgramFiles") {
+        let program_files = env::var_os("ProgramFiles").map(PathBuf::from);
+        return resolve_windows(&weasel_registry(), program_files.as_deref());
+    }
+    #[cfg(not(windows))]
+    {
+        let mut resolution = DataDirResolution::default();
+        push_candidate(
+            &mut resolution,
+            PathBuf::from(LINUX_DATA_DIR),
+            "platform:linux",
+        );
+        finish(resolution)
+    }
+}
+
+/// 兼容入口：只返回实际要打补丁的目录（0 或 1 个）。
+pub fn data_dirs() -> Vec<PathBuf> {
+    resolve_data_dirs().dirs
+}
+
+/// 解析 data 目录并打补丁（CLI / 设置页 / 启动自举统一走这里）。
+pub fn patch_auto(version: &str) -> DataPatchReport {
+    let resolution = resolve_data_dirs();
+    let mut report = patch_dirs(&resolution.dirs, version);
+    report.data_candidates = resolution.candidates;
+    report.data_error = resolution.error;
+    report
+}
+
+/// RIMESYNC_WEASEL_DATA 的解析：空串 / 0 = 关闭（不是错误）；其余按系统路径
+/// 分隔符拆分，逐个探测存在性。
+fn resolve_env(raw: &OsStr) -> DataDirResolution {
+    let mut resolution = DataDirResolution::default();
+    let text = raw.to_string_lossy();
+    if text.trim().is_empty() || text.trim() == "0" {
+        return resolution;
+    }
+    for part in env::split_paths(raw) {
+        push_candidate(&mut resolution, part, "env:RIMESYNC_WEASEL_DATA");
+    }
+    finish(resolution)
+}
+
+/// Windows 的解析顺序，纯函数（Linux 上也能单测）。
+pub fn resolve_windows(
+    registry: &WeaselRegistryValues,
+    program_files: Option<&Path>,
+) -> DataDirResolution {
+    let mut resolution = DataDirResolution::default();
+    if let Some(root) = &registry.weasel_root {
+        push_candidate(&mut resolution, root.join("data"), "registry:WeaselRoot");
+        push_glob_candidates(&mut resolution, root, "glob:WeaselRoot\\weasel-*");
+    }
+    if let Some(dir) = &registry.install_dir {
+        push_candidate(&mut resolution, dir.join("data"), "registry:InstallDir");
+        push_glob_candidates(&mut resolution, dir, "glob:InstallDir\\weasel-*");
+    }
+    if registry.weasel_root.is_none() && registry.install_dir.is_none() {
+        if let Some(program_files) = program_files {
+            let rime = program_files.join("Rime");
             push_candidate(
-                &mut dirs,
-                PathBuf::from(program_files).join("Rime").join("data"),
+                &mut resolution,
+                rime.join("data"),
+                "default:%ProgramFiles%\\Rime",
+            );
+            push_glob_candidates(
+                &mut resolution,
+                &rime,
+                "glob:%ProgramFiles%\\Rime\\weasel-*",
             );
         }
     }
-    #[cfg(not(windows))]
-    push_candidate(&mut dirs, PathBuf::from(LINUX_DATA_DIR));
-    dirs
+    if let Some(program_files) = program_files {
+        push_candidate(
+            &mut resolution,
+            program_files.join("Rime").join("data"),
+            "fallback:%ProgramFiles%\\Rime\\data",
+        );
+    }
+    finish(resolution)
 }
 
-/// RIMESYNC_WEASEL_DATA 的解析：空串 / 0 = 关闭；其余按系统路径分隔符拆分，
-/// 只保留真实存在的目录。
-fn dirs_from_env(raw: &OsStr) -> Vec<PathBuf> {
-    let text = raw.to_string_lossy();
-    if text.trim().is_empty() || text.trim() == "0" {
+fn push_glob_candidates(resolution: &mut DataDirResolution, root: &Path, source: &str) {
+    for dir in weasel_version_dirs(root) {
+        push_candidate(resolution, dir.join("data"), source);
+    }
+}
+
+/// 记一个候选；第一个存在的目录成为实际使用的目录（顺序即优先级）。
+fn push_candidate(resolution: &mut DataDirResolution, path: PathBuf, source: &str) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let text = path.display().to_string();
+    if resolution.candidates.iter().any(|item| item.path == text) {
+        return;
+    }
+    let exists = path.is_dir();
+    if exists && resolution.dirs.is_empty() {
+        resolution.dirs.push(path);
+    }
+    resolution.candidates.push(DataDirCandidate {
+        path: text,
+        source: source.to_string(),
+        exists,
+    });
+}
+
+/// 一个候选都不存在时，把探测过的路径写成一句可读原因。
+fn finish(mut resolution: DataDirResolution) -> DataDirResolution {
+    if resolution.dirs.is_empty() && !resolution.candidates.is_empty() {
+        let probed: Vec<String> = resolution
+            .candidates
+            .iter()
+            .map(|item| format!("{}（{}，目录不存在）", item.path, item.source))
+            .collect();
+        resolution.error = Some(format!(
+            "未找到可用的 Rime data 目录：已探测 {} 个候选，全部不存在：{}",
+            probed.len(),
+            probed.join("；")
+        ));
+    }
+    resolution
+}
+
+/// <root>\weasel-<版本> 目录，按版本从高到低（0.17.10 排在 0.17.4 前面）。
+pub fn weasel_version_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
-    }
-    let mut dirs = Vec::new();
-    for part in env::split_paths(raw) {
-        push_dir(&mut dirs, part);
-    }
-    dirs
+    };
+    let mut found: Vec<(Vec<u64>, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            weasel_version(&name).map(|version| (version, entry.path()))
+        })
+        .collect();
+    found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    found.into_iter().map(|(_, path)| path).collect()
 }
 
-fn push_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if candidate.is_dir() {
-        push_candidate(dirs, candidate);
+/// "weasel-0.17.4" → [0, 17, 4]；不是这个形状（没有数字版本）返回 None。
+pub fn weasel_version(name: &str) -> Option<Vec<u64>> {
+    let suffix = name.strip_prefix("weasel-")?;
+    if suffix.is_empty() {
+        return None;
     }
+    let mut parts = Vec::new();
+    for part in suffix.split('.') {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        parts.push(part.parse::<u64>().ok()?);
+    }
+    Some(parts)
 }
 
-fn push_candidate(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !candidate.as_os_str().is_empty() && !dirs.iter().any(|dir| dir == &candidate) {
-        dirs.push(candidate);
-    }
-}
-
-/// 读注册表拿 WeaselRoot / InstallDir。失败（键不存在、权限、非 Windows）返回 None。
+/// 读注册表拿 WeaselRoot / InstallDir（32 位视图 + 64 位视图都试）。
 #[cfg(windows)]
-fn weasel_root_from_registry() -> Option<PathBuf> {
-    let output = std::process::Command::new("reg")
-        .args(["query", REG_KEY])
-        .output()
-        .ok()?;
+pub fn weasel_registry() -> WeaselRegistryValues {
+    // Weasel 是 32 位程序，主键在 WOW6432Node；某些安装方式会写进 64 位视图，
+    // 所以两个视图都读，值以先命中的为准。
+    let queries: [(&str, Option<&str>); 3] = [
+        (REG_KEY, None),
+        (REG_KEY, Some("/reg:32")),
+        (REG_KEY_64, Some("/reg:64")),
+    ];
+    let mut values = WeaselRegistryValues::default();
+    for (key, view) in queries {
+        let Some(output) = reg_query(key, view) else {
+            continue;
+        };
+        let parsed = weasel_registry_from_output(&output);
+        values.weasel_root = values.weasel_root.or(parsed.weasel_root);
+        values.install_dir = values.install_dir.or(parsed.install_dir);
+    }
+    values
+}
+
+#[cfg(windows)]
+fn reg_query(key: &str, view: Option<&str>) -> Option<String> {
+    let mut command = std::process::Command::new("reg");
+    command.args(["query", key]);
+    if let Some(view) = view {
+        command.arg(view);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
-    weasel_root_from_reg_output(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// 解析 reg query 的输出（下面这段是纯文本，不是 Rust 代码）：
@@ -175,28 +373,29 @@ fn weasel_root_from_registry() -> Option<PathBuf> {
 ///     WeaselRoot    REG_SZ    C:\Program Files\Rime
 /// ```
 ///
-/// 先取 WeaselRoot，没有再取 InstallDir；值里可以带空格。
-pub fn weasel_root_from_reg_output(output: &str) -> Option<PathBuf> {
-    for wanted in REG_VALUES {
-        for line in output.lines() {
-            let mut tokens = line.split_whitespace();
-            let Some(name) = tokens.next() else { continue };
-            if !name.eq_ignore_ascii_case(wanted) {
-                continue;
-            }
-            let Some(kind) = tokens.next() else { continue };
-            if !kind.eq_ignore_ascii_case("REG_SZ") {
-                continue;
-            }
-            // 路径可能带空格：从类型标记之后整段取。
-            let Some(pos) = line.find(kind) else { continue };
-            let value = line[pos + kind.len()..].trim().trim_matches('"');
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
-            }
+/// 两个值都保留（WeaselRoot 用来找版本目录，InstallDir 兜底）；值里可以带空格。
+pub fn weasel_registry_from_output(output: &str) -> WeaselRegistryValues {
+    let mut values = WeaselRegistryValues::default();
+    for line in output.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(name) = tokens.next() else { continue };
+        let Some(kind) = tokens.next() else { continue };
+        if !kind.eq_ignore_ascii_case("REG_SZ") {
+            continue;
+        }
+        // 路径可能带空格：从类型标记之后整段取。
+        let Some(pos) = line.find(kind) else { continue };
+        let value = line[pos + kind.len()..].trim().trim_matches('"');
+        if value.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("WeaselRoot") && values.weasel_root.is_none() {
+            values.weasel_root = Some(PathBuf::from(value));
+        } else if name.eq_ignore_ascii_case("InstallDir") && values.install_dir.is_none() {
+            values.install_dir = Some(PathBuf::from(value));
         }
     }
-    None
+    values
 }
 
 /// 逐目录给 <data>/*.schema.yaml 打补丁；单个文件失败不中断整批。
@@ -229,23 +428,34 @@ pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport {
                 .push(format!("{}（没有 *.schema.yaml）", dir.display()));
         }
         for file in files {
-            match patch_file(&file, version) {
-                Ok(PatchOutcome::Patched) => {
-                    report.schemas_patched.push(file.display().to_string());
-                    if report.backup_dir.is_empty() {
-                        report.backup_dir = dir.display().to_string();
+            match patch_file_detailed(&file, version) {
+                Ok((outcome, punctuator)) => {
+                    report.punctuator_patched += punctuator.patched;
+                    for skipped in &punctuator.skipped {
+                        report
+                            .punctuator_skipped
+                            .push(format!("{}：{skipped}", file.display()));
+                    }
+                    match outcome {
+                        PatchOutcome::Patched => {
+                            report.schemas_patched.push(file.display().to_string());
+                            if report.backup_dir.is_empty() {
+                                report.backup_dir = dir.display().to_string();
+                            }
+                        }
+                        PatchOutcome::Unchanged => {
+                            report.schemas_unchanged.push(file.display().to_string())
+                        }
+                        PatchOutcome::Skipped => report
+                            .schemas_skipped
+                            .push(format!("{}（结构不适用）", file.display())),
                     }
                 }
-                Ok(PatchOutcome::Unchanged) => {
-                    report.schemas_unchanged.push(file.display().to_string())
-                }
-                Ok(PatchOutcome::Skipped) => report
-                    .schemas_skipped
-                    .push(format!("{}（结构不适用）", file.display())),
                 Err(error) => report.errors.push(format!("{}：{error:#}", file.display())),
             }
         }
     }
+    report.data_dir = report.data_dirs.first().cloned().unwrap_or_default();
     report
 }
 
@@ -256,12 +466,35 @@ fn is_schema_yaml(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 给一个 <schema>.schema.yaml 打补丁。
+/// punctuator 深合并的结果（0.6.20）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PunctuatorPatch {
+    /// 本次注入的条目个数（"\\" 与 ":" 各算一个）。
+    pub patched: usize,
+    /// 跳过的条目与原因（已存在 / 结构不适用）。
+    pub skipped: Vec<String>,
+    /// 本次真正注入的键（写盘前核对目标状态用，不进报告）。
+    injected: Vec<String>,
+}
+
+impl PunctuatorPatch {
+    fn mark(&mut self, key: &str) {
+        self.patched += 1;
+        self.injected.push(key.to_string());
+    }
+}
+
+/// 给一个 <schema>.schema.yaml 打补丁（不看 punctuator 明细）。
+pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
+    patch_file_detailed(path, version).map(|(outcome, _)| outcome)
+}
+
+/// 给一个 <schema>.schema.yaml 打补丁，并返回 punctuator 深合并结果。
 ///
 /// 顺序：读文件 -> serde_yaml 解析（不合法就不动）-> 文本级插入 -> 渲染 -> 与原文
 /// 比对（相同即 Unchanged，幂等的定义）-> 再次解析 + 核对目标状态 -> 备份（只做
 /// 一次）-> 写回。
-pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
+pub fn patch_file_detailed(path: &Path, version: &str) -> Result<(PatchOutcome, PunctuatorPatch)> {
     let bytes = fs::read(path).with_context(|| format!("读取 {}", path.display()))?;
     let raw = String::from_utf8(bytes.clone()).map_err(|_| anyhow!("文件不是 UTF-8，跳过"))?;
     // 目标是 UTF-8 无 BOM：输入带 BOM 时去掉，写回也不写 BOM。
@@ -274,6 +507,15 @@ pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
     applicable |= doc.ensure_translator(&value);
     applicable |= doc.ensure_processors(&value);
     applicable |= doc.ensure_vnum_pattern(&value);
+    // punctuator 只在「能按行安全改写」的方案上做：flow 风格 / 没有 engine 的文件
+    // 连别的补丁都没动，这里也不该凭空塞一个新段。
+    let punctuator = if applicable {
+        let patch = doc.ensure_punctuator(&value);
+        applicable |= patch.patched > 0;
+        patch
+    } else {
+        PunctuatorPatch::default()
+    };
     if applicable {
         // 只有真的补过（或已经是目标状态）才留标记：纯 YAML、没有 engine 的
         // 文件不该被我们写上注释。
@@ -283,11 +525,12 @@ pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
     let patched = doc.render();
     if patched == text {
         // 一个字节都没变：要么已经打过补丁，要么没有可补的结构。
-        return Ok(if applicable || doc.changed {
+        let outcome = if applicable || doc.changed {
             PatchOutcome::Unchanged
         } else {
             PatchOutcome::Skipped
-        });
+        };
+        return Ok((outcome, punctuator));
     }
 
     // 安全闸：写盘前重新解析 + 核对目标状态，失败就不写。
@@ -295,13 +538,15 @@ pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
         .with_context(|| format!("补丁后的 {} 不是合法 YAML，已取消写入", path.display()))?;
     verify(&parsed)
         .with_context(|| format!("补丁后的 {} 没达到目标状态，已取消写入", path.display()))?;
+    verify_punctuator(&parsed, &punctuator)
+        .with_context(|| format!("补丁后的 {} 没达到目标状态，已取消写入", path.display()))?;
 
     let backup = backup_path(path);
     if !backup.exists() {
         fs::write(&backup, &bytes).with_context(|| format!("备份 {}", backup.display()))?;
     }
     fs::write(path, patched.as_bytes()).map_err(|error| anyhow!(io_error(path, &error)))?;
-    Ok(PatchOutcome::Patched)
+    Ok((PatchOutcome::Patched, punctuator))
 }
 
 /// <file>.rimesync-orig。
@@ -357,6 +602,36 @@ fn verify(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// punctuator 目标状态核对：只核对本次真的注入的键（已有键属于用户配置，不碰）。
+fn verify_punctuator(value: &Value, patch: &PunctuatorPatch) -> Result<()> {
+    if patch.injected.is_empty() {
+        return Ok(());
+    }
+    let half = value
+        .get(PUNCTUATOR_KEY)
+        .and_then(|punctuator| punctuator.get(HALF_SHAPE_KEY))
+        .ok_or_else(|| anyhow!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY} 缺失"))?;
+    for key in &patch.injected {
+        let entry = half
+            .get(key.as_str())
+            .ok_or_else(|| anyhow!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY} 缺少 {key}"))?;
+        // 注入的是标量（直接 commit）；兼容用户已有的 {commit: …} 写法。
+        let commit = entry
+            .as_str()
+            .or_else(|| entry.get("commit").and_then(Value::as_str))
+            .ok_or_else(|| anyhow!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}/{key} 没有 commit"))?;
+        let expected = if key == PUNCT_BACKSLASH {
+            PUNCT_BACKSLASH_COMMIT
+        } else {
+            PUNCT_COLON_COMMIT
+        };
+        if commit != expected {
+            bail!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}/{key} 的 commit 不是 {expected}");
+        }
+    }
+    Ok(())
+}
+
 /* ------------------------------ 文本编辑 ------------------------------ */
 
 fn indent_of(line: &str) -> usize {
@@ -405,6 +680,40 @@ fn item_name(line: &str) -> String {
         .unwrap_or("")
         .trim_matches(|ch| ch == '\'' || ch == '"')
         .to_string()
+}
+
+/// YAML 键的写法：双引号 + 反斜杠转义（反斜杠键写成 "\\"）。
+fn yaml_key(key: &str) -> String {
+    format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// 简单标量的写法：普通标识符原样，其余用双引号包起来。
+fn yaml_scalar(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// half_shape 的一条：标量形式（直接上屏，不进候选列表）。
+///
+/// 必须是标量而不是 "{commit: …}" 映射：rime-prelude/symbols.yaml 里
+/// "'\\' : [ 、, '\\', ＼ ]" 是列表，schema 里用映射覆盖预设列表会让
+/// librime 合并配置失败、整个方案部署不出来（0.6.20 容器 smoke 实测）。
+/// 标量属于 ConfigValue，直接替换预设值，Rime 的 TranslateUniquePunct 会
+/// 立刻上屏、不弹候选列表。
+fn half_shape_entry(key: &str) -> String {
+    let commit = if key == PUNCT_BACKSLASH {
+        PUNCT_BACKSLASH_COMMIT
+    } else {
+        PUNCT_COLON_COMMIT
+    };
+    format!("{}: \"{commit}\"", yaml_key(key))
 }
 
 struct Doc {
@@ -711,64 +1020,404 @@ impl Doc {
             }
         }
     }
+
+    /// punctuator 深合并（0.6.20）：保证 half_shape 里有
+    /// "\\" -> 、 与 ":" -> ：（标量形式，直接上屏）；已有同键一律跳过。
+    ///
+    /// 三种形态：
+    /// * 段缺失 → 追加 import_preset: default + half_shape；
+    /// * 标量（punctuator: default）→ 规范化为映射并保留原 preset 名；
+    /// * 已是映射 → 只补 half_shape 里缺的键（half_shape 缺失就新建）。
+    fn ensure_punctuator(&mut self, value: &Value) -> PunctuatorPatch {
+        let mut patch = PunctuatorPatch::default();
+        match value.get(PUNCTUATOR_KEY) {
+            None => self.append_punctuator_block(DEFAULT_PUNCTUATOR_PRESET, &mut patch),
+            Some(Value::Mapping(mapping)) => {
+                self.merge_punctuator_mapping(mapping, &mut patch);
+            }
+            Some(Value::String(preset)) => {
+                let preset = preset.trim();
+                let preset = if preset.is_empty() {
+                    DEFAULT_PUNCTUATOR_PRESET
+                } else {
+                    preset
+                };
+                if !self.replace_scalar_punctuator(preset, &mut patch) {
+                    patch.skipped.push(format!(
+                        "{PUNCTUATOR_KEY}: {preset}（内联写法，无法安全改写）"
+                    ));
+                }
+            }
+            Some(_) => patch
+                .skipped
+                .push(format!("{PUNCTUATOR_KEY}: 既不是映射也不是标量，跳过")),
+        }
+        patch
+    }
+
+    /// 段缺失：在文件末尾追加完整的 punctuator 块。
+    fn append_punctuator_block(&mut self, preset: &str, patch: &mut PunctuatorPatch) {
+        let needs_blank = self
+            .lines
+            .last()
+            .map(|line| !is_blank(line))
+            .unwrap_or(false);
+        if needs_blank {
+            self.lines.push(String::new());
+        }
+        self.lines.push(format!("{PUNCTUATOR_KEY}:"));
+        self.lines
+            .push(format!("  {IMPORT_PRESET_KEY}: {}", yaml_scalar(preset)));
+        self.lines.push(format!("  {HALF_SHAPE_KEY}:"));
+        for key in [PUNCT_BACKSLASH, PUNCT_COLON] {
+            self.lines.push(format!("    {}", half_shape_entry(key)));
+            patch.mark(key);
+        }
+        self.changed = true;
+    }
+
+    /// 标量形态（punctuator: default）→ 映射，保留原 preset 名与行尾注释。
+    fn replace_scalar_punctuator(&mut self, preset: &str, patch: &mut PunctuatorPatch) -> bool {
+        let Some(index) = self
+            .lines
+            .iter()
+            .position(|line| is_key_at(line, PUNCTUATOR_KEY, 0))
+        else {
+            return false;
+        };
+        if is_flow_value(&self.lines[index]) {
+            return false;
+        }
+        let comment = self.lines[index]
+            .split_once(" #")
+            .map(|(_, tail)| format!(" #{}", tail))
+            .unwrap_or_default();
+        let mut replacement = vec![
+            format!("{PUNCTUATOR_KEY}:{comment}"),
+            format!("  {IMPORT_PRESET_KEY}: {}", yaml_scalar(preset)),
+            format!("  {HALF_SHAPE_KEY}:"),
+        ];
+        for key in [PUNCT_BACKSLASH, PUNCT_COLON] {
+            replacement.push(format!("    {}", half_shape_entry(key)));
+            patch.mark(key);
+        }
+        self.lines.splice(index..=index, replacement);
+        self.changed = true;
+        true
+    }
+
+    /// 已是映射：只往 half_shape 里补缺的键。
+    fn merge_punctuator_mapping(
+        &mut self,
+        mapping: &serde_yaml::Mapping,
+        patch: &mut PunctuatorPatch,
+    ) {
+        let Some((start, end)) = self.find_block(PUNCTUATOR_KEY, 0) else {
+            patch.skipped.push(format!("{PUNCTUATOR_KEY}:（找不到块）"));
+            return;
+        };
+        if is_flow_value(&self.lines[start]) {
+            patch
+                .skipped
+                .push(format!("{PUNCTUATOR_KEY}:（flow 写法，无法安全改写）"));
+            return;
+        }
+        let half_key = Value::String(HALF_SHAPE_KEY.to_string());
+        match mapping.get(&half_key) {
+            Some(Value::Mapping(half)) => {
+                let Some((hs_start, hs_end)) = self.find_block_from(HALF_SHAPE_KEY, 2, start + 1)
+                else {
+                    patch
+                        .skipped
+                        .push(format!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}（找不到块）"));
+                    return;
+                };
+                if hs_start >= end {
+                    patch.skipped.push(format!(
+                        "{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}（不在 punctuator 块内）"
+                    ));
+                    return;
+                }
+                if is_flow_value(&self.lines[hs_start]) {
+                    patch.skipped.push(format!(
+                        "{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}（flow 写法，无法安全改写）"
+                    ));
+                    return;
+                }
+                let indent = (hs_start + 1..hs_end)
+                    .find(|&index| !is_blank(&self.lines[index]) && !is_comment(&self.lines[index]))
+                    .map(|index| indent_of(&self.lines[index]))
+                    .unwrap_or_else(|| indent_of(&self.lines[hs_start]) + 2);
+                let mut at = hs_end;
+                for key in [PUNCT_BACKSLASH, PUNCT_COLON] {
+                    if half.get(Value::String(key.to_string())).is_some() {
+                        patch.skipped.push(format!(
+                            "{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY}/{key}（已存在，未覆盖）"
+                        ));
+                        continue;
+                    }
+                    self.lines.insert(
+                        at,
+                        format!("{}{}", " ".repeat(indent), half_shape_entry(key)),
+                    );
+                    at += 1;
+                    patch.mark(key);
+                    self.changed = true;
+                }
+            }
+            Some(_) => patch
+                .skipped
+                .push(format!("{PUNCTUATOR_KEY}/{HALF_SHAPE_KEY} 不是映射，跳过")),
+            None => {
+                // punctuator 有、half_shape 没有：在 punctuator 块末尾补一整段。
+                let base = indent_of(&self.lines[start]) + 2;
+                let mut at = end;
+                self.lines
+                    .insert(at, format!("{}{HALF_SHAPE_KEY}:", " ".repeat(base)));
+                at += 1;
+                for key in [PUNCT_BACKSLASH, PUNCT_COLON] {
+                    self.lines.insert(
+                        at,
+                        format!("{}{}", " ".repeat(base + 2), half_shape_entry(key)),
+                    );
+                    at += 1;
+                    patch.mark(key);
+                }
+                self.changed = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 测试用临时目录（core 不带 tempfile 依赖，手写一份就够）。
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                env::temp_dir().join(format!("rime-sync-data-dirs-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn paths(value: &[PathBuf]) -> Vec<String> {
+        value
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect()
+    }
+
     #[test]
-    fn registry_output_prefers_weasel_root() {
+    fn registry_output_keeps_both_values() {
         let output = "\r\nHKEY_LOCAL_MACHINE\\Software\\WOW6432Node\\Rime\\Weasel\r\n    \
             InstallDir    REG_SZ    C:\\Program Files\\Rime\\weasel-0.17.4\r\n    \
             WeaselRoot    REG_SZ    C:\\Program Files\\Rime\r\n";
+        let values = weasel_registry_from_output(output);
         assert_eq!(
-            weasel_root_from_reg_output(output),
+            values.weasel_root,
             Some(PathBuf::from(r"C:\Program Files\Rime"))
+        );
+        assert_eq!(
+            values.install_dir,
+            Some(PathBuf::from(r"C:\Program Files\Rime\weasel-0.17.4"))
         );
     }
 
     #[test]
     fn registry_output_falls_back_to_install_dir() {
         let output = "    InstallDir    REG_SZ    D:\\Apps\\Rime  \r\n";
+        let values = weasel_registry_from_output(output);
+        assert_eq!(values.weasel_root, None);
+        assert_eq!(values.install_dir, Some(PathBuf::from(r"D:\Apps\Rime")));
+    }
+
+    #[test]
+    fn registry_output_without_values_is_empty() {
         assert_eq!(
-            weasel_root_from_reg_output(output),
-            Some(PathBuf::from(r"D:\Apps\Rime"))
+            weasel_registry_from_output("HKEY_LOCAL_MACHINE\\Nope\r\n"),
+            WeaselRegistryValues::default()
+        );
+        assert_eq!(
+            weasel_registry_from_output("    WeaselRoot    REG_DWORD    0x1\r\n"),
+            WeaselRegistryValues::default()
         );
     }
 
     #[test]
-    fn registry_output_without_values_is_none() {
-        assert_eq!(
-            weasel_root_from_reg_output("HKEY_LOCAL_MACHINE\\Nope\r\n"),
-            None
-        );
-        assert_eq!(
-            weasel_root_from_reg_output("    WeaselRoot    REG_DWORD    0x1\r\n"),
-            None
+    fn weasel_version_parsing() {
+        assert_eq!(weasel_version("weasel-0.17.4"), Some(vec![0, 17, 4]));
+        assert_eq!(weasel_version("weasel-0.17.10"), Some(vec![0, 17, 10]));
+        assert_eq!(weasel_version("weasel-"), None);
+        assert_eq!(weasel_version("weasel-0.17.x"), None);
+        assert_eq!(weasel_version("Rime"), None);
+    }
+
+    /// ② 注册表 WeaselRoot 命中：<WeaselRoot>\data 存在就直接用。
+    #[test]
+    fn weasel_root_data_dir_wins() {
+        let tmp = TempDir::new("root-hit");
+        let rime = tmp.path().join("Rime");
+        fs::create_dir_all(rime.join("data")).expect("mkdir");
+        let registry = WeaselRegistryValues {
+            weasel_root: Some(rime.clone()),
+            install_dir: None,
+        };
+
+        let resolution = resolve_windows(&registry, Some(tmp.path()));
+
+        assert_eq!(resolution.dirs, vec![rime.join("data")]);
+        assert!(resolution.error.is_none());
+        assert!(
+            resolution.candidates.iter().any(|item| {
+                item.path == rime.join("data").display().to_string() && item.exists
+            }),
+            "候选里必须记下命中的目录：{:?}",
+            resolution.candidates
         );
     }
 
-    /// 平台默认目录即使不存在也要出现在报告里（「不存在则跳过并报告」）。
+    /// 227 实测的形状：WeaselRoot 是 C:\Program Files\Rime，data 在版本目录里。
+    #[test]
+    fn weasel_root_without_data_falls_back_to_version_dir() {
+        let tmp = TempDir::new("root-glob");
+        let rime = tmp.path().join("Rime");
+        let version_dir = rime.join("weasel-0.17.4");
+        fs::create_dir_all(version_dir.join("data")).expect("mkdir");
+        let registry = WeaselRegistryValues {
+            weasel_root: Some(rime.clone()),
+            install_dir: None,
+        };
+
+        let resolution = resolve_windows(&registry, Some(tmp.path()));
+
+        assert_eq!(resolution.dirs, vec![version_dir.join("data")]);
+        assert!(
+            resolution
+                .candidates
+                .iter()
+                .any(|item| item.path == rime.join("data").display().to_string() && !item.exists),
+            "不存在的 <WeaselRoot>\\data 也要记进候选：{:?}",
+            resolution.candidates
+        );
+    }
+
+    /// ③ WeaselRoot 缺失：用 InstallDir 通配 weasel-*，多个版本取最高。
+    #[test]
+    fn install_dir_glob_picks_highest_version() {
+        let tmp = TempDir::new("install-glob");
+        let install = tmp.path().join("Rime");
+        for version in ["weasel-0.16.0", "weasel-0.17.4", "weasel-0.17.10"] {
+            fs::create_dir_all(install.join(version).join("data")).expect("mkdir");
+        }
+        // 同名文件不算版本目录
+        fs::write(install.join("weasel-0.18.0"), b"not a dir").expect("write");
+        let registry = WeaselRegistryValues {
+            weasel_root: None,
+            install_dir: Some(install.clone()),
+        };
+
+        let resolution = resolve_windows(&registry, Some(tmp.path()));
+
+        assert_eq!(
+            paths(&resolution.dirs),
+            vec![install
+                .join("weasel-0.17.10")
+                .join("data")
+                .display()
+                .to_string()]
+        );
+    }
+
+    /// ④ 两个注册值都没有：默认 %ProgramFiles%\Rime 下也找一遍。
+    #[test]
+    fn default_program_files_layout_is_probed() {
+        let tmp = TempDir::new("default-layout");
+        let version_dir = tmp.path().join("Rime").join("weasel-0.17.4");
+        fs::create_dir_all(version_dir.join("data")).expect("mkdir");
+
+        let resolution = resolve_windows(&WeaselRegistryValues::default(), Some(tmp.path()));
+
+        assert_eq!(resolution.dirs, vec![version_dir.join("data")]);
+    }
+
+    /// ⑤ 全部候选都不存在：错误文案要列出探测过的路径。
+    #[test]
+    fn no_candidate_reports_probed_paths() {
+        let tmp = TempDir::new("all-missing");
+        let resolution = resolve_windows(&WeaselRegistryValues::default(), Some(tmp.path()));
+
+        assert!(resolution.dirs.is_empty());
+        let error = resolution.error.expect("必须有可读原因");
+        assert!(error.contains("未找到可用的 Rime data 目录"), "{error}");
+        assert!(
+            error.contains(&tmp.path().join("Rime").join("data").display().to_string()),
+            "错误文案必须列出探测过的路径：{error}"
+        );
+        assert!(
+            error.contains("default:%ProgramFiles%"),
+            "错误文案要带候选来源：{error}"
+        );
+    }
+
+    /// 平台默认目录作为候选记进报告（Linux 上不存在也照样列出来）。
     #[cfg(not(windows))]
     #[test]
-    fn platform_default_dir_is_always_reported() {
+    fn platform_default_dir_is_a_candidate() {
         if env::var_os(ENV_DATA_DIR).is_some() {
             return; // 别的测试/CI 显式指定过 data 目录，跳过
         }
-        let dirs = data_dirs();
+        let resolution = resolve_data_dirs();
         assert!(
-            dirs.iter().any(|dir| dir == Path::new(LINUX_DATA_DIR)),
-            "{dirs:?} 里没有 {LINUX_DATA_DIR}"
+            resolution
+                .candidates
+                .iter()
+                .any(|item| item.path == LINUX_DATA_DIR),
+            "{:?} 里没有 {LINUX_DATA_DIR}",
+            resolution.candidates
         );
     }
 
     #[test]
     fn env_override_parsing() {
-        assert!(dirs_from_env(OsStr::new("")).is_empty());
-        assert!(dirs_from_env(OsStr::new("0")).is_empty());
-        // 不存在的目录被过滤掉
-        assert!(dirs_from_env(OsStr::new("/nonexistent/rime-sync-test")).is_empty());
+        assert!(resolve_env(OsStr::new("")).dirs.is_empty());
+        assert!(resolve_env(OsStr::new("0")).dirs.is_empty());
+
+        let tmp = TempDir::new("env");
+        let resolution = resolve_env(tmp.path().as_os_str());
+        assert_eq!(resolution.dirs, vec![tmp.path().to_path_buf()]);
+        assert_eq!(
+            resolution
+                .candidates
+                .first()
+                .map(|item| item.source.as_str()),
+            Some("env:RIMESYNC_WEASEL_DATA")
+        );
+
+        // 不存在的目录被过滤掉，并给出可读原因
+        let missing = resolve_env(OsStr::new("/nonexistent/rime-sync-test"));
+        assert!(missing.dirs.is_empty());
+        assert!(missing
+            .error
+            .expect("必须有可读原因")
+            .contains("/nonexistent/rime-sync-test"));
     }
 
     #[test]

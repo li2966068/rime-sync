@@ -38,9 +38,32 @@ else
 fi
 echo "glog: ${GLOG_LIB:-none} -> ENABLE_LOGGING=$ENABLE_LOGGING"
 
+# ---------------------------------------------------------- librime 缓存 ----
+# 可选（$RIME_IME_CACHE 由 scripts/ime/build-linux.sh 从宿主挂进来）：只缓存
+# cmake --install 出来的安装前缀 + manifest.json。命中判定在
+# scripts/ime/librime-build-cache.sh 里（源码/插件/脚本哈希 + librime.so 里的插件明文），
+# 任何不符都回落到全量构建 —— 绝不拿过期 .so 出包。
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CACHE=${RIME_IME_CACHE:-}
+CACHE_HIT=0
+if [ -n "$CACHE" ]; then
+  if bash "$SCRIPT_DIR/librime-build-cache.sh" verify "$CACHE" "$SRC" "$LIBDIR" "$ENABLE_LOGGING" "$BASE_IMAGE"; then
+    CACHE_HIT=1
+  else
+    log "1/6a librime 缓存作废：清空 $CACHE，走全量构建"
+    # $CACHE 是宿主挂进来的挂载点，删不掉（Device or resource busy），只能清空内容。
+    find "$CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    mkdir -p "$CACHE"
+  fi
+fi
+
 # ---------------------------------------------------------------- librime ----
-log "1/6 configure + build librime 1.17.0"
 T0=$(stamp)
+if [ "$CACHE_HIT" = "1" ]; then
+  log "1/6 librime 1.17.0 命中缓存（cache=hit）：跳过 configure + build + install"
+  cp -a "$CACHE/root/." "$ROOT/"
+else
+log "1/6 configure + build librime 1.17.0"
 # -DLINUX=ON: librime only links Boost.regex when the never-defined upstream
 # variable LINUX is true; without it librime.so is built with undefined
 # boost::re_detail symbols and fails to link any executable that uses it.
@@ -57,6 +80,18 @@ cmake -S "$SRC/third_party/librime" -B "$WORK/librime" \
   -DENABLE_LOGGING=$ENABLE_LOGGING
 cmake --build "$WORK/librime" -j"$JOBS"
 DESTDIR="$ROOT" cmake --install "$WORK/librime"
+if [ -n "$CACHE" ]; then
+  # 只把 librime 自己的安装树放进缓存（单独再 install 一次到 $CACHE/root，免得把后面
+  # fcitx5-rime / 插件的产物混进来），manifest 写完才算缓存可用。
+  log "1/6b 写 librime 缓存（$CACHE）"
+  rm -rf "$CACHE/root"
+  mkdir -p "$CACHE/root"
+  DESTDIR="$CACHE/root" cmake --install "$WORK/librime"
+  bash "$SCRIPT_DIR/librime-build-cache.sh" write "$CACHE" "$SRC" "$LIBDIR" "$ENABLE_LOGGING" "$BASE_IMAGE"
+  # 容器里是 root：缓存文件必须能被宿主 runner（cache action）读和删。
+  chown -R "${CACHE_UID:-0}:${CACHE_GID:-0}" "$CACHE" || true
+fi
+fi
 # Drop the staged tree into the container's /usr so pkg-config, cmake and ldd
 # see real paths while fcitx5-rime is built against it.
 cp -a "$ROOT$PREFIX/." "$PREFIX/"

@@ -20,7 +20,7 @@ Rime 用户目录。安装器的同名逻辑仍然保留（能跑就跑），程
 
 | 状态 | 含义 |
 |---|---|
-| `none` | `<Rime 用户目录>/build/luna_pinyin.schema.yaml` 不存在 |
+| `none` | `<Rime 用户目录>/build/luna_pinyin_simp.schema.yaml` 不存在 |
 | `deploy` | 文件存在，但不同时包含 `rimesync_vnum` 与 `rimesync_punct`（官方部署产物） |
 | `prebuilt` | 文件存在且两个标记都在 —— 我们这套产物，可用 |
 
@@ -67,19 +67,69 @@ pub fn install_prebuilt_with(
 ```rust
 pub enum PatchOutcome { Patched, Unchanged, Skipped }
 pub struct DataPatchReport {
-    pub data_dirs: Vec<String>,
+    pub data_dirs: Vec<String>,                 // 实际打补丁的目录（0 或 1 个）
+    pub data_dir: String,                       // 实际使用；空 = 没找到
+    pub data_candidates: Vec<DataDirCandidate>, // 探测过的全部候选（含不存在）
+    pub data_error: Option<String>,             // 全都不是目录时的可读原因
     pub schemas_patched: Vec<String>,
     pub schemas_unchanged: Vec<String>,
     pub schemas_skipped: Vec<String>,
     pub backup_dir: String,
     pub errors: Vec<String>,
 }
+pub struct DataDirCandidate { path: String, source: String, exists: bool }
 
-pub fn data_dirs() -> Vec<PathBuf>;
+pub fn resolve_data_dirs() -> DataDirResolution;
+pub fn data_dirs() -> Vec<PathBuf>;          // 兼容入口：只取实际目录
+pub fn resolve_windows(
+    reg: &WeaselRegistryValues,
+    program_files: Option<&Path>,
+) -> DataDirResolution;
+pub fn patch_auto(version: &str) -> DataPatchReport;  // 解析 + 打补丁（CLI/GUI 都用它）
 pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport;
 pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome>;
 pub fn backup_path(path: &Path) -> PathBuf;
-pub fn weasel_root_from_reg_output(output: &str) -> Option<PathBuf>;
+pub fn weasel_registry_from_output(output: &str) -> WeaselRegistryValues;
+pub fn weasel_version_dirs(root: &Path) -> Vec<PathBuf>;
+pub fn weasel_version(name: &str) -> Option<Vec<u64>>;
+
+0.6.20 的 data 目录解析顺序（逐项探测存在性，第一个命中的胜出，全部候选进报告）：
+RIMESYNC_WEASEL_DATA → <WeaselRoot>\data → <WeaselRoot>\weasel-*\data（版本号最大的）→
+<InstallDir>\data → <InstallDir>\weasel-*\data → %ProgramFiles%\Rime 下的前两种布局 →
+%ProgramFiles%\Rime\data（旧行为兜底）→ Linux 的 /usr/share/rime-data。
+227 的 data_dirs=["C:\Program Files\Rime\data"]（目录不存在）就死在只拼了 `<WeaselRoot>\data`。
+
+`crates/core/src/ime.rs`（0.6.20，见第 10 节）：
+
+```rust
+pub struct WeaselHealth {
+    pub present: bool,      // 服务端 exe + 带插件标记的 rime.dll
+    pub version: String,    // weasel-<ver> 目录名里的版本
+    pub root: String,
+    pub server_exe: String,
+    pub rime_dll: String,
+    pub plugin: bool,       // rime.dll 里有没有 rimesync_vnum
+    pub reason: String,     // exe-present / registry-missing / server-missing / plugin-missing …
+}
+
+pub struct ImeReport {
+    pub platform: String,
+    pub present: bool,
+    pub installed: bool,          // 本次是否真的装上了
+    pub version: String,
+    pub installer: String,
+    pub installer_source: String,
+    pub install: String,          // installed / already-present / skipped(platform) / disabled / failed
+    pub error: Option<String>,
+    pub needs_elevation: bool,
+    pub log: String,
+}
+
+pub fn ensure(exe_dir: Option<&Path>) -> ImeReport;                 // 平台分派
+pub fn check_root(root: &Path) -> WeaselHealth;
+pub fn check_values(reg: &WeaselRegistryValues) -> WeaselHealth;
+pub fn resolve_installer(exe_dir: Option<&Path>) -> Option<(PathBuf, String)>;
+```
 ```
 
 `schemas_patched.len()`（即 `report.patched()`）就是 CLI / 界面报告里的
@@ -260,7 +310,7 @@ Test-Path "$env:ProgramFiles\rime-sync\rime-sync-cli.exe"
 
 0.6.16/0.6.17 的兜底只把随包产物铺进 `%APPDATA%\Rime\build\`。227 实测：
 
-* `build/luna_pinyin.schema.yaml` 里已经有 `rimesync_vnum`（translators）、
+* `build/luna_pinyin_simp.schema.yaml` 里已经有 `rimesync_vnum`（translators）、
   `rimesync_vselect`（processors），`rime.dll` 里也确实有插件符号；
 * 但按 `a` 选词后上屏文本后面多出一个 `a`、小键盘数字完全没反应、`v1234`
   也没有候选 —— **引擎没有使用我们铺的 build**，它在用 `<WeaselRoot>\data\`
@@ -287,6 +337,7 @@ Test-Path "$env:ProgramFiles\rime-sync\rime-sync-cli.exe"
 | `engine/translators` | 首位插入 `rimesync_vnum`（已在别处就挪到首位，不重复） |
 | `engine/processors` | 在 `recognizer` 之后插入 `rimesync_vselect`，紧接着插入 `numpad`；没有 `recognizer` 时依次退到 `key_binder` / `speller` 之前，都没有就追加到末尾 |
 | `recognizer/patterns` | 增加 `vnum: '^[vV][0-9.]*$'`；已有 `vnum`（用户自定义）就不动 |
+| `punctuator/half_shape` | 0.6.20 起深合并两条中文态直出：`"\\": "、"`、`":": "："`（**标量**，不是 `{commit: …}`，原因见下）；已有同键一律跳过（用户配置优先）。`punctuator` 段缺失就补 `import_preset: default` + `half_shape`；是标量（`punctuator: default`）就规范化为映射并保留原 preset 名 |
 | 文件顶部 | 插入 `# patched by rime-sync <version>`（已有就不再插，不追版本号） |
 
 `numpad` 是 0.6.18 新增的插件组件（见 `third_party/librime/PLUGINS.md` 第 4 节）：
@@ -305,12 +356,28 @@ schema 的 alphabet**，对普通拼音输入同样生效。
 2. 只做行级插入（保留原有缩进、注释、键顺序与换行风格 CRLF/LF）；
 3. 渲染后与原文比较：**相同就是 Unchanged**——这就是幂等的定义；
 4. 与原文不同时，再解析一次确认合法，并核对目标状态（translators 首位、
-   processors 相邻、vnum 存在），任何一步不满足就取消写入；
+   processors 相邻、vnum 存在、本次注入的 punctuator 条目 commit 正确），任何一步
+   不满足就取消写入；
 5. 备份 `<file>.rimesync-orig`（**只做一次**，已存在不覆盖），然后写回；
 6. 输出始终是 UTF-8 无 BOM（输入带 BOM 时去掉）。
 
 结构不适用的文件（没有 `engine`、列表是 flow 风格 `processors: [a, b]`、
-`patterns: {}` 等）计为 `schemas_skipped`，**不会**凭空写一个坏文件。
+`patterns: {}` 等）计为 `schemas_skipped`，**不会**凭空写一个坏文件；punctuator
+深合并也只在其它补丁能安全落地的文件上做（flow 风格 schema 不塞新段）。
+
+punctuator 深合并的边界：
+
+* **为什么写成标量**：`rime-prelude/symbols.yaml` 里 `'\' : [ 、, '\', ＼ ]` 是列表；
+  schema 里用 `{commit: "、"}` 映射覆盖预设列表会让 librime 合并配置失败，
+  整个方案部署不出来（容器 smoke 实测：`build/luna_pinyin_simp.schema.yaml` 根本不生成，
+  引擎对所有按键都没反应）。标量是 `ConfigValue`，直接替换预设值，
+  `TranslateUniquePunct` 立刻上屏、不弹候选列表——功能与 `{commit}` 相同；
+* `punctuator` 段缺失 → 文件末尾补 `import_preset: default` + `half_shape`；
+* `punctuator: <preset>`（标量）→ 换成映射，`import_preset` 保留原 preset 名；
+* 已是映射但没有 `half_shape` → 在 `punctuator` 块末尾补 `half_shape`；
+* `half_shape` 里已有 `"\\"` 或 `":"` → **跳过、一个字节都不改**，
+  原因写进报告的 `punctuator_skipped`；
+* 半角 `/` 键与 `/fh` 等 `symbols` 预设不受影响（只新增两个键）。
 
 ### 9.4 手工 smoke（容器里跑过）
 
@@ -331,6 +398,16 @@ ASCII 态与主键盘 `.` 一样交给客户端、IME 不提交中文标点；`v
 `壹拾贰元叁角肆分` 且小数点本身不上屏；`v12. + a` 不产生金额且组字不被清空；
 普通拼音组字中 `KP_Decimal` 与主键盘 `.` 的结果完全一致；主键盘 `.` 中文态
 仍然上屏 `。`。
+
+0.6.20 追加的断言（punctuator 深合并，同一个 smoke）：中文态 `\\` 上屏恰好「、」
+且没有候选列表、没有残留组字；Shift+; 上屏恰好「：」；`,` `;` `'` `[` `]`
+分别仍是「，」「；」「‘」「「」「」」；`/fh` 仍出符号表并上屏第一个「©」；
+英文态 `\\` 与 `;` 仍交给客户端（`process_key` 返回 false、无 IME 提交）。
+
+> 注意：注入 `half_shape` 的必须是**标量**（`"\\": "、"`）。用
+> `{commit: "、"}` 映射覆盖 symbols 预设里的列表会让整个方案部署失败
+> （`build/luna_pinyin.schema.yaml` 不生成、引擎对所有键无响应）——这是
+> 0.6.20 容器 smoke 实测出来的坑，`data_patch` 已按标量写入并有单测兜底。
 
 ### 9.5 幂等与回滚
 
@@ -379,54 +456,163 @@ sudo cp /usr/share/rime-data/luna_pinyin.schema.yaml.rimesync-orig \
 
 ```text
 data_patched=1 data_unchanged=0 data_skipped=0 data_failed=0 backup_dir=/usr/share/rime-data
+punctuator_patched=2 punctuator_skipped=0
 data_dir=/usr/share/rime-data
+data_candidates=[/usr/share/rime-data]
 data_file=/usr/share/rime-data/luna_pinyin.schema.yaml
+weasel_present=true weasel_installed=false weasel_version=0.17.4 weasel_install=already-present
+weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-installer.exe source=exe:resources/weasel
 ```
 
-`--json` 时在 PrebuiltReport 上平铺 `data_patched`，另加一个 `data` 对象：
+一个候选都不存在时，还会多一行可读原因（列出所有探测过的路径与来源）：
+
+```text
+data_dir=-
+data_candidates=[C:\Program Files\Rime\data, ...]
+data_error=未找到可用的 Rime data 目录：已探测 2 个候选，全部不存在：...
+```
+
+`--json` 时在 PrebuiltReport 上平铺 `data_patched` 与 `weasel_*` 字段，
+另加一个 `data` 对象：
 
 ```json
 {
   "data_patched": 1,
+  "weasel_present": false,
+  "weasel_installed": true,
+  "weasel_version": "0.17.4",
+  "weasel_installer": "C:\\Program Files\\rime-sync\\resources\\weasel\\weasel-0.17.4.0-installer.exe",
+  "weasel_install": "installed",
+  "weasel_error": null,
   "data": {
-    "data_dirs": ["/usr/share/rime-data"],
-    "schemas_patched": ["/usr/share/rime-data/luna_pinyin.schema.yaml"],
+    "data_dirs": ["C:\\Program Files\\Rime\\weasel-0.17.4\\data"],
+    "data_dir": "C:\\Program Files\\Rime\\weasel-0.17.4\\data",
+    "data_candidates": [
+      { "path": "C:\\Program Files\\Rime\\data", "source": "registry:WeaselRoot", "exists": false },
+      { "path": "C:\\Program Files\\Rime\\weasel-0.17.4\\data", "source": "glob:WeaselRoot\\weasel-*", "exists": true }
+    ],
+    "data_error": null,
+    "punctuator_patched": 2,
+    "punctuator_skipped": [],
+    "schemas_patched": ["C:\\Program Files\\Rime\\weasel-0.17.4\\data\\luna_pinyin.schema.yaml"],
     "schemas_unchanged": [],
     "schemas_skipped": [],
-    "backup_dir": "/usr/share/rime-data",
+    "backup_dir": "C:\\Program Files\\Rime\\weasel-0.17.4\\data",
     "errors": []
   }
 }
 ```
 
-`--no-data-patch` 只铺 build/，完全不碰 data（报告里 `data_patched=0`）。
+`--no-data-patch` 只铺 build/，完全不碰 data（报告里 `data_patched=0`）；
+输入法本体检查 / 装回不受它影响。
 
-## 10. 测试
+## 10. 输入法本体自举（0.6.20）
+
+### 10.1 起因（227 实测）
+
+0.6.19 用 setup.exe /S 静默安装时，Tauri 的 NSIS 钩子没有执行：旧 Weasel 被 Tauri
+卸载器卸掉，钩子里的「未就绪 → 内嵌安装器装回」也没跑，结果机器上没有任何输入法。
+结论：输入法本体不能只靠安装器钩子兜底，程序自己必须能判定 + 装回。
+
+### 10.2 判定（与 NSIS 钩子同一判据）
+
+Windows：
+
+1. 注册表 HKLM\Software\WOW6432Node\Rime\Weasel（32 位视图）与
+   HKLM\Software\Rime\Weasel（64 位视图）的 WeaselRoot / InstallDir 有值；
+2. 该目录里真有 WeaselServer.exe——直接在根目录，或在 weasel-*\ 版本目录里
+   （取版本号最大的一个）；
+3. WeaselServer.exe 同目录的 rime.dll 里能搜到 rimesync_vnum。
+
+任一条不满足 = weasel_present=false，原因是 registry-missing / server-missing /
+rime-dll-missing / plugin-missing / rime-dll-unreadable。
+Linux 完全跳过（由包管理器负责），报告 weasel_install=skipped(platform)。
+
+### 10.3 装回
+
+* 安装器：<exe 目录>/resources/weasel/weasel-0.17.4.0-installer.exe
+  （Tauri resources；开发态回落到 packaging/windows/vendor/）；
+* 参数固定 /S /NOREBOOT（静默、绝不允许安装器重启机器），等待上限 300 秒
+  （与 NSIS 钩子的 RIMESYNC_WEASEL_INSTALL_TIMEOUT_MS 一致）；
+* 装完立即复查判定；不通过就是 failed，带上安装器退出码与可读原因；
+* 需要管理员权限（spawn 740 / 退出码 5 / UAC 被拒 1223）→ weasel_needs_elevation=true，
+  界面提示「以管理员身份重启 rime-sync 后再点修复输入法」；
+* 开关：RIMESYNC_INSTALL_IME=0 只检查不安装。
+
+### 10.4 触发点
+
+* 启动自举（prebuilt_cmds::bootstrap）：后台线程里先检查 / 装回，再铺 build/；
+  失败只写 bootstrap.log 与应用日志，不阻塞窗口；
+* 设置页「修复输入法」与 rime-sync-cli fix-ime：同步执行，结果进报告。
+
+### 10.5 报告字段
+
+```text
+weasel_present=true weasel_installed=false weasel_version=0.17.4 weasel_install=already-present
+weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-installer.exe source=exe:resources/weasel
+```
+
+| 字段 | 含义 |
+|---|---|
+| weasel_present | 检查（安装后复查）是否就绪 |
+| weasel_installed | 本次是否真的用随包安装器装上了 |
+| weasel_version | 命中的 Weasel 版本（从 weasel-<ver> 目录名取） |
+| weasel_installer | 随包安装器路径；空 = 没找到 |
+| weasel_install | installed / already-present / skipped(platform) / disabled / failed |
+| weasel_error | 可读失败原因（含提权提示） |
+
+### 10.6 打包接线
+
+* src-tauri/tauri.windows.conf.json 把
+  packaging/windows/vendor/weasel-0.17.4.0-installer.exe 映射到
+  resources/weasel/weasel-0.17.4.0-installer.exe（Windows 平台配置：Linux 的
+  deb/AppImage 不该背这 12 MB）；
+* 与 NSIS 钩子内嵌的是同一个 vendor 文件（fetch-weasel.ps1 / 自编译产出），
+  所以两处不会各带一份不同版本；
+* packaging/windows/check-nsis-hooks.sh 断言：映射存在、文件名与
+  crates/core/src/ime.rs 的 INSTALLER_FILE 一致、卸载时清掉 resources\weasel；
+  工作区里有 vendor 文件时还校验 ≥8 MiB + MZ 头。
+
+## 11. 测试
+
 
 * `crates/core/src/prebuilt.rs` 单测（8 个）：缺文件铺、已有文件跳过、旧产物无标记触发
   build 覆盖、config 永不覆盖、force 只影响 build、payload 缺失的可读错误、
   probe 三态、exe 相对定位；
-* `crates/core/src/data_patch.rs` 单测（6 个）：注册表输出解析（WeaselRoot 优先、
-  InstallDir 兜底、非 REG_SZ 忽略）、`RIMESYNC_WEASEL_DATA` 解析、列表项名解析、
-  平台默认目录（`/usr/share/rime-data`）即使不存在也要出现在报告里；
-* `crates/core/tests/data_patch_real.rs` 集成测试（12 个）：三处补丁 + 顶部标记、
+* `crates/core/src/data_patch.rs` 单测（12 个）：注册表输出解析（WeaselRoot +
+  InstallDir 都保留、只有 InstallDir、非 REG_SZ 忽略）、`weasel-*` 版本解析与排序、
+  data 目录解析 5 条路径（WeaselRoot 命中 / WeaselRoot 没有 data 走版本目录（227 形状）/
+  InstallDir 通配多个 weasel-* 取最高版本 / 默认 %ProgramFiles% 布局 / 全部不存在时的
+  错误文案与候选清单）、`RIMESYNC_WEASEL_DATA` 解析、列表项名解析；
+* `crates/core/src/ime.rs` 单测（11 个）：`<root>\weasel-9.9.9\WeaselServer.exe` 伪造目录
+  的就绪判定、根目录直接布局、缺 exe / 缺 rime.dll / rime.dll 没有 `rimesync_vnum`、
+  注册表值为空、WeaselRoot 失效后回落 InstallDir、安装器参数 `/S /NOREBOOT`、
+  安装器缺失的可读错误、安装成功后复查、需要管理员权限、已就绪不跑安装器、
+  `RIMESYNC_INSTALL_IME=0` 关闭；
+* `crates/core/tests/data_patch_real.rs` 集成测试（18 个）：三处补丁 + 顶部标记、
   幂等（第二次逐字节相同）、备份只做一次且不被后续编辑覆盖、CRLF 与「无结尾换行」
   保持、UTF-8 无 BOM、坏 YAML 不动文件、无 engine / flow 风格跳过、用户自定义
   vnum 不被改写、目录级计数与 `backup_dir`、权限错误可读、缺 recognizer 的合成方案；
+  0.6.20 起另有 6 个 punctuator 用例：段缺失 / 标量 / 已是映射三种形态都能注入、
+  已有 `"\\"` 或 `":"` 时不覆盖且文件不变、重复执行逐字节相同、CRLF + 无 BOM 保持；
 * `crates/cli/tests/fix_ime.rs` 集成测试（4 个）：假 payload + 临时目录跑
   `fix-ime --json`，校验 JSON 计数、真实落盘文件与 `--no-data-patch`；
 * `scripts/ime/rime-vmode-smoke.cc`（容器 smoke，手工跑）：在真实部署过的 data
   方案上敲 `v1234 + a` 与 `KP_1..KP_4 + a`，断言上屏无多余 `a`、两者结果一致；
   0.6.19 起还覆盖 `KP_Decimal` 的六种情形（中文态无组字 / ASCII 态 / v12.34 /
-  v12. 边界 / 拼音组字中 / 主键盘 `.` 防回归）；
+  v12. 边界 / 拼音组字中 / 主键盘 `.` 防回归）；0.6.20 起同一个 smoke 还断言
+  中文态 `\\` → 恰好「、」（且不弹候选列表）、`:` → 恰好「：」、`,` `;` `'` `[` `]`
+  行为不变、`/fh` 仍可用，以及英文态 `\\` / `;` 仍交给客户端；
 * `third_party/librime/plugins/rimesync-extra/test/engine_smoke_test.cc`（对真实
   librime 手工编译，见文件头）：`TestNumpad` 直接驱动 `numpad` 处理器，断言
   无组字时 `KP_Decimal` 立即上屏一个 `0x2E`、有组字时与主键盘 `.` 结果一致；
 * 门禁：`cargo test --workspace --all-targets`、`cargo fmt --all -- --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、
-  `pnpm exec tsc --noEmit`、`pnpm build`。
+  `pnpm exec tsc --noEmit`、`pnpm build`、
+  `python3 scripts/ime/gen-prebuilt-build.py --check`、
+  `bash packaging/windows/check-nsis-hooks.sh --strict`。
 
-## 11. 已知限制 / 未验证
+## 12. 已知限制 / 未验证
 
 * 真机（Windows 227）上的启动自举还没有跑过：本地只验证了编译、单测与 CLI 集成测试；
   0.6.17 起 `%APPDATA%\com.rimesync.app\bootstrap.log` 会逐行记录每一步，

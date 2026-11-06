@@ -312,7 +312,9 @@ File ...resources...
 - 自编译安装包不含输入方案（plum 为空子模块）；需要方案时用 `-WithRimeData`
   或走官方安装包，见 `docs/THIRD-PARTY.md`。
 
-- 自编译安装包内置 third_party/rime-data 的 16 个方案（拼音/五笔/仓颉/笔画/地球/注音）；
+- 0.6.21 起随包只保留 3 个方案（朙月拼音·简化字 / 五笔拼音 / 五笔86）及其依赖；
+  third_party/rime-data 里仍 vendored 16 个方案（供生成器选择），安装后其余方案会被
+  `rime-sync-cli prune-schemas` 清掉（见 docs/SCHEMA-RETENTION.md）。
   需要更多方案时用 -WithRimeData 走 plum，见 docs/THIRD-PARTY.md。
 - 0.6.5 新增：WebView2 的真实探测/安装/弹框只做了 makensis 编译期验证，
   受限代理真机、静默安装中止路径、`%TEMP%\rime-sync-setup.log` 的 UTF-16LE 追加
@@ -525,9 +527,17 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 
 | 目标 | 规则 |
 |---|---|
-| `%APPDATA%\Rime\default.custom.yaml` | 目录不存在就创建；**已存在就沿用**，不覆盖。仍要求 Weasel 的 `data` 里有 `wubi86.schema.yaml`（模板的 `schema_list` 列了五笔，缺方案会让 librime 整次部署失败） |
+| `%APPDATA%\Rime\default.custom.yaml` | 目录不存在就创建；**已存在就沿用**，不覆盖（0.6.21 起模板只列 3 个保留方案：`luna_pinyin_simp` / `wubi_pinyin` / `wubi86`）。仍要求 Weasel 的 `data` 里有 `wubi86.schema.yaml`，缺方案会让 librime 整次部署失败 |
 | `%APPDATA%\Rime\weasel.custom.yaml` | 已存在就沿用；缺失才写（只影响外观：候选横向排列） |
-| `%APPDATA%\Rime\<schema>.custom.yaml` | 遍历 `$INSTDIR\resources\schemas\*.custom.yaml`，**逐个**要求 Weasel `data` 里有 `<schema>.schema.yaml`，否则跳过；已存在则沿用 |
+| `%APPDATA%\Rime\<schema>.custom.yaml` | 遍历 `$INSTDIR\resources\schemas\*.custom.yaml`（0.6.21 起只有 3 个），**逐个**要求 Weasel `data` 里有 `<schema>.schema.yaml`，否则跳过；已存在则沿用 |
+
+**0.6.21 清理非保留方案**：`POSTINSTALL` 在写入配置之后、`RimeSyncSelfCheck` 的部署之前
+调用 `rime-sync-cli.exe prune-schemas`（实现与 Linux/Rust 共用，清单是
+`packaging/rime/retained-schemas.txt`，钩子不另抄一份）。它删除 data / 用户目录 / build 里
+不属于保留清单的方案，删除前备份为 `<原文件名>.rimesync-removed-<时间戳>`，并把
+`data\default.yaml` 与 `%APPDATA%\Rime\default.custom.yaml` 的 `schema_list` 裁到 3 项
+（否则下一次部署会因缺 schema 整次失败）。`RIMESYNC_PRUNE_SCHEMAS=0` 关闭；日志行
+`phase=PRUNE state=ok|failed|no-cli|skipped`，DONE 行带 `prune=`。
 
 **为什么改成「沿用」**：卸载旧版时不会删除 `%APPDATA%\Rime`，升级后用户自己的改造
 （以及同步下来的设置）必须原样保留；安装器只补缺失的文件。想强制刷新某个配置，删掉
@@ -540,9 +550,10 @@ Standalone 静默安装的退出码/重启提示、弹框按钮语义、静默�
 [rime-sync] 2026-11-02 20:00:03 phase=UNINSTALL-OLD target=weasel exit=0 ms=2410
 [rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed begin version=0.6.12 policy=reuse-existing
 [rime-sync] 2026-11-02 20:00:05 seed file=default.custom.yaml result=reuse
-[rime-sync] 2026-11-02 20:00:05 seed file=luna_pinyin.custom.yaml result=new
-[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed done configs=1 reused=15 version=0.6.12
-[rime-sync] 2026-11-02 20:00:06 phase=DONE setup finished configs=1 reused=15 weasel-kept=0
+[rime-sync] 2026-11-02 20:00:05 seed file=luna_pinyin_simp.custom.yaml result=new
+[rime-sync] 2026-11-02 20:00:05 phase=POSTINSTALL seed done configs=1 reused=3 version=0.6.21
+[rime-sync] 2026-11-02 20:00:06 phase=PRUNE state=ok
+[rime-sync] 2026-11-02 20:00:06 phase=DONE setup finished configs=1 reused=3 weasel-kept=0 prune=ok
 ```
 
 ### 10.3 用户数据一律不动
@@ -740,7 +751,7 @@ Get-Process WeaselServer -ErrorAction SilentlyContinue | Select-Object Id,Sessio
 reg query "HKLM\SOFTWARE\Microsoft\CTF\TIP\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}" /s
 
 # 5) 部署产物是不是新的
-Get-Item "$env:APPDATA\Rime\build\luna_pinyin.schema.yaml" | Select-Object LastWriteTime,Length
+Get-Item "$env:APPDATA\Rime\build\luna_pinyin_simp.schema.yaml" | Select-Object LastWriteTime,Length
 
 # 6) 安装器留下的备份 / 回滚残留
 Get-ChildItem "$env:ProgramFiles" -Filter "Rime.bak-*" | Select-Object Name,LastWriteTime
@@ -778,7 +789,7 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
    （`%ProgramFiles%` 与 `%ProgramFiles(x86)%` 两处都扫，命中一个就够）；
 4. 报配置目标目录与写入数量（`configs=` 新写入、`reused=` 沿用）；
 5. 调一次 `WeaselDeployer.exe /deploy`（`nsExec`，最多 20 秒 / `RIMESYNC_DEPLOY_TIMEOUT_MS`），
-   然后比较 `%APPDATA%\Rime\build\luna_pinyin.schema.yaml` 的写入时间。
+   然后比较 `%APPDATA%\Rime\build\luna_pinyin_simp.schema.yaml` 的写入时间。
 
 `weasel-ready` 字段：
 
@@ -842,7 +853,7 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
 非致命告警的形态：
 
 ```text
-[...] phase=SELF-CHECK warning=build-not-updated state=stale file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin.schema.yaml
+[...] phase=SELF-CHECK warning=build-not-updated state=stale file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin_simp.schema.yaml
 ```
 
 * 判成 `stale` 不一定是坏事：没改任何配置时，部署产物的内容与时间戳本来就可能不变；
@@ -870,14 +881,14 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
 
 | 位置 | 内容 |
 |---|---|
-| `$INSTDIR\resources\prebuilt\build\` | `luna_pinyin` / `wubi86` 的 `*.schema.yaml` + `*.prism.bin` + `*.table.bin` + `*.reverse.bin`，依赖方案的产物（`stroke`、`pinyin_simp`），以及 `default.yaml` |
-| `$INSTDIR\resources\prebuilt\config\` | 生成这套产物时用的 `default.custom.yaml`（`schema_list` 已裁剪到两套方案）+ 两个 `<schema>.custom.yaml` |
+| `$INSTDIR\resources\prebuilt\build\` | 保留方案（`luna_pinyin_simp` / `wubi_pinyin` / `wubi86`）的 `*.schema.yaml` + `*.prism.bin` + `*.table.bin` + `*.reverse.bin`，依赖方案的产物（`luna_pinyin`、`stroke`、`pinyin_simp`），以及 `default.yaml` |
+| `$INSTDIR\resources\prebuilt\config\` | 生成这套产物时用的 `default.custom.yaml`（`schema_list` 已裁剪到 3 个保留方案）+ 3 个 `<schema>.custom.yaml` |
 | `$INSTDIR\resources\prebuilt\MANIFEST.json` | 文件清单（大小 / sha256）、方案表、体积、rime 版本 |
 
 体积：这套产物 `du -sh` 约 29 MB，安装包会相应增大（`.bin` 本身已是压缩过的
 字典/表，NSIS 再压收益很小）。预算 60 MB，超了生成脚本会自动退化成只带 `luna_pinyin`。
 
-判据与 Linux 侧完全一致：`%APPDATA%\Rime\build\luna_pinyin.schema.yaml`
+判据与 Linux 侧完全一致：`%APPDATA%\Rime\build\luna_pinyin_simp.schema.yaml`
 **存在**，且文件里同时出现 `rimesync_vnum` 与 `rimesync_punct`。
 只认「文件在」不行——官方部署出来的同名文件没有这两个插件标记，设备上跑的是别的配置。
 
@@ -894,7 +905,7 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
      - 满足 → `PREBUILT ok source=prebuilt copied=<n> kept=<m> escalated=0`；
      - 仍不满足 → **只对 `build\` 升级成覆盖模式再铺一遍**（`phase=PREBUILT retry
        reason=probe-after-skip-only scope=build-only`）。这一步是必须的：用户目录里
-       本来就有旧的 `build\luna_pinyin.schema.yaml`（没有插件标记、日期停在旧部署），
+       本来就有旧的 `build\luna_pinyin_simp.schema.yaml`（没有插件标记、日期停在旧部署），
        「存在即跳过」会把它留下，兜底就白做了。`build\` 是部署器随时重写的派生数据，
        覆盖它是安全的；`config\*.yaml`（用户配置）**绝不参与这一遍**；
      - 重铺后仍不满足 → `PREBUILT failed reason=probe-after-copy … escalated=1` +
@@ -916,7 +927,7 @@ UNINSTALL-OLD 又卸 Weasel、预检挪到卸载之后、删掉自检 `SetErrorL
 复查失败的形态（只告警）：
 
 ```text
-[rime-sync] 2026-11-05 10:00:09 phase=PREBUILT failed reason=probe-after-copy copied=0 kept=0 file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin.schema.yaml
+[rime-sync] 2026-11-05 10:00:09 phase=PREBUILT failed reason=probe-after-copy copied=0 kept=0 file=C:\Users\me\AppData\Roaming\Rime\build\luna_pinyin_simp.schema.yaml
 ```
 
 ### 13.4 关闭 / 强制覆盖

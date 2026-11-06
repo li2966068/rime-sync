@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "../packaging/windows/vendor/weasel-0.17.4.0-installer.exe": "resources/weasel/weasel-0.17.4.0-installer.exe"
+    }
+  }
+}

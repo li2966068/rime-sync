@@ -110,21 +110,24 @@ rm -rf "$PKGROOT/usr/include" "$PKGROOT/usr/lib/x86_64-linux-gnu/pkgconfig" \
        "$PKGROOT/usr/share/cmake"
 
 # ---------------------------------------------------------- schema data ------
+# 0.6.21：随包只装保留方案（packaging/rime/retained-schemas.txt）与它自动解析出的
+# 依赖闭包（luna_pinyin / pinyin_simp / stroke 等）；闭包与 default.yaml 的
+# schema_list 由 scripts/ime/gen-rime-data.py 统一生成（纯 stdlib，镜像里没有 PyYAML）。
 # Flat install, exactly the layout librime expects under RIME_DATA_DIR.
 DATA_SRC=$REPO_ROOT/third_party/rime-data
 DATA_DST=$PKGROOT/usr/share/rime-data
 install -d "$DATA_DST"
 install -d "$PKGROOT/usr/share/doc/$PKG"
-# Every vendored recipe (any third_party/rime-data/* dir holding *.yaml / *.txt)
-# is flattened, so adding a schema upstream only means vendoring its repo.
+python3 "$REPO_ROOT/scripts/ime/gen-rime-data.py" --rime-data "$DATA_SRC" --out "$DATA_DST" ||
+  { echo "!! 生成裁剪后的 rime-data 失败" >&2; exit 1; }
+# Recipe licenses stay in the package (one copyright file per vendored recipe).
 for recipe_dir in "$DATA_SRC"/*/; do
   recipe=$(basename "$recipe_dir")
-  # *.yaml and *.txt both matter: rime-essay ships only essay.txt and would be
-  # skipped by a yaml-only filter.
-  find "$recipe_dir" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.txt' \) \
-    -exec cp -f {} "$DATA_DST"/ \;
   cp -f "$recipe_dir/LICENSE" "$PKGROOT/usr/share/doc/$PKG/copyright.$recipe" 2>/dev/null || true
 done
+# 保留清单本身也随包：安装器/排错时能直接看到「哪些方案该留」，不用另抄一份。
+install -D -m 644 "$REPO_ROOT/packaging/rime/retained-schemas.txt" \
+  "$PKGROOT/usr/share/rime-sync/retained-schemas.txt"
 [ -f "$DATA_DST/essay.txt" ] || { echo "!! third_party/rime-data/rime-essay/essay.txt missing" >&2; exit 1; }
 # Every schema named in default.yaml must ship here: librime's deployer treats a
 # missing schema as a deployment failure (exit 1), so fail the build instead.
@@ -138,7 +141,7 @@ done
 [ -z "$missing" ] || { echo "!! schema_list names schemas that are not packaged:$missing" >&2; exit 1; }
 echo "schema_list: $(printf '%s\n' "$schema_ids" | wc -l) schemas, all packaged"
 # ------------------------------------------------- schema custom 模板 --------
-# 16 个随包方案的 <schema>.custom.yaml：给引擎加 rimesync_vnum / rimesync_punct，
+# 3 个保留方案的 <schema>.custom.yaml：给引擎加 rimesync_vnum / rimesync_punct，
 # 并把 punctuator 半角主字符改成单值 commit。安装器（postinst / install.sh）只在
 # 用户 Rime 目录缺文件时写入，升级默认不动，见 docs/INPUT-ENHANCEMENTS.md。
 # 构建时优先现场生成（保证与 vendored schema 一致）；没有 python3+PyYAML 时退回
@@ -161,12 +164,15 @@ for schema in $schema_ids; do
   test -f "$TEMPLATES_DST/$schema.custom.yaml" ||
     { echo "!! 缺少 $schema.custom.yaml" >&2; exit 1; }
 done
+[ "$templ_count" -eq 3 ] ||
+  { echo "!! 随包模板应为 3 个（retained-schemas.txt），实际 $templ_count" >&2; exit 1; }
 echo "schema custom 模板: $templ_count 个 -> /usr/share/rime-sync/defaults/schemas"
 # ------------------------------------------------ 预编译 build 产物 --------
 # 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy
 # 返回 0 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。
 # packaging/rime/prebuilt 是构建期用 rime_deployer 真实部署出来的产物：
-#   build/   luna_pinyin / wubi86 及其依赖方案的 *.schema.yaml + *.bin
+#   build/   保留方案（luna_pinyin_simp / wubi_pinyin / wubi86）及其依赖方案的
+#            *.schema.yaml + *.bin
 #   config/  生成这套产物时用的 default.custom.yaml + <schema>.custom.yaml
 # 用户目录缺 build 时由 rime-sync 的 postinst / install.sh 铺过去。
 # 生成：scripts/ime/gen-prebuilt-build.py（--check 供 CI 校验）。
@@ -289,9 +295,26 @@ ADDON_SO_REL=${ADDON_SO#"$ROOT"/}
 deb_assert "$ADDON_SO_REL" -rw-r--r-- "rimesync.so (fcitx5 config page addon)"
 deb_assert usr/share/fcitx5/addon/rimesync.conf -rw-r--r-- "rimesync.conf (addon metadata)"
 deb_assert usr/bin/rime-sync-open-setup -rwxr-xr-x "rime-sync-open-setup (action button target)"
-deb_assert usr/share/rime-sync/defaults/schemas/luna_pinyin.custom.yaml -rw-r--r--   "schema custom 模板（luna_pinyin：rimesync_vnum / rimesync_punct）"
-deb_assert usr/share/rime-sync/prebuilt/build/luna_pinyin.schema.yaml -rw-r--r-- \
+deb_assert usr/share/rime-sync/defaults/schemas/luna_pinyin_simp.custom.yaml -rw-r--r-- \
+  "schema custom 模板（luna_pinyin_simp：rimesync_vnum / rimesync_punct）"
+deb_assert usr/share/rime-sync/prebuilt/build/luna_pinyin_simp.schema.yaml -rw-r--r-- \
   "预编译 build 产物（部署不产出的机器上直接铺到用户目录）"
+deb_assert usr/share/rime-sync/retained-schemas.txt -rw-r--r-- \
+  "保留方案清单（与 Rust pruner / Python 生成器同一份）"
+# 0.6.21：非保留方案的数据与模板绝不能进包（dpkg -c 是用户实际装到什么的唯一证据）。
+for removed in terra_pinyin bopomofo cangjie5 wubi_trad luna_pinyin_fluency; do
+  if printf '%s
+' "$DEB_LIST" | grep -q "/usr/share/rime-data/$removed.schema.yaml"; then
+    echo "!! non-retained schema leaked into $DEB: /usr/share/rime-data/$removed.schema.yaml" >&2
+    exit 1
+  fi
+  if printf '%s
+' "$DEB_LIST" | grep -q "/usr/share/rime-sync/defaults/schemas/$removed.custom.yaml"; then
+    echo "!! non-retained template leaked into $DEB: $removed.custom.yaml" >&2
+    exit 1
+  fi
+done
+printf '    ok 非保留方案（terra_pinyin/bopomofo/cangjie5/wubi_trad/luna_pinyin_fluency）不在包里\n'
 # Without this .mo every option of the rime addon (including the new
 # UserDataDirPath) is displayed in English even under LANG=zh_CN.UTF-8.
 deb_assert usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo -rw-r--r-- \

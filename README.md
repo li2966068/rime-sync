@@ -86,6 +86,27 @@ chmod +x rime-sync_<版本>_amd64.AppImage
 ./rime-sync_<版本>_amd64.AppImage --appimage-extract-and-run   # 无 FUSE2 时
 ```
 
+### 随包输入方案（3 个）与旧方案清理
+
+随包只装这 3 个方案（顺序即 `schema_list`）：
+
+| 方案 id | 名称 |
+|---|---|
+| `luna_pinyin_simp` | 朙月拼音·简化字 |
+| `wubi_pinyin` | 五笔拼音 |
+| `wubi86` | 五笔86（也是五笔拼音的依赖） |
+
+清单的唯一来源是 `packaging/rime/retained-schemas.txt`：Rust（`crates/core/src/prune.rs`
+用 `include_str!`）、Python 生成器与安装脚本都读它；`luna_pinyin` / `pinyin_simp` /
+`stroke` 这类依赖由闭包自动解析，不需要手写。
+
+安装（deb postinst / `.run` install.sh / NSIS POSTINSTALL）与每次启动自举会把**不在
+保留清单里**的方案清掉（data 的 `*.schema.yaml` 与 `*.bin`、用户目录的
+`<schema>.custom.yaml`、`build/` 产物，以及 `schema_list` 里指向它们的条目）。
+删除前同目录备份为 `<原文件名>.rimesync-removed-<时间戳>`，幂等；
+`RIMESYNC_PRUNE_SCHEMAS=0` 关闭。细节、回滚与验证见
+[docs/SCHEMA-RETENTION.md](docs/SCHEMA-RETENTION.md)。
+
 ### fcitx5 配置页（可选）
 
 `packaging/fcitx5-addon/` 提供一个 Qt 配置页与最小 fcitx5 addon，可直接读写
@@ -214,6 +235,8 @@ HTTP/HTTPS/SOCKS5 代理配置见 [docs/PROXY.md](docs/PROXY.md)。
 |---|---|---|
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | push（master/main）、PR、手动 | `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --workspace`、`tsc --noEmit`、**rclone E2E**（两轮幂等 + userdb 红线） |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | tag `v*`、手动指定 tag | Linux `deb` + `AppImage`；Windows `NSIS` + 便携 `zip`；汇总生成 `latest.json` 并上传 Release |
+
+自建输入法（librime / Weasel）的构建缓存：key 组成、命中校验、手动清理见 [docs/CI-CACHE.md](docs/CI-CACHE.md)。
 
 ### 自动更新（需要你替换占位）
 

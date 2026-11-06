@@ -16,8 +16,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 判据文件：luna_pinyin 是默认方案，其它方案的产物没有独立的可用性判据。
-pub const PROBE_FILE: &str = "luna_pinyin.schema.yaml";
+/// 判据文件：0.6.21 起随包只保留 3 个方案，luna_pinyin_simp 是其中的默认方案
+/// （luna_pinyin 只是 __include 基类，不再带 rimesync 插件标记）。
+pub const PROBE_FILE: &str = "luna_pinyin_simp.schema.yaml";
 /// 随包 custom.yaml 才有的插件标记；官方部署产物不含。
 pub const MARKERS: [&str; 2] = ["rimesync_vnum", "rimesync_punct"];
 /// 调试用：直接指定预编译产物目录（优先于所有平台路径）。

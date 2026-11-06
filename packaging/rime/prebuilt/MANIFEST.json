@@ -1,16 +1,27 @@
 {
   "schema": 1,
   "generator": "scripts/ime/gen-prebuilt-build.py",
-  "generated_at": "2026-11-06T05:17:44Z",
+  "generated_at": "2026-11-06T14:51:41Z",
   "rime_version": "1.17.0",
   "deployer": "build/ime-staging/debian-13/root/usr/bin/rime_deployer",
   "docker_image": "rime-ime-builder:debian_13",
   "schemas": [
-    "luna_pinyin",
+    "luna_pinyin_simp",
+    "wubi_pinyin",
     "wubi86"
   ],
+  "retained_schemas": [
+    "luna_pinyin_simp",
+    "wubi_pinyin",
+    "wubi86"
+  ],
+  "dependencies": [
+    "luna_pinyin",
+    "pinyin_simp",
+    "stroke"
+  ],
   "markers": {
-    "luna_pinyin.schema.yaml": [
+    "luna_pinyin_simp.schema.yaml": [
       "rimesync_vnum",
       "rimesync_punct"
     ],
@@ -19,20 +30,19 @@
     "wubi86.schema.yaml": [
       "rimesync_vnum",
       "rimesync_punct"
+    ],
+    "wubi_pinyin.schema.yaml": [
+      "rimesync_vnum",
+      "rimesync_punct"
     ]
   },
   "budget_bytes": 62914560,
-  "total_bytes": 29720926,
+  "total_bytes": 30564865,
   "files": [
     {
       "path": "build/default.yaml",
-      "bytes": 5265,
-      "sha256": "233a968d5c72eaae1ad829a4d36d2a719b668edfce32e82b89b14135f284fd27"
-    },
-    {
-      "path": "build/luna_pinyin.prism.bin",
-      "bytes": 31728,
-      "sha256": "d4952e5a5565beefb36c55b78c440f04ab375e745b7a874d3c57aa206350dafc"
+      "bytes": 5294,
+      "sha256": "823477cc252164385dabc6898492a7f0be76b6daf2f82fe373ec0e61df28e22d"
     },
     {
       "path": "build/luna_pinyin.reverse.bin",
@@ -40,14 +50,19 @@
       "sha256": "ab79a69aa9541b4f13af8f6eb41e34ea94093eb6f855cda243b48271bbf85e93"
     },
     {
-      "path": "build/luna_pinyin.schema.yaml",
-      "bytes": 42094,
-      "sha256": "388a70940617def4013035e3c1712808711e510b2e150e470cd2c4a0dcb7077c"
-    },
-    {
       "path": "build/luna_pinyin.table.bin",
       "bytes": 13011364,
       "sha256": "920f6c4a3f89ab56f2a756bb102c96380376da2aef7dd9818b7238bad1ffc763"
+    },
+    {
+      "path": "build/luna_pinyin_simp.prism.bin",
+      "bytes": 31728,
+      "sha256": "d35f337dcfd493f8582504ab2ad4f1dd17594ebeb05db593a6aa1c6195095918"
+    },
+    {
+      "path": "build/luna_pinyin_simp.schema.yaml",
+      "bytes": 42071,
+      "sha256": "cf69d145bba396d9ac20a015d0e741b8b5e3ec2e086d59af41bc5a7dc624a3d3"
     },
     {
       "path": "build/pinyin_simp.prism.bin",
@@ -110,19 +125,34 @@
       "sha256": "9b1d3356ef9f5d8732ddc3fc53385f9e9c122856835c9ba83bc6a19be847ae96"
     },
     {
-      "path": "config/default.custom.yaml",
-      "bytes": 1603,
-      "sha256": "b06e06658f08ba55071913a95ab08b764eb14c621d72eddb8ecd159f0a51eb21"
+      "path": "build/wubi_pinyin.prism.bin",
+      "bytes": 834876,
+      "sha256": "8c9e13146e778c81f38531766aa2ad70a2748f92261a512832023f276fc55e86"
     },
     {
-      "path": "config/luna_pinyin.custom.yaml",
-      "bytes": 28244,
-      "sha256": "fcb85d7dd0151eaecf040c429cc0f57bbbd7c6d58b09a82c99c7b6e4e9d7b656"
+      "path": "build/wubi_pinyin.schema.yaml",
+      "bytes": 5919,
+      "sha256": "2a77887c7333b68b092218209b0e54a1a8b469102566045d93e793502b307cd0"
+    },
+    {
+      "path": "config/default.custom.yaml",
+      "bytes": 1940,
+      "sha256": "7ff0fe6e22acb4c2ac41d3049d8f47ff9f91db275045970ccd5682eec322d200"
+    },
+    {
+      "path": "config/luna_pinyin_simp.custom.yaml",
+      "bytes": 28254,
+      "sha256": "2e1de77d17b439497fa9cdccff9e7f386de511e7486862e1b5310cdf3bc12e7b"
     },
     {
       "path": "config/wubi86.custom.yaml",
       "bytes": 28189,
       "sha256": "f16ff44cffa44214bda477ec8a4bf253dd5de08375e9a796dcd8b2ee7fedef79"
+    },
+    {
+      "path": "config/wubi_pinyin.custom.yaml",
+      "bytes": 2791,
+      "sha256": "d702c45aa1fe7e32b41eb4d2565d224663329eea6fdd897e9411846ecb3a4884"
     }
   ]
 }

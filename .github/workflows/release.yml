@@ -291,11 +291,33 @@ jobs:
             exit 1
           fi
 
+      # librime 构建缓存（ime job）：只缓存 cmake --install 的安装前缀 + manifest.json。
+      # 命中判定在容器里由 scripts/ime/librime-build-cache.sh 做（源码树/插件/脚本哈希 +
+      # librime.so 里的插件明文），判 invalid 就删掉重编 —— 缓存只影响耗时，不影响 deb。
+      - name: compute librime cache key (ime)
+        id: ime_cache_key
+        run: |
+          set -euo pipefail
+          key="rime-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-linux.sh', 'scripts/ime/container-build.sh', 'scripts/ime/librime-build-cache.sh', 'scripts/ime/Dockerfile') }}"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "librime cache key: $key"
+
+      - name: restore librime build cache (ime · ${{ matrix.distro }})
+        id: ime_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build/ime-cache/${{ matrix.distro }}
+          key: ${{ steps.ime_cache_key.outputs.key }}
+          restore-keys: |
+            rime-${{ runner.os }}-${{ matrix.distro }}-
+
       - name: build input-method deb (${{ matrix.distro }})
+        id: build_ime_deb
         timeout-minutes: 20
         env:
           IMAGE: ${{ matrix.image }}
           DISTRO: ${{ matrix.distro }}
+          CACHE_DIR: ${{ github.workspace }}/build/ime-cache/${{ matrix.distro }}
         run: |
           set -euo pipefail
           ls -l packaging/out/
@@ -306,6 +328,14 @@ jobs:
           f=$(ls -1t "build/deb/${DISTRO}"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
           [ -n "$f" ] || { echo "::error::$DISTRO: 没有生成 rime-inputmethod deb"; exit 1; }
           echo "$DISTRO: $(basename "$f") ($(( $(stat -c %s "$f") / 1024 / 1024 )) MiB)"
+
+      - name: save librime build cache (ime · ${{ matrix.distro }})
+        if: steps.ime_cache_restore.outputs.cache-hit != 'true' && steps.build_ime_deb.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: build/ime-cache/${{ matrix.distro }}
+          key: ${{ steps.ime_cache_key.outputs.key }}
 
       - name: fetch vendor dependency closure (${{ matrix.distro }})
         timeout-minutes: 15
@@ -535,53 +565,67 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # 缓存四件套：
-      #   boost/ + stage/   命中就直接跳过下载/bootstrap/b2（日志会打印「来源=cache」）
-      #   b2.exe            源码/头文件在、但 b2 丢了时不用重跑 bootstrap
-      #   boost_1_84_0.7z   失败重跑时不必再从 archives.boost.io 拉 120 MB
-      # key 含 build-weasel.ps1 的哈希：脚本一改就换 key，但 restore-keys 会捞上一次的同名缓存，
-      # 所以调试期间不会每次都从零编译。
-      - name: cache weasel build deps (boost 1.84.0)
+      # ---- 自建输入法构建缓存 ----
+      # 只缓存**产物目录**，不缓存 build 中间目录：
+      #   third_party/librime/dist           librime 安装前缀（x64 + Win32 的 rime.dll/rime.lib/include）
+      #   third_party/weasel/output          Weasel 输出（WeaselServer.exe / WeaselDeployer.exe /
+      #                                      rime.dll / archives\weasel-0.17.4.0-installer.exe）
+      #   third_party/weasel/{lib,lib64,include}   build-librime 部署进 Weasel 树的产物
+      #   third_party/weasel/deps/boost_1_84_0/{boost,stage}  boost 产物（自建 librime 的前提）
+      #   build/cache-manifest.json          清单：源码树 id / 插件哈希 / 脚本哈希 / 产物 sha256
+      # 命中后必须过 scripts/ime/verify-win-build-cache.ps1：任一不符就删掉缓存产物、
+      # 打 cache=invalid reason=…，照常全量构建 —— 缓存只影响耗时，不影响产物。
+      #
+      # key 只在 checkout 之后算一次并写进 RIME_CACHE_KEY：构建会往 third_party/librime 里写
+      # dist\ / deps\，save 时重算 hashFiles 会得到另一个 key（缓存就永远存不到该存的地方）。
+      - name: compute ime build cache key
+        id: ime_cache_key
+        shell: pwsh
+        run: |
+          $key = "rime-${{ runner.os }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}-${{ hashFiles('scripts/ime/build-weasel.ps1') }}"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "key=$key"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RIME_CACHE_KEY=$key"
+          Write-Host "ime cache key: $key"
+
+      - name: restore ime build cache (librime + weasel + boost)
+        id: ime_cache_restore
         if: steps.weasel_mode.outputs.mode != 'fetch'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
+            build/cache-manifest.json
+            third_party/librime/dist
+            third_party/weasel/output
+            third_party/weasel/lib
+            third_party/weasel/lib64
+            third_party/weasel/include
             third_party/weasel/deps/boost_1_84_0/boost
             third_party/weasel/deps/boost_1_84_0/stage
-            third_party/weasel/deps/boost_1_84_0/b2.exe
-            third_party/weasel/deps/boost_1_84_0/project-config.jam
-            third_party/weasel/deps/boost_1_84_0.7z
-          key: ${{ runner.os }}-weasel-boost-1.84.0-${{ hashFiles('scripts/ime/build-weasel.ps1', 'third_party/weasel/weasel.sln') }}
+            packaging/windows/vendor/weasel-0.17.4.0-installer.exe
+          key: ${{ steps.ime_cache_key.outputs.key }}
           restore-keys: |
-            ${{ runner.os }}-weasel-boost-1.84.0-
+            rime-${{ runner.os }}-
 
-      # 自建 librime（0.6.9）的缓存：
-      #   third_party/librime/deps/<name>/build  MSVC 增量编译目录（deps 静态库）
-      #   third_party/librime/build              librime 自己的 build\x64 与 build\win32
-      # 命中后 build-librime-win.ps1 只做 configure + install，不再重编 deps/源码；
-      # 不缓存 dist\（安装前缀）：它由 --target install 立刻重建，缓存它反而可能留下别的
-      # 架构/工具集的 DLL。key 含 deps pin 与脚本哈希，pin 或脚本一改就换 key。
-      - name: cache self-built librime (deps + build dirs)
+      # 命中校验（脚本自己打印 cache=hit / cache=invalid reason=…）：
+      #   rime.dll 存在且含 rimesync_vnum + numpad 明文、WeaselServer.exe / WeaselDeployer.exe 在、
+      #   清单里的源码树 id 与脚本哈希和当前 checkout 一致、每个产物 sha256 对得上。
+      # 判 invalid 时脚本会删掉缓存产物并以 0 退出（job 继续跑全量构建），只有 valid 输出不同。
+      - name: verify ime build cache (cache=hit / cache=invalid)
+        id: ime_cache_verify
         if: steps.weasel_mode.outputs.mode != 'fetch'
-        uses: actions/cache@v4
-        with:
-          path: |
-            third_party/librime/deps/glog/build
-            third_party/librime/deps/leveldb/build
-            third_party/librime/deps/yaml-cpp/build
-            third_party/librime/deps/marisa-trie/build
-            third_party/librime/deps/opencc/build
-            third_party/librime/build
-          key: >-
-            ${{ runner.os }}-librime-1.17.0-pins1-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}
-          restore-keys: |
-            ${{ runner.os }}-librime-1.17.0-pins1-
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/ime/verify-win-build-cache.ps1 -Mode verify
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::verify-win-build-cache.ps1 -Mode verify 失败（exit $LASTEXITCODE）"
+            exit $LASTEXITCODE
+          }
 
       # 先在 1 分钟内把工具链看清楚，再进 90 分钟的自编译。
       # -Check 不下载、不编译，只打印 repo root/VS/cl.exe/b2/boost 状态；
       # v0.6.1 的失败点（bootstrap 探测不到工具集）在这里就会以「cl.exe = ok」+ VS 路径暴露。
       - name: preflight · weasel toolchain（VS2022 / v143 / boost 缓存）
-        if: steps.weasel_mode.outputs.mode != 'fetch'
+        if: steps.weasel_mode.outputs.mode != 'fetch' && steps.ime_cache_verify.outputs.valid != 'true'
         timeout-minutes: 10
         shell: pwsh
         run: |
@@ -595,7 +639,7 @@ jobs:
       # 这里先单独把 boost 建好，否则 build-librime-win.ps1 会因 BOOST_ROOT 不可用直接失败
       # （首次跑就是这么挂的：缓存只有 boost 源码树，没有 stage\lib）。
       - name: bootstrap boost for self-built librime
-        if: steps.weasel_mode.outputs.mode != 'fetch'
+        if: steps.weasel_mode.outputs.mode != 'fetch' && steps.ime_cache_verify.outputs.valid != 'true'
         timeout-minutes: 40
         shell: pwsh
         run: |
@@ -623,6 +667,15 @@ jobs:
         env:
           WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
         run: |
+          # 缓存命中（verify-win-build-cache.ps1 已经验过 rime.dll 的插件明文、产物哈希与源码
+          # 树 id）：跳过自建，但这一步必须照常「成功」——后面的 weasel_verify 按 outcome 判断
+          # Weasel 来源是不是自编译，skipped 会被当成回退上游包。
+          if ('${{ steps.ime_cache_verify.outputs.valid }}' -eq 'true') {
+            Write-Host 'cache=hit：librime 安装前缀来自缓存，跳过自建（详见上一步的 cache=hit 明细）'
+            Get-Item -LiteralPath 'third_party/librime/dist/x64/lib/rime.dll' |
+              ForEach-Object { Write-Host ("cached rime.dll: {0:N1} MiB" -f ($_.Length / 1MB)) }
+            exit 0
+          }
           pwsh -NoProfile -File scripts/ime/build-librime-win.ps1
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::build-librime-win.ps1 失败（exit $LASTEXITCODE；模式 $env:WEASEL_MODE）：自建 librime 失败，Windows 版将没有输入增强插件"
@@ -653,6 +706,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEASEL_MODE: ${{ steps.weasel_mode.outputs.mode }}
         run: |
+          # 同上：缓存命中时跳过 msbuild + makensis，vendor 目录里的 weasel 安装包由
+          # verify-win-build-cache.ps1 从 output\archives 恢复（哈希对得上才会 cache=hit）。
+          if ('${{ steps.ime_cache_verify.outputs.valid }}' -eq 'true') {
+            Write-Host 'cache=hit：Weasel 输出来自缓存，跳过 msbuild + makensis'
+            $cached = Get-Item -LiteralPath 'packaging/windows/vendor/weasel-0.17.4.0-installer.exe'
+            Write-Host ("cached weasel: {0:N1} MiB" -f ($cached.Length / 1MB))
+            exit 0
+          }
           pwsh -NoProfile -File scripts/ime/build-weasel.ps1 -LibrimeSource self
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::build-weasel.ps1 失败（exit $LASTEXITCODE；模式 $env:WEASEL_MODE）：require=本 job 失败，build/fetch=回退上游安装包"
@@ -660,6 +721,47 @@ jobs:
           }
           $exe = Get-Item -LiteralPath 'packaging/windows/vendor/weasel-0.17.4.0-installer.exe'
           Write-Host ("self-built weasel: {0:N1} MiB" -f ($exe.Length / 1MB))
+
+      # 全量构建成功后写清单：记录源码树 id（git tree）、插件哈希、脚本哈希与每个产物的
+      # sha256。只有清单存在且下一次校验通过，才允许 cache=hit。
+      - name: record ime build cache manifest
+        id: ime_cache_manifest
+        if: >-
+          steps.weasel_mode.outputs.mode != 'fetch' &&
+          steps.ime_cache_verify.outputs.valid != 'true' &&
+          steps.librime_selfbuild.outcome == 'success' &&
+          steps.weasel_selfbuild.outcome == 'success'
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/ime/verify-win-build-cache.ps1 -Mode write
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::写缓存清单失败（exit $LASTEXITCODE）：本次不保存缓存"
+            exit $LASTEXITCODE
+          }
+
+      # 只保存**刚构建完且已验证过**的产物：命中缓存的那次不重复保存（exact key 已存在，
+      # 再存只会冲突），构建或清单失败的那次不保存（半成品永远不进缓存）。
+      # 想强制重建：先用 gh cache delete 删掉同名 key（见 docs/CI-CACHE.md）。
+      - name: save ime build cache (librime + weasel + boost)
+        if: >-
+          steps.weasel_mode.outputs.mode != 'fetch' &&
+          steps.ime_cache_restore.outputs.cache-hit != 'true' &&
+          steps.ime_cache_verify.outputs.valid != 'true' &&
+          steps.ime_cache_manifest.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/cache-manifest.json
+            third_party/librime/dist
+            third_party/weasel/output
+            third_party/weasel/lib
+            third_party/weasel/lib64
+            third_party/weasel/include
+            third_party/weasel/deps/boost_1_84_0/boost
+            third_party/weasel/deps/boost_1_84_0/stage
+            packaging/windows/vendor/weasel-0.17.4.0-installer.exe
+          key: ${{ steps.ime_cache_key.outputs.key }}
 
       # 只有自编译失败时才跑：把 VS 安装 / cl.exe / boost 目录状态一次性打到日志里。
       # v0.6.1 的日志里只有 "unable to detect your toolset installation" 这一句猜谜；
@@ -855,7 +957,7 @@ jobs:
             Write-Host "::error::weasel 安装包里没有 rime.dll（$($installer.Name)）"
             exit 1
           }
-          $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
+          $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect', 'numpad')
           $missing = @()
           foreach ($dll in $dlls) {
             $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($dll.FullName))
@@ -956,6 +1058,55 @@ jobs:
           if ($schemas.Count -eq 0) {
             Write-Host '::error::setup.exe 里没有 resources/prebuilt/**/*.schema.yaml：检查 bundle.resources 里 ../packaging/rime/prebuilt/ 的映射'
             exit 1
+          }
+
+          # 缓存不影响正确性：不管这次是 cache=hit 还是全量构建，最终 setup.exe 里都必须有
+          # 带插件的 rime.dll。NSIS 用 File 把 weasel 安装包内嵌进 setup，所以先解 setup 找出
+          # 内嵌的 weasel-*.exe，再解一层查 rime.dll 里的明文常量（rimesync_vnum / numpad）。
+          # 上游回退包本来就没有插件（那种情况由 weasel_verify 红字标注并拦住发布），所以只在
+          # 自编译成功时要求。
+          if ('${{ steps.weasel_selfbuild.outcome }}' -eq 'success') {
+            $payload = Join-Path $env:RUNNER_TEMP 'setup-payload'
+            if (Test-Path -LiteralPath $payload) { Remove-Item -LiteralPath $payload -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $payload | Out-Null
+            & $sevenZip x -y "-o$payload" $setup.FullName | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::7z 解不开 $($setup.Name)（exit $LASTEXITCODE），无法断言内嵌的 rime.dll"
+              exit 1
+            }
+            $embedded = @(Get-ChildItem -LiteralPath $payload -Recurse -File -Filter 'weasel-*-installer.exe' -ErrorAction SilentlyContinue |
+              Sort-Object Length -Descending | Select-Object -First 1)
+            if ($embedded.Count -eq 0) {
+              # 7z 读不出嵌套载荷时退回 vendor 里的同一份文件：NSIS 的 !define RIMESYNC_WEASEL_EXE
+              # 内嵌的就是它，而且上面已经断言 setup >= 12 MiB（说明内嵌安装包确实在）。
+              Write-Host '::warning::setup.exe 里没解析出内嵌的 weasel-*-installer.exe，退回用 packaging/windows/vendor 里的同一份文件做断言'
+              $embedded = @(Get-ChildItem -LiteralPath 'packaging/windows/vendor' -Filter 'weasel-*-installer.exe' -File -ErrorAction SilentlyContinue |
+                Sort-Object Length -Descending | Select-Object -First 1)
+            }
+            if ($embedded.Count -eq 0) {
+              Write-Host '::error::没有可断言的 weasel 安装包（setup.exe 与 packaging/windows/vendor 里都没有）'
+              exit 1
+            }
+            $inner = Join-Path $env:RUNNER_TEMP 'setup-payload-weasel'
+            if (Test-Path -LiteralPath $inner) { Remove-Item -LiteralPath $inner -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $inner | Out-Null
+            & $sevenZip x -y "-o$inner" $embedded[0].FullName | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::7z 解不开 $($embedded[0].Name)"; exit 1 }
+            $payloadDlls = @(Get-ChildItem -LiteralPath $inner -Recurse -File -Filter 'rime.dll')
+            if ($payloadDlls.Count -eq 0) { Write-Host '::error::内嵌的 Weasel 安装包里没有 rime.dll'; exit 1 }
+            $expectedComponents = @('rimesync_vnum', 'numpad')
+            $missingComponents = @()
+            foreach ($dll in $payloadDlls) {
+              $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($dll.FullName))
+              foreach ($name in $expectedComponents) {
+                if ($text.IndexOf($name, [System.StringComparison]::Ordinal) -lt 0) { $missingComponents += ("{0}:{1}" -f $dll.Name, $name) }
+              }
+            }
+            if ($missingComponents.Count -gt 0) {
+              Write-Host ("::error title=缓存影响了正确性::最终 setup.exe 里的 rime.dll 缺组件：" + ($missingComponents -join ', ') + '（缓存里的产物绝不允许缺插件）')
+              exit 1
+            }
+            Write-Host ("setup payload ok (cache-independent): rime.dll 含 {0}（{1} 个 DLL）" -f ($expectedComponents -join ' / '), $payloadDlls.Count)
           }
           Write-Host ("setup payload ok: rime-sync-cli.exe + {0} 个 prebuilt schema" -f $schemas.Count)
 

@@ -186,7 +186,9 @@ jobs:
             packaging/linux/test/verify-in-container.sh \
             packaging/windows/fetch-weasel.ps1 \
             scripts/ime/build-librime-win.ps1 \
-            scripts/ime/build-weasel.ps1; do
+            scripts/ime/build-weasel.ps1 \
+            scripts/ime/verify-win-build-cache.ps1 \
+            scripts/ime/librime-build-cache.sh; do
             [ -f "$f" ] || { echo "::error::缺少 $f"; missing=1; }
           done
           [ "$missing" -eq 0 ] || exit 1
@@ -257,6 +259,25 @@ jobs:
           grep -qF 'check_rime_components' .github/scripts/verify-artifacts.sh ||
             { echo "::error::verify-artifacts.sh 缺少 check_rime_components（Windows 断言入口）"; exit 1; }
           echo "guard OK：release.yml -> build-librime-win.ps1 -> rime.dll 组件断言的链路完整"
+
+      # 构建缓存只在「命中后必须校验」的前提下安全：删掉 verify 步骤、换掉 key、或者去掉
+      # manifest 写入，都会让坏缓存静默进发布包（或者让缓存永远不命中）。
+      - name: guard · release.yml keeps the ime build-cache verification wired
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          for f in scripts/ime/verify-win-build-cache.ps1 scripts/ime/librime-build-cache.sh; do
+            grep -qF "$f" "$wf" || { echo "::error::$wf 没有引用 $f"; exit 1; }
+          done
+          grep -qF 'scripts/ime/verify-win-build-cache.ps1 -Mode verify' "$wf" ||
+            { echo "::error::$wf 没有在 cache 恢复后跑 verify（坏缓存会直接进包）"; exit 1; }
+          grep -qF 'scripts/ime/verify-win-build-cache.ps1 -Mode write' "$wf" ||
+            { echo "::error::$wf 没有在构建后写 manifest（缓存永远不命中）"; exit 1; }
+          grep -qF "hashFiles('third_party/librime/**')" "$wf" ||
+            { echo "::error::$wf 的缓存 key 不含 third_party/librime/**"; exit 1; }
+          grep -qF 'cache=hit' "$wf" || { echo "::error::$wf 不会打印 cache=hit"; exit 1; }
+          grep -qF 'cache=invalid reason=' "$wf" || { echo "::error::$wf 不会打印 cache=invalid reason=…"; exit 1; }
+          echo "guard OK：缓存 -> 校验 -> manifest -> 保存 的链路完整"
 
       # ps1 在 ubuntu runner 上不能执行，但可以解析：语法错误不必等 windows job 首跑才发现。
       # 本机没有 pwsh（改脚本的人也不一定有），所以这一段是唯一的「改完就能验」的入口。

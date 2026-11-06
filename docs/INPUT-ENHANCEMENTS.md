@@ -27,13 +27,15 @@ ASCII 键，这三处保持原样（改了会破坏注音自己的键盘布局�
 ## 2. 生成的文件
 
 ```
-packaging/rime/schemas/<schema>.custom.yaml   # 16 个，随包方案各一份
+packaging/rime/schemas/<schema>.custom.yaml   # 3 个，随包保留方案各一份
 ```
 
-`<schema>` 的 16 个：`luna_pinyin`、`luna_pinyin_simp`、`luna_pinyin_fluency`、
-`luna_pinyin_tw`、`luna_quanpin`、`wubi86`、`wubi_pinyin`、`wubi_trad`、
-`cangjie5`、`cangjie5_express`、`stroke`、`terra_pinyin`、`terra_pinyin_12345`、
-`bopomofo`、`bopomofo_tw`、`bopomofo_express`（= 随包 `default.yaml` 的 schema_list）。
+`<schema>` 的 3 个（0.6.21 起）：`luna_pinyin_simp`（朙月拼音·简化字）、
+`wubi_pinyin`（五笔拼音）、`wubi86`（五笔86）。清单的唯一来源是
+`packaging/rime/retained-schemas.txt`，其余方案在安装/自举期由
+`rime-sync-cli prune-schemas` 清理（见 `docs/SCHEMA-RETENTION.md`）。
+依赖方案（`luna_pinyin` / `pinyin_simp` / `stroke`）由闭包自动解析，不生成模板：
+它们不需要 `rimesync_vnum` / `rimesync_punct` 标记。
 
 内容结构：
 
