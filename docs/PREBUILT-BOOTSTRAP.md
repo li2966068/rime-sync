@@ -293,6 +293,12 @@ Test-Path "$env:ProgramFiles\rime-sync\rime-sync-cli.exe"
 把 `KP_0..KP_9` / `KP_Decimal` 归一化成 `0..9` / `.` 后交回引擎，**不改任何
 schema 的 alphabet**，对普通拼音输入同样生效。
 
+0.6.19 起 `KP_Decimal` 有一个唯一的例外：**没有组字时直接上屏 ASCII 句点
+`.`**（`engine_->CommitText`，不再交回标点处理器），所以中文态也是 `.` 而不是
+`。`；正在组字时仍按 `.` 交回引擎（v 模式 `v12.34` 依赖它）。主键盘 `.` 不受
+影响，中文态照旧是 `。`。英文/ASCII 态由 `ascii_composer` 先把按键交给客户端，
+结果与主键盘 `.` 完全一致。
+
 ### 9.3 写盘纪律
 
 1. 读文件 -> `serde_yaml` 解析（不合法就整份跳过，一个字节都不写）；
@@ -319,6 +325,12 @@ LD_LIBRARY_PATH=<build>/lib /tmp/vmode-smoke <shared_data_dir> <user_data_dir>
 它断言：`v 1 2 3 4 + a` 与 `v KP_1..KP_4 + a` 都上屏
 `壹仟贰佰叁拾肆元整`、上屏文本里没有多余的 `a`、输入上下文清空；
 `v KP_1 KP_Decimal KP_5 + space` 上屏 `壹元伍角整`；字母输入不受影响。
+
+0.6.19 追加的断言：中文态无组字时 `KP_Decimal` 上屏单字节 `2E`（不是 `。`）；
+ASCII 态与主键盘 `.` 一样交给客户端、IME 不提交中文标点；`v12.34 + a` 上屏
+`壹拾贰元叁角肆分` 且小数点本身不上屏；`v12. + a` 不产生金额且组字不被清空；
+普通拼音组字中 `KP_Decimal` 与主键盘 `.` 的结果完全一致；主键盘 `.` 中文态
+仍然上屏 `。`。
 
 ### 9.5 幂等与回滚
 
@@ -405,6 +417,11 @@ data_file=/usr/share/rime-data/luna_pinyin.schema.yaml
   `fix-ime --json`，校验 JSON 计数、真实落盘文件与 `--no-data-patch`；
 * `scripts/ime/rime-vmode-smoke.cc`（容器 smoke，手工跑）：在真实部署过的 data
   方案上敲 `v1234 + a` 与 `KP_1..KP_4 + a`，断言上屏无多余 `a`、两者结果一致；
+  0.6.19 起还覆盖 `KP_Decimal` 的六种情形（中文态无组字 / ASCII 态 / v12.34 /
+  v12. 边界 / 拼音组字中 / 主键盘 `.` 防回归）；
+* `third_party/librime/plugins/rimesync-extra/test/engine_smoke_test.cc`（对真实
+  librime 手工编译，见文件头）：`TestNumpad` 直接驱动 `numpad` 处理器，断言
+  无组字时 `KP_Decimal` 立即上屏一个 `0x2E`、有组字时与主键盘 `.` 结果一致；
 * 门禁：`cargo test --workspace --all-targets`、`cargo fmt --all -- --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、
   `pnpm exec tsc --noEmit`、`pnpm build`。

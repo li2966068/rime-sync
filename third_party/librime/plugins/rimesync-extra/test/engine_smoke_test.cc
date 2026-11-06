@@ -229,6 +229,7 @@ punctuator:
   half_shape:
     '/': [ '、', '/', '／', '÷' ]
     '\': [ '、', '＼' ]
+    '.': '。'
   symbols:
     '/fh': [ '©', '®' ]
 )YAML";
@@ -464,6 +465,78 @@ void TestNumpad() {
   Check(engine->ProcessKey(KeyEvent(XK_space, 0)), "space confirms");
   CheckEq(committed, u8"壹元伍角整", "KP_Decimal produced a fraction");
   Check(!ctx->IsComposing(), "KP_Decimal composition is finished");
+
+  // 0.6.19: KP_Decimal outside a composition is always an ASCII period.  It
+  // must be committed directly instead of being replayed as '.', which the
+  // punctuation chain would turn into '。' in Chinese mode.
+  ctx->set_option("ascii_mode", false);
+  if (numpad) {
+    committed.clear();
+    Check(numpad->ProcessKeyEvent(KeyEvent(0xffae, 0)) == kAccepted,
+          "numpad: KP_Decimal is consumed outside a composition");
+    CheckEq(committed, ".", "numpad: KP_Decimal commits a period directly");
+    Check(committed.size() == 1 && committed[0] == '.',
+          "numpad: the commit is one byte 0x2E, not UTF-8 。");
+    Check(!ctx->IsComposing() && ctx->input().empty(),
+          "numpad: KP_Decimal leaves no composition");
+  }
+
+  // Through the whole chain the same key must still beam up one ASCII period.
+  committed.clear();
+  Check(engine->ProcessKey(KeyEvent(0xffae, 0)),
+        "engine: KP_Decimal is accepted outside a composition");
+  CheckEq(committed, ".", "engine: KP_Decimal commits an ASCII period");
+  Check(!ctx->IsComposing() && ctx->input().empty(),
+        "engine: KP_Decimal leaves the context empty");
+
+  // Regression guard: the main keyboard '.' keeps the punctuator mapping.
+  committed.clear();
+  Check(engine->ProcessKey(KeyEvent('.', 0)), "engine: main '.' is accepted");
+  CheckEq(committed, u8"。", "engine: main '.' still commits 。");
+  Check(!ctx->IsComposing(), "engine: main '.' leaves no composition");
+
+  // English/ASCII mode: ascii_composer rejects the key before the numpad
+  // processor runs, so the client inserts the character - exactly like the
+  // main keyboard '.' - and the IME must not commit any Chinese punctuation.
+  ctx->set_option("ascii_mode", true);
+  committed.clear();
+  Check(!engine->ProcessKey(KeyEvent(0xffae, 0)),
+        "ascii mode: KP_Decimal is left to the client");
+  Check(committed.empty(), "ascii mode: KP_Decimal commits nothing");
+  Check(!engine->ProcessKey(KeyEvent('.', 0)),
+        "ascii mode: main '.' is left to the client");
+  Check(committed.empty(), "ascii mode: main '.' commits nothing");
+  ctx->set_option("ascii_mode", false);
+
+  // While a composition is in progress KP_Decimal is still replayed as '.',
+  // so it must be indistinguishable from the main keyboard '.' (Rime's own
+  // punctuator decides what the dot does; the numpad key must not be dropped
+  // and must not destroy anything on its own).
+  ctx->Clear();
+  TypeString(engine.get(), "ni");
+  const std::string before_punct = ctx->input();
+  committed.clear();
+  Check(engine->ProcessKey(KeyEvent(0xffae, 0)),
+        "pinyin: KP_Decimal is accepted while composing");
+  const std::string kp_input = ctx->input();
+  const std::string kp_commit = committed;
+  std::printf("pinyin KP_Decimal: input=[%s] commit=[%s]\n", kp_input.c_str(),
+              kp_commit.c_str());
+  CheckEq(before_punct, std::string("ni"), "pinyin: input before the period");
+  Check(!(kp_input.empty() && kp_commit.empty()),
+        "pinyin: KP_Decimal is not silently swallowed");
+
+  committed.clear();
+  TypeString(engine.get(), "ni");
+  Check(engine->ProcessKey(KeyEvent('.', 0)),
+        "pinyin: main '.' is accepted while composing");
+  const std::string dot_input = ctx->input();
+  const std::string dot_commit = committed;
+  std::printf("pinyin main '.':   input=[%s] commit=[%s]\n", dot_input.c_str(),
+              dot_commit.c_str());
+  CheckEq(kp_input, dot_input, "pinyin: KP_Decimal matches main '.' input");
+  CheckEq(kp_commit, dot_commit, "pinyin: both keys commit the same text");
+  ctx->Clear();
 }
 
 // rimesync_vselect/keys overrides the default "abcdefgh".

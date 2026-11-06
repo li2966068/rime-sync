@@ -7,7 +7,13 @@
 // selector) sees exactly what a main-keyboard key produces.
 //
 // It is intentionally schema agnostic and applies to ordinary pinyin input as
-// well: digits and '.' behave the same on both keyboards, on both platforms.
+// well: digits behave the same on both keyboards, on both platforms.
+//
+// KP_Decimal is the one exception to "replay the normalised key": outside a
+// composition it is committed directly as ASCII '.', because the punctuation
+// chain maps '.' to '。' in Chinese mode and the numpad decimal point must
+// always be '.'.  While a composition is in progress it is still replayed as
+// '.', so v-mode decimals (v12.34) and ordinary pinyin keep working.
 
 #ifndef RIMESYNC_EXTRA_NUMPAD_PROCESSOR_H_
 #define RIMESYNC_EXTRA_NUMPAD_PROCESSOR_H_

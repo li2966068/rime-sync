@@ -2,6 +2,7 @@
 
 #include "numpad_processor.h"
 
+#include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/key_event.h>
 
@@ -24,6 +25,14 @@ ProcessResult NumpadProcessor::ProcessKeyEvent(const KeyEvent& key_event) {
     return kNoop;
   if (!engine_)
     return kNoop;
+  // The numpad decimal point is always an ASCII period.  Outside a
+  // composition, replaying '.' would let the punctuation chain turn it into
+  // '。' in Chinese mode, so commit it here and consume the key instead.
+  Context* ctx = engine_->context();
+  if (ch == '.' && (!ctx || !ctx->IsComposing())) {
+    engine_->CommitText(string(1, '.'));
+    return kAccepted;
+  }
   // Re-enter the engine with the normalised key: the nested call cannot loop,
   // because ch is ASCII and this processor returns kNoop for it.  If nothing
   // handles the normalised key either, keep the original KP key alive instead

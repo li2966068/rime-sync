@@ -1,10 +1,13 @@
 // rime-vmode-smoke.cc -- 用真正部署过的 data 方案验证 v 模式与数字小键盘。
 //
 // 与 rime-smoke.cc 的分工：那个证明「装好的数据能部署、能出候选」；这个证明
-// 0.6.18 的 data 方案补丁在引擎里真的生效：
+// data 方案补丁在引擎里真的生效：
 //   * v 1 2 3 4 + a  -> 壹仟贰佰叁拾肆元整，且上屏文本后面不能多出一个 a
 //   * v KP_1..KP_4 + a -> 同上（小键盘被 numpad 归一化成 ASCII 数字）
 //   * v KP_1 KP_Decimal KP_5 + space -> 壹元伍角整（KP_Decimal -> 句点）
+//   * 0.6.19：KP_Decimal 在无组字时永远上屏 ASCII 句点 0x2E（中文态也不是「。」），
+//     英文态与主键盘 '.' 一样交给客户端；正在组字时仍作为 '.' 交回引擎；
+//     主键盘 '.' 中文态保持「。」。
 //
 // 用法：rime-vmode-smoke <shared_data_dir> <user_data_dir> [--no-deploy]
 //      --no-deploy 直接用 user_data_dir/build 里已有的产物。
@@ -57,6 +60,27 @@ std::string Input(RimeApi* api, RimeSessionId session) {
   return input ? input : "";
 }
 
+// 把上屏文本渲染成十六进制，便于在日志里看清是 '.'（2E）还是「。」（E3 80 82）。
+std::string BytesOf(const std::string& text) {
+  char buf[8];
+  std::string out;
+  for (unsigned char c : text) {
+    std::snprintf(buf, sizeof(buf), "%02X ", c);
+    out += buf;
+  }
+  if (!out.empty())
+    out.pop_back();
+  return "[" + out + "]";
+}
+
+void CheckText(const std::string& actual,
+               const char* expected,
+               const char* what) {
+  Check(actual == expected, what,
+        actual == expected ? std::string()
+                           : (actual + " " + BytesOf(actual)));
+}
+
 void Press(RimeApi* api, RimeSessionId session, int keycode) {
   api->process_key(session, keycode, 0);
 }
@@ -66,8 +90,10 @@ void PressAll(RimeApi* api, RimeSessionId session, const int* keys, size_t n) {
     Press(api, session, keys[i]);
 }
 
+// 清空会话。不用 Escape：express_editor 的 Escape 是「回退上一段」，
+// 在没有候选的输入（例如 v12.）上不保证清干净。
 void Reset(RimeApi* api, RimeSessionId session) {
-  Press(api, session, 0xff1b);  // Escape
+  api->clear_composition(session);
   TakeCommit(api, session);
 }
 
@@ -181,6 +207,119 @@ int main(int argc, char** argv) {
   Check(Input(api, session) == "ni", "pinyin: letters still work",
         Input(api, session));
   Reset(api, session);
+
+  // 5. 0.6.19：中文态、没有组字时，KP_Decimal 直接上屏 ASCII 句点。
+  api->set_option(session, "ascii_mode", False);
+  Reset(api, session);
+  Press(api, session, 0xffae);
+  const std::string kp_period = TakeCommit(api, session);
+  CheckText(kp_period, ".", "chinese: KP_Decimal commits an ASCII period");
+  Check(kp_period.size() == 1 &&
+            static_cast<unsigned char>(kp_period[0]) == 0x2e,
+        "chinese: the commit is exactly one byte 0x2E", BytesOf(kp_period));
+  Check(kp_period != u8"。", "chinese: KP_Decimal does not commit 。",
+        BytesOf(kp_period));
+  Check(Input(api, session).empty(),
+        "chinese: KP_Decimal leaves no composition", Input(api, session));
+
+  // 6. 英文/ASCII 态：引擎把键交给客户端（与主键盘 '.' 完全一致），由客户端
+  //    插入字符；IME 既不提交中文标点，也不留下任何组合文本。
+  api->set_option(session, "ascii_mode", True);
+  const Bool kp_handled = api->process_key(session, 0xffae, 0);
+  const std::string kp_ascii_commit = TakeCommit(api, session);
+  Check(!kp_handled, "ascii: KP_Decimal is passed to the client",
+        std::string("process_key=") + (kp_handled ? "true" : "false"));
+  Check(kp_ascii_commit.empty(), "ascii: KP_Decimal commits no IME text",
+        BytesOf(kp_ascii_commit));
+  const Bool dot_handled = api->process_key(session, '.', 0);
+  const std::string dot_ascii_commit = TakeCommit(api, session);
+  Check(dot_handled == kp_handled,
+        "ascii: KP_Decimal matches the main keyboard '.'",
+        std::string("KP=") + (kp_handled ? "true" : "false") + " main=" +
+            (dot_handled ? "true" : "false"));
+  Check(dot_ascii_commit.empty(),
+        "ascii: main '.' commits no IME text either",
+        BytesOf(dot_ascii_commit));
+  api->set_option(session, "ascii_mode", False);
+
+  // 7. v 模式：v12.34 + a —— 小数点参与编码，不被上屏。
+  Reset(api, session);
+  Press(api, session, 'v');
+  Press(api, session, 0xffb1);
+  Press(api, session, 0xffb2);
+  Press(api, session, 0xffae);
+  Press(api, session, 0xffb3);
+  Press(api, session, 0xffb4);
+  Check(Input(api, session) == "v12.34",
+        "v-mode: KP_Decimal joins the vnum encoding", Input(api, session));
+  Press(api, session, 'a');
+  const std::string v1234_commit = TakeCommit(api, session);
+  CheckText(v1234_commit, u8"壹拾贰元叁角肆分",
+            "v-mode: v12.34 + a commits the amount");
+  Check(v1234_commit.find('.') == std::string::npos &&
+            v1234_commit.find(u8"。") == std::string::npos,
+        "v-mode: the period itself is not committed", v1234_commit);
+  Check(Input(api, session).empty(), "v-mode: input is empty after a",
+        Input(api, session));
+
+  // 8. v 模式边界：v12. + a —— 现有转换规则拒绝空小数（小数点后必须至少
+  //    一位数字），所以不产生金额，也不崩。
+  Reset(api, session);
+  Press(api, session, 'v');
+  Press(api, session, 0xffb1);
+  Press(api, session, 0xffb2);
+  Press(api, session, 0xffae);
+  Check(Input(api, session) == "v12.",
+        "v-mode boundary: trailing period stays in the input",
+        Input(api, session));
+  api->process_key(session, 'a', 0);
+  const std::string boundary_commit = TakeCommit(api, session);
+  Check(boundary_commit.empty(),
+        "v-mode boundary: no amount is committed for v12.",
+        BytesOf(boundary_commit));
+  Check(!Input(api, session).empty(),
+        "v-mode boundary: the composition is still alive",
+        Input(api, session));
+  std::printf("     v12. + a: input=[%s] commit=%s\n",
+              Input(api, session).c_str(), BytesOf(boundary_commit).c_str());
+
+  // 9. 普通拼音组字中按 KP_Decimal：与主键盘 '.' 完全一致，不清空组字。
+  Reset(api, session);
+  Press(api, session, 'n');
+  Press(api, session, 'i');
+  Check(Input(api, session) == "ni", "pinyin: input is ni",
+        Input(api, session));
+  const Bool kp_composing = api->process_key(session, 0xffae, 0);
+  const std::string kp_pinyin_input = Input(api, session);
+  const std::string kp_pinyin_commit = TakeCommit(api, session);
+  Check(kp_composing, "pinyin: KP_Decimal is accepted while composing");
+  Check(!(kp_pinyin_input.empty() && kp_pinyin_commit.empty()),
+        "pinyin: KP_Decimal is not silently swallowed",
+        "input=" + kp_pinyin_input + " commit=" + kp_pinyin_commit);
+  Reset(api, session);
+  Press(api, session, 'n');
+  Press(api, session, 'i');
+  const Bool dot_composing = api->process_key(session, '.', 0);
+  const std::string dot_pinyin_input = Input(api, session);
+  const std::string dot_pinyin_commit = TakeCommit(api, session);
+  Check(dot_composing == kp_composing,
+        "pinyin: KP_Decimal matches main '.' handling");
+  Check(dot_pinyin_input == kp_pinyin_input,
+        "pinyin: KP_Decimal matches main '.' input",
+        "KP=" + kp_pinyin_input + " main=" + dot_pinyin_input);
+  Check(dot_pinyin_commit == kp_pinyin_commit,
+        "pinyin: KP_Decimal matches main '.' commit",
+        "KP=" + kp_pinyin_commit + " main=" + dot_pinyin_commit);
+  std::printf("     pinyin 'ni' + KP_Decimal: input=[%s] commit=[%s]\n",
+              kp_pinyin_input.c_str(), kp_pinyin_commit.c_str());
+
+  // 10. 防回归：主键盘 '.' 在中文态仍然是「。」。
+  Reset(api, session);
+  Press(api, session, '.');
+  const std::string dot_commit = TakeCommit(api, session);
+  CheckText(dot_commit, u8"。", "chinese: main '.' still commits 。");
+  Check(dot_commit != ".", "chinese: main '.' is not the numpad rule",
+        BytesOf(dot_commit));
 
   api->destroy_session(session);
   api->finalize();
