@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "generator": "scripts/ime/gen-prebuilt-build.py",
-  "generated_at": "2026-11-05T05:22:00Z",
+  "generated_at": "2026-11-06T05:17:44Z",
   "rime_version": "1.17.0",
   "deployer": "build/ime-staging/debian-13/root/usr/bin/rime_deployer",
   "docker_image": "rime-ime-builder:debian_13",
@@ -22,7 +22,7 @@
     ]
   },
   "budget_bytes": 62914560,
-  "total_bytes": 29720874,
+  "total_bytes": 29720926,
   "files": [
     {
       "path": "build/default.yaml",
@@ -32,7 +32,7 @@
     {
       "path": "build/luna_pinyin.prism.bin",
       "bytes": 31728,
-      "sha256": "899fde1191ff8ae639e66a2876d580f6713c342bc82d7de2038c3b8c5d2b468d"
+      "sha256": "d4952e5a5565beefb36c55b78c440f04ab375e745b7a874d3c57aa206350dafc"
     },
     {
       "path": "build/luna_pinyin.reverse.bin",
@@ -41,8 +41,8 @@
     },
     {
       "path": "build/luna_pinyin.schema.yaml",
-      "bytes": 42081,
-      "sha256": "b9cab36690a533de97ff8e8261f128dcc64da10ac9148fe9290c4b04d5444c2f"
+      "bytes": 42094,
+      "sha256": "388a70940617def4013035e3c1712808711e510b2e150e470cd2c4a0dcb7077c"
     },
     {
       "path": "build/luna_pinyin.table.bin",
@@ -92,7 +92,7 @@
     {
       "path": "build/wubi86.prism.bin",
       "bytes": 834876,
-      "sha256": "432dbd85ee17dc943749387e845851bfe34a990b7b4881f0e5d3f95ca4b88199"
+      "sha256": "dc44062bb67ddaccd8306aaf55ab6a64acf1b1972c9853ca09b578fde51e467a"
     },
     {
       "path": "build/wubi86.reverse.bin",
@@ -101,8 +101,8 @@
     },
     {
       "path": "build/wubi86.schema.yaml",
-      "bytes": 40512,
-      "sha256": "f366ca92119c4a46f4bfd3d1b1494d466be3e92af05f9b3d93737c498b998cd7"
+      "bytes": 40525,
+      "sha256": "16a98a587c05b340e981f57b4798db034cb39b1f06258695875f5a8b6c2efd8b"
     },
     {
       "path": "build/wubi86.table.bin",
@@ -116,13 +116,13 @@
     },
     {
       "path": "config/luna_pinyin.custom.yaml",
-      "bytes": 28231,
-      "sha256": "29ee0e158d4465a4362679a37f23a6cb67995c79cff83504d333beab33fc7a4b"
+      "bytes": 28244,
+      "sha256": "fcb85d7dd0151eaecf040c429cc0f57bbbd7c6d58b09a82c99c7b6e4e9d7b656"
     },
     {
       "path": "config/wubi86.custom.yaml",
-      "bytes": 28176,
-      "sha256": "2ed017502b2b01d0716566c9e2dc41a2b631c013d39d622936944803810fe3c7"
+      "bytes": 28189,
+      "sha256": "f16ff44cffa44214bda477ec8a4bf253dd5de08375e9a796dcd8b2ee7fedef79"
     }
   ]
 }

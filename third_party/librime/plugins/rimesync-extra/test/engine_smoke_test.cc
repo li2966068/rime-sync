@@ -203,6 +203,7 @@ engine:
     - ascii_composer
     - rimesync_punct
     - rimesync_vselect
+    - numpad
     - recognizer
     - key_binder
     - speller
@@ -340,6 +341,24 @@ void TestSchemaSession() {
   CheckEq(committed, u8"一千二百三十四", "b commits the lower number");
   Check(!ctx->IsComposing(), "b finishes the composition");
 
+  // 7b. A key that really picked a candidate must be consumed: if the
+  //     processor returned kNoop the letter would fall through to speller and
+  //     start a new composition (the "extra a after the amount" bug).
+  committed.clear();
+  TypeString(engine.get(), "v1234");
+  {
+    std::unique_ptr<Processor> selector(
+        Processor::Require("rimesync_vselect")
+            ->Create(Ticket(engine.get())));
+    if (selector) {
+      Check(selector->ProcessKeyEvent(KeyEvent('a', 0)) == kAccepted,
+            "a key that selected a candidate is consumed");
+      CheckEq(committed, u8"壹仟贰佰叁拾肆元整",
+              "the consumed key committed the amount");
+      Check(!ctx->IsComposing(), "the consumed key started no new composition");
+    }
+  }
+
   // 8. Negative cases, checked on the processor itself so that no other
   //    processor can hide what rimesync_vselect does with the key.
   std::unique_ptr<Processor> vselect(
@@ -393,6 +412,60 @@ void TestSchemaSession() {
   }
 }
 
+// The numeric keypad reaches the engine as KP_0..KP_9 / KP_Decimal.
+void TestNumpad() {
+  Context* ctx = nullptr;
+  the<Engine> engine(CreateSchemaEngine("", &ctx));
+  if (!engine)
+    return;
+  std::string committed;
+  engine->sink().connect([&committed](const std::string& text) {
+    committed += text;
+  });
+
+  std::unique_ptr<Processor> numpad(
+      Processor::Require("numpad")->Create(Ticket(engine.get())));
+  Check(numpad.get() != nullptr, "processor numpad is registered");
+  if (numpad) {
+    Check(numpad->ProcessKeyEvent(KeyEvent('1', 0)) == kNoop,
+          "plain '1' is not a numpad key");
+    Check(numpad->ProcessKeyEvent(KeyEvent(0xff8d, 0)) == kNoop,
+          "KP_Enter is not normalised");
+    Check(numpad->ProcessKeyEvent(KeyEvent(0xffab, 0)) == kNoop,
+          "KP_Add is not normalised");
+    Check(numpad->ProcessKeyEvent(KeyEvent(0xffb1, kControlMask)) == kNoop,
+          "Ctrl+KP_1 is left to key_binder");
+  }
+
+  // KP_1 KP_2 KP_3 KP_4 behaves exactly like 1234 in v-mode.
+  committed.clear();
+  engine->ProcessKey(KeyEvent('v', 0));
+  const int digits[] = {0xffb1, 0xffb2, 0xffb3, 0xffb4};
+  for (int code : digits) {
+    Check(engine->ProcessKey(KeyEvent(code, 0)),
+          "a numpad digit is accepted by the chain");
+  }
+  CheckEq(ctx->input(), "v1234", "KP_1..KP_4 entered the vnum input");
+  Check(ctx->HasMenu(), "the numpad opened the vnum menu");
+  CheckEq(CandidateText(ctx, 0), u8"壹仟贰佰叁拾肆元整",
+          "numpad v-mode upper candidate");
+  Check(engine->ProcessKey(KeyEvent('a', 0)), "a selects after numpad input");
+  CheckEq(committed, u8"壹仟贰佰叁拾肆元整", "numpad input commits the amount");
+  Check(!ctx->IsComposing(), "numpad input leaves nothing behind");
+
+  // KP_Decimal stands for '.'.
+  committed.clear();
+  engine->ProcessKey(KeyEvent('v', 0));
+  engine->ProcessKey(KeyEvent(0xffb1, 0));
+  Check(engine->ProcessKey(KeyEvent(0xffae, 0)), "KP_Decimal is accepted");
+  engine->ProcessKey(KeyEvent(0xffb5, 0));
+  CheckEq(ctx->input(), "v1.5", "KP_Decimal becomes a period");
+  Check(ctx->HasMenu(), "KP_Decimal opened the vnum menu");
+  Check(engine->ProcessKey(KeyEvent(XK_space, 0)), "space confirms");
+  CheckEq(committed, u8"壹元伍角整", "KP_Decimal produced a fraction");
+  Check(!ctx->IsComposing(), "KP_Decimal composition is finished");
+}
+
 // rimesync_vselect/keys overrides the default "abcdefgh".
 void TestVselectKeysOverride() {
   Context* ctx = nullptr;
@@ -427,6 +500,7 @@ int main() {
   TestTranslator();
   TestProcessor();
   TestSchemaSession();
+  TestNumpad();
   TestVselectKeysOverride();
   if (g_failures != 0) {
     std::printf("\n%d check(s) failed\n", g_failures);

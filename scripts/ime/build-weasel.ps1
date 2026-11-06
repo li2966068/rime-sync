@@ -573,11 +573,11 @@ function Test-LibrimeReady {
     return $true
 }
 
-# 组件名断言：rimesync-extra 的 rimesync_vnum / rimesync_punct / rimesync_vselect 是
+# 组件名断言：rimesync-extra 的 rimesync_vnum / rimesync_punct / rimesync_vselect / numpad 是
 # registry 注册时用的普通 string 常量，合并进 rime.dll 后是 UTF-8（= ASCII）明文。
 # 官方预编译包里搜不到（它没有外部插件加载能力），所以这条断言同时是「自建 vs 预编译」的判据。
 function Get-MissingLibrimeComponents {
-    $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
+    $names = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect', 'numpad')
     $dlls = @('output\rime.dll')
     if (-not $SkipWin32) { $dlls += 'output\Win32\rime.dll' }
     $missing = @()

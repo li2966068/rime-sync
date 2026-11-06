@@ -18,7 +18,10 @@ third_party/librime/plugins/rimesync-extra/
 ├── vnum_translator.h/.cc       # component "rimesync_vnum" (translator)
 ├── punct_processor.h/.cc       # component "rimesync_punct" (processor)
 ├── vselect_processor.h/.cc     # component "rimesync_vselect" (processor)
+├── numpad_key.h/.cc            # pure KP_* -> ASCII mapping (no librime deps)
+├── numpad_processor.h/.cc      # component "numpad" (processor)
 ├── test/vnum_convert_test.cc   # standalone unit test
+├── test/numpad_key_test.cc     # standalone unit test
 └── test/engine_smoke_test.cc   # optional runtime harness
 ```
 
@@ -27,9 +30,9 @@ third_party/librime/plugins/rimesync-extra/
 | directory | `third_party/librime/plugins/rimesync-extra` |
 | module name | `rimesync_extra` |
 | translator component | `rimesync_vnum` |
-| processor components | `rimesync_punct`, `rimesync_vselect` |
+| processor components | `rimesync_punct`, `rimesync_vselect`, `numpad` |
 | merged CMake target | `rimesync-extra-objs` |
-| test target | `rimesync_extra_vnum_test`, custom target `check-rimesync-extra` |
+| test target | `rimesync_extra_vnum_test`, `rimesync_extra_numpad_test`, custom target `check-rimesync-extra` |
 | non-merged artifact | `rime-rimesync-extra` (`RIME_PLUGINS_DIR`) |
 
 ## 1. `rimesync_vnum` — “v” mode number conversion
@@ -225,6 +228,47 @@ rimesync_vselect:
 Wiring: add `rimesync_vselect` to `engine/processors` before `recognizer` /
 `speller` (it must see the letter before the speller turns it into input).
 
+A key that really selected a candidate is **consumed** (`kAccepted`); every
+other key is `kNoop`. Returning `kNoop` after committing would let the letter
+fall through to the speller and append it to the committed text
+(`壹仟贰佰叁拾肆元整a`), which is why the two cases are separate.
+
+## 4. `numpad` — numeric keypad
+
+librime receives the numeric keypad as X11 keysyms: `KP_0`..`KP_9`
+(`0xffb0`..`0xffb9`) and `KP_Decimal` (`0xffae`). No schema `alphabet`, no
+`recognizer` pattern and no translator accepts those, so `v` + keypad digits
+produced no candidates and keypad `.` did not reach the punctuator.
+
+| key | becomes |
+| --- | --- |
+| `KP_0` … `KP_9` | `0` … `9` |
+| `KP_Decimal` | `.` |
+| anything else (`KP_Enter`, `KP_Add`, `KP_Home`, plain `1`, …) | `kNoop`, untouched |
+
+The processor rewrites the key into its ASCII equivalent and lets the engine
+process that key, so `recognizer` / `key_binder` / `speller` / `punctuator` /
+`selector` see exactly what the main keyboard produces. It is not v-mode
+specific: keypad digits and `.` work the same during ordinary pinyin input, on
+both platforms (Weasel uses the same keycodes, see
+`third_party/weasel/include/KeyEvent.h`). Nothing in the schema `alphabet` has
+to change. If the normalised key is handled by nobody, the original KP key is
+left alone instead of being swallowed.
+
+Wiring: add `numpad` to `engine/processors` next to `rimesync_vselect`; it must
+run before `speller` / `punctuator`:
+
+```yaml
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - rimesync_vselect
+    - numpad            # after vselect, before key_binder / speller
+    - key_binder
+    # ... existing processors
+```
+
 ## How to disable
 
 * Per schema: drop `rimesync_punct` from `engine/processors` and/or
@@ -232,6 +276,8 @@ Wiring: add `rimesync_vselect` to `engine/processors` before `recognizer` /
 * Punctuation menu only: `rimesync_punct/shift_alternatives: false`.
 * Letter selection only: drop `rimesync_vselect` from `engine/processors`
   (or set `rimesync_vselect/keys: ""`, which leaves it inert).
+* Keypad only: drop `numpad` from `engine/processors`; the numeric keypad then
+  behaves as before (its keycodes are ignored by every other component).
 * Build level: remove `third_party/librime/plugins/rimesync-extra` before
   configuring, or build with `-DRIMESYNC_EXTRA_BUILD_TEST=OFF` to skip only
   the unit tests. `RIME_PLUGINS` (space separated allow-list) can also keep

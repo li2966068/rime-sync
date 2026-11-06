@@ -7,6 +7,7 @@
 pub mod backup;
 pub mod cancel;
 pub mod config;
+pub mod data_patch;
 pub mod dedupe;
 pub mod engine;
 pub mod history;
@@ -32,6 +33,7 @@ pub mod webdav;
 pub use backup::{BackupInfo, BackupManager, BackupManifest, RestoreReport};
 pub use cancel::CancelToken;
 pub use config::{Config, FirstSyncPolicy, MigrationReport, PasswordRef, CONFIG_SCHEMA_VERSION};
+pub use data_patch::{DataPatchReport, PatchOutcome};
 pub use engine::{
     ConflictDetail, Engine, PlanAction, PlanCounts, PlanKind, PlanReport, Progress, ProgressSink,
     Report,

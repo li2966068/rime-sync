@@ -12,7 +12,9 @@ set(rimesync_extra_src
   vnum_convert.cc
   vnum_translator.cc
   punct_processor.cc
-  vselect_processor.cc)
+  vselect_processor.cc
+  numpad_key.cc
+  numpad_processor.cc)
 
 add_library(rimesync-extra-objs OBJECT ${rimesync_extra_src})
 if(BUILD_SHARED_LIBS)
@@ -32,15 +34,24 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
     vnum_convert.cc)
   target_include_directories(rimesync_extra_vnum_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_executable(rimesync_extra_numpad_test
+    test/numpad_key_test.cc
+    numpad_key.cc)
+  target_include_directories(rimesync_extra_numpad_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(MSVC)
     target_compile_options(rimesync_extra_vnum_test PRIVATE /utf-8)
+    target_compile_options(rimesync_extra_numpad_test PRIVATE /utf-8)
   endif()
   add_custom_target(check-rimesync-extra
     COMMAND $<TARGET_FILE:rimesync_extra_vnum_test>
-    DEPENDS rimesync_extra_vnum_test
+    COMMAND $<TARGET_FILE:rimesync_extra_numpad_test>
+    DEPENDS rimesync_extra_vnum_test rimesync_extra_numpad_test
     COMMENT "Running rimesync-extra unit tests")
   if(BUILD_TEST)
     add_test(NAME rimesync_extra_vnum_test COMMAND rimesync_extra_vnum_test)
+    add_test(NAME rimesync_extra_numpad_test
+      COMMAND rimesync_extra_numpad_test)
   endif()
 endif()
 

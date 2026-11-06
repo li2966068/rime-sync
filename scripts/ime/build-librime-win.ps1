@@ -9,7 +9,7 @@
   路径），所以我们的 rimesync-extra（v 模式 / 标点 Shift 备选 / a-h 选词）在 Windows 上
   完全不生效。唯一可行的办法是把插件以 **合并** 方式（BUILD_MERGED_PLUGINS=ON，librime 的
   默认值）编进 rime.dll —— 合并进来的模块名会进 src/rime/setup.cc 的 kDefaultModules，
-  Weasel 不用任何改动就能拿到 rimesync_vnum / rimesync_punct / rimesync_vselect。
+  Weasel 不用任何改动就能拿到 rimesync_vnum / rimesync_punct / rimesync_vselect / numpad。
 
   流程（每一步都能单独复跑）：
     1. deps 子目录为空 → 按 pin 的 tag 浅克隆到 third_party/librime/deps/<name>
@@ -20,7 +20,7 @@
        编出 32 位 + 旧工具集的产物。所以这里自己生成 env.bat。
     3. cmd /c build.bat deps nologging   （x64 / Win32 各一遍，deps 静态，独立安装前缀）
     4. cmd /c build.bat librime          （BUILD_MERGED_PLUGINS=ON → 带上 rimesync-extra）
-    5. 断言两个 rime.dll 里都有 rimesync_vnum / rimesync_punct / rimesync_vselect 明文
+    5. 断言两个 rime.dll 里都有 rimesync_vnum / rimesync_punct / rimesync_vselect / numpad 明文
        （组件名是普通 string 常量，UTF-8 即 ASCII，直接搜字节即可），顺手校验 PE 架构
     6. 按上游 get-rime.ps1 -use dev 的同一套映射摆进 third_party/weasel：
          dist\x64\lib\rime.lib       -> <Weasel>\lib64\rime.lib
@@ -94,7 +94,7 @@ $script:DepsPins = [ordered]@{
 $script:GoogletestPin = @{ Url = 'https://github.com/google/googletest.git'; Tag = 'v1.14.0'; Commit = 'f8d7d77c06936315286eb55f8de22cd23c188571' }
 
 # 组件名 = plugins/rimesync-extra/rimesync_extra_module.cc 里 registry 注册的字符串
-$script:LibrimeComponents = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect')
+$script:LibrimeComponents = @('rimesync_vnum', 'rimesync_punct', 'rimesync_vselect', 'numpad')
 $script:PlaceholderMarker = 'rimesync-googletest-placeholder.txt'
 
 $script:RepoRoot = ''

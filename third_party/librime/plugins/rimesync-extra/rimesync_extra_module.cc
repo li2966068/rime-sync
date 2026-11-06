@@ -5,6 +5,7 @@
 #include <rime/registry.h>
 #include <rime_api.h>
 
+#include "numpad_processor.h"
 #include "punct_processor.h"
 #include "vnum_translator.h"
 #include "vselect_processor.h"
@@ -17,6 +18,7 @@ static void rime_rimesync_extra_initialize() {
   r.Register("rimesync_vnum", new Component<rimesync::VnumTranslator>);
   r.Register("rimesync_punct", new Component<rimesync::PunctProcessor>);
   r.Register("rimesync_vselect", new Component<rimesync::VselectProcessor>);
+  r.Register("numpad", new Component<rimesync::NumpadProcessor>);
 }
 
 static void rime_rimesync_extra_finalize() {}

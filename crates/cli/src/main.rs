@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};
 use rime_sync_core::config::{self, Config};
+use rime_sync_core::data_patch;
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::history;
 use rime_sync_core::index::FileIndex;
@@ -108,6 +109,9 @@ enum Command {
         /// 预编译产物目录；缺省按 exe / AppImage / deb 路径自动定位
         #[arg(long, value_name = "DIR")]
         payload: Option<PathBuf>,
+        /// 只铺 build/，不给 Weasel/Linux 的 data 方案打补丁
+        #[arg(long)]
+        no_data_patch: bool,
     },
 }
 
@@ -229,6 +233,16 @@ struct ProbeFailed;
 /// fix-ime 铺完仍不可用：报告已经打印过，main 只负责退出码。
 #[derive(Debug)]
 struct FixImeFailed;
+
+/// fix-ime 的 JSON 报告：PrebuiltReport 的字段平铺，再补 data 补丁结果。
+#[derive(Serialize)]
+struct FixImeJson<'a> {
+    #[serde(flatten)]
+    prebuilt: &'a prebuilt::PrebuiltReport,
+    /// 本次真正写入的 data 方案个数（重复执行时为 0）。
+    data_patched: usize,
+    data: &'a data_patch::DataPatchReport,
+}
 
 impl std::fmt::Display for FixImeFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -620,7 +634,11 @@ fn run(cli: Cli) -> Result<()> {
                 Err(anyhow::Error::new(ProbeFailed))
             }
         }
-        Command::FixIme { force, payload } => {
+        Command::FixIme {
+            force,
+            payload,
+            no_data_patch,
+        } => {
             let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
             let location = match payload {
                 Some(dir) => prebuilt::PayloadLocation {
@@ -634,8 +652,19 @@ fn run(cli: Cli) -> Result<()> {
                 &rime_dir,
                 prebuilt::InstallOptions { force },
             )?;
+            // 0.6.18：build/ 可能根本不被引擎使用（227 实测），补丁还要直接写进
+            // Weasel 的 data 方案源文件。失败只提示、不影响 fix-ime 的退出码。
+            let data = if no_data_patch {
+                data_patch::DataPatchReport::default()
+            } else {
+                data_patch::patch_dirs(&data_patch::data_dirs(), env!("CARGO_PKG_VERSION"))
+            };
             if cli.json {
-                print_json(&report)?;
+                print_json(&FixImeJson {
+                    prebuilt: &report,
+                    data_patched: data.patched(),
+                    data: &data,
+                })?;
             } else {
                 println!("rime_dir={}", rime_dir.display());
                 println!(
@@ -658,6 +687,39 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 if let Some(log) = &report.log_path {
                     println!("log={log}");
+                }
+                if no_data_patch {
+                    println!("data_patch=disabled (--no-data-patch)");
+                } else {
+                    println!(
+                        "data_patched={} data_unchanged={} data_skipped={} data_failed={} backup_dir={}",
+                        data.patched(),
+                        data.schemas_unchanged.len(),
+                        data.schemas_skipped.len(),
+                        data.errors.len(),
+                        if data.backup_dir.is_empty() {
+                            "-"
+                        } else {
+                            &data.backup_dir
+                        }
+                    );
+                    for dir in &data.data_dirs {
+                        println!("data_dir={dir}");
+                    }
+                    for file in &data.schemas_patched {
+                        println!("data_file={file}");
+                    }
+                    for file in &data.schemas_skipped {
+                        println!("data_skipped={file}");
+                    }
+                    for error in &data.errors {
+                        eprintln!("warning: {error}");
+                    }
+                    if data.needs_elevation() {
+                        eprintln!(
+                            "hint: 写入 data 方案需要管理员权限；请以管理员身份重新运行 rime-sync-cli fix-ime（或先以管理员身份启动 rime-sync 再点「修复输入法」）"
+                        );
+                    }
                 }
             }
             if report.build_ok {

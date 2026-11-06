@@ -46,6 +46,8 @@ USER_DEFAULT = REPO / "packaging" / "rime" / "default.custom.yaml"
 VNUM = "rimesync_vnum"
 PUNCT = "rimesync_punct"
 VSEL = "rimesync_vselect"
+# 小键盘归一化（KP_0..KP_9 / KP_Decimal -> 0..9 / .），对所有输入都生效。
+NUMPAD = "numpad"
 # rimesync_punct 要插在 key_binder / punctuator / selector 里最先出现的那个之前：
 # 只插在 punctuator 前的话，数字选词会先被 selector（或 key_binder 的页码键）吃掉。
 PUNCT_ANCHORS = ("key_binder", "punctuator", "selector")
@@ -257,6 +259,9 @@ def build_schema(sid, index, rime_data=RIME_DATA):
     if VSEL not in processors:
         # 紧随 rimesync_punct：两者都必须在 speller 之前（vselect 要能拦字母、punct 要能拦标点）。
         processors.insert(processors.index(PUNCT) + 1, VSEL)
+    if NUMPAD not in processors:
+        # 紧随 vselect：小键盘要先归一化成 ASCII，再交给 recognizer/speller。
+        processors.insert(processors.index(VSEL) + 1, NUMPAD)
     if VNUM not in translators:
         translators.insert(0, VNUM)
 

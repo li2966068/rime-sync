@@ -101,20 +101,27 @@ def static_checks(gen):
             check(
                 idx == want_idx
                 and (processors[idx + 1] == src_p[want_idx]
-                     or (processors[idx + 1] == gen.VSEL and processors[idx + 2] == src_p[want_idx])),
+                     or (processors[idx + 1] == gen.VSEL
+                         and processors[idx + 2] == gen.NUMPAD
+                         and processors[idx + 3] == src_p[want_idx])),
                 "%s rimesync_punct 在最先出现的 key_binder/punctuator/selector 之前" % sid,
                 "idx=%s want=%s" % (idx, want_idx),
             )
         else:
             check(False, "%s 有 rimesync_punct" % sid)
         check(
-            [x for x in processors if x not in (gen.PUNCT, gen.VSEL)] == src_p,
+            [x for x in processors if x not in (gen.PUNCT, gen.VSEL, gen.NUMPAD)] == src_p,
             "%s processors 其余顺序与源方案一致" % sid,
         )
         check(
             gen.VSEL in processors
             and processors.index(gen.VSEL) == processors.index(gen.PUNCT) + 1,
             "%s rimesync_vselect 紧跟 rimesync_punct" % sid,
+        )
+        check(
+            gen.NUMPAD in processors
+            and processors.index(gen.NUMPAD) == processors.index(gen.VSEL) + 1,
+            "%s numpad 紧跟 rimesync_vselect" % sid,
         )
         check(
             patch.get("recognizer/patterns/vnum") == gen.VNUM_PATTERN,
@@ -237,9 +244,11 @@ def deploy_checks(gen, keep=False):
             idx = processors.index(gen.PUNCT)
             check(
                 idx == want_idx
-                and [x for x in processors if x not in (gen.PUNCT, gen.VSEL)] == src_proc
+                and [x for x in processors if x not in (gen.PUNCT, gen.VSEL, gen.NUMPAD)] == src_proc
                 and gen.VSEL in processors
-                and processors.index(gen.VSEL) == idx + 1,
+                and processors.index(gen.VSEL) == idx + 1
+                and gen.NUMPAD in processors
+                and processors.index(gen.NUMPAD) == idx + 2,
                 "[生效] %s rimesync_punct 位置正确且引擎其余顺序不变" % sid,
             )
         else:

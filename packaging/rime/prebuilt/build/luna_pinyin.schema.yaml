@@ -30,6 +30,7 @@ engine:
     - recognizer
     - rimesync_punct
     - rimesync_vselect
+    - numpad
     - key_binder
     - speller
     - punctuator

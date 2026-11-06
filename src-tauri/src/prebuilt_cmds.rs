@@ -13,6 +13,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use rime_sync_core::data_patch::{self, DataPatchReport};
 use rime_sync_core::prebuilt::{self, BuildProbe, InstallOptions, PayloadLocation, PrebuiltReport};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
@@ -29,6 +30,11 @@ fn env_mode() -> Option<bool> {
     }
 }
 
+/// 补丁注释里写的版本：用发布版本（tauri.conf.json 的 version），不是 crate 的 0.1.0。
+fn app_version(app: &AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 /// 当前可执行文件所在目录：安装版把预编译产物放在 <exe 目录>/resources/prebuilt。
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
@@ -43,6 +49,15 @@ fn perform(rime_dir: &Path, force: bool) -> Result<(PayloadLocation, PrebuiltRep
         prebuilt::install_prebuilt_with(&location.path, rime_dir, InstallOptions { force })
             .map_err(|error| format!("铺入预编译产物失败：{error:#}"))?;
     Ok((location, report))
+}
+
+/// data 方案补丁：定位 Weasel 的 data 目录并直接改方案源文件。
+///
+/// 0.6.18 的起因：227 上 build/ 里已经有插件标记，但引擎没用它（按反斜杠不直出
+/// 「、」、v1234 没候选），部署链又不可用——只能把补丁写进 data。
+/// 每次启动都跑（幂等：没变化就一个字节都不写）。
+fn patch_data(version: &str) -> DataPatchReport {
+    data_patch::patch_dirs(&data_patch::data_dirs(), version)
 }
 
 /// 一句话结论；界面与日志共用。
@@ -69,6 +84,11 @@ pub struct FixImeReport {
     pub payload_source: String,
     pub probe_before: String,
     pub message: String,
+    /// 本次真正写入的 data 方案个数（重复执行时为 0）。
+    pub data_patched: usize,
+    /// 是否需要提示用户以管理员身份重试。
+    pub needs_elevation: bool,
+    pub data: DataPatchReport,
     #[serde(flatten)]
     pub report: PrebuiltReport,
 }
@@ -84,22 +104,28 @@ pub fn cmd_fix_ime(
     let rime_dir = detect_rime(&config)?.path;
     let probe_before = prebuilt::probe_build(&rime_dir);
     let (location, report) = perform(&rime_dir, force.unwrap_or(false))?;
-    let message = summary(&report);
-    push_log(
-        &state.0,
-        format!(
-            "[fix-ime] {message} payload={} source={} probe_before={}",
-            location.path.display(),
-            location.source,
-            probe_before
-        ),
+    let data = patch_data(&app_version(&app));
+    let message = format!("{}；{}", summary(&report), data.summary());
+    let mut log = format!(
+        "[fix-ime] {message} payload={} source={} probe_before={} data_patched={}",
+        location.path.display(),
+        location.source,
+        probe_before,
+        data.patched()
     );
+    if data.needs_elevation() {
+        log.push_str("（data 目录需要管理员权限：请以管理员身份重启 rime-sync 后重试）");
+    }
+    push_log(&state.0, log);
     Ok(FixImeReport {
         rime_dir: rime_dir.display().to_string(),
         payload: location.path.display().to_string(),
         payload_source: location.source,
         probe_before: probe_before.as_str().to_string(),
         message,
+        data_patched: data.patched(),
+        needs_elevation: data.needs_elevation(),
+        data,
         report,
     })
 }
@@ -177,7 +203,7 @@ pub(crate) fn bootstrap(app: &AppHandle) {
             .unwrap_or_else(|error| format!("<unavailable: {error}>"));
         log(format!(
             "bootstrap begin version={} exe={exe} RIMESYNC_PREBUILT={}",
-            env!("CARGO_PKG_VERSION"),
+            app_version(&handle),
             std::env::var(prebuilt::ENV_MODE).unwrap_or_else(|_| "<unset>".to_string())
         ));
 
@@ -214,78 +240,119 @@ pub(crate) fn bootstrap(app: &AppHandle) {
 
         let probe = prebuilt::probe_build(&rime_dir);
         log(format!("probe_before={probe}"));
+        let force = env_mode();
+        let mut end = "skip";
         if probe == BuildProbe::Prebuilt {
-            log("bootstrap end result=skip reason=probe-prebuilt".to_string());
-            return;
-        }
-        let Some(force) = env_mode() else {
-            log("bootstrap end result=skip reason=env-disabled RIMESYNC_PREBUILT=0".to_string());
+            log("skip stage=prebuilt reason=probe-prebuilt".to_string());
+        } else if let Some(force) = force {
+            // 与 perform() 同一顺序（resolve → install），这里展开是因为要在两步之间
+            // 把「命中了哪个候选目录」写进日志。
+            match prebuilt::resolve_payload(exe_dir().as_deref()) {
+                Ok(location) => {
+                    log(format!(
+                        "payload hit path={} source={}",
+                        location.path.display(),
+                        location.source
+                    ));
+                    log(format!("install start force={force}"));
+                    match prebuilt::install_prebuilt_with(
+                        &location.path,
+                        &rime_dir,
+                        InstallOptions { force },
+                    ) {
+                        Ok(report) => {
+                            log(format!(
+                                "install done copied={} kept={} overwritten={} config_copied={} config_kept={} failed={} probe_after={} build_ok={} escalated={} core_log={}",
+                                report.copied,
+                                report.kept,
+                                report.overwritten,
+                                report.config_copied,
+                                report.config_kept,
+                                report.failed,
+                                report.probe_after,
+                                report.build_ok,
+                                report.escalated,
+                                report.log_path.as_deref().unwrap_or("-"),
+                            ));
+                            end = if report.build_ok { "ok" } else { "degraded" };
+                            push_log(
+                                &state.0,
+                                format!(
+                                    "[bootstrap] probe={} 不可用，已自举：{} payload={}（{}）",
+                                    probe,
+                                    summary(&report),
+                                    location.path.display(),
+                                    location.source
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            log(format!("install failed error={error:#}"));
+                            end = "failed stage=install";
+                            push_log(
+                                &state.0,
+                                format!("[bootstrap] 预编译产物自举失败（不影响启动）：{error}"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    log(format!("payload failed stage=resolve error={error:#}"));
+                    end = "failed stage=payload";
+                    push_log(
+                        &state.0,
+                        format!("[bootstrap] 未找到预编译产物（不影响启动）：{error:#}"),
+                    );
+                }
+            }
+        } else {
+            log("skip stage=prebuilt reason=env-disabled RIMESYNC_PREBUILT=0".to_string());
             push_log(
                 &state.0,
                 "[bootstrap] RIMESYNC_PREBUILT=0，跳过预编译产物自举",
             );
-            return;
-        };
-
-        // 与 perform() 同一顺序（resolve → install），这里展开是因为要在两步之间
-        // 把「命中了哪个候选目录」写进日志。
-        let location = match prebuilt::resolve_payload(exe_dir().as_deref()) {
-            Ok(location) => location,
-            Err(error) => {
-                log(format!("payload failed stage=resolve error={error:#}"));
-                log("bootstrap end result=failed stage=payload".to_string());
-                push_log(
-                    &state.0,
-                    format!("[bootstrap] 未找到预编译产物（不影响启动）：{error:#}"),
-                );
-                return;
-            }
-        };
-        log(format!(
-            "payload hit path={} source={}",
-            location.path.display(),
-            location.source
-        ));
-
-        log(format!("install start force={force}"));
-        match prebuilt::install_prebuilt_with(&location.path, &rime_dir, InstallOptions { force }) {
-            Ok(report) => {
-                log(format!(
-                    "install done copied={} kept={} overwritten={} config_copied={} config_kept={} failed={} probe_after={} build_ok={} escalated={} core_log={}",
-                    report.copied,
-                    report.kept,
-                    report.overwritten,
-                    report.config_copied,
-                    report.config_kept,
-                    report.failed,
-                    report.probe_after,
-                    report.build_ok,
-                    report.escalated,
-                    report.log_path.as_deref().unwrap_or("-"),
-                ));
-                log(format!(
-                    "bootstrap end result={}",
-                    if report.build_ok { "ok" } else { "degraded" }
-                ));
-                push_log(
-                    &state.0,
-                    format!(
-                        "[bootstrap] probe={} 不可用，已自举：{} payload={}（{}）",
-                        probe,
-                        summary(&report),
-                        location.path.display(),
-                        location.source
-                    ),
-                );
-            }
-            Err(error) => {
-                log(format!("install failed error={error:#}"));
-                log("bootstrap end result=failed stage=install".to_string());
-                push_log(
-                    &state.0,
-                    format!("[bootstrap] 预编译产物自举失败（不影响启动）：{error}"),
-                );
-            }
         }
+
+        // data 方案补丁（0.6.18）：与 build/ 状态无关，每次启动都跑。
+        // 227 实测：build/ 里已经是带插件标记的产物，引擎却仍按 data 下的原版方案
+        // 工作；部署链不可用，只能直接改 <WeaselRoot>\data\*.schema.yaml。
+        if force.is_some() {
+            let data = patch_data(&app_version(&handle));
+            if data.data_dirs.is_empty() {
+                // Linux 下 /usr/share/rime-data 不存在；Windows 下没读到 WeaselRoot。
+                log("skip stage=data reason=no-dirs".to_string());
+            }
+            log(format!(
+                "data patch dirs={} patched={} unchanged={} skipped={} failed={} backup_dir={} files={}",
+                data.data_dirs.join(";"),
+                data.patched(),
+                data.schemas_unchanged.len(),
+                data.schemas_skipped.len(),
+                data.errors.len(),
+                data.backup_dir,
+                data.schemas_patched.join(";"),
+            ));
+            for error in &data.errors {
+                log(format!("data patch error={error}"));
+            }
+            for skipped in &data.schemas_skipped {
+                log(format!("data patch skipped={skipped}"));
+            }
+            // 启动时不把权限错误推给用户（Linux 的 /usr/share/rime-data 属 root，
+            // 每次启动都会失败）；诊断信息留在 bootstrap.log，设置页的
+            // 「修复输入法」仍会把 needs_elevation 显示出来。
+            if data.patched() > 0 {
+                push_log(&state.0, format!("[bootstrap] {}", data.summary()));
+            }
+            if data.needs_elevation() {
+                log(
+                    "data patch needs elevation: 以管理员身份运行 rime-sync-cli fix-ime"
+                        .to_string(),
+                );
+            }
+        } else {
+            log("skip stage=data reason=env-disabled".to_string());
+        }
+        log(format!("bootstrap end result={end}"));
     });
 }
