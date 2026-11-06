@@ -686,7 +686,11 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 // 0.6.20：data 目录按「WeaselRoot\data → weasel-*\data → InstallDir
                 // → %ProgramFiles%\Rime\data」逐项探测，报告里带全部候选。
-                data_patch::patch_auto(env!("CARGO_PKG_VERSION"))
+                // 手动跑 fix-ime = 显式操作，允许触发重载。
+                data_patch::patch_auto(
+                    &data_patch::resolve_version(None),
+                    data_patch::FixSource::Explicit,
+                )
             };
             // 0.6.21：data/用户/build 里不属于保留清单的方案一并清理（幂等、带备份）。
             let pruned = prune::prune_auto();
@@ -763,6 +767,16 @@ fn run(cli: Cli) -> Result<()> {
                             data.data_dir.as_str()
                         }
                     );
+                    // 0.6.22：注释版本与「是否降级到用户目录」必须可核对。
+                    println!("data_version={}", data.version);
+                    println!("data_fallback={}", data.fallback);
+                    // schema = 直接改共享方案；custom = 共享目录只读，写了用户级 custom.yaml。
+                    println!("data_mode={}", data.mode);
+                    println!("data_deploy={}", data.deploy_triggered);
+                    println!("data_skipped_not_retained={}", data.skipped_not_retained);
+                    for file in &data.custom_written {
+                        println!("data_custom_written={file}");
+                    }
                     let candidates: Vec<&str> = data
                         .data_candidates
                         .iter()
@@ -785,6 +799,13 @@ fn run(cli: Cli) -> Result<()> {
                     if data.needs_elevation() {
                         eprintln!(
                             "hint: 写入 data 方案需要管理员权限；请以管理员身份重新运行 rime-sync-cli fix-ime（或先以管理员身份启动 rime-sync 再点「修复输入法」）"
+                        );
+                    }
+                    if data.mode == data_patch::MODE_CUSTOM
+                        && data.deploy_triggered != data_patch::DEPLOY_OK
+                    {
+                        eprintln!(
+                            "hint: 已写用户级 custom.yaml，但没能自动触发部署；请执行 fcitx5-remote -r 或右键托盘「重新部署」"
                         );
                     }
                 }
@@ -859,6 +880,10 @@ fn run(cli: Cli) -> Result<()> {
                 println!("prune_failed={}", report.failures.len());
                 println!("prune_dry_run={}", report.dry_run);
                 println!("keep={}", report.keep.join(","));
+                println!("kept_by_env={}", report.kept_by_env.join(","));
+                for warning in &report.warnings {
+                    eprintln!("warning: {warning}");
+                }
                 for path in &report.removed {
                     println!("prune_removed_file={path}");
                 }

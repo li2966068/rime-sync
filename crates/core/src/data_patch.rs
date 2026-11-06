@@ -16,14 +16,32 @@
 //! 写盘纪律：先备份 <file>.rimesync-orig（只做一次），补丁后用 serde_yaml 重新
 //! 解析确认合法、核对目标状态，再按原换行风格写成 UTF-8（不带 BOM）。权限不足时
 //! 返回可读错误（提示以管理员身份重试），不 panic。
+//!
+//! 0.6.22：
+//! * 注释版本不再写死 crate 版本（0.1.0）：build.rs 从 src-tauri/tauri.conf.json
+//!   注入发布版本，运行时可用 RIMESYNC_VERSION 覆盖（见 resolve_version）。
+//!
+//! Linux 降级（共享 data 目录不可写）：
+//! * **不再**往用户目录写方案文件（librime 的共享方案只从共享 data 目录读，用户
+//!   目录只认 *.custom.yaml 与 build/，写进去等于静默失效）：改为在用户目录写
+//!   <schema>.custom.yaml，用 patch 语义把引擎改动叠到共享方案上，写完触发一次
+//!   重新部署；没有用户目录则 skipped + 提示 sudo。
+//! * custom.yaml 的 engine/processors、engine/translators 是整段替换，写的是
+//!   「展开 __include 后的完整列表 + 插入项」；用户已有的同键配置一律保留。
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
+
+use crate::prune;
+#[cfg(not(windows))]
+use serde_yaml::Mapping;
 use serde_yaml::Value;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::process::Command;
 
 /// 原文件备份后缀：只建一次，重复执行不覆盖。
 pub const BACKUP_SUFFIX: &str = ".rimesync-orig";
@@ -46,10 +64,31 @@ pub const PUNCT_BACKSLASH_COMMIT: &str = "、";
 /// Shift+; 的冒号键直出「：」。
 pub const PUNCT_COLON: &str = ":";
 pub const PUNCT_COLON_COMMIT: &str = "：";
+/// 用户级降级补丁：共享 data 目录不可写时写 <schema>.custom.yaml（patch 语义）。
+pub const CUSTOM_SUFFIX: &str = ".custom.yaml";
+/// 报告里的处理路径：直接改共享方案 / 写用户级 custom.yaml / 完全跳过。
+pub const MODE_SCHEMA: &str = "schema";
+pub const MODE_CUSTOM: &str = "custom";
+pub const MODE_SKIPPED: &str = "skipped";
+/// 部署触发结果。
+pub const DEPLOY_OK: &str = "ok";
+pub const DEPLOY_FAILED: &str = "failed";
+pub const DEPLOY_SKIPPED: &str = "skipped";
+/// 启动自举写了新文件但没有主动重载：留给用户点「重新部署」或重启输入法。
+pub const DEPLOY_DEFERRED: &str = "deferred";
+/// 部署命令（Linux）：先让 fcitx5 重载，没有再直接让 rime_deployer 构建。
+#[cfg(not(windows))]
+pub const DEPLOY_RELOAD: &str = "fcitx5-remote";
+#[cfg(not(windows))]
+pub const DEPLOY_BUILDER: &str = "rime_deployer";
 /// 显式指定 data 目录（多个用系统路径分隔符）；空串或 0 = 关闭补丁。测试靠它隔离。
 pub const ENV_DATA_DIR: &str = "RIMESYNC_WEASEL_DATA";
 /// Linux 的 data 目录。
 pub const LINUX_DATA_DIR: &str = "/usr/share/rime-data";
+/// 数据补丁注释的版本覆盖（0.6.22）：设置后优先于构建期版本。
+pub const ENV_VERSION: &str = "RIMESYNC_VERSION";
+/// 构建期注入的发布版本（build.rs 读 src-tauri/tauri.conf.json / CHANGELOG）。
+pub const BUILD_VERSION: &str = env!("RIMESYNC_BUILD_VERSION");
 /// Windows 注册表里的 Weasel 配置键（32 位视图）。
 pub const REG_KEY: &str = r"HKLM\Software\WOW6432Node\Rime\Weasel";
 /// 同一个键的 64 位视图（某些安装方式把值写在这里）。
@@ -68,12 +107,25 @@ pub enum PatchOutcome {
 }
 
 /// 一批 data 目录的补丁结果。
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DataPatchReport {
     /// 实际打补丁的 data 目录（0 或 1 个；找不到就是空）。
     pub data_dirs: Vec<String>,
     /// 实际使用的 data 目录；空串 = 没找到可用目录。
     pub data_dir: String,
+    /// 补丁注释里写的版本（0.6.22：CLI 与 GUI 共用同一个来源）。
+    pub version: String,
+    /// schema / custom / skipped（见 MODE_*）。
+    pub mode: String,
+    /// 是否降级到用户目录写入（Linux；共享 data 目录不可写时）。
+    pub fallback: bool,
+    /// 本次写入的用户级 <schema>.custom.yaml。
+    pub custom_written: Vec<String>,
+    /// custom 模式下因不在保留清单（含依赖闭包）而没有生成 custom.yaml 的方案个数；
+    /// 具体 id 见 schemas_skipped。
+    pub skipped_not_retained: usize,
+    /// 写 custom.yaml 后的部署触发结果：ok / failed / skipped / deferred（见 DEPLOY_*）。
+    pub deploy_triggered: String,
     /// 本次探测过的全部候选（含不存在的），按探测顺序。
     pub data_candidates: Vec<DataDirCandidate>,
     /// 一个候选都不存在时的可读原因（列出探测过的路径）。
@@ -94,15 +146,46 @@ pub struct DataPatchReport {
     pub errors: Vec<String>,
 }
 
+impl Default for DataPatchReport {
+    fn default() -> Self {
+        Self {
+            data_dirs: Vec::new(),
+            data_dir: String::new(),
+            version: String::new(),
+            mode: MODE_SKIPPED.to_string(),
+            fallback: false,
+            custom_written: Vec::new(),
+            skipped_not_retained: 0,
+            deploy_triggered: DEPLOY_SKIPPED.to_string(),
+            data_candidates: Vec::new(),
+            data_error: None,
+            punctuator_patched: 0,
+            punctuator_skipped: Vec::new(),
+            schemas_patched: Vec::new(),
+            schemas_unchanged: Vec::new(),
+            schemas_skipped: Vec::new(),
+            backup_dir: String::new(),
+            errors: Vec::new(),
+        }
+    }
+}
+
 impl DataPatchReport {
     /// 本次写入的方案个数，就是 CLI 报告里的 data_patched。
+    ///
+    /// custom 模式下写的是 <schema>.custom.yaml，同样计入（那是引擎真正会读的产物）。
     pub fn patched(&self) -> usize {
         self.schemas_patched.len()
     }
 
     /// 是否需要提示用户以管理员身份重试。
     pub fn needs_elevation(&self) -> bool {
-        self.errors.iter().any(|error| error.contains("管理员"))
+        self.errors
+            .iter()
+            .chain(self.data_error.iter())
+            .any(|error| {
+                error.contains("管理员") || error.contains("sudo") || error.contains("root")
+            })
     }
 
     /// 一句话结论（界面 / 日志共用）。
@@ -116,6 +199,31 @@ impl DataPatchReport {
             self.punctuator_patched,
             self.punctuator_skipped.len()
         );
+        if self.mode == MODE_CUSTOM {
+            let dir = if self.data_dir.is_empty() {
+                "共享 Rime data 目录"
+            } else {
+                self.data_dir.as_str()
+            };
+            text.push_str(&format!(
+                "（{dir} 不可写，已改写 {} 个用户级 custom.yaml",
+                self.custom_written.len()
+            ));
+            match self.deploy_triggered.as_str() {
+                DEPLOY_OK => text.push_str("，已触发重新部署）"),
+                DEPLOY_FAILED => text.push_str("，自动部署失败，请手动「重新部署」）"),
+                DEPLOY_DEFERRED => {
+                    text.push_str("，已更新输入法配置，请点「重新部署」或重启输入法）")
+                }
+                _ => text.push_str("，未找到部署命令，请手动「重新部署」）"),
+            }
+            if self.skipped_not_retained > 0 {
+                text.push_str(&format!(
+                    "（非保留方案 {} 个未生成 custom.yaml）",
+                    self.skipped_not_retained
+                ));
+            }
+        }
         if let Some(first) = self.errors.first() {
             text.push_str(&format!("；首个错误：{first}"));
         }
@@ -191,13 +299,678 @@ pub fn data_dirs() -> Vec<PathBuf> {
     resolve_data_dirs().dirs
 }
 
+/// 补丁注释使用的版本（0.6.22）。
+///
+/// 顺序：显式参数（GUI 传 tauri app version）> `RIMESYNC_VERSION` 环境变量 >
+/// 构建期注入的 `BUILD_VERSION`（build.rs 从 src-tauri/tauri.conf.json 读，
+/// 缺失时退回 CHANGELOG 顶部版本）。CLI 不再写死 `CARGO_PKG_VERSION`（0.1.0），
+/// 与 GUI 写同一个发布版本。
+pub fn resolve_version(explicit: Option<&str>) -> String {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    if let Ok(value) = env::var(ENV_VERSION) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    BUILD_VERSION.to_string()
+}
+
+/// Linux 的用户级 data 目录候选（存在才算）：$XDG_DATA_HOME/fcitx5/rime，
+/// 再是 ~/.local/share/fcitx5/rime。Windows 没有这个降级路径。
+pub fn user_fallback_candidates() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(windows))]
+    {
+        let mut out: Vec<PathBuf> = Vec::new();
+        if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
+            let path = PathBuf::from(xdg).join("fcitx5").join("rime");
+            if path.is_dir() {
+                out.push(path);
+            }
+        }
+        if let Some(home) = env::var_os("HOME") {
+            let path = PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("fcitx5")
+                .join("rime");
+            if path.is_dir() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+        out
+    }
+}
+
+/// 目录能否新建文件（只读的 /usr/share/rime-data 会被判 false）。
+fn dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".rimesync-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn describe_dirs(dirs: &[PathBuf], fallback_text: &str) -> String {
+    if dirs.is_empty() {
+        return fallback_text.to_string();
+    }
+    dirs.iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 /// 解析 data 目录并打补丁（CLI / 设置页 / 启动自举统一走这里）。
-pub fn patch_auto(version: &str) -> DataPatchReport {
+///
+/// source 决定写完 custom.yaml 后要不要触发重载：启动自举绝不能打断用户打字。
+pub fn patch_auto(version: &str, source: FixSource) -> DataPatchReport {
     let resolution = resolve_data_dirs();
-    let mut report = patch_dirs(&resolution.dirs, version);
-    report.data_candidates = resolution.candidates;
-    report.data_error = resolution.error;
+    patch_auto_from(resolution, user_fallback_candidates(), version, source)
+}
+
+/// 部署触发（可注入：单测用桩替换，避免真的去跑 fcitx5-remote / rime_deployer）。
+type DeployFn<'a> = dyn Fn(&Path, &Path) -> DeployOutcome + 'a;
+
+/// 部署触发的来源（决定要不要打断正在用输入法的用户）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixSource {
+    /// 用户点「修复输入法」或手动跑 rime-sync-cli fix-ime：允许触发重载。
+    Explicit,
+    /// 应用启动时的后台自举：只记录 deferred，绝不主动重载。
+    Bootstrap,
+}
+
+impl FixSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FixSource::Explicit => "explicit",
+            FixSource::Bootstrap => "bootstrap",
+        }
+    }
+}
+
+/// 部署触发结果，报告里序列化成 DEPLOY_*。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployOutcome {
+    Ok,
+    Failed,
+    Skipped,
+    /// 没有执行任何外部命令：留给用户手动重新部署（Bootstrap 来源）。
+    Deferred,
+}
+
+impl DeployOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeployOutcome::Ok => DEPLOY_OK,
+            DeployOutcome::Failed => DEPLOY_FAILED,
+            DeployOutcome::Skipped => DEPLOY_SKIPPED,
+            DeployOutcome::Deferred => DEPLOY_DEFERRED,
+        }
+    }
+}
+
+/// 同 patch_auto，但目录解析结果与降级候选由调用方给出（测试 / 安装器用）。
+///
+/// Windows 保持原行为：不可写就报提权提示。Linux 在共享目录不可写时把改动写进
+/// 用户目录的 <schema>.custom.yaml（librime 只从共享目录读方案本体，用户目录只认
+/// *.custom.yaml 与 build/）；用户目录也没有就只报告 skipped + 需 sudo，不写任何文件。
+pub fn patch_auto_from(
+    resolution: DataDirResolution,
+    fallbacks: Vec<PathBuf>,
+    version: &str,
+    source: FixSource,
+) -> DataPatchReport {
+    #[cfg(not(windows))]
+    {
+        patch_auto_with(resolution, fallbacks, version, source, &deploy_outcome)
+    }
+    #[cfg(windows)]
+    {
+        patch_auto_with(resolution, fallbacks, version, source, &|_, _| {
+            DeployOutcome::Skipped
+        })
+    }
+}
+
+fn patch_auto_with(
+    resolution: DataDirResolution,
+    fallbacks: Vec<PathBuf>,
+    version: &str,
+    _source: FixSource,
+    _deploy: &DeployFn<'_>,
+) -> DataPatchReport {
+    let mut candidates = resolution.candidates.clone();
+    for path in &fallbacks {
+        let text = path.display().to_string();
+        if !candidates.iter().any(|item| item.path == text) {
+            candidates.push(DataDirCandidate {
+                path: text,
+                source: "fallback:user".to_string(),
+                exists: path.is_dir(),
+            });
+        }
+    }
+
+    let mut report;
+    #[cfg(windows)]
+    {
+        report = patch_dirs(&resolution.dirs, version);
+        report.data_error = resolution.error.clone();
+    }
+    #[cfg(not(windows))]
+    {
+        if resolution.dirs.is_empty() {
+            // 一个 data 目录都没有（例如没装 rime-data）：没有方案可读，什么都不写。
+            report = patch_dirs(&[], version);
+            report.data_error = resolution.error.clone();
+        } else if resolution.dirs.iter().any(|dir| dir_writable(dir)) {
+            report = patch_dirs(&resolution.dirs, version);
+            report.data_error = resolution.error.clone();
+        } else if let Some(user) = fallbacks.first() {
+            report = patch_custom(&resolution.dirs, user, version);
+            report.fallback = true;
+            report.data_error = Some(if report.custom_written.is_empty() {
+                // 有用户目录但一份都没写出来（方案读不了 / 结构不适用）：如实说，别谎报降级成功。
+                format!(
+                    "{} 不可写，也没能写出用户目录 {} 下的 custom.yaml（原因见 errors / skipped）；请用 sudo 重试 rime-sync-cli fix-ime",
+                    describe_dirs(&resolution.dirs, "Rime data 目录"),
+                    user.display()
+                )
+            } else {
+                // 只有真写了新文件才谈部署触发；Bootstrap 来源绝不跑外部命令，
+                // 否则启动自举会把用户正在用的 fcitx5 重载掉。
+                report.deploy_triggered = match _source {
+                    FixSource::Bootstrap => DEPLOY_DEFERRED.to_string(),
+                    FixSource::Explicit => match resolution.dirs.first() {
+                        Some(shared) => _deploy(user, shared).as_str().to_string(),
+                        None => DEPLOY_SKIPPED.to_string(),
+                    },
+                };
+                let deploy_hint = match report.deploy_triggered.as_str() {
+                    DEPLOY_OK => "，已触发重新部署",
+                    DEPLOY_FAILED => "，自动部署失败，请手动「重新部署」",
+                    DEPLOY_DEFERRED => "，已更新输入法配置，请点「重新部署」或重启输入法",
+                    _ => "，未找到部署命令，请手动「重新部署」",
+                };
+                format!(
+                    "{} 不可写，已改写用户目录 {} 下的 <schema>.custom.yaml（仅当前用户生效）{deploy_hint}",
+                    describe_dirs(&resolution.dirs, "Rime data 目录"),
+                    user.display()
+                )
+            });
+        } else {
+            report = patch_dirs(&[], version);
+            report.data_error = Some(format!(
+                "{} 不可写，且没有可用的用户目录（$XDG_DATA_HOME/fcitx5/rime 或 ~/.local/share/fcitx5/rime）；已跳过 data 补丁，请用 sudo 重试 rime-sync-cli fix-ime",
+                describe_dirs(&resolution.dirs, "Rime data 目录")
+            ));
+            report
+                .schemas_skipped
+                .push("data 补丁：目标目录不可写，需要 sudo（已跳过）".to_string());
+        }
+    }
+    report.data_candidates = candidates;
     report
+}
+
+/// 一条外部命令的执行结果（可注入：单测断言尝试顺序，不真的跑命令）。
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunResult {
+    Ok,
+    Failed,
+    /// 命令不存在（PATH 里没有）。
+    Missing,
+}
+
+#[cfg(not(windows))]
+fn run_command(program: &str, args: &[&OsStr]) -> RunResult {
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => RunResult::Ok,
+        Ok(_) => RunResult::Failed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => RunResult::Missing,
+        Err(_) => RunResult::Failed,
+    }
+}
+
+/// 写 custom.yaml 后触发一次重新部署：先让 fcitx5 重载，没有再让 rime_deployer
+/// 直接重建。两个命令都不存在 = skipped（调用方提示手动「重新部署」）。
+#[cfg(not(windows))]
+fn deploy_outcome(user_dir: &Path, shared_dir: &Path) -> DeployOutcome {
+    deploy_outcome_with(&run_command, user_dir, shared_dir)
+}
+
+/// deploy_outcome 的实现（命令执行器可注入）。
+#[cfg(not(windows))]
+fn deploy_outcome_with(
+    run: &dyn Fn(&str, &[&OsStr]) -> RunResult,
+    user_dir: &Path,
+    shared_dir: &Path,
+) -> DeployOutcome {
+    // 顺序固定：先试轻量的 fcitx5 重载，失败 / 不存在再退回 rime_deployer 重建。
+    if run(DEPLOY_RELOAD, &[OsStr::new("-r")]) == RunResult::Ok {
+        return DeployOutcome::Ok;
+    }
+    match run(
+        DEPLOY_BUILDER,
+        &[
+            OsStr::new("--build"),
+            user_dir.as_os_str(),
+            shared_dir.as_os_str(),
+        ],
+    ) {
+        RunResult::Ok => DeployOutcome::Ok,
+        RunResult::Missing => DeployOutcome::Skipped,
+        RunResult::Failed => DeployOutcome::Failed,
+    }
+}
+
+/// 单个方案的 custom.yaml 结果。
+#[cfg(not(windows))]
+enum CustomOutcome {
+    /// 写入（路径，是否留了 .rimesync-orig 备份）。
+    Written(PathBuf, bool),
+    /// 已经是目标状态，一个字节都没动。
+    Unchanged(PathBuf),
+    /// 结构不适用（原因）。
+    Skipped(&'static str),
+}
+
+/// 共享 data 目录不可写时的降级：给每个 <schema>.schema.yaml 生成 / 合并一份
+/// 用户级 <schema>.custom.yaml。共享目录只读，一个字节都不动。
+#[cfg(not(windows))]
+fn patch_custom(shared_dirs: &[PathBuf], user_dir: &Path, version: &str) -> DataPatchReport {
+    let mut report = DataPatchReport {
+        version: version.to_string(),
+        mode: MODE_CUSTOM.to_string(),
+        ..DataPatchReport::default()
+    };
+    if !user_dir.is_dir() {
+        report
+            .errors
+            .push(format!("用户目录 {} 不存在（已跳过）", user_dir.display()));
+        return report;
+    }
+    // 方案集合与 prune 同源（retained-schemas.txt + 依赖闭包）：集合外的方案
+    // 一个都不写，否则给已裁掉的方案生成 custom.yaml，prune 下一次启动又删掉它。
+    let known = prune::known_schemas(shared_dirs);
+    let keep = prune::keep_set(&known, &prune::env_keep().0);
+    for dir in shared_dirs {
+        report.data_dirs.push(dir.display().to_string());
+        if !dir.is_dir() {
+            report
+                .schemas_skipped
+                .push(format!("{}（目录不存在）", dir.display()));
+            continue;
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.errors.push(io_error(dir, &error));
+                continue;
+            }
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && is_schema_yaml(path))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            report
+                .schemas_skipped
+                .push(format!("{}（没有 *.schema.yaml）", dir.display()));
+        }
+        for file in files {
+            let Some(id) = schema_id(&file) else {
+                report
+                    .schemas_skipped
+                    .push(format!("{}（不是 <id>.schema.yaml）", file.display()));
+                continue;
+            };
+            if !keep.contains(&id) {
+                report.skipped_not_retained += 1;
+                report.schemas_skipped.push(format!(
+                    "{}（{id} 不在保留清单及依赖闭包里，未生成 custom.yaml）",
+                    file.display()
+                ));
+                continue;
+            }
+            match write_user_custom(&file, user_dir, version) {
+                Ok(CustomOutcome::Written(path, backed_up)) => {
+                    report.custom_written.push(path.display().to_string());
+                    report.schemas_patched.push(path.display().to_string());
+                    if backed_up && report.backup_dir.is_empty() {
+                        report.backup_dir = user_dir.display().to_string();
+                    }
+                }
+                Ok(CustomOutcome::Unchanged(path)) => {
+                    report.schemas_unchanged.push(path.display().to_string())
+                }
+                Ok(CustomOutcome::Skipped(reason)) => report
+                    .schemas_skipped
+                    .push(format!("{}（{reason}）", file.display())),
+                Err(error) => report.errors.push(format!("{}：{error:#}", file.display())),
+            }
+        }
+    }
+    report.data_dir = report.data_dirs.first().cloned().unwrap_or_default();
+    report
+}
+
+/// <shared>/<id>.schema.yaml 的方案 id（就是文件名去掉后缀）。
+#[cfg(not(windows))]
+fn schema_id(schema_file: &Path) -> Option<String> {
+    schema_file
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".schema.yaml")
+        .map(str::to_string)
+}
+
+/// <shared>/<id>.schema.yaml -> <user>/<id>.custom.yaml。
+#[cfg(not(windows))]
+fn custom_target(schema_file: &Path, user_dir: &Path) -> Option<PathBuf> {
+    let name = schema_file.file_name()?.to_str()?;
+    let id = name.strip_suffix(".schema.yaml")?;
+    Some(user_dir.join(format!("{id}{CUSTOM_SUFFIX}")))
+}
+
+/// 读方案文件并把 \`__include\` 展开（只支持根包含 `xxx.schema:/`）。
+///
+/// luna_pinyin_simp.schema.yaml 这种方案自己只有 `__include: luna_pinyin.schema:/`
+/// 和 schema 段，engine/processors 全在父方案里；不展开的话会误判成「没有 engine」，
+/// 主方案反而降级不生效。
+#[cfg(not(windows))]
+fn load_schema_doc(dir: &Path, file: &Path, depth: usize) -> Result<Value> {
+    let bytes = fs::read(file).with_context(|| format!("读取 {}", file.display()))?;
+    let raw = String::from_utf8(bytes).map_err(|_| anyhow!("文件不是 UTF-8，跳过"))?;
+    let text = raw.strip_prefix(BOM).unwrap_or(&raw);
+    let value: Value = serde_yaml::from_str(text)
+        .with_context(|| format!("{} 不是合法 YAML，跳过", file.display()))?;
+    let Some(map) = value.as_mapping() else {
+        bail!("{} 顶层不是映射", file.display());
+    };
+    let Some(include) = map.get(Value::from("__include")).and_then(Value::as_str) else {
+        return Ok(value);
+    };
+    if depth >= 4 {
+        bail!("__include 嵌套超过 4 层");
+    }
+    // 只认整棵方案包含；`a/b` 这种子树包含不猜。
+    let Some(name) = include
+        .strip_suffix(":/")
+        .or_else(|| include.strip_suffix(':'))
+    else {
+        bail!("__include: {include} 不是根包含，跳过");
+    };
+    let base_file = match name.strip_suffix(".schema") {
+        Some(name) => dir.join(format!("{name}.schema.yaml")),
+        None => dir.join(format!("{name}.yaml")),
+    };
+    if !base_file.is_file() {
+        bail!("__include 指向的 {} 不存在", base_file.display());
+    }
+    let mut base = load_schema_doc(dir, &base_file, depth + 1)?;
+    merge_values(&mut base, &value);
+    Ok(base)
+}
+
+/// 递归合并映射（列表/标量由 overlay 整段替换），与 rime 的 include 语义一致。
+#[cfg(not(windows))]
+fn merge_values(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(key.clone()) {
+                    Some(slot) => merge_values(slot, value),
+                    None => {
+                        base_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// 生成 / 合并一个用户级 <schema>.custom.yaml。
+///
+/// custom.yaml 是 patch 语义：engine/processors、engine/translators 这类列表是
+/// **整段替换**，所以必须写出完整的目标列表（共享方案原列表 + 我们插入的项）。
+/// 只写增量的几个名字会让引擎丢掉 recognizer/speller 等处理器，输入法直接不可用。
+#[cfg(not(windows))]
+fn write_user_custom(schema_file: &Path, user_dir: &Path, version: &str) -> Result<CustomOutcome> {
+    let target = custom_target(schema_file, user_dir)
+        .ok_or_else(|| anyhow!("{} 不是 <schema>.schema.yaml", schema_file.display()))?;
+    let dir = schema_file
+        .parent()
+        .ok_or_else(|| anyhow!("{} 没有父目录", schema_file.display()))?;
+    let schema = load_schema_doc(dir, schema_file, 0)?;
+    let Some(engine) = schema.get("engine").and_then(Value::as_mapping) else {
+        return Ok(CustomOutcome::Skipped(
+            "方案里没有 engine（展开 __include 后仍缺失）",
+        ));
+    };
+    let Some(processors) = list_at(engine, &["processors"]) else {
+        return Ok(CustomOutcome::Skipped("方案里没有 engine/processors 列表"));
+    };
+
+    let existing = match fs::read(&target) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(anyhow!(io_error(&target, &error))),
+    };
+    let mut root = match &existing {
+        Some(bytes) => {
+            let raw = String::from_utf8(bytes.clone())
+                .map_err(|_| anyhow!("{} 不是 UTF-8，跳过（不覆盖用户文件）", target.display()))?;
+            let text = raw.strip_prefix(BOM).unwrap_or(&raw);
+            let value: Value = serde_yaml::from_str(text).with_context(|| {
+                format!("{} 不是合法 YAML，跳过（不覆盖用户文件）", target.display())
+            })?;
+            if !value.is_mapping() {
+                return Ok(CustomOutcome::Skipped("已有 custom.yaml 顶层不是映射"));
+            }
+            value
+        }
+        None => Value::Mapping(Mapping::new()),
+    };
+    let before = root.clone();
+
+    let root_map = match &mut root {
+        Value::Mapping(map) => map,
+        _ => return Ok(CustomOutcome::Skipped("已有 custom.yaml 顶层不是映射")),
+    };
+    if !root_map.contains_key(Value::from("patch")) {
+        root_map.insert(Value::from("patch"), Value::Mapping(Mapping::new()));
+    }
+    let patch = match root_map.get_mut(Value::from("patch")) {
+        Some(Value::Mapping(map)) => map,
+        _ => return Ok(CustomOutcome::Skipped("已有 custom.yaml 的 patch 不是映射")),
+    };
+
+    let half_shape = match get_path(patch, &["punctuator", "half_shape"]) {
+        Some(Value::Mapping(map)) => Some(map.clone()),
+        Some(_) => return Ok(CustomOutcome::Skipped("punctuator/half_shape 不是映射")),
+        None => None,
+    };
+
+    // engine/processors：完整列表。已有 custom.yaml 里的列表优先（用户可能改过；
+    // 幂等也靠它：第二次运行算出来的还是同一份）。想跟随新方案重算就删掉该文件。
+    let base = list_at(patch, &["engine", "processors"]).unwrap_or(processors);
+    remove_nested(patch, &["engine", "processors"]);
+    patch.insert(
+        Value::from("engine/processors"),
+        string_list(&processor_target(&base)),
+    );
+
+    // engine/translators：首位 rimesync_vnum，其余顺序不动。
+    let translators =
+        list_at(patch, &["engine", "translators"]).or_else(|| list_at(engine, &["translators"]));
+    if let Some(translators) = translators {
+        let mut merged: Vec<String> = translators
+            .into_iter()
+            .filter(|name| name != VNUM_TRANSLATOR)
+            .collect();
+        merged.insert(0, VNUM_TRANSLATOR.to_string());
+        remove_nested(patch, &["engine", "translators"]);
+        patch.insert(Value::from("engine/translators"), string_list(&merged));
+    }
+
+    // recognizer/patterns/vnum：用户自己写过就不覆盖。
+    if !contains_path(patch, &["recognizer", "patterns", "vnum"]) {
+        patch.insert(
+            Value::from("recognizer/patterns/vnum"),
+            Value::from(VNUM_PATTERN),
+        );
+    }
+
+    // punctuator/half_shape：只补缺的两个键，用户已有的同键配置一律保留。
+    let mut half = half_shape.unwrap_or_default();
+    for (key, commit) in [
+        (PUNCT_BACKSLASH, PUNCT_BACKSLASH_COMMIT),
+        (PUNCT_COLON, PUNCT_COLON_COMMIT),
+    ] {
+        if !half.contains_key(Value::from(key)) {
+            half.insert(Value::from(key), Value::from(commit));
+        }
+    }
+    patch.insert(Value::from("punctuator/half_shape"), Value::Mapping(half));
+
+    if root == before {
+        return Ok(CustomOutcome::Unchanged(target));
+    }
+    let rendered =
+        serde_yaml::to_string(&root).with_context(|| format!("序列化 {}", target.display()))?;
+    let header = format!(
+        "{MARKER_PREFIX} {version}\n# 用户级降级：共享 data 目录不可写，这里用 patch 叠加引擎改动（本文件其它内容保留）\n"
+    );
+    let body = format!("{header}{rendered}");
+    // 安全闸：写盘前重新解析一次，确认还是同一棵树。
+    let parsed: Value = serde_yaml::from_str(&body)
+        .with_context(|| format!("生成的 {} 不是合法 YAML，已取消写入", target.display()))?;
+    if parsed != root {
+        bail!("生成的 {} 与目标结构不一致，已取消写入", target.display());
+    }
+    let backed_up = match &existing {
+        Some(bytes) => {
+            let backup = backup_path(&target);
+            if !backup.exists() {
+                fs::write(&backup, bytes).with_context(|| format!("备份 {}", backup.display()))?;
+            }
+            true
+        }
+        None => false,
+    };
+    fs::write(&target, body.as_bytes()).map_err(|error| anyhow!(io_error(&target, &error)))?;
+    Ok(CustomOutcome::Written(target, backed_up))
+}
+
+/// 在完整处理器列表上按 schema 模式同样的锚点插入 rimesync_vselect + numpad：
+/// recognizer 之后优先，否则 key_binder / speller 之前，都没有就追加到末尾。
+#[cfg(not(windows))]
+fn processor_target(base: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = base
+        .iter()
+        .filter(|name| *name != VSELECT_PROCESSOR && *name != NUMPAD_PROCESSOR)
+        .cloned()
+        .collect();
+    let anchor = order
+        .iter()
+        .position(|name| name == "recognizer")
+        .map(|index| index + 1)
+        .or_else(|| {
+            order
+                .iter()
+                .position(|name| name == "key_binder" || name == "speller")
+        })
+        .unwrap_or(order.len());
+    order.insert(anchor, VSELECT_PROCESSOR.to_string());
+    order.insert(anchor + 1, NUMPAD_PROCESSOR.to_string());
+    order
+}
+
+#[cfg(not(windows))]
+fn string_list(items: &[String]) -> Value {
+    Value::Sequence(
+        items
+            .iter()
+            .map(|item| Value::from(item.as_str()))
+            .collect(),
+    )
+}
+
+/// 取 patch 里的列表：先认 "a/b" 路径写法，再认嵌套映射写法。
+#[cfg(not(windows))]
+fn list_at(map: &Mapping, path: &[&str]) -> Option<Vec<String>> {
+    get_path(map, path)?
+        .as_sequence()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+/// 按路径取值，两种写法都认（"a/b/c" 与 a: {b: {c: …}}）。
+#[cfg(not(windows))]
+fn get_path<'a>(map: &'a Mapping, path: &[&str]) -> Option<&'a Value> {
+    if let Some(value) = map.get(Value::from(path.join("/"))) {
+        return Some(value);
+    }
+    let (head, tail) = path.split_first()?;
+    match map.get(Value::from(*head))? {
+        Value::Mapping(next) if !tail.is_empty() => get_path(next, tail),
+        value if tail.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn contains_path(map: &Mapping, path: &[&str]) -> bool {
+    get_path(map, path).is_some()
+}
+
+/// 删掉嵌套写法（engine: {processors: […] }），避免和 "a/b" 路径写法并存。
+#[cfg(not(windows))]
+fn remove_nested(map: &mut Mapping, path: &[&str]) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    if parents.is_empty() {
+        return map.remove(Value::from(*last)).is_some();
+    }
+    let removed = match map.get_mut(Value::from(parents[0])) {
+        Some(Value::Mapping(next)) => remove_nested(next, &path[1..]),
+        _ => false,
+    };
+    if removed {
+        let empty = matches!(
+            map.get(Value::from(parents[0])),
+            Some(Value::Mapping(next)) if next.is_empty()
+        );
+        if empty {
+            map.remove(Value::from(parents[0]));
+        }
+    }
+    removed
 }
 
 /// RIMESYNC_WEASEL_DATA 的解析：空串 / 0 = 关闭（不是错误）；其余按系统路径
@@ -400,7 +1173,10 @@ pub fn weasel_registry_from_output(output: &str) -> WeaselRegistryValues {
 
 /// 逐目录给 <data>/*.schema.yaml 打补丁；单个文件失败不中断整批。
 pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport {
-    let mut report = DataPatchReport::default();
+    let mut report = DataPatchReport {
+        version: version.to_string(),
+        ..DataPatchReport::default()
+    };
     for dir in dirs {
         report.data_dirs.push(dir.display().to_string());
         if !dir.is_dir() {
@@ -456,6 +1232,12 @@ pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport {
         }
     }
     report.data_dir = report.data_dirs.first().cloned().unwrap_or_default();
+    report.mode = if report.data_dirs.is_empty() {
+        MODE_SKIPPED
+    } else {
+        MODE_SCHEMA
+    }
+    .to_string();
     report
 }
 
@@ -1418,6 +2200,598 @@ mod tests {
             .error
             .expect("必须有可读原因")
             .contains("/nonexistent/rime-sync-test"));
+    }
+
+    const SCHEMA_FIXTURE: &str = "schema:\n  schema_id: luna_pinyin_simp\nengine:\n  processors:\n    - recognizer\n    - key_binder\n  translators:\n    - table_translator\n";
+
+    /// 0.6.22：注入 RIMESYNC_VERSION 后，注释行必须用这个版本（CLI 与 GUI 同源）。
+    #[test]
+    fn env_version_is_used_for_marker() {
+        let tmp = TempDir::new("env-version");
+        let file = tmp.path().join("luna_pinyin_simp.schema.yaml");
+        fs::write(&file, SCHEMA_FIXTURE).expect("write");
+        let previous = env::var_os(ENV_VERSION);
+        env::set_var(ENV_VERSION, "9.9.9-test");
+        let version = resolve_version(None);
+        let outcome = patch_file(&file, &version).expect("patch");
+        match previous {
+            Some(value) => env::set_var(ENV_VERSION, value),
+            None => env::remove_var(ENV_VERSION),
+        }
+        assert_eq!(version, "9.9.9-test");
+        assert_eq!(outcome, PatchOutcome::Patched);
+        let text = fs::read_to_string(&file).expect("read");
+        assert!(
+            text.starts_with("# patched by rime-sync 9.9.9-test\n"),
+            "{text}"
+        );
+        // 显式参数优先级最高（GUI 传 app version）。
+        assert_eq!(resolve_version(Some("1.2.3")), "1.2.3");
+    }
+
+    #[cfg(not(windows))]
+    fn readonly_files(
+        tmp: &TempDir,
+        tag: &str,
+        files: &[(&str, &str)],
+        original: &std::fs::Permissions,
+    ) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tmp.path().join(tag);
+        fs::create_dir_all(&data).expect("mkdir");
+        for (name, body) in files {
+            fs::write(data.join(name), body).expect("write");
+        }
+        let mut readonly = original.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&data, readonly).expect("chmod");
+        // root / 特殊文件系统下 chmod 挡不住写：跳过（没有可验证的降级场景）。
+        let probe = data.join(".probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&data, original.clone()).expect("restore");
+            return None;
+        }
+        Some(data)
+    }
+
+    #[cfg(not(windows))]
+    fn readonly_dir(tmp: &TempDir, tag: &str, original: &std::fs::Permissions) -> Option<PathBuf> {
+        readonly_files(
+            tmp,
+            tag,
+            &[("luna_pinyin_simp.schema.yaml", SCHEMA_FIXTURE)],
+            original,
+        )
+    }
+
+    fn read_yaml(path: &Path) -> Value {
+        let text =
+            fs::read_to_string(path).unwrap_or_else(|error| panic!("读取 {path:?}: {error}"));
+        serde_yaml::from_str(&text).unwrap_or_else(|error| panic!("解析 {path:?}: {error}"))
+    }
+
+    /// 0.6.23：/usr/share/rime-data 只读（普通用户）时不再往用户目录写方案文件
+    /// （librime 只从共享目录读方案本体，写过去等于静默失效），改为生成用户级
+    /// <schema>.custom.yaml；engine/processors 必须是「共享方案原列表 + 插入项」的
+    /// 完整列表——custom.yaml 是 patch 语义，列表整段替换。
+    #[cfg(not(windows))]
+    #[test]
+    fn readonly_data_dir_writes_custom_yaml() {
+        let tmp = TempDir::new("custom");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: vec![DataDirCandidate {
+                path: data.display().to_string(),
+                source: "test:readonly".to_string(),
+                exists: true,
+            }],
+            error: None,
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Ok,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert!(report.fallback, "{report:?}");
+        assert_eq!(report.mode, MODE_CUSTOM);
+        assert_eq!(report.data_dir, data.display().to_string());
+        assert_eq!(report.deploy_triggered, DEPLOY_OK, "{report:?}");
+        assert_eq!(report.version, "9.9.9");
+        assert_eq!(report.patched(), 1, "{report:?}");
+        // 降级成功：没用上全局目录，但也不该报「需要提权」。
+        assert!(!report.needs_elevation());
+        assert!(
+            report
+                .data_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("custom.yaml"),
+            "{:?}",
+            report.data_error
+        );
+        assert!(report
+            .data_candidates
+            .iter()
+            .any(|item| item.source == "fallback:user"));
+
+        let custom = user.join("luna_pinyin_simp.custom.yaml");
+        assert_eq!(
+            report.custom_written,
+            vec![custom.display().to_string()],
+            "{report:?}"
+        );
+        let document = read_yaml(&custom);
+        let patch = document
+            .get("patch")
+            .and_then(Value::as_mapping)
+            .expect("patch 段");
+        let names = |key: &str| list_at(patch, &["engine", key]).expect("engine 列表");
+        // 原有处理器一个都不能丢，顺序也不能变（只在 recognizer 之后插入两项）。
+        assert_eq!(
+            names("processors"),
+            vec![
+                "recognizer",
+                VSELECT_PROCESSOR,
+                NUMPAD_PROCESSOR,
+                "key_binder"
+            ]
+        );
+        assert_eq!(
+            names("translators"),
+            vec![VNUM_TRANSLATOR, "table_translator"]
+        );
+        assert_eq!(
+            get_path(patch, &["recognizer", "patterns", "vnum"]).and_then(Value::as_str),
+            Some(VNUM_PATTERN)
+        );
+        let half = get_path(patch, &["punctuator", "half_shape"]).expect("half_shape");
+        assert_eq!(
+            half.get(PUNCT_BACKSLASH).and_then(Value::as_str),
+            Some(PUNCT_BACKSLASH_COMMIT)
+        );
+        assert_eq!(
+            half.get(PUNCT_COLON).and_then(Value::as_str),
+            Some(PUNCT_COLON_COMMIT)
+        );
+        // 共享目录里的方案一个字节都没动。
+        assert_eq!(
+            fs::read_to_string(data.join("luna_pinyin_simp.schema.yaml")).expect("read"),
+            SCHEMA_FIXTURE
+        );
+    }
+
+    /// luna_pinyin_simp 这类方案自己只有 `__include: luna_pinyin.schema:/`，
+    /// engine 全在父方案里；不展开 include 就会误判「没有 engine」，主方案降级失效。
+    #[cfg(not(windows))]
+    #[test]
+    fn custom_yaml_expands_include_chain() {
+        // luna_pinyin 不在保留清单里，但它是 luna_pinyin_simp 的 __include 基类，
+        // 属于依赖闭包，必须一并生成 custom.yaml（否则主方案的补丁静默失效）。
+        const BASE: &str = "schema:\n  schema_id: luna_pinyin\nengine:\n  processors:\n    - ascii_composer\n    - recognizer\n    - key_binder\n    - speller\n    - punctuator\n  translators:\n    - table_translator\n";
+        const CHILD: &str =
+            "schema:\n  schema_id: luna_pinyin_simp\n__include: luna_pinyin.schema:/\n";
+        let tmp = TempDir::new("custom-include");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_files(
+            &tmp,
+            "data",
+            &[
+                ("luna_pinyin.schema.yaml", BASE),
+                ("luna_pinyin_simp.schema.yaml", CHILD),
+            ],
+            &original,
+        ) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Ok,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert_eq!(report.mode, MODE_CUSTOM, "{report:?}");
+        assert_eq!(report.skipped_not_retained, 0, "{report:?}");
+        assert_eq!(report.custom_written.len(), 2, "{report:?}");
+        assert!(user.join("luna_pinyin.custom.yaml").is_file(), "{report:?}");
+        let custom = user.join("luna_pinyin_simp.custom.yaml");
+        assert!(custom.is_file(), "{report:?}");
+        let document = read_yaml(&custom);
+        let patch = document
+            .get("patch")
+            .and_then(Value::as_mapping)
+            .expect("patch 段");
+        assert_eq!(
+            list_at(patch, &["engine", "processors"]).expect("processors"),
+            vec![
+                "ascii_composer",
+                "recognizer",
+                VSELECT_PROCESSOR,
+                NUMPAD_PROCESSOR,
+                "key_binder",
+                "speller",
+                "punctuator"
+            ]
+        );
+        assert_eq!(
+            list_at(patch, &["engine", "translators"]).expect("translators"),
+            vec![VNUM_TRANSLATOR, "table_translator"]
+        );
+    }
+
+    /// 已有 custom.yaml：合并而不是覆盖——用户自己的键、已有列表顺序都保留，
+    /// 原文件另外留一份 .rimesync-orig。
+    #[cfg(not(windows))]
+    #[test]
+    fn custom_yaml_merges_existing_user_file() {
+        let tmp = TempDir::new("custom-merge");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let custom = user.join("luna_pinyin_simp.custom.yaml");
+        let existing = "schema: luna_pinyin_simp
+patch:
+  menu/page_size: 9
+  engine/processors:
+    - speller
+    - punctuator
+  punctuator/half_shape:
+    \":\": \"用户冒号\"
+";
+        fs::write(&custom, existing).expect("write existing");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Failed,
+        );
+
+        assert_eq!(report.mode, MODE_CUSTOM, "{report:?}");
+        assert_eq!(report.deploy_triggered, DEPLOY_FAILED, "{report:?}");
+        let document = read_yaml(&custom);
+        // 顶层用户键与 patch 里的其它键都保留。
+        assert_eq!(
+            document.get("schema").and_then(Value::as_str),
+            Some("luna_pinyin_simp")
+        );
+        let patch = document
+            .get("patch")
+            .and_then(Value::as_mapping)
+            .expect("patch 段");
+        assert_eq!(patch.get("menu/page_size").and_then(Value::as_u64), Some(9));
+        // 基准列表来自用户自己的 custom.yaml（不是共享方案的），顺序保留。
+        assert_eq!(
+            list_at(patch, &["engine", "processors"]).expect("processors"),
+            vec![VSELECT_PROCESSOR, NUMPAD_PROCESSOR, "speller", "punctuator"]
+        );
+        let half = get_path(patch, &["punctuator", "half_shape"]).expect("half_shape");
+        // 用户写过的键不覆盖，缺的键才补。
+        assert_eq!(
+            half.get(PUNCT_COLON).and_then(Value::as_str),
+            Some("用户冒号")
+        );
+        assert_eq!(
+            half.get(PUNCT_BACKSLASH).and_then(Value::as_str),
+            Some(PUNCT_BACKSLASH_COMMIT)
+        );
+        // 原文件备份（只留一份，内容是改写前的那份）。
+        assert_eq!(
+            fs::read_to_string(backup_path(&custom)).expect("backup"),
+            existing
+        );
+        assert!(report
+            .custom_written
+            .iter()
+            .any(|path| path == &custom.display().to_string()));
+
+        // 再跑一次：已经是目标状态，不再改写、不再覆盖备份。
+        let again = patch_auto_with(
+            DataDirResolution {
+                dirs: vec![data.clone()],
+                candidates: Vec::new(),
+                error: None,
+            },
+            vec![user],
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Skipped,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+        assert!(again.custom_written.is_empty(), "{again:?}");
+        assert_eq!(again.schemas_unchanged.len(), 1, "{again:?}");
+    }
+
+    /// 0.6.23：custom 降级只处理保留清单 + 依赖闭包里的方案。共享目录里残留的
+    /// terra_pinyin / cangjie5 之类已裁掉的方案，一个 custom.yaml 都不该生成
+    /// （否则用户目录被污染，prune 下次启动又把它删掉）。
+    #[cfg(not(windows))]
+    #[test]
+    fn custom_mode_only_writes_retained_schemas() {
+        let tmp = TempDir::new("custom-retained");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_files(
+            &tmp,
+            "data",
+            &[
+                ("luna_pinyin_simp.schema.yaml", SCHEMA_FIXTURE),
+                ("wubi_pinyin.schema.yaml", SCHEMA_FIXTURE),
+                ("wubi86.schema.yaml", SCHEMA_FIXTURE),
+                ("terra_pinyin.schema.yaml", SCHEMA_FIXTURE),
+                ("cangjie5.schema.yaml", SCHEMA_FIXTURE),
+            ],
+            &original,
+        ) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Ok,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert_eq!(report.mode, MODE_CUSTOM, "{report:?}");
+        assert_eq!(report.custom_written.len(), 3, "{report:?}");
+        assert_eq!(report.skipped_not_retained, 2, "{report:?}");
+        for id in ["luna_pinyin_simp", "wubi_pinyin", "wubi86"] {
+            assert!(
+                user.join(format!("{id}.custom.yaml")).is_file(),
+                "{id} 在保留清单里，必须生成 custom.yaml：{report:?}"
+            );
+        }
+        for id in ["terra_pinyin", "cangjie5"] {
+            assert!(
+                !user.join(format!("{id}.custom.yaml")).exists(),
+                "{id} 不在保留清单里，不该生成 custom.yaml"
+            );
+            assert!(
+                report.schemas_skipped.iter().any(|item| item.contains(id)),
+                "{id} 要进日志：{:?}",
+                report.schemas_skipped
+            );
+        }
+        // 共享目录只读：一个字节都没动。
+        assert_eq!(
+            fs::read_to_string(data.join("terra_pinyin.schema.yaml")).expect("read"),
+            SCHEMA_FIXTURE
+        );
+    }
+
+    /// 0.6.23：启动自举写了新文件也只记 deploy=deferred——绝不调用外部命令，
+    /// 否则 fcitx5-remote -r 会把用户正在用的输入法打断。
+    #[cfg(not(windows))]
+    #[test]
+    fn bootstrap_source_defers_deploy_without_running_commands() {
+        use std::cell::Cell;
+        let tmp = TempDir::new("deploy-bootstrap");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+        let calls = Cell::new(0);
+        let deploy = |_: &Path, _: &Path| {
+            calls.set(calls.get() + 1);
+            DeployOutcome::Ok
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Bootstrap,
+            &deploy,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert_eq!(calls.get(), 0, "Bootstrap 不得触发任何外部命令：{report:?}");
+        assert_eq!(report.deploy_triggered, DEPLOY_DEFERRED, "{report:?}");
+        assert_eq!(report.custom_written.len(), 1, "{report:?}");
+        assert!(
+            report
+                .data_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("重新部署"),
+            "{:?}",
+            report.data_error
+        );
+    }
+
+    /// Explicit（用户点「修复输入法」/ 手动跑 fix-ime）仍然触发一次部署，
+    /// 并把用户目录与共享目录交给 runner。
+    #[cfg(not(windows))]
+    #[test]
+    fn explicit_source_runs_deploy_once() {
+        use std::cell::RefCell;
+        let tmp = TempDir::new("deploy-explicit");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let user = tmp.path().join("xdg").join("fcitx5").join("rime");
+        fs::create_dir_all(&user).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let deploy = |user_dir: &Path, shared_dir: &Path| {
+            seen.borrow_mut()
+                .push(format!("{}|{}", user_dir.display(), shared_dir.display()));
+            DeployOutcome::Ok
+        };
+
+        let report = patch_auto_with(
+            resolution,
+            vec![user.clone()],
+            "9.9.9",
+            FixSource::Explicit,
+            &deploy,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert_eq!(report.deploy_triggered, DEPLOY_OK, "{report:?}");
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(
+            seen[0],
+            format!("{}|{}", user.display(), data.display()),
+            "runner 拿到的必须是用户目录 + 共享目录"
+        );
+    }
+
+    /// 没有用户目录可降级：不写任何文件，报告 skipped + 需 sudo。
+    #[cfg(not(windows))]
+    #[test]
+    fn readonly_without_fallback_reports_skipped() {
+        let tmp = TempDir::new("fallback-none");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+
+        let report = patch_auto_from(resolution, Vec::new(), "9.9.9", FixSource::Explicit);
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert!(!report.fallback);
+        assert_eq!(report.mode, MODE_SKIPPED);
+        assert_eq!(report.deploy_triggered, DEPLOY_SKIPPED);
+        assert_eq!(report.data_dir, "");
+        assert!(report.custom_written.is_empty());
+        assert!(report.patched() == 0);
+        assert!(
+            report
+                .schemas_skipped
+                .iter()
+                .any(|item| item.contains("sudo")),
+            "{:?}",
+            report.schemas_skipped
+        );
+        assert!(report.needs_elevation());
+        assert_eq!(
+            fs::read_to_string(data.join("luna_pinyin_simp.schema.yaml")).expect("read"),
+            SCHEMA_FIXTURE
+        );
+    }
+
+    /// Explicit 下的部署顺序：先 fcitx5-remote -r，失败 / 不存在再退
+    /// rime_deployer --build <用户目录> <共享目录>。
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_order_tries_reload_then_builder() {
+        use std::cell::RefCell;
+        let user = PathBuf::from("/tmp/rime-user");
+        let shared = PathBuf::from("/usr/share/rime-data");
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let run = |program: &str, args: &[&OsStr]| {
+            seen.borrow_mut().push(
+                std::iter::once(program)
+                    .chain(args.iter().map(|arg| arg.to_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            if program == DEPLOY_RELOAD {
+                RunResult::Failed
+            } else {
+                RunResult::Ok
+            }
+        };
+
+        assert_eq!(deploy_outcome_with(&run, &user, &shared), DeployOutcome::Ok);
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                format!("{DEPLOY_RELOAD} -r"),
+                format!(
+                    "{DEPLOY_BUILDER} --build {} {}",
+                    user.display(),
+                    shared.display()
+                ),
+            ]
+        );
+    }
+
+    /// 重载成功就不再多跑重建命令；两个命令都不存在 = skipped。
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_outcome_stops_on_success_and_maps_missing() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let ok = |_: &str, _: &[&OsStr]| {
+            calls.set(calls.get() + 1);
+            RunResult::Ok
+        };
+        assert_eq!(
+            deploy_outcome_with(&ok, Path::new("/u"), Path::new("/s")),
+            DeployOutcome::Ok
+        );
+        assert_eq!(calls.get(), 1, "重载成功后不该再跑 rime_deployer");
+
+        let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let missing = |program: &str, _: &[&OsStr]| {
+            seen.borrow_mut().push(program.to_string());
+            RunResult::Missing
+        };
+        assert_eq!(
+            deploy_outcome_with(&missing, Path::new("/u"), Path::new("/s")),
+            DeployOutcome::Skipped
+        );
+        assert_eq!(seen.into_inner().len(), 2);
     }
 
     #[test]

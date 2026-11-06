@@ -66,6 +66,9 @@ Windows 对应 `<WeaselRoot>\data\terra_pinyin.schema.yaml.rimesync-removed-*`�
 
 * `RIMESYNC_PRUNE_SCHEMAS=0`（也认 `no` / `off` / `false`）：关闭清理，
   `prune-schemas` 只输出 `disabled=true`。
+* `RIMESYNC_PRUNE_KEEP=terra_pinyin,bopomofo`（0.6.22）：逗号分隔的追加白名单，
+  这些 id 视为保留；只接受 `[a-zA-Z0-9_-.]+`，非法项写进报告 `warnings` 且不生效。
+  生效的 id 记在报告 `kept_by_env` 里（JSON 与 `prune-schemas` 文本输出都有）。
 * `rime-sync-cli prune-schemas --dry-run`：只报告将删除什么。
 * 排错时可用 `--data-dir DIR` / `--user-dir DIR` 指定临时目录（不碰真实数据）。
 * 清理失败（例如 Linux 上以普通用户跑、`/usr/share/rime-data` 属 root）只记
@@ -73,8 +76,13 @@ Windows 对应 `<WeaselRoot>\data\terra_pinyin.schema.yaml.rimesync-removed-*`�
 
 ## 打包侧（同一份清单的产物）
 
+* 依赖闭包除 `__include:` 与 `dependencies:` 外还解析 `dictionary:`
+  （如 `translator.dictionary: wubi86`）：只被 `dictionary` 引用的码表
+  （`<name>.dict.yaml` / `<name>.table.bin`）不会被删。
 * **deb**：`/usr/share/rime-data` 只装 3 个方案 + 依赖闭包（
   `scripts/ime/gen-rime-data.py` 生成，`default.yaml` 的 `schema_list` 同步裁剪）；
+  `--check` 的「多余」断言只校验 `*.schema.yaml` / `*.custom.yaml`，其它配置
+  （`fcitx5.yaml`、`weasel.yaml`、`symbols.yaml` 等）一律放行；
   `/usr/share/rime-sync/defaults/schemas/` 只有 3 个 `<schema>.custom.yaml`；
   `/usr/share/rime-sync/retained-schemas.txt` 随包（排错/审计用）。
 * **预编译产物**：`packaging/rime/prebuilt` 由 `gen-prebuilt-build.py` 生成，
@@ -88,6 +96,7 @@ Windows 对应 `<WeaselRoot>\data\terra_pinyin.schema.yaml.rimesync-removed-*`�
 ```bash
 scripts/ime/gen-schema-custom.py --check
 scripts/ime/gen-prebuilt-build.py --check
+python3 scripts/ime/test_gen_rime_data.py
 bash packaging/windows/check-nsis-hooks.sh --strict
 cargo test -p rime-sync-core --lib prune
 cargo test -p rime-sync-cli --test prune_schemas

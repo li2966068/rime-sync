@@ -41,6 +41,8 @@ pub const INSTALL_TIMEOUT_SECS: u64 = 300;
 pub const SERVER_EXE: &str = "WeaselServer.exe";
 /// 输入法引擎 DLL。
 pub const RIME_DLL: &str = "rime.dll";
+/// NSIS 安装版写在 exe 同级的卸载器（便携判据用）。
+pub const UNINSTALL_FILE: &str = "uninstall.exe";
 /// 我们自己的 librime 插件标记（插件合进 rime.dll 后是 ASCII 明文）。
 pub const PLUGIN_MARKER: &str = "rimesync_vnum";
 
@@ -271,6 +273,33 @@ impl ImeReport {
     }
 }
 
+/// 便携版判据（只用来选提示文案，不影响任何真实逻辑）。
+///
+/// 便携 = 下面三样都没有：
+/// 1. exe 同级的 resources/（Windows 安装版由 Tauri / NSIS 铺在这里）；
+/// 2. ../lib/rime-sync/resources（Linux deb / AppImage 的安装布局）；
+/// 3. exe 同级的 uninstall.exe（NSIS 安装版一定会写卸载器）。
+///
+/// 0.6.22 起便携 zip 也会带 resources/prebuilt 与 resources/weasel；资源被手工删掉
+/// 的便携版同样要判成便携，所以这里只做「像不像安装版」的弱判据。
+pub fn looks_portable(exe_dir: Option<&Path>) -> bool {
+    let Some(dir) = exe_dir else { return false };
+    if dir.join("resources").is_dir() || dir.join(UNINSTALL_FILE).is_file() {
+        return false;
+    }
+    if let Some(prefix) = dir.parent() {
+        if prefix
+            .join("lib")
+            .join("rime-sync")
+            .join("resources")
+            .is_dir()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// 随包安装器的候选路径（按优先级；单测据此断言「安装器缺失」的错误文案）。
 pub fn installer_candidates(exe_dir: Option<&Path>) -> Vec<(PathBuf, String)> {
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
@@ -479,11 +508,17 @@ fn ensure_impl(
             .map(|(path, source)| format!("{}（{source}）", path.display()))
             .collect();
         report.install = "failed".to_string();
-        report.error = Some(format!(
+        let mut message = format!(
             "输入法未就绪（{}），且没有随包安装器 {INSTALLER_FILE}；已探测：{}",
             before.reason,
             probed.join("；")
-        ));
+        );
+        if looks_portable(exe_dir) {
+            message.push_str(
+                "；检测到便携版（exe 同级没有 resources/）：便携版不内置输入法安装器，请手动安装小狼毫（Weasel）后再重试，或改用 NSIS 安装版",
+            );
+        }
+        report.error = Some(message);
         log.push("installer missing".to_string());
         report.log = log.join("\n");
         return report;
@@ -738,6 +773,10 @@ mod tests {
             error.contains("resources/weasel"),
             "错误里要带探测过的路径：{error}"
         );
+        assert!(
+            error.contains("便携版") && error.contains("手动安装"),
+            "便携版要给出明确的手动安装提示：{error}"
+        );
     }
 
     #[test]
@@ -857,5 +896,40 @@ mod tests {
         assert!(!report.installed);
         assert!(report.ok(), "用户显式关掉自动安装不算失败");
         assert!(report.error.expect("错误").contains(ENV_INSTALL_IME));
+    }
+
+    /// 便携判据（只影响提示文案）：三种真实布局都要判对。
+    #[test]
+    fn portable_layout_detection() {
+        let tmp = TempDir::new("portable");
+        // 1. Windows 安装版：exe 同级有 resources/。
+        let installed = tmp.path().join("program-files");
+        fs::create_dir_all(installed.join("resources")).expect("mkdir");
+        assert!(!looks_portable(Some(&installed)));
+
+        // 2. Linux 安装版：资源在 ../lib/rime-sync/resources。
+        let bin = tmp.path().join("usr").join("bin");
+        fs::create_dir_all(&bin).expect("mkdir");
+        fs::create_dir_all(
+            tmp.path()
+                .join("usr")
+                .join("lib")
+                .join("rime-sync")
+                .join("resources"),
+        )
+        .expect("mkdir");
+        assert!(!looks_portable(Some(&bin)));
+
+        // 3. 便携：只有一个 exe，既没有 resources/ 也没有安装版标记。
+        let portable = tmp.path().join("portable");
+        fs::create_dir_all(&portable).expect("mkdir");
+        assert!(looks_portable(Some(&portable)));
+
+        // 4. 便携目录里有 NSIS 卸载器 => 仍按安装版处理（提示文案别误导）。
+        fs::write(portable.join(UNINSTALL_FILE), b"MZ stub").expect("write");
+        assert!(!looks_portable(Some(&portable)));
+
+        // 不知道 exe 目录时按安装版处理（保持旧行为，不乱提示便携）。
+        assert!(!looks_portable(None));
     }
 }

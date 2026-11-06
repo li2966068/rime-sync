@@ -26,6 +26,8 @@ use crate::rime_dir;
 pub const RETAINED_SCHEMAS_TXT: &str = include_str!("../../../packaging/rime/retained-schemas.txt");
 /// 关闭开关：0 / no / off / false。
 pub const ENV_PRUNE: &str = "RIMESYNC_PRUNE_SCHEMAS";
+/// 追加白名单（0.6.22）：逗号分隔的方案 id，视为保留；非法项只记 warning。
+pub const ENV_KEEP: &str = "RIMESYNC_PRUNE_KEEP";
 /// 备份后缀；实际文件名是 <原文件名>.rimesync-removed-<时间戳>。
 pub const BACKUP_SUFFIX: &str = ".rimesync-removed-";
 /// 部署器在 data/ 与 build/ 里产出的方案产物后缀。
@@ -63,6 +65,44 @@ pub fn disabled_by_env() -> bool {
     disabled_value(env::var(ENV_PRUNE).ok().as_deref())
 }
 
+/// 方案 id 的合法形状：仅 [a-zA-Z0-9_-.]+（0.6.22 的追加白名单用它校验）。
+pub fn valid_schema_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+/// 解析 RIMESYNC_PRUNE_KEEP：逗号分隔；非法项不生效，进 warnings。
+pub fn parse_keep_env(raw: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut keep = Vec::new();
+    let mut warnings = Vec::new();
+    let Some(raw) = raw else {
+        return (keep, warnings);
+    };
+    for item in raw.split(',') {
+        let id = item.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if !valid_schema_id(id) {
+            warnings.push(format!(
+                "{ENV_KEEP} 里的 {id:?} 不是合法方案 id（只允许 [a-zA-Z0-9_-.]+），已忽略"
+            ));
+            continue;
+        }
+        if !keep.iter().any(|known| known == id) {
+            keep.push(id.to_string());
+        }
+    }
+    (keep, warnings)
+}
+
+/// 当前进程环境里的 RIMESYNC_PRUNE_KEEP。
+pub fn env_keep() -> (Vec<String>, Vec<String>) {
+    parse_keep_env(env::var(ENV_KEEP).ok().as_deref())
+}
+
 /// 清理选项。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PruneOptions {
@@ -81,8 +121,12 @@ pub struct PruneReport {
     pub timestamp: String,
     /// 保留清单（不含依赖）。
     pub retained: Vec<String>,
-    /// 实际保留集合 = 保留清单 + 依赖闭包。
+    /// RIMESYNC_PRUNE_KEEP 追加的 id（已校验；非法项只在 warnings 里）。
+    pub kept_by_env: Vec<String>,
+    /// 实际保留集合 = 保留清单 + kept_by_env + 依赖闭包。
     pub keep: Vec<String>,
+    /// 非致命问题（非法的 RIMESYNC_PRUNE_KEEP 项等）。
+    pub warnings: Vec<String>,
     /// 扫描过的 data 目录。
     pub data_dirs: Vec<String>,
     /// 扫描过的用户目录。
@@ -140,12 +184,15 @@ pub fn prune_auto_with(
     user_dir: Option<&Path>,
     options: PruneOptions,
 ) -> PruneReport {
+    let (env_keep, mut warnings) = env_keep();
     let retained = retained_schemas();
     if disabled_by_env() {
         return PruneReport {
             disabled: true,
             dry_run: options.dry_run,
             retained: retained.into_iter().map(str::to_string).collect(),
+            kept_by_env: env_keep,
+            warnings,
             ..PruneReport::default()
         };
     }
@@ -158,7 +205,9 @@ pub fn prune_auto_with(
         Some(dir) => Some(dir.to_path_buf()),
         None => rime_dir::detect(None).ok().map(|detection| detection.path),
     };
-    prune_paths(&dirs, user.as_deref(), &timestamp, options)
+    let mut report = prune_paths_with_keep(&dirs, user.as_deref(), &timestamp, options, &env_keep);
+    report.warnings.append(&mut warnings);
+    report
 }
 
 /// 在指定目录上执行清理（测试与安装器用；不读环境开关）。
@@ -168,12 +217,26 @@ pub fn prune_paths(
     timestamp: &str,
     options: PruneOptions,
 ) -> PruneReport {
+    // 不读环境变量：测试与安装器演练要的是确定性结果。env 白名单由
+    // prune_auto_with 读取后走这里。
+    prune_paths_with_keep(data_dirs, user_dir, timestamp, options, &[])
+}
+
+/// 同 prune_paths，但允许追加保留 id（RIMESYNC_PRUNE_KEEP 的解析结果）。
+pub fn prune_paths_with_keep(
+    data_dirs: &[PathBuf],
+    user_dir: Option<&Path>,
+    timestamp: &str,
+    options: PruneOptions,
+    extra_keep: &[String],
+) -> PruneReport {
     let retained = retained_schemas();
     let mut report = PruneReport {
         disabled: false,
         dry_run: options.dry_run,
         timestamp: timestamp.to_string(),
         retained: retained.iter().map(|id| (*id).to_string()).collect(),
+        kept_by_env: extra_keep.to_vec(),
         data_dirs: data_dirs
             .iter()
             .map(|dir| dir.display().to_string())
@@ -187,8 +250,7 @@ pub fn prune_paths(
     // data 目录里现存的 schema 文件：既是依赖闭包的输入，也是「这个 id 确实是方案」
     // 的证据（产物文件只有在能确认归属时才删，避免误删码表 table）。
     let known = known_schemas(data_dirs);
-    let mut keep: BTreeSet<String> = retained.iter().map(|id| (*id).to_string()).collect();
-    expand_keep(&known, &mut keep);
+    let keep = keep_set(&known, extra_keep);
     report.keep = keep.iter().cloned().collect();
 
     for dir in data_dirs {
@@ -229,7 +291,9 @@ fn unix_timestamp() -> String {
 }
 
 /// 目录里的 <id>.schema.yaml 到 id（只读文件名，不解析内容）。
-fn known_schemas(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+///
+/// 公开是为了让 data_patch 的 custom 降级算同一份保留集合（见 keep_set）。
+pub fn known_schemas(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for dir in dirs {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -248,7 +312,21 @@ fn known_schemas(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// 展开依赖闭包：__include: <x>.schema:/ 与 dependencies:。
+/// 保留集合 = retained-schemas.txt ∪ extra_keep，再展开依赖闭包。
+///
+/// prune 与 data_patch 的 Linux custom 降级共用这一份计算：两边各算一份必然漂移
+/// （custom 给已裁掉的方案生成 custom.yaml，prune 下一次启动又把它删掉）。
+pub fn keep_set(known: &[(String, PathBuf)], extra_keep: &[String]) -> BTreeSet<String> {
+    let mut keep: BTreeSet<String> = retained_schemas()
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect();
+    keep.extend(extra_keep.iter().cloned());
+    expand_keep(known, &mut keep);
+    keep
+}
+
+/// 展开依赖闭包：__include: <x>.schema:/、dependencies: 与 dictionary:。
 fn expand_keep(known: &[(String, PathBuf)], keep: &mut BTreeSet<String>) {
     let mut queue: Vec<String> = keep.iter().cloned().collect();
     while let Some(id) = queue.pop() {
@@ -293,7 +371,38 @@ fn schema_refs(path: &Path) -> Vec<String> {
             }
         }
     }
+    // dictionary: 指向的码表（<name>.dict.yaml / <name>.table.bin）也是依赖：
+    // 只被 translator/reverse_lookup 的 dictionary 引用、没有 dependencies 的
+    // 码表不能被当垃圾删掉。字典项可以嵌套（translator.dictionary 等），递归收集。
+    let mut dictionaries = Vec::new();
+    collect_dictionaries(&doc, &mut dictionaries);
+    out.extend(dictionaries);
     out
+}
+
+/// 递归收集所有 `dictionary: <name>` 的字符串取值（空串 / 通配不算）。
+fn collect_dictionaries(value: &serde_yaml::Value, out: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, item) in map {
+                if key.as_str() == Some("dictionary") {
+                    if let Some(name) = item.as_str() {
+                        let name = name.trim();
+                        if !name.is_empty() && name != "*" {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+                collect_dictionaries(item, out);
+            }
+        }
+        serde_yaml::Value::Sequence(list) => {
+            for item in list {
+                collect_dictionaries(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 删除 data/ 或 build/ 里非保留方案的 <id>.schema.yaml 与配套产物。
@@ -679,6 +788,88 @@ mod tests {
         assert!(again.failures.is_empty(), "{:?}", again.failures);
         assert_eq!(again.removed.len(), 0, "{:?}", again.removed);
         assert_eq!(again.backups.len(), 0, "{:?}", again.backups);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dictionary_refs_keep_tables_without_dependencies() {
+        let root = scratch("dictionary");
+        let data = root.join("data");
+        // 保留方案 wubi86 只在 translator.dictionary 里引用共享码表：旧实现只看
+        // __include/dependencies，会把 shared_dict 的 schema 与 table.bin 删掉。
+        write(
+            &data.join("wubi86.schema.yaml"),
+            "schema:\n  schema_id: wubi86\ntranslator:\n  dictionary: shared_dict\n",
+        );
+        // 对照：没有任何引用（也没有 dependencies）的码表必须照旧清理。
+        write(
+            &data.join("other_dict.schema.yaml"),
+            "schema:\n  schema_id: other_dict\n",
+        );
+        write(
+            &data.join("shared_dict.schema.yaml"),
+            "schema:\n  schema_id: shared_dict\n",
+        );
+        write(&data.join("shared_dict.table.bin"), "bin");
+        write(&data.join("shared_dict.dict.yaml"), "name: shared_dict\n");
+        write(&data.join("other_dict.table.bin"), "bin");
+        let report = prune_paths(
+            std::slice::from_ref(&data),
+            None,
+            "T0",
+            PruneOptions::default(),
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            report.keep.iter().any(|id| id == "shared_dict"),
+            "dictionary 引用没进闭包：{:?}",
+            report.keep
+        );
+        assert!(data.join("shared_dict.schema.yaml").is_file());
+        assert!(data.join("shared_dict.table.bin").is_file());
+        assert!(data.join("shared_dict.dict.yaml").is_file());
+        assert!(!data.join("other_dict.schema.yaml").exists());
+        assert!(!data.join("other_dict.table.bin").exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn env_keep_parsing_validates_ids() {
+        let (keep, warnings) = parse_keep_env(Some(" wubi86 ,terra_pinyin,, bad id!,中文"));
+        assert_eq!(keep, vec!["wubi86", "terra_pinyin"]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let (empty, none) = parse_keep_env(None);
+        assert!(empty.is_empty());
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn env_keep_prevents_removal() {
+        let root = scratch("env-keep");
+        let data = root.join("data");
+        let user = root.join("user");
+        fake_schema(&data, "terra_pinyin");
+        let previous = env::var_os(ENV_KEEP);
+        env::set_var(ENV_KEEP, "terra_pinyin,bad id!");
+        let report = prune_auto_with(
+            Some(std::slice::from_ref(&data)),
+            Some(&user),
+            PruneOptions::default(),
+        );
+        match previous {
+            Some(value) => env::set_var(ENV_KEEP, value),
+            None => env::remove_var(ENV_KEEP),
+        }
+        assert_eq!(report.kept_by_env, vec!["terra_pinyin"]);
+        assert!(
+            report.warnings.iter().any(|item| item.contains("bad id!")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(report.keep.iter().any(|id| id == "terra_pinyin"));
+        assert_eq!(report.removed.len(), 0, "{:?}", report.removed);
+        assert!(data.join("terra_pinyin.schema.yaml").is_file());
+        assert!(data.join("terra_pinyin.table.bin").is_file());
         fs::remove_dir_all(&root).ok();
     }
 

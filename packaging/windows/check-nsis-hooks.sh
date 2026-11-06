@@ -409,6 +409,13 @@ if [ "$static_fail" -ne 0 ]; then
 fi
 printf 'ok   static  %s 条结构断言（就绪判定只认 exe/TSF 只写日志/先判定再卸装/改名留证/回滚/自检硬失败退出码 5/预编译产物兜底/失败不 Abort）\n' "$static_count"
 
+# 0.6.22：便携 zip 的静态断言单独成脚本（resources/prebuilt 必带、weasel 安装器、
+# 便携版提示）。这里一并跑，--strict 与非 strict 都会失败。
+if ! bash "$HERE/check-portable-zip.sh"; then
+  echo "check-nsis-hooks: 便携 zip 静态断言失败" >&2
+  exit 1
+fi
+
 if ! command -v makensis >/dev/null 2>&1; then
   if [ "$STRICT" -eq 1 ]; then
     echo "check-nsis-hooks: 缺少 makensis（apt-get install nsis / makensis.org），--strict 下视为失败" >&2

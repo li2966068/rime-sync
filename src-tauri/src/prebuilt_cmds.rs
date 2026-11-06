@@ -58,10 +58,11 @@ fn perform(rime_dir: &Path, force: bool) -> Result<(PayloadLocation, PrebuiltRep
 /// 0.6.18 的起因：227 上 build/ 里已经有插件标记，但引擎没用它（按反斜杠不直出
 /// 「、」、v1234 没候选），部署链又不可用——只能把补丁写进 data。
 /// 每次启动都跑（幂等：没变化就一个字节都不写）。
-fn patch_data(version: &str) -> DataPatchReport {
+fn patch_data(version: &str, source: data_patch::FixSource) -> DataPatchReport {
     // 0.6.20：data 目录按 WeaselRoot → weasel-* → InstallDir → %ProgramFiles%\Rime
     // 逐项探测，报告里带全部候选（227 的目录不存在问题就出在这里）。
-    data_patch::patch_auto(version)
+    // source = Bootstrap 时不会主动重载 fcitx5（不打断正在打字的用户）。
+    data_patch::patch_auto(version, source)
 }
 
 /// 输入法健康检查 + 缺失时用随包安装器装回去（0.6.20）。
@@ -133,7 +134,8 @@ pub fn cmd_fix_ime(
     let weasel = ensure_ime();
     let probe_before = prebuilt::probe_build(&rime_dir);
     let (location, report) = perform(&rime_dir, force.unwrap_or(false))?;
-    let data = patch_data(&app_version(&app));
+    // 用户点「修复输入法」= 显式操作，允许触发重载。
+    let data = patch_data(&app_version(&app), data_patch::FixSource::Explicit);
     let weasel_message = weasel.summary();
     let message = format!(
         "{}；{}；{}",
@@ -147,13 +149,16 @@ pub fn cmd_fix_ime(
         .map(|candidate| candidate.path.as_str())
         .collect();
     let mut log = format!(
-        "[fix-ime] {message} payload={} source={} probe_before={} data_patched={} punctuator_patched={} punctuator_skipped={} data_dir={} data_candidates=[{}] weasel_present={} weasel_installed={} weasel_version={} weasel_install={} weasel_installer={}",
+        "[fix-ime] {message} payload={} source={} probe_before={} data_patched={} punctuator_patched={} punctuator_skipped={} data_mode={} custom_written={} deploy={} data_dir={} data_candidates=[{}] weasel_present={} weasel_installed={} weasel_version={} weasel_install={} weasel_installer={}",
         location.path.display(),
         location.source,
         probe_before,
         data.patched(),
         data.punctuator_patched,
         data.punctuator_skipped.len(),
+        data.mode,
+        data.custom_written.len(),
+        data.deploy_triggered,
         if data.data_dir.is_empty() {
             "-"
         } else {
@@ -188,6 +193,13 @@ pub fn cmd_fix_ime(
     }
     if data.needs_elevation() {
         log.push_str("（data 目录需要管理员权限：请以管理员身份重启 rime-sync 后重试）");
+    } else if data.mode == data_patch::MODE_CUSTOM {
+        log.push_str(&format!(
+            "（data 目录不可写，已写用户级 custom.yaml {} 个：{}；部署={}）",
+            data.custom_written.len(),
+            data.custom_written.join(", "),
+            data.deploy_triggered
+        ));
     }
     push_log(&state.0, log);
     Ok(FixImeReport {
@@ -433,19 +445,27 @@ pub(crate) fn bootstrap(app: &AppHandle) {
         // 227 实测：build/ 里已经是带插件标记的产物，引擎却仍按 data 下的原版方案
         // 工作；部署链不可用，只能直接改 <WeaselRoot>\data\*.schema.yaml。
         if force.is_some() {
-            let data = patch_data(&app_version(&handle));
+            // 启动自举：只写文件、记录 deploy=deferred，绝不重载用户正在用的输入法。
+            let data = patch_data(&app_version(&handle), data_patch::FixSource::Bootstrap);
             if data.data_dirs.is_empty() {
                 // Linux 下 /usr/share/rime-data 不存在；Windows 下没读到 WeaselRoot。
                 log("skip stage=data reason=no-dirs".to_string());
             }
             log(format!(
-                "data patch dirs={} patched={} unchanged={} skipped={} failed={} backup_dir={} files={}",
+                "data patch dirs={} data_dir={} version={} mode={} fallback={} patched={} unchanged={} skipped={} skipped_not_retained={} failed={} backup_dir={} custom_written={} deploy={} files={}",
                 data.data_dirs.join(";"),
+                data.data_dir,
+                data.version,
+                data.mode,
+                data.fallback,
                 data.patched(),
                 data.schemas_unchanged.len(),
                 data.schemas_skipped.len(),
+                data.skipped_not_retained,
                 data.errors.len(),
                 data.backup_dir,
+                data.custom_written.join(";"),
+                data.deploy_triggered,
                 data.schemas_patched.join(";"),
             ));
             for error in &data.errors {
@@ -459,6 +479,13 @@ pub(crate) fn bootstrap(app: &AppHandle) {
             // 「修复输入法」仍会把 needs_elevation 显示出来。
             if data.patched() > 0 {
                 push_log(&state.0, format!("[bootstrap] {}", data.summary()));
+            }
+            if data.deploy_triggered == data_patch::DEPLOY_DEFERRED {
+                // 自举很可能发生在用户正在打字时：不重载，把「什么时候生效」交给用户。
+                push_log(
+                    &state.0,
+                    "[bootstrap] 已更新输入法配置，请点「重新部署」或重启输入法",
+                );
             }
             if data.needs_elevation() {
                 log(
@@ -478,14 +505,19 @@ pub(crate) fn bootstrap(app: &AppHandle) {
             log("skip stage=prune reason=env-disabled".to_string());
         } else {
             log(format!(
-                "prune keep={} removed={} backups={} failed={} dirs={} user={}",
+                "prune keep={} kept_by_env={} removed={} backups={} failed={} warnings={} dirs={} user={}",
                 pruned.keep.join(";"),
+                pruned.kept_by_env.join(";"),
                 pruned.removed(),
                 pruned.backups.len(),
                 pruned.failures.len(),
+                pruned.warnings.len(),
                 pruned.data_dirs.join(";"),
                 pruned.user_dir,
             ));
+            for warning in &pruned.warnings {
+                log(format!("prune warning={warning}"));
+            }
             for path in &pruned.removed {
                 log(format!("prune removed={path}"));
             }

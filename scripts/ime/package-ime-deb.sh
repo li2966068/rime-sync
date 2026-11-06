@@ -120,6 +120,13 @@ install -d "$DATA_DST"
 install -d "$PKGROOT/usr/share/doc/$PKG"
 python3 "$REPO_ROOT/scripts/ime/gen-rime-data.py" --rime-data "$DATA_SRC" --out "$DATA_DST" ||
   { echo "!! 生成裁剪后的 rime-data 失败" >&2; exit 1; }
+# 0.6.22：「多余方案」断言只校验方案文件（*.schema.yaml / *.custom.yaml）。
+# default.yaml / weasel.yaml / fcitx5.yaml / symbols.yaml / key_bindings.yaml /
+# punctuation.yaml / installation.yaml / user.yaml / *.txt / *.json 是 librime、
+# fcitx5 或用户后续生成的配置，一律放行——0.6.21 的 CI 就是把 fcitx5.yaml 判成
+# 「多余方案」才失败。闭包判定统一在 scripts/ime/rime_common.py。
+python3 "$REPO_ROOT/scripts/ime/gen-rime-data.py" --rime-data "$DATA_SRC" --out "$DATA_DST" --check ||
+  { echo "!! data 目录与保留方案闭包不一致（只校验方案文件）" >&2; exit 1; }
 # Recipe licenses stay in the package (one copyright file per vendored recipe).
 for recipe_dir in "$DATA_SRC"/*/; do
   recipe=$(basename "$recipe_dir")

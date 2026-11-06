@@ -213,6 +213,71 @@ def data_files(
     return out
 
 
+SCHEME_FILE_SUFFIXES = (".schema.yaml", ".custom.yaml")
+
+
+def expected_data(rime_data: Path = RIME_DATA) -> dict[str, str]:
+    """闭包内应该出现在 data 目录里的文件（名字 -> 期望内容）。
+
+    default.yaml 按保留清单重写 schema_list；其余文件逐字节一致。
+    """
+    ids = retained_schemas()
+    index = schema_index(rime_data)
+    files = data_files(ids, rime_data, index)
+    out: dict[str, str] = {}
+    for src in files:
+        if src.name == "default.yaml":
+            out[src.name] = trim_default_yaml(src.read_text(encoding="utf-8"), ids)
+        else:
+            out[src.name] = src.read_text(encoding="utf-8")
+    if "essay.txt" not in out:
+        raise SystemExit("闭包里没有 essay.txt（rime-essay 没有随包）")
+    return out
+
+
+def is_scheme_file(name: str) -> bool:
+    """方案文件只认 *.schema.yaml 与 *.custom.yaml。
+
+    default.yaml / weasel.yaml / fcitx5.yaml / symbols.yaml / key_bindings.yaml /
+    punctuation.yaml / installation.yaml / user.yaml / *.txt / *.json 都不是方案，
+    --check 不能把它们判成「多余」。
+    """
+    return name.endswith(SCHEME_FILE_SUFFIXES)
+
+
+def extra_scheme_files(actual, expected) -> list[str]:
+    """实际目录里多出来的方案文件（非方案配置一律放行）。"""
+    want = set(expected)
+    return sorted(
+        name
+        for name in set(actual)
+        if is_scheme_file(name) and name not in want
+    )
+
+
+def check_data(out_dir: Path, rime_data: Path = RIME_DATA) -> list[str]:
+    """校验 data 目录与保留方案闭包：缺失 / 内容过期 / 多余方案。
+
+    只把 *.schema.yaml / *.custom.yaml 当方案文件；其它配置（含 fcitx5.yaml）
+    不参与「多余」判定。
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return ["%s 不存在" % out_dir]
+    want = expected_data(rime_data)
+    problems: list[str] = []
+    actual = {p.name for p in out_dir.iterdir() if p.is_file()}
+    for name, text in sorted(want.items()):
+        path = out_dir / name
+        if not path.is_file():
+            problems.append("缺失 %s" % name)
+        elif path.read_text(encoding="utf-8") != text:
+            problems.append("内容过期 %s" % name)
+    for name in extra_scheme_files(actual, want):
+        problems.append("多余 %s（不在保留方案闭包里）" % name)
+    return problems
+
+
 def trim_default_yaml(text: str, ids: list[str]) -> str:
     """把 rime-prelude/default.yaml 的 schema_list 改写成保留清单。"""
     lines = text.splitlines()

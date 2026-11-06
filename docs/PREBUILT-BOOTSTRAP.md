@@ -624,6 +624,10 @@ weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-ins
   会白占约 29 MB；
 * 自举只铺产物，不触发重新部署；已运行的 Weasel / fcitx5 需要重启输入法或重新选方案
   后才会加载新的 `build/`。
+* Linux 的 custom 降级（共享 data 目录不可写 → 用户级 `<schema>.custom.yaml`）在启动
+  自举里 **不跑 `fcitx5-remote -r`**：只记 `deploy=deferred` 并在 GUI 日志提示
+  「已更新输入法配置，请点『重新部署』或重启输入法」，避免打断正在打字的用户；
+  只有用户点「修复输入法」或手动跑 `rime-sync-cli fix-ime` 才会真正触发重载。
 * data 方案补丁在**真实 227 上还没有跑过**：本地验证的是单测、CLI 集成测试、
   容器里「真实 patched data + 真实 librime 部署 + 真按键」的 smoke。**没验证
   Program Files 的写权限路径**（非管理员进程写 `%ProgramFiles%\Rime\weasel-*\data`

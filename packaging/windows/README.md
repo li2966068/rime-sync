@@ -1009,6 +1009,18 @@ Copy-Item target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe `
 pnpm tauri build --bundles nsis
 ```
 
+### 便携 zip 的 resources（0.6.22）
+
+`packaging/portable-zip.ps1` 会把 `target/release/resources/` 整棵复制进便携包：
+
+* `resources/prebuilt/` **必带**（缺失或空目录直接 throw）——部署不产出
+  `build/` 的机器靠它兜底，否则便携版等于没有输入法产物；
+* `resources/weasel/weasel-*.exe`：构建时跑过 `fetch-weasel.ps1` 就一起带，
+  `fix-ime` 用它装回小狼毫；缺失只告警，便携版 README 与 `fix-ime` 都会提示
+  「便携版请手动安装输入法」；
+* 静态断言：`bash packaging/windows/check-nsis-hooks.sh --strict` 会调用
+  `packaging/windows/check-portable-zip.sh`（Linux 上没有 PowerShell 也能验证）。
+
 缺少 sidecar 时 `tauri build` 会直接失败（不会静默发一个不带 CLI 的包）。
 安装后可以直接跑：
 
