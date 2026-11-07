@@ -619,14 +619,20 @@ jobs:
 
           for stale in glob.glob('/tmp/inline-*.ps1'):
               os.remove(stale)
+          import re
           doc = yaml.safe_load(open('.github/workflows/release.yml'))
           index = 0
           for job in doc['jobs'].values():
               for step in job.get('steps', []):
                   if step.get('shell') == 'pwsh' and 'run' in step:
                       index += 1
+                      # GitHub 表达式（${{ ... }}）是**运行时**由 Actions 替换的：
+                      # 抽出来的原文里它不是合法 PowerShell（${{ runner.os }} 会被解析
+                      # 成「变量名里出现了 {」）。先把表达式换成占位符再解析，块里其余
+                      # 的语法照样能查出来 —— 不能整段跳过。
+                      body = re.sub(r'\$\{\{.*?\}\}', 'PLACEHOLDER', step['run'])
                       with open(f'/tmp/inline-{index}.ps1', 'w') as handle:
-                          handle.write(step['run'])
+                          handle.write(body)
           print(f'extracted {index} inline pwsh steps')
           PY
           cat >/tmp/parse-pwsh.ps1 <<'PS1'

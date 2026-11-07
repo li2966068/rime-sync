@@ -379,7 +379,10 @@ jobs:
           steps.build_ime_deb.outcome == 'success' &&
           steps.build_ime_deb.outputs.cache_status != 'hit' &&
           steps.build_ime_deb.outputs.cache_status != ''
-        continue-on-error: true
+        # 缓存保存失败（配额/缓存服务抖动）不该让发布失败：缓存只是加速手段。
+        # 不写死 true —— ci.yml 的护栏要求每处 continue-on-error 都写出依据；
+        # 下面的 "report librime cache save" 会把 saved/failed 明确打出来，不静默。
+        continue-on-error: ${{ true }}
         uses: actions/cache/save@v4
         with:
           path: build/ime-cache/${{ matrix.distro }}
@@ -820,7 +823,9 @@ jobs:
         if: >-
           steps.weasel_mode.outputs.mode != 'fetch' &&
           steps.ime_cache_manifest.outcome == 'success'
-        continue-on-error: true
+        # 同上：缓存保存失败不影响发布（下一条步骤会报告 cache=saved/failed），
+        # 但不写死 true —— 护栏要求每处 continue-on-error 都写出依据。
+        continue-on-error: ${{ true }}
         uses: actions/cache/save@v4
         with:
           path: |
