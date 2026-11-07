@@ -13,6 +13,27 @@ out=${2:?usage: prepare-sync-deb.sh IN.deb OUT.deb}
 test -f "$src" || { echo "!! missing $src" >&2; exit 1; }
 mkdir -p "$(dirname "$out")"
 
+# 0.6.23：/usr/bin/rime-sync-cli 的唯一来源是 tauri 的 bundle.externalBin sidecar。
+# deb 里出现两份就说明 bundle.linux.deb.files 又映射了同一个路径（两条路写同一个文件，
+# 谁赢取决于 tauri-bundler 内部顺序）。dpkg-deb -c 数 tar 条目，是用户实际装到什么的唯一证据。
+cli_count() { dpkg-deb -c "$1" | awk '$6 == "./usr/bin/rime-sync-cli"' | wc -l; }
+assert_one_cli() { # <deb>
+  local n mode
+  n=$(cli_count "$1")
+  if [ "$n" -ne 1 ]; then
+    echo "!! $1: /usr/bin/rime-sync-cli 应恰好 1 份，实际 $n 份" >&2
+    dpkg-deb -c "$1" | grep rime-sync-cli >&2 || true
+    exit 1
+  fi
+  mode=$(dpkg-deb -c "$1" | awk '$6 == "./usr/bin/rime-sync-cli" { print $1 }')
+  if [ "$mode" != "-rwxr-xr-x" ]; then
+    echo "!! $1: /usr/bin/rime-sync-cli 权限是 $mode（期望 -rwxr-xr-x）" >&2
+    exit 1
+  fi
+  echo "    ok /usr/bin/rime-sync-cli x1 ($mode)"
+}
+assert_one_cli "$src"
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/rime-sync-deb.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 dpkg-deb -R "$src" "$tmp/root"
@@ -32,4 +53,5 @@ fi
 find "$tmp/root/DEBIAN" -type f -name 'post*' -exec chmod 0755 {} +
 find "$tmp/root/DEBIAN" -type f -name 'pre*' -exec chmod 0755 {} +
 dpkg-deb --root-owner-group -Zxz --build "$tmp/root" "$out" >/dev/null
+assert_one_cli "$out"
 echo "==> $(basename "$out") ($(stat -c %s "$out") bytes, scripts from $HERE)"

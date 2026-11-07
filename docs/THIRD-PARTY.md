@@ -55,13 +55,14 @@ Weasel 源码未做功能性修改（`third_party/weasel` 是上游 tag 0.17.4 �
 
 ### 安装与卸载
 
-- **安装顺序：先装小狼毫，再装同步程序。**
-  构建期用 NSIS `File` 把 Weasel 安装器内嵌进 rime-sync 的 setup.exe；运行时的
-  `PREINSTALL` 钩子（在 Tauri 拷贝主程序与 resources **之前**）把它解到 `$PLUGINSDIR`，
-  `ExecWait ... /S` 等安装结束，然后 Tauri 才拷贝 rime-sync 自己的程序文件。
-- 安装器把带时间戳的顺序写入 `$INSTDIR\install-ime-order.log`（静默安装的可复核证据，
+- **安装顺序（B 方案）：安装器只装同步程序本体，输入法由程序首次启动时自举。**
+  构建期仍把 Weasel 安装器作为 Tauri resource 打进去（`resources/weasel/`），但
+  运行时不再由 `PREINSTALL` 钩子安装：程序在首次启动时用
+  `resources/weasel/weasel-0.17.4.0-installer.exe /S /NOREBOOT` 静默安装
+  （详见 [WINDOWS-IME-BOOTSTRAP.md](WINDOWS-IME-BOOTSTRAP.md)）。
+- 安装器把带时间戳的顺序写入 `$INSTDIR\install-order.log`（静默安装的可复核证据，
   卸载时删除），并**同时**追加到 `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名
-  `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`，
+  `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `POSTINSTALL` / `DONE`，
   安装结束后仍在，失败路径也写）。
 - 安装前先检查系统版本（≥ Windows 10 1803）与 WebView2 运行时（见第 3 节），
   再卸载旧版、装小狼毫；全部在 Tauri 拷贝主程序之前。

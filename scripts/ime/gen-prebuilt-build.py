@@ -198,8 +198,21 @@ def reduced_default_custom(schemas: tuple[str, ...]) -> str:
 
 
 def prepare_user(dest: Path, schemas: tuple[str, ...]) -> None:
+    """生成 payload 的 config/（A-4：config 模板的**唯一一份源**）。
+
+    目录是扁平的：default.custom.yaml / weasel.custom.yaml / <schema>.custom.yaml。
+    程序的 seed_templates 与 install_prebuilt 都从这一份读（Windows 资源目录里
+    不再另拷一份 resources/schemas/）。
+
+    weasel.custom.yaml 只影响外观（候选横向排列），但它也得在这儿：种子路径
+    （seed_templates）读的就是这个目录，少一份就播不出去。
+    """
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "default.custom.yaml").write_text(reduced_default_custom(schemas), encoding="utf-8")
+    weasel = TEMPLATE_DIR / "weasel.custom.yaml"
+    if not weasel.is_file():
+        die(f"缺少 {weasel}（外观模板必须随包提供）")
+    shutil.copyfile(weasel, dest / weasel.name)
     for schema in schemas:
         src = SCHEMA_CUSTOM_DIR / f"{schema}.custom.yaml"
         if not src.is_file():
@@ -607,8 +620,13 @@ def check_payload(out_dir: Path, budget: int) -> list[str]:
     if config_dir.is_dir():
         for path in sorted(config_dir.glob("*.custom.yaml")):
             stem = path.name[: -len(".custom.yaml")]
-            if stem != "default" and stem not in schemas:
-                fail.append(f"多余配置模板 config/{path.name}（只允许保留方案 {schemas}）")
+            # A-4：config/ 是**唯一一份** config 源（扁平布局）：
+            #   default.custom.yaml（写 schema_list）/ weasel.custom.yaml（外观）
+            #   / <保留方案>.custom.yaml
+            if stem not in ("default", "weasel") and stem not in schemas:
+                fail.append(f"多余配置模板 config/{path.name}（只允许 default/weasel 与保留方案 {schemas}）")
+        if not (config_dir / "weasel.custom.yaml").is_file():
+            fail.append("缺少 config/weasel.custom.yaml（A-4：种子路径要靠它播外观模板）")
     for schema in schemas:
         name = f"build/{schema}.schema.yaml"
         path = out_dir / name
@@ -682,9 +700,23 @@ def check_wiring() -> list[str]:
 
     has(REPO_ROOT / "src-tauri" / "tauri.conf.json",
         ['"../packaging/rime/prebuilt/"', '"resources/prebuilt/"'])
-    has(REPO_ROOT / "packaging" / "nsis-hooks.nsh",
-        ["resources\\prebuilt", "PREBUILT ok", "PREBUILT failed", "build-source=",
-         "RIMESYNC_PREBUILT"])
+    # 0.6.24（B 方案）：NSIS 钩子**不再**碰输入法 / 产物 / 裁剪 ——
+    # 一切都由程序侧的 ensure(Install/Bootstrap) 负责。断言方向因此**反转**：
+    # 钩子里出现这些名字就说明「输入法逻辑又被搬回安装器」。
+    nsis_hooks = REPO_ROOT / "packaging" / "nsis-hooks.nsh"
+    if nsis_hooks.is_file():
+        text = nsis_hooks.read_text(encoding="utf-8", errors="replace")
+        for forbidden in ("RIMESYNC_PREBUILT", "RimeSyncPruneSchemas", "prune-schemas",
+                          "phase=PRUNE", "PREBUILT ok", "PREBUILT failed"):
+            if forbidden in text:
+                fail.append(f"packaging/nsis-hooks.nsh 不该再出现 {forbidden!r}"
+                            "（输入法逻辑必须留在程序侧）")
+    else:
+        fail.append("缺少打包文件 packaging/nsis-hooks.nsh")
+    # 程序侧必须真的接住了这份责任。
+    has(REPO_ROOT / "crates" / "core" / "src" / "ime_state.rs",
+        ["pub fn ensure(", "pub fn install() -> Self", "pub fn bootstrap() -> Self",
+         "pub fn seed_templates(", "ime::ensure("])
     for script in ("postinst", "install.sh"):
         has(REPO_ROOT / "packaging" / "linux" / script,
             ["/usr/share/rime-sync/prebuilt", "RIMESYNC_PREBUILT", "seed_prebuilt_build"])
@@ -694,8 +726,10 @@ def check_wiring() -> list[str]:
     for script in ("postinst", "install.sh"):
         has(REPO_ROOT / "packaging" / "linux" / script,
             ["prune_extra_schemas", "rime-sync-cli", "retained-schemas.txt"])
-    has(REPO_ROOT / "packaging" / "nsis-hooks.nsh",
-        ["RimeSyncPruneSchemas", "prune-schemas", "phase=PRUNE"])
+    # A-4：config 模板只有一份手写源（packaging/rime/schemas/），
+    # 分发副本（prebuilt/config/）由生成器产出，脚本断言两者不漂移。
+    if not (REPO_ROOT / "packaging" / "windows" / "check-config-sources.sh").is_file():
+        fail.append("缺少 packaging/windows/check-config-sources.sh（A-4 的单一源校验）")
     return fail
 
 

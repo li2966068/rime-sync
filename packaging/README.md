@@ -62,6 +62,13 @@ Copy-Item target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe `
 装完 CLI 与主程序同级：Windows `<安装目录>\rime-sync-cli.exe`（便携 zip 同名），
 Linux deb `/usr/bin/rime-sync-cli`，AppImage `$APPDIR/usr/bin/rime-sync-cli`。
 
+0.6.23 起 deb 里的 `/usr/bin/rime-sync-cli` **只有这一个来源**：
+`bundle.linux.deb.files` 里那条同名映射已删除。别再往 `packaging/linux/rime-sync-cli`
+之类的路径 install 副本——两条路往同一个路径写字，谁赢取决于 tauri-bundler 的内部顺序
+（先 externalBin、后 custom files），等于把「装进去的是哪一份」交给打包器决定。
+release.yml 的 `assert rime-sync deb`、`packaging/linux/prepare-sync-deb.sh` 与
+`.github/scripts/verify-artifacts.sh` 都会断言该路径恰好一份且可执行。
+
 ## 2. CI 分工
 
 | 工作流 | 触发 | 产物 |

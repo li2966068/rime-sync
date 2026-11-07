@@ -511,7 +511,8 @@ fn apply_schemas(
 
     let schemas = order_schemas(collect_schemas(rime_dir, shared_dirs), &selected);
     let backup = backup.map(|path| path.display().to_string());
-    match trigger.deploy(rime_dir) {
+    // 0.6.23：用户显式「保存并重新部署」→ 走 manual_deploy（Windows = 进程内 librime）。
+    match trigger.manual_deploy(rime_dir) {
         Ok(()) => Ok(SetSchemasResult {
             schemas,
             backup,

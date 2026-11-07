@@ -63,7 +63,10 @@ fn proxy_for_updater(app: &AppHandle, inner: &Arc<crate::Inner>) -> Option<tauri
             url
         }
         Err(error) => {
-            crate::push_log(inner, format!("更新检查：读取代理配置失败（按直连处理）：{error}"));
+            crate::push_log(
+                inner,
+                format!("更新检查：读取代理配置失败（按直连处理）：{error}"),
+            );
             None
         }
     }
@@ -72,9 +75,10 @@ fn proxy_for_updater(app: &AppHandle, inner: &Arc<crate::Inner>) -> Option<tauri
 async fn build_updater(app: &AppHandle, state: &AppState) -> Result<Updater, String> {
     let app_for_config = app.clone();
     let inner = Arc::clone(&state.0);
-    let proxy = tauri::async_runtime::spawn_blocking(move || proxy_for_updater(&app_for_config, &inner))
-        .await
-        .map_err(|error| format!("更新器初始化失败：{error}"))?;
+    let proxy =
+        tauri::async_runtime::spawn_blocking(move || proxy_for_updater(&app_for_config, &inner))
+            .await
+            .map_err(|error| format!("更新器初始化失败：{error}"))?;
     let mut builder = app.updater_builder();
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy);

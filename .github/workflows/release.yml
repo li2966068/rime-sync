@@ -119,6 +119,19 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      # 0.6.24：打包前的护栏。NSIS 钩子静态断言 + 预编译清单 + config 单一源 ——
+      # 以前这三个脚本只在本地跑，坏了要等装到用户机器上才发现。
+      - name: guards · nsis hooks / prebuilt manifest / config sources
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nsis
+          makensis -VERSION
+          bash packaging/windows/check-nsis-hooks.sh --strict
+          bash packaging/windows/test-nsis-hooks-negative.sh
+          python3 scripts/ime/gen-prebuilt-build.py --check
+          bash packaging/windows/check-config-sources.sh
+
       - name: free runner disk space
         run: |
           set -euo pipefail
@@ -160,21 +173,21 @@ jobs:
       # 这里刻意不抓 vendor 闭包：tauri deb 的 bundle.linux.deb.files 会把
       # packaging/linux/vendor/ 整个拷进 /usr/share/rime-sync/vendor/，闭包会撑到
       # ~170 MiB。闭包只在 ime-<distro> 的 .run 里按发行版单份使用。
-      # fcitx5 配置页的「立即同步」按钮调用 /usr/bin/rime-sync-cli；CLI 不在 tauri 产物里，
-      # 必须在打包前编译好并放到 deb.files 指定的位置，否则该按钮会静默 no-op。
-      # 0.6.17 起 CLI 还是 tauri 的 externalBin sidecar：Tauri 按 <路径>-<target-triple>
-      # 找源文件，所以同一份产物还要按 host triple 再放一份，否则 tauri build 直接失败
-      # （deb 会因此多带一份 /usr/bin/rime-sync-cli，AppImage 也能拿到 CLI）。
-      - name: build CLI for the deb
+      # fcitx5 配置页的「立即同步」按钮调用 /usr/bin/rime-sync-cli。0.6.23 起 CLI 只有一个
+      # 来源：bundle.externalBin（sidecar）。tauri-bundler 打包 deb 时先把 externalBin 拷进
+      # usr/bin，再拷 bundle.linux.deb.files —— 两条路写同一个路径只会互相覆盖，谁赢取决于
+      # 打包器内部顺序（crates/tauri-bundler/src/bundle/linux/debian.rs）。所以 deb.files 里
+      # 那条同名映射已删除，这里也不再往源码树里 install 临时文件。
+      - name: build CLI sidecar for the bundle
         timeout-minutes: 15
         run: |
           set -euo pipefail
           cargo build -p rime-sync-cli --release --locked
-          install -Dm755 target/release/rime-sync-cli packaging/linux/rime-sync-cli
           triple=$(rustc -vV | sed -n 's/^host: //p')
           [ -n "$triple" ] || { echo "::error::rustc -vV 里没有 host triple"; exit 1; }
           install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
-          file packaging/linux/rime-sync-cli "target/release/rime-sync-cli-$triple"
+          file "target/release/rime-sync-cli-$triple"
+          ls -l target/release/rime-sync-cli
 
       - name: build bundles (deb + AppImage)
         timeout-minutes: 45
@@ -199,6 +212,26 @@ jobs:
             "rime-sync_${ver}_"*) : ;;
             *) echo "::error::deb 名 $deb 与 tauri.conf.json 版本 $ver 不一致"; exit 1 ;;
           esac
+          # 0.6.23：CLI 的唯一来源是 bundle.externalBin sidecar，所以 deb 里必须恰好一份
+          # /usr/bin/rime-sync-cli 且可执行。少了 = fcitx5「立即同步」静默 no-op；多份 =
+          # sidecar 与 deb.files 双供（正是这次要根除的状态）。dpkg-deb -c 是用户实际
+          # 装到什么的唯一证据，这里直接数 tar 条目。
+          listing=$(dpkg-deb -c "${debs[0]}")
+          cli_count=$(printf '%s\n' "$listing" | awk '$6 == "./usr/bin/rime-sync-cli"' | wc -l)
+          if [ "$cli_count" -ne 1 ]; then
+            echo "::error::deb 里 /usr/bin/rime-sync-cli 应恰好 1 份，实际 $cli_count 份"
+            printf '%s\n' "$listing" | grep rime-sync-cli || true
+            exit 1
+          fi
+          cli_field=$(printf '%s\n' "$listing" | awk '$6 == "./usr/bin/rime-sync-cli" { print $1, $3 }')
+          cli_size=${cli_field##* }
+          case "$cli_field" in
+            -rwxr-xr-x\ *) : ;;
+            *) echo "::error::deb 内 /usr/bin/rime-sync-cli 不可执行（$cli_field）"; exit 1 ;;
+          esac
+          [ "$cli_size" -ge 1048576 ] ||
+            { echo "::error::deb 内 rime-sync-cli 只有 $cli_size 字节（< 1 MiB），不像真 CLI"; exit 1; }
+          echo "CLI: /usr/bin/rime-sync-cli x1 ($cli_size bytes)"
           echo "$deb ($(( $(stat -c %s "${debs[0]}") / 1024 / 1024 )) MiB)"
 
       # 直接进草稿 Release：四个 ime job 用 `gh release download --pattern 'rime-sync_*.deb'` 取它。
@@ -294,20 +327,28 @@ jobs:
       # librime 构建缓存（ime job）：只缓存 cmake --install 的安装前缀 + manifest.json。
       # 命中判定在容器里由 scripts/ime/librime-build-cache.sh 做（源码树/插件/脚本哈希 +
       # librime.so 里的插件明文），判 invalid 就删掉重编 —— 缓存只影响耗时，不影响 deb。
+      # 0.6.23：restore 用内容指纹（RIME_CACHE_KEY_RESTORE，跨运行命中），save 用
+      # 「指纹-github.run_id」（RIME_CACHE_KEY_SAVE，永远唯一）——同一个 key 存第二次的
+      # 「unable to reserve cache」不会再出现，判 invalid 后重建的产物一定写得回去。
       - name: compute librime cache key (ime)
         id: ime_cache_key
         run: |
           set -euo pipefail
           key="rime-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-linux.sh', 'scripts/ime/container-build.sh', 'scripts/ime/librime-build-cache.sh', 'scripts/ime/Dockerfile') }}"
+          save_key="$key-${{ github.run_id }}"
           echo "key=$key" >> "$GITHUB_OUTPUT"
-          echo "librime cache key: $key"
+          {
+            echo "RIME_CACHE_KEY_RESTORE=$key"
+            echo "RIME_CACHE_KEY_SAVE=$save_key"
+          } >> "$GITHUB_ENV"
+          echo "librime cache key: restore=$key save=$save_key"
 
       - name: restore librime build cache (ime · ${{ matrix.distro }})
         id: ime_cache_restore
         uses: actions/cache/restore@v4
         with:
           path: build/ime-cache/${{ matrix.distro }}
-          key: ${{ steps.ime_cache_key.outputs.key }}
+          key: ${{ env.RIME_CACHE_KEY_RESTORE }}
           restore-keys: |
             rime-${{ runner.os }}-${{ matrix.distro }}-
 
@@ -329,13 +370,29 @@ jobs:
           [ -n "$f" ] || { echo "::error::$DISTRO: 没有生成 rime-inputmethod deb"; exit 1; }
           echo "$DISTRO: $(basename "$f") ($(( $(stat -c %s "$f") / 1024 / 1024 )) MiB)"
 
+      # 只在「这次真的重建了」之后保存：cache_status 由 scripts/ime/build-linux.sh 从容器日志
+      # 里读出来（hit / invalid）。invalid（含从未命中）说明容器已经删掉旧产物全量重编，这次
+      # 必须把新产物按唯一 key 存回去；否则坏缓存会一直躺在 restore-keys 前缀里被反复命中。
       - name: save librime build cache (ime · ${{ matrix.distro }})
-        if: steps.ime_cache_restore.outputs.cache-hit != 'true' && steps.build_ime_deb.outcome == 'success'
+        id: ime_cache_save
+        if: >-
+          steps.build_ime_deb.outcome == 'success' &&
+          steps.build_ime_deb.outputs.cache_status != 'hit' &&
+          steps.build_ime_deb.outputs.cache_status != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: build/ime-cache/${{ matrix.distro }}
-          key: ${{ steps.ime_cache_key.outputs.key }}
+          key: ${{ env.RIME_CACHE_KEY_SAVE }}
+
+      - name: report librime cache save (ime · ${{ matrix.distro }})
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.ime_cache_save.outcome }}" = "success" ]; then
+            echo "cache=saved key=$RIME_CACHE_KEY_SAVE"
+          else
+            echo "cache=not-saved（cache=hit 且校验通过，或构建失败：本次没有新产物可存）"
+          fi
 
       - name: fetch vendor dependency closure (${{ matrix.distro }})
         timeout-minutes: 15
@@ -562,6 +619,11 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      # 0.6.23：先把 Windows 专属代码过一遍 cargo check（只 check，不链接、不打包）。
+      # 坏代码在这里一两分钟就红，不会等到 40 分钟的 Weasel + NSIS 构建才暴露。
+      - name: typecheck · cargo check (core + cli, fail fast)
+        run: cargo check -p rime-sync-core -p rime-sync-cli
+
       - name: install frontend dependencies
         run: pnpm install --frozen-lockfile
 
@@ -576,16 +638,25 @@ jobs:
       # 命中后必须过 scripts/ime/verify-win-build-cache.ps1：任一不符就删掉缓存产物、
       # 打 cache=invalid reason=…，照常全量构建 —— 缓存只影响耗时，不影响产物。
       #
-      # key 只在 checkout 之后算一次并写进 RIME_CACHE_KEY：构建会往 third_party/librime 里写
-      # dist\ / deps\，save 时重算 hashFiles 会得到另一个 key（缓存就永远存不到该存的地方）。
+      # 指纹只在 checkout 之后算一次：构建会往 third_party/librime 里写 dist\ / deps\，
+      # save 时重算 hashFiles 会得到另一个 key（缓存就永远存不到该存的地方）。
+      #
+      # 0.6.23：restore 用内容指纹（RIME_CACHE_KEY_RESTORE，可跨运行命中），save 用
+      # 「指纹-github.run_id」（RIME_CACHE_KEY_SAVE，永远唯一）。同一个 key 存两次的
+      # 「unable to reserve cache」因此不可能再出现：exact key 命中但判 invalid 的那次，
+      # 全量重建的产物一定写得回去。两个 key 不同，靠 restore-keys 前缀覆盖。
       - name: compute ime build cache key
         id: ime_cache_key
         shell: pwsh
         run: |
           $key = "rime-${{ runner.os }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}-${{ hashFiles('scripts/ime/build-weasel.ps1') }}"
+          $saveKey = "$key-${{ github.run_id }}"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "key=$key"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RIME_CACHE_KEY_RESTORE=$key"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RIME_CACHE_KEY_SAVE=$saveKey"
+          # verify-win-build-cache.ps1 -Mode write 把 RIME_CACHE_KEY 写进清单：保持内容指纹。
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "RIME_CACHE_KEY=$key"
-          Write-Host "ime cache key: $key"
+          Write-Host "ime cache key: restore=$key save=$saveKey"
 
       - name: restore ime build cache (librime + weasel + boost)
         id: ime_cache_restore
@@ -602,7 +673,7 @@ jobs:
             third_party/weasel/deps/boost_1_84_0/boost
             third_party/weasel/deps/boost_1_84_0/stage
             packaging/windows/vendor/weasel-0.17.4.0-installer.exe
-          key: ${{ steps.ime_cache_key.outputs.key }}
+          key: ${{ env.RIME_CACHE_KEY_RESTORE }}
           restore-keys: |
             rime-${{ runner.os }}-
 
@@ -739,14 +810,15 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      # 只保存**刚构建完且已验证过**的产物：命中缓存的那次不重复保存（exact key 已存在，
-      # 再存只会冲突），构建或清单失败的那次不保存（半成品永远不进缓存）。
-      # 想强制重建：先用 gh cache delete 删掉同名 key（见 docs/CI-CACHE.md）。
+      # 只保存**刚构建完且已验证过**的产物：清单写入成功 == 这次是全量构建且校验通过
+      # （verify 判 hit 的路径根本不会走到 -Mode write）。命中且校验通过的那次没有新产物，
+      # 不重复保存；构建或清单失败的那次也不保存（半成品永远不进缓存）。
+      # 0.6.23：save 的 key 带 run_id（RIME_CACHE_KEY_SAVE），所以「exact key 命中但判
+      # invalid」那一次重建出来的产物一定写得回去 —— 不需要再手动 gh cache delete。
       - name: save ime build cache (librime + weasel + boost)
+        id: ime_cache_save
         if: >-
           steps.weasel_mode.outputs.mode != 'fetch' &&
-          steps.ime_cache_restore.outputs.cache-hit != 'true' &&
-          steps.ime_cache_verify.outputs.valid != 'true' &&
           steps.ime_cache_manifest.outcome == 'success'
         continue-on-error: true
         uses: actions/cache/save@v4
@@ -761,7 +833,18 @@ jobs:
             third_party/weasel/deps/boost_1_84_0/boost
             third_party/weasel/deps/boost_1_84_0/stage
             packaging/windows/vendor/weasel-0.17.4.0-installer.exe
-          key: ${{ steps.ime_cache_key.outputs.key }}
+          key: ${{ env.RIME_CACHE_KEY_SAVE }}
+
+      # save 的最终结果只有这里能一眼看出来：cache=saved key=<save key> 就是这次写回的唯一 key。
+      - name: report ime cache save (cache=saved key=…)
+        if: steps.weasel_mode.outputs.mode != 'fetch'
+        shell: pwsh
+        run: |
+          if ('${{ steps.ime_cache_save.outcome }}' -eq 'success') {
+            Write-Host "cache=saved key=$env:RIME_CACHE_KEY_SAVE"
+          } else {
+            Write-Host "cache=not-saved（cache=hit 且校验通过，或构建/清单失败：本次没有新产物可存）"
+          }
 
       # 只有自编译失败时才跑：把 VS 安装 / cl.exe / boost 目录状态一次性打到日志里。
       # v0.6.1 的日志里只有 "unable to detect your toolset installation" 这一句猜谜；

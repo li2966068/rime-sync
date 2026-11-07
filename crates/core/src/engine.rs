@@ -75,8 +75,9 @@ pub struct Report {
     /// *.userdb.txt 词条级冲突统计；统计失败时整体降级为 null（不影响主流程）。
     #[serde(default)]
     pub conflict_details: Option<Vec<ConflictDetail>>,
-    /// 本轮有 *.custom.yaml 被拉取 / 合并 / 写入本地：Windows 上需要重新部署
-    /// （WeaselDeployer /deploy），否则改动不会生效。
+    /// 本轮有 *.custom.yaml 被拉取 / 合并 / 写入本地：Windows 上需要重新加载
+    /// （0.6.23 起 = 结束 WeaselServer，系统在下次输入时拉起；不再调 WeaselDeployer），
+    /// 否则改动不会生效。
     #[serde(default)]
     pub config_changed: bool,
     /// 本轮拉到新的/变化的 *.userdb.txt：transport 只搬文件，必须再跑 apply

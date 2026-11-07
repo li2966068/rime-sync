@@ -32,6 +32,12 @@ packaging/linux/out/rime-sync-installer_<appver>.trixie.thin.run
 | --- | --- | --- |
 | debian-13 | debian:13 | trixie |
 
+两个 `.run` 里的 `rime-sync_<appver>_amd64.deb` 自带命令行工具
+`/usr/bin/rime-sync-cli`（fcitx5 配置页的「立即同步」按钮也调它）。它由打包时 Tauri 的
+sidecar（`bundle.externalBin`）写入，**deb 里只有这一份**：0.6.23 起
+`bundle.linux.deb.files` 里同名的映射已删除，否则两个来源会往同一个路径写字。
+`packaging/linux/prepare-sync-deb.sh` 重新打包维护脚本时会断言该路径恰好一份。
+
 发行版仍是参数（`DISTRO_KEY` / `SUITE` / `suite_for`）：以后要加版本，
 在 `build-linux.sh`、`build-offline-installer.sh`、`verify-offline.sh` 各补一条即可。
 

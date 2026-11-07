@@ -48,6 +48,83 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --all-targets
 
+  # CI 防回归：Windows 专属代码（cfg(windows)）每次 push/PR 都过一遍 cargo check。
+  #
+  # 目标平台用 x86_64-pc-windows-gnu 而不是 msvc：core → reqwest → rustls → ring
+  # 的 build.rs 用 cc-rs 编译 C，msvc 目标需要 MSVC 的 lib.exe（ubuntu runner 上没有；
+  # 本机实测报错：`error occurred in cc-rs: failed to find tool "lib.exe"`）。
+  # gnu 目标的 target_os 同样是 windows，而 cargo check 不链接，所以对「Windows 专属
+  # 代码能否编过」等价；mingw 的 gcc 只用来编 ring 的 C。结论见
+  # docs/PREBUILT-BOOTSTRAP.md §13.7。
+  windows-typecheck:
+    name: windows · cargo check（core + cli）
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: windows-typecheck
+
+      - name: install mingw（只为编 ring 的 C）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: cargo check · rime-sync-core
+        run: cargo check -p rime-sync-core --target x86_64-pc-windows-gnu
+
+      - name: cargo check · rime-sync-cli
+        run: cargo check -p rime-sync-cli --target x86_64-pc-windows-gnu
+
+  # 0.6.23：判据 / 修补 / 报告一致性在真实 Windows 上验一遍（不装输入法、不需要 librime）。
+  # 断言全部从 JSON 报告里取字段（PowerShell ConvertFrom-Json），不解析 stdout 文本。
+  windows-e2e:
+    name: windows · e2e（ensure-ime 判据 / 修补 / 失败退出码）
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: windows-e2e
+
+      - name: build cli
+        run: cargo build -p rime-sync-cli --locked
+
+      # B 方案：安装器只交付程序本体，输入法在程序首次启动时自举。
+      # 这一条模拟「装完后第一次启动程序」：--mode install 必须给出 result=ok，
+      # 且铺进去的 build 是我们这套（schema 含 rimesync_vnum）。
+      - name: e2e · 模拟装完后首次启动（ensure-ime --mode install）
+        shell: pwsh
+        run: ./.github/scripts/e2e-windows-first-start.ps1
+
+      # 只伪造 user dir + payload：验证判据（assess）、修补（补缺失的 bin）与报告字段。
+      - name: e2e · ensure-ime / check-ime
+        shell: pwsh
+        run: ./.github/scripts/e2e-windows-ime.ps1
+
+      - name: upload e2e json reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ime-e2e
+          path: ${{ runner.temp }}/rime-sync-ime-e2e-*
+          if-no-files-found: ignore
+          retention-days: 7
+
   frontend:
     name: frontend · tsc --noEmit
     runs-on: ubuntu-22.04
@@ -277,14 +354,55 @@ jobs:
             { echo "::error::$wf 的缓存 key 不含 third_party/librime/**"; exit 1; }
           grep -qF 'cache=hit' "$wf" || { echo "::error::$wf 不会打印 cache=hit"; exit 1; }
           grep -qF 'cache=invalid reason=' "$wf" || { echo "::error::$wf 不会打印 cache=invalid reason=…"; exit 1; }
-          echo "guard OK：缓存 -> 校验 -> manifest -> 保存 的链路完整"
+          # 0.6.23：restore 用内容指纹、save 用「指纹-run_id」。同一个 key 存第二次会
+          # unable to reserve cache，判 invalid 后重建的产物就永远存不回去（见 docs/CI-CACHE.md）。
+          grep -qF 'RIME_CACHE_KEY_RESTORE' "$wf" ||
+            { echo "::error::$wf 没有把 restore 用的 key 写进 RIME_CACHE_KEY_RESTORE"; exit 1; }
+          grep -qF 'RIME_CACHE_KEY_SAVE' "$wf" ||
+            { echo "::error::$wf 没有把 save 用的 key 写进 RIME_CACHE_KEY_SAVE"; exit 1; }
+          grep -qF 'github.run_id' "$wf" ||
+            { echo "::error::$wf 的 save key 没带 run_id（exact key 命中且判 invalid 时产物存不回去）"; exit 1; }
+          grep -qF 'cache=saved key=' "$wf" ||
+            { echo "::error::$wf 不会打印 cache=saved key=<save key>"; exit 1; }
+          # Linux ime job 的 save 只在真重建时发生，靠 build-linux.sh 把 cache_status 转成 output。
+          grep -qF 'cache_status' scripts/ime/build-linux.sh ||
+            { echo "::error::scripts/ime/build-linux.sh 不再输出 cache_status（Linux 缓存永远存不回去）"; exit 1; }
+          grep -qF 'cache_status' "$wf" ||
+            { echo "::error::$wf 的 ime save 步没有按 cache_status 判断"; exit 1; }
+          echo "guard OK：缓存 -> 校验 -> manifest -> 保存 的链路完整，restore/save key 已分开"
+
+      # 0.6.23：#8 deb 里的 /usr/bin/rime-sync-cli 只能有一个来源（bundle.externalBin
+      # sidecar）。deb.files 再映射一次就是双供：两条路写同一个路径，谁赢取决于
+      # tauri-bundler 内部顺序，产物里一旦变成两份就没人说得清装进去的是哪个。
+      - name: guard · rime-sync-cli comes from the sidecar only
+        run: |
+          set -euo pipefail
+          conf=src-tauri/tauri.conf.json
+          wf=.github/workflows/release.yml
+          va=.github/scripts/verify-artifacts.sh
+          cli=/usr/bin/rime-sync-cli
+          if grep -qF '"/usr/bin/rime-sync-cli"' "$conf"; then
+            echo "::error::$conf 的 bundle.linux.deb.files 又映射了 /usr/bin/rime-sync-cli（与 sidecar 双供）"
+            exit 1
+          fi
+          grep -qF '"externalBin"' "$conf" ||
+            { echo "::error::$conf 没有 bundle.externalBin（CLI 会从 deb/AppImage 里消失）"; exit 1; }
+          grep -qF 'target/release/rime-sync-cli' "$conf" ||
+            { echo "::error::$conf 的 externalBin 不是 rime-sync-cli"; exit 1; }
+          grep -qF 'rime-sync-cli x1' "$wf" ||
+            { echo "::error::$wf 没有断言 deb 内 /usr/bin/rime-sync-cli 恰好 1 份"; exit 1; }
+          grep -qF 'SYNC_CLI' "$va" ||
+            { echo "::error::$va 没有校验 deb 内 $cli 恰好 1 份"; exit 1; }
+          grep -qF 'assert_one_cli' packaging/linux/prepare-sync-deb.sh ||
+            { echo "::error::packaging/linux/prepare-sync-deb.sh 没有断言 CLI 恰好 1 份"; exit 1; }
+          echo "guard OK：CLI 唯一来源 = bundle.externalBin sidecar，deb 侧断言恰好 1 份"
 
       # ps1 在 ubuntu runner 上不能执行，但可以解析：语法错误不必等 windows job 首跑才发现。
       # 本机没有 pwsh（改脚本的人也不一定有），所以这一段是唯一的「改完就能验」的入口。
       - name: parse Windows packaging ps1 (syntax only)
         run: |
           set -euo pipefail
-          files=$(find scripts/ime packaging/windows -maxdepth 1 -type f -name '*.ps1' | sort)
+          files=$(find scripts/ime packaging/windows .github/scripts -maxdepth 1 -type f -name '*.ps1' | sort)
           [ -n "$files" ] || { echo "::error::没找到任何 Windows 打包 ps1"; exit 1; }
           printf '%s\n' "$files"
           if ! command -v pwsh >/dev/null 2>&1; then
@@ -542,3 +660,75 @@ jobs:
             }
             Write-Host "fetch-weasel.ps1 语法 OK"
           '
+
+  # M4：B 方案的核心契约是「安装器不碰输入法」。这个 job 把契约变成会失败的门：
+  #   ① --strict 真编译两套钩子（Ubuntu 装 nsis）；② 变异测试把真实 Weasel 安装调用
+  #   插回 PREINSTALL，必须立刻变红 —— 否则断言就是空转的。
+  nsis-hooks:
+    name: windows · NSIS 钩子静态断言 + 变异测试
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install nsis（makensis）
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nsis
+          makensis -VERSION
+
+      - name: check-nsis-hooks --strict
+        run: bash packaging/windows/check-nsis-hooks.sh --strict
+
+      - name: mutation test（真实安装调用插回 PREINSTALL 必须变红）
+        run: bash packaging/windows/test-nsis-hooks-negative.sh
+
+      # 0.6.24：预编译产物清单以前**从没**在 CI 里校验过 —— 清单与磁盘不一致
+      # （少文件、体积对不上、方案标记缺失）只能等打包时才炸。
+      - name: prebuilt manifest check
+        run: python3 scripts/ime/gen-prebuilt-build.py --check
+
+      # config 模板只能有一份源：手写源与分发副本漂移 = 用户拿到两套配置。
+      - name: config sources check
+        run: bash packaging/windows/check-config-sources.sh
+
+  # 0.6.24：NSIS 钩子的**运行期**冒烟 —— wine 跑的就是发布用的那个 Windows
+  # 二进制（NSIS stub + 钩子），验的是静态断言看不出来的东西：静默安装/卸载的
+  # 退出码、/PURGEDATA 有没有生效、两条用户数据目录删没删、卸载日志写没写全。
+  # 0.6.24 就是靠这一步抓到「日志追加语义坏掉、只剩最后一行」的。
+  nsis-smoke:
+    name: windows · NSIS 钩子 wine 冒烟
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install nsis + wine
+        run: |
+          set -uo pipefail
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update
+          sudo apt-get install -y nsis
+          sudo apt-get install -y wine || sudo apt-get install -y wine64 || true
+          makensis -VERSION
+          wine --version || true
+
+      # wine 装不上 / 跑不了 32 位程序时跳过（不阻塞 CI），但要留痕。
+      - name: preflight · wine 可用性
+        run: |
+          set -uo pipefail
+          if ! command -v wine >/dev/null 2>&1; then
+            echo "::notice::wine 不可用，跳过 wine 冒烟"
+            echo "SKIP_WINE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if ! WINEPREFIX="$RUNNER_TEMP/wine-preflight" WINEDEBUG=-all wine cmd /c echo ok >/dev/null 2>&1; then
+            echo "::notice::wine 跑不了 32 位程序，跳过 wine 冒烟"
+            echo "SKIP_WINE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: wine smoke（静默安装 + 静默卸载 + 用户数据清理）
+        if: env.SKIP_WINE != '1'
+        run: bash packaging/windows/test-nsis-hooks-wine.sh --strict

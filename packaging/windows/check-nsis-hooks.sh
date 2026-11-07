@@ -10,27 +10,31 @@
 #   bash packaging/windows/check-nsis-hooks.sh            # 没有 makensis 时打印 SKIP 并退出 0
 #   bash packaging/windows/check-nsis-hooks.sh --strict   # 没有 makensis 视为失败（CI 用）
 #
-# 验证范围：NSIS 编译期（语法、标签、!ifdef 分支、File 内嵌路径、未引用函数告警）。
-# 不验证：运行期行为（注册表探测、弹框、ExecWait 退出码）—— 那需要真 Windows。
+# 验证范围：NSIS 编译期（语法、标签、!ifdef 分支、File 内嵌路径、未引用函数告警）
+# + 静态结构断言（B 方案：安装器不碰输入法）。
+# 不验证：运行期行为——由 packaging/windows/test-nsis-hooks-wine.sh（wine）与
+#         .github/scripts/e2e-windows-ime.ps1（真 Windows）负责。
+#
+# 「B 方案」：输入法的一切判断与安装从 NSIS 搬到程序
+#   （crates/core/src/ime_state.rs 的 ensure(Mode::Install)）。因此本脚本的核心
+#   断言从「钩子里必须有就绪判定/自检」反转为「钩子里必须没有这些」：
+#     * 没有 Weasel 安装调用、prebuilt 铺设、prune、自检、部署、文本匹配；
+#     * 没有 StrStrW / rimesync_vnum / rimesync_punct / ensure-ime / check-ime /
+#       RIMESYNC_PREBUILT 之类的判据与解析；
+#     * 没有 config 模板播种（default.custom.yaml / weasel.custom.yaml / schemas）；
+#     * POSTINSTALL 不设退出码、不弹框、不判定输入法。
+#   同时保留对「安装器本职」的断言：OS 版本门槛、WebView2 检查/安装、卸旧版
+#   rime-sync、快捷方式、$INSTDIR\resources、卸载时的用户数据询问与清理。
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/.." && pwd)
+REPO=$(cd "$PKG/.." && pwd)
 STRICT=0
 [ "${1:-}" = "--strict" ] && STRICT=1
 
 # ---------------------------------------------------------------------------
 # 1) 静态结构断言（不需要 makensis）
-#    编译只能证明「语法对」，证明不了「卸载命令长得对 / 超时在 / 失败不 Abort」。
-#    这里按函数体做文本断言，改坏了会直接指出是哪一条（--strict 与非 strict 都跑）。
-#    0.6.11 起：卸载旧版 → 全新安装，POSTINSTALL 按新版无条件写配置（覆盖前备份）。
-#    0.6.13 起：Weasel 就绪判定（注册表 + exe）、未就绪自动修复且失败硬退出、
-#               配置写进 current 用户目录、POSTINSTALL 自检（部署 + build 产物）。
-#    0.6.14 起：判定只认「目录里真有 WeaselServer.exe」（tsf 只写日志）、先判定再卸/装、
-#               未就绪改名留证 + 重装失败回滚（Rime.bak-<ts> 改回原名）、
-#               UNINSTALL-OLD 不再卸 Weasel、SELF-CHECK 硬性检查失败 → 退出码 5。
-#    0.6.15 起：预编译 build 产物兜底 —— 部署没产出（或产出的不是我们这套）时，
-#               把 $INSTDIR\resources\prebuilt 铺进用户目录，SELF-CHECK 增加 build-source=。
 # ---------------------------------------------------------------------------
 # RIMESYNC_HOOKS：给「反向验证」用（对临时改坏的副本跑同一套断言，不动工作区文件）
 HOOKS="${RIMESYNC_HOOKS:-$PKG/nsis-hooks.nsh}"
@@ -53,6 +57,14 @@ fn_body() { # <函数名> → 该函数体（到同列 FunctionEnd 为止）
   ' "$HOOKS"
 }
 
+macro_body() { # <宏名> → 宏体（到 !macroend 为止）
+  awk -v m="!macro $1" '
+    $0 == m { inside = 1 }
+    inside { print }
+    inside && $0 == "!macroend" { exit }
+  ' "$HOOKS"
+}
+
 assert_fn_has() { # <函数名> <说明> <固定字符串>
   static_count=$((static_count + 1))
   if ! fn_body "$1" | grep -qF -- "$3"; then
@@ -70,11 +82,10 @@ assert_count() { # <说明> <固定字符串> <最少出现次数>（整文件�
   fi
 }
 
-assert_fn_count() { # <函数名> <说明> <固定字符串> <最少出现次数>
+assert_macro_has() { # <宏名> <说明> <固定字符串>
   static_count=$((static_count + 1))
-  n=$(fn_body "$1" | grep -cF -- "$3" || true)
-  if [ "${n:-0}" -lt "$4" ]; then
-    printf 'FAIL static  %s\n           函数 %s 里 "%s" 只出现 %s 处（应 ≥ %s）\n' "$2" "$1" "$3" "${n:-0}" "$4" >&2
+  if ! macro_body "$1" | grep -qF -- "$3"; then
+    printf 'FAIL static  %s\n           宏 %s 里缺少：%s\n' "$2" "$1" "$3" >&2
     static_fail=1
   fi
 }
@@ -87,13 +98,10 @@ assert_fn_not_has() { # <函数名> <说明> <禁止出现的固定字符串>
   fi
 }
 
-assert_fn_no_abort() { # <函数名>
+assert_macro_not_has() { # <宏名> <说明> <禁止出现的固定字符串>
   static_count=$((static_count + 1))
-  if fn_body "$1" | grep -qE '^[[:space:]]*Abort\b'; then
-    printf 'FAIL static  %s 里出现 Abort（卸载/写配置失败只许记日志）\n' "$1" >&2
-    static_fail=1
-  elif [ -z "$(fn_body "$1")" ]; then
-    printf 'FAIL static  找不到函数 %s\n' "$1" >&2
+  if macro_body "$1" | grep -qF -- "$3"; then
+    printf 'FAIL static  %s\n           宏 %s 里不该有：%s\n' "$2" "$1" "$3" >&2
     static_fail=1
   fi
 }
@@ -117,23 +125,6 @@ assert_fn_order() { # <函数名> <先出现> <后出现> <说明>
   fi
 }
 
-assert_tsf_log_only() { # tsf= 只许出现在 phase=TSF-EVIDENCE 证据行（注释行除外）
-  static_count=$((static_count + 1))
-  bad=$(grep -n 'tsf=' "$HOOKS" | grep -v 'phase=TSF-EVIDENCE' | grep -vE '^[0-9]+:;' || true)
-  if [ -n "$bad" ]; then
-    printf 'FAIL static  tsf 参与了判定/日志分支（只许出现在 phase=TSF-EVIDENCE 行）\n%s\n' "$bad" >&2
-    static_fail=1
-  fi
-}
-
-macro_body() { # <宏名> → 宏体（到 !macroend 为止）
-  awk -v m="!macro $1" '
-    $0 == m { inside = 1 }
-    inside { print }
-    inside && $0 == "!macroend" { exit }
-  ' "$HOOKS"
-}
-
 assert_macro_order() { # <宏名> <先出现> <后出现> <说明>
   static_count=$((static_count + 1))
   a=$(macro_body "$1" | grep -nF -- "$2" | head -1 | cut -d: -f1)
@@ -145,191 +136,34 @@ assert_macro_order() { # <宏名> <先出现> <后出现> <说明>
   fi
 }
 
-# 卸载旧版：抽成函数、静默 + 原地卸载（_?=）、120 秒超时、先停进程
-assert_has "PREINSTALL 调用卸载旧版"                "Call RimeSyncUninstallOldVersion"
-assert_has "旧 rime-sync：路径带引号 + /S + 原地 _?=" '"$R9" /S _?=$0'
-assert_has "卸载前先 taskkill 同步程序"           "taskkill /IM rime-sync-app.exe /F"
-assert_has "卸载前先 taskkill 输入法服务"         "taskkill /IM WeaselServer.exe /F"
-assert_has "卸载等待有 120 秒超时"                '!define RIMESYNC_UNINSTALL_TIMEOUT_MS "120000"'
-assert_has "超时通过 nsExec /TIMEOUT 生效"        'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_UNINSTALL_TIMEOUT_MS}'
-assert_has "阶段日志 UNINSTALL-OLD"               "phase=UNINSTALL-OLD"
-assert_has "/SKIPIME 记 weasel-kept"              'StrCpy $RimeSyncWeaselKept "1"'
+# 安装侧正文：整份钩子去掉 NSIS_HOOK_PREUNINSTALL。
+# 卸载要清掉随包载荷（resources\weasel 与安装器文件本身），那些名字只允许出现在卸载段。
+install_side() {
+  awk '
+    $0 == "!macro NSIS_HOOK_PREUNINSTALL" { skip = 1 }
+    !skip { print }
+    skip && $0 == "!macroend" { skip = 0 }
+  ' "$HOOKS"
+}
 
-# 0.6.14 修复点 3：UNINSTALL-OLD 只卸同步程序，不得连带卸 Weasel
-assert_fn_not_has RimeSyncUninstallOldVersion "UNINSTALL-OLD 不再卸 Weasel" 'Call RimeSyncUninstallOldWeasel'
-assert_absent "旧 Weasel 卸载函数整套删除" 'Function RimeSyncUninstallOldWeasel'
-assert_absent "旧 Weasel 卸载命令变量删除" 'RimeSyncOldWeaselCmd'
-
-# 0.6.14 修复点 2：顺序 = 先判定 → 再卸/重装
-assert_macro_order NSIS_HOOK_PREINSTALL 'Call RimeSyncWeaselPreflight' 'Call RimeSyncUninstallOldVersion' \
-  "PREINSTALL 必须先判就绪再卸旧版"
-assert_has "PREINSTALL 有独立的只读 preflight" 'Call RimeSyncWeaselPreflight'
-assert_fn_has RimeSyncWeaselPreflight "preflight 只做就绪判定" 'Call RimeSyncWeaselReady'
-assert_has "preflight 日志阶段名" 'phase=IME-CHECK stage=preflight'
-assert_fn_order RimeSyncInstallWeaselPre 'Call RimeSyncWeaselReady' 'Call RimeSyncBackupLeftoverWeasel' \
-  "必须判定后才能改名"
-assert_fn_order RimeSyncInstallWeaselPre 'Call RimeSyncBackupLeftoverWeasel' 'Call RimeSyncRunWeaselInstaller' \
-  "先改名留证再跑安装器"
-assert_fn_order RimeSyncInstallWeaselPre 'Call RimeSyncRunWeaselInstaller' 'Call RimeSyncRollbackWeasel' \
-  "安装并复查之后才回滚"
-assert_fn_order RimeSyncInstallWeaselPre 'Call RimeSyncRollbackWeasel' 'Call RimeSyncAbortWeasel' \
-  "回滚必须在硬失败之前"
-
-# 0.6.14 修复点 1：就绪判定唯一硬条件 = 注册表值指向的目录里真有 WeaselServer.exe
-assert_fn_count RimeSyncWeaselReady "就绪判定读 InstallDir（64+32 两个视图）" \
-  'ReadRegStr $R5 HKLM "Software\Rime\Weasel" "InstallDir"' 2
-assert_fn_count RimeSyncWeaselReady "就绪判定读 WeaselRoot（64+32 两个视图）" \
-  'ReadRegStr $R5 HKLM "Software\Rime\Weasel" "WeaselRoot"' 2
-assert_fn_has RimeSyncWeaselReady "就绪判定同时读 32 位视图" 'SetRegView 32'
-assert_fn_has RimeSyncWeaselReadyFromDir "命中条件：目录里有 WeaselServer.exe" \
-  'Call RimeSyncWeaselRootFromDir'
-assert_fn_has RimeSyncWeaselReadyFromDir "探测时不冲掉依据标签（\$1 压栈）" 'Push $1'
-assert_has "就绪判定要求 WeaselServer.exe 真的存在" 'IfFileExists "$R5\WeaselServer.exe"'
-assert_has "任意版本号目录（weasel-*）也认" 'FindFirst $0 $1 "$R5\weasel-*"'
-assert_has "注册表有值但没有 exe 也算未就绪" 'no-WeaselServer.exe'
-assert_has "空目录也算未就绪" 'StrCpy $RimeSyncWeaselReadyReason "empty-dir"'
-assert_has "未就绪原因是 registry-missing" 'StrCpy $RimeSyncWeaselReadyReason "registry-missing"'
-assert_has "已就绪分支写清 reason=exe-present" 'action=skip reason=exe-present"'
-# TSF 只写日志：它一旦出现在判定/汇总行，这条断言立刻变红
-assert_tsf_log_only
-assert_fn_has RimeSyncWeaselLogEvidence "TSF/进程证据单独一行写日志" 'phase=TSF-EVIDENCE'
-assert_fn_has RimeSyncWeaselLogEvidence "证据行标注不参与判定" 'log-only-not-used-for-readiness'
-assert_fn_not_has RimeSyncInstallWeaselPre "IME-CHECK 分支不再带 tsf" 'tsf='
-
-# 0.6.14 修复点 4：未就绪 → 停进程 → 改名留证（非空且 exe 在）→ 内嵌安装器（300s）→ 复查
-assert_fn_has RimeSyncInstallWeaselPre "未就绪走修复流程" 'Call RimeSyncBackupLeftoverWeasel'
-assert_fn_has RimeSyncInstallWeaselPre "修复前先停输入法服务" "taskkill /IM WeaselServer.exe /F"
-assert_fn_count RimeSyncInstallWeaselPre "修复走带 300 秒超时的等待" 'Call RimeSyncRunWeaselInstaller' 1
-assert_fn_has RimeSyncInstallWeaselPre "内嵌安装器静默 + 防重启" '"$R0" /S /NOREBOOT'
-assert_fn_has RimeSyncInstallWeaselPre "安装后必须复查就绪" 'Call RimeSyncWeaselReady'
-assert_fn_has RimeSyncInstallWeaselPre "未就绪分支写清原因" 'phase=IME-CHECK ready=no'
-assert_has "残留目录改名成 Rime.bak-<时间戳>" '.bak-$R2'
-assert_fn_has RimeSyncBackupLeftoverDir "只改非空目录" 'IfFileExists "$9\*.*" 0 rimesync_bk_skip'
-assert_fn_has RimeSyncBackupLeftoverDir "只改 exe 真的在的目录" 'StrCmp $R8 "" rimesync_bk_skip'
-assert_fn_has RimeSyncBackupLeftoverDir "改名前的 exe 检查真的去探测" 'Call RimeSyncWeaselRootFromDir'
-assert_has "跳过改名也要写日志" 'rename skipped dir='
-assert_has "改名成功写进日志" 'phase=IME-REPAIR rename ok'
-assert_has "安装器等待上限 300 秒" '!define RIMESYNC_WEASEL_INSTALL_TIMEOUT_MS "300000"'
-assert_has "300 秒超时真的传给 nsExec" \
-  'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_WEASEL_INSTALL_TIMEOUT_MS}'
-assert_fn_has RimeSyncInstallWeaselPre "缺少载荷也走硬失败" 'StrCpy $R7 "payload-missing"'
-assert_fn_has RimeSyncInstallWeaselPre "缺载荷写清日志" 'phase=IME-INSTALL payload=missing'
-
-# 0.6.14 修复点 2/5：复查失败 → 回滚（Rime.bak-<ts> 改回原名）→ 硬失败
-assert_fn_has RimeSyncInstallWeaselPre "复查失败写 WEASEL-INSTALL failed" \
-  'WEASEL-INSTALL failed reason=$R7 installer-exit=$R4 rollback=$RimeSyncWeaselRollback'
-assert_fn_has RimeSyncRollbackWeasel "回滚把备份目录改回原名" \
-  'Rename "$RimeSyncWeaselBackupDir" "$RimeSyncWeaselBackupOrig"'
-assert_fn_has RimeSyncRollbackWeasel "回滚结果 ok/failed/none" 'StrCpy $RimeSyncWeaselRollback "ok"'
-assert_fn_has RimeSyncRollbackWeasel "改名失败必须记 failed（不许假报 ok）" 'StrCpy $RimeSyncWeaselRollback "failed"'
-assert_fn_has RimeSyncRollbackWeasel "回滚日志可复核" 'phase=WEASEL-ROLLBACK result='
-assert_fn_has RimeSyncRollbackWeasel "回滚成功判据是 exe 真的回来" 'Call RimeSyncWeaselRootFromDir'
-assert_fn_has RimeSyncAbortWeasel "硬失败设非零退出码" 'SetErrorLevel 5'
-assert_fn_has RimeSyncAbortWeasel "硬失败必须 Abort" 'Abort'
-assert_has "硬失败路径在安装器之后可达" 'Call RimeSyncAbortWeasel'
-
-# 0.6.13：配置播种必须写进 current 用户目录（不能是 ProgramData）
-assert_fn_count RimeSyncSeedRimeConfig "播种切到 current 上下文" 'SetShellVarContext current' 1
-assert_fn_has RimeSyncSeedRimeConfig "解析出的用户目录存进全局" 'StrCpy $RimeSyncRimeUserDir "$APPDATA"'
-assert_fn_has RimeSyncSeedRimeConfig "默认配置写进该目录" 'CreateDirectory "$RimeSyncRimeUserDir"'
-assert_fn_has RimeSyncSeedRimeConfig "weasel.custom.yaml 也写该目录" 'StrCpy $1 "$RimeSyncRimeUserDir"'
-assert_fn_not_has RimeSyncSeedRimeConfig '播种里不再直接用 $APPDATA 拼路径' '$APPDATA\Rime'
-
-# 0.6.14 修复点 6：安装结束自检 = 硬性检查（InstallDir / 默认布局 exe）+ 退出码 5
-assert_fn_has RimeSyncSelfCheck "自检再判一次就绪" 'Call RimeSyncWeaselReady'
-assert_fn_has RimeSyncSelfCheck "硬性检查读注册表 InstallDir（32 位视图兜底）" \
-  'ReadRegStr $0 HKLM "Software\Rime\Weasel" "InstallDir"'
-assert_fn_has RimeSyncSelfCheck "硬性检查默认布局 WeaselServer.exe" 'Call RimeSyncScanDefaultLayout'
-assert_fn_has RimeSyncScanDefaultLayout "扫 weasel-* 里的 WeaselServer.exe" \
-  'IfFileExists "$2\$1\WeaselServer.exe"'
-assert_fn_has RimeSyncSelfCheck "任一不满足 → weasel-ready=no" 'phase=SELF-CHECK weasel-ready=no ready='
-assert_fn_has RimeSyncSelfCheck "/SKIPIME 不因自检硬失败" 'warning=weasel-not-ready-skipped'
-assert_fn_has RimeSyncSelfCheck "硬失败设退出码 5" '    SetErrorLevel 5'
-assert_fn_has RimeSyncSelfCheck "非静默弹 STOP 框" 'MessageBox MB_OK|MB_ICONSTOP'
-assert_fn_has RimeSyncSelfCheck "自检调用部署" 'WeaselDeployer.exe" /deploy'
-assert_has "部署等待上限 20 秒" '!define RIMESYNC_DEPLOY_TIMEOUT_MS "20000"'
-assert_has "20 秒超时真的传给 nsExec" 'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_DEPLOY_TIMEOUT_MS}'
-assert_fn_has RimeSyncSelfCheck "自检检查 build 里的 luna_pinyin_simp" 'build\luna_pinyin_simp.schema.yaml'
-assert_fn_has RimeSyncSelfCheck "自检写 phase=SELF-CHECK" 'phase=SELF-CHECK'
-assert_fn_has RimeSyncSelfCheck "自检报配置目录与数量" 'configdir=$0 configs=$RimeSyncSeedWritten'
-assert_fn_has RimeSyncSelfCheck "自检未更新只告警" 'warning=build-not-updated'
-assert_fn_has RimeSyncSelfCheck "非静默时弹简报框" 'MessageBox MB_OK|MB_ICONINFORMATION'
-assert_count "POSTINSTALL 调用自检" 'Call RimeSyncSelfCheck' 1
-assert_has "自检失败不写 DONE、改写 SETUP failed" 'phase=SETUP failed stage=SELF-CHECK exit=5'
-assert_has "DONE 行带 install-dir / default-exe" 'install-dir=$RimeSyncWeaselRegInstallDir default-exe=$RimeSyncWeaselDefaultExe'
-
-# 0.6.15：预编译 build 产物兜底（某些机器上 WeaselDeployer /deploy 返回 0 但什么都不写）
-assert_has "预编译产物随安装包分发" 'resources\prebuilt'
-assert_has "兜底判据落在 build\luna_pinyin_simp.schema.yaml" 'build\luna_pinyin_simp.schema.yaml'
-assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_vnum" 'StrCpy $R8 "rimesync_vnum"'
-assert_fn_has RimeSyncProbeBuild "判据要求插件标记 rimesync_punct" 'StrCpy $R8 "rimesync_punct"'
-assert_fn_has RimeSyncFileContains "真的逐行读文件内容" 'FileOpen $0 "$R9" r'
-assert_fn_count RimeSyncEnsurePrebuiltBuild "build 与 config 两个目录都要铺" 'Call RimeSyncCopyPrebuiltDir' 2
-assert_fn_has RimeSyncCopyPrebuiltDir "存在即跳过（不覆盖用户已生成的）" 'IfFileExists "$6\$2" 0 rimesync_cpd_copy'
-assert_fn_has RimeSyncCopyPrebuiltDir "RIMESYNC_PREBUILT=force 才覆盖" 'StrCmp $RimeSyncPrebuiltEffMode "force" rimesync_cpd_copy'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "第一遍铺完不可用 → 只对 build/ 覆盖重铺" 'scope=build-only'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "重铺结果写进日志" 'escalated=$RimeSyncPrebuiltRecopy'
-assert_fn_has RimeSyncCopyPrebuiltDir "复制失败逐个记日志" 'phase=PREBUILT copy failed file='
-assert_fn_has RimeSyncPrebuiltMode "关闭开关 RIMESYNC_PREBUILT=0" 'StrCpy $RimeSyncPrebuiltMode "off"'
-assert_fn_has RimeSyncPrebuiltMode "强制覆盖开关 RIMESYNC_PREBUILT=force" 'StrCpy $RimeSyncPrebuiltMode "force"'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "部署可用时记 source=deploy" 'PREBUILT ok source=deploy'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "铺制成功记 PREBUILT ok source=prebuilt" 'PREBUILT ok source=prebuilt'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "铺完必须复查" 'reason=probe-after-copy'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "复查失败记 PREBUILT failed" 'phase=PREBUILT failed'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "载荷缺失单独一个原因" 'reason=payload-missing'
-assert_fn_has RimeSyncEnsurePrebuiltBuild "复查失败要告警（加计数）" 'IntOp $RimeSyncSelfCheckWarn $RimeSyncSelfCheckWarn + 1'
-assert_fn_order RimeSyncSelfCheck 'WeaselDeployer.exe" /deploy' 'Call RimeSyncEnsurePrebuiltBuild' \
-  "先尝试 /deploy，再用预编译产物兜底"
-assert_fn_has RimeSyncSelfCheck "兜底成功不再报 build-not-updated" 'StrCmp $RimeSyncBuildSource "prebuilt" rimesync_sc_build_ok'
-assert_fn_has RimeSyncSelfCheck "SELF-CHECK 增加 build-source 字段" 'build-source=$RimeSyncBuildSource'
-assert_has "DONE 行也带 build-source" 'build=$RimeSyncBuildState build-source=$RimeSyncBuildSource'
-assert_has "卸载时清掉随包产物" 'RMDir /r "$INSTDIR\resources\prebuilt"'
-
-# ---------------------------------------------------------------------------
-# 0.6.21：随包只保留 3 个方案（朙月拼音·简化字 / 五笔拼音 / 五笔86）
-#   * 模板目录必须与 packaging/rime/retained-schemas.txt 逐项一致（清单是单一真相源）；
-#   * POSTINSTALL 必须调用 rime-sync-cli prune-schemas（钩子不另抄一份清单）；
-#   * 钩子里不许出现已移除方案的名字（否则就是把清单抄进了 NSIS）。
-# ---------------------------------------------------------------------------
-RETAINED_LIST="$PKG/rime/retained-schemas.txt"
-static_count=$((static_count + 1))
-if [ ! -f "$RETAINED_LIST" ]; then
-  printf 'FAIL static  缺少保留清单 %s\n' "$RETAINED_LIST" >&2
-  static_fail=1
-else
-  want=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$RETAINED_LIST" | sed '/^$/d' | sort)
-  have=$(cd "$PKG/rime/schemas" 2>/dev/null && ls *.custom.yaml 2>/dev/null | sed 's/\.custom\.yaml$//' | sort)
-  if [ "$want" != "$have" ]; then
-    printf 'FAIL static  方案模板与保留清单不一致\n           清单：%s\n           模板：%s\n' \
-      "$(printf '%s' "$want" | tr '\n' ' ')" "$(printf '%s' "$have" | tr '\n' ' ')" >&2
+assert_install_side_absent() { # <说明> <固定字符串>
+  static_count=$((static_count + 1))
+  if install_side | grep -qF -- "$2"; then
+    printf 'FAIL static  %s\n           安装侧不该出现：%s\n' "$1" "$2" >&2
     static_fail=1
   fi
-  count=$(printf '%s\n' "$want" | wc -l)
-  if [ "$count" -ne 3 ]; then
-    printf 'FAIL static  保留清单应为 3 个方案，实际 %s\n' "$count" >&2
+}
+
+assert_fn_no_abort() { # <函数名>
+  static_count=$((static_count + 1))
+  if fn_body "$1" | grep -qE '^[[:space:]]*Abort\b'; then
+    printf 'FAIL static  %s 里出现 Abort（卸载/写日志失败只许记日志）\n' "$1" >&2
+    static_fail=1
+  elif [ -z "$(fn_body "$1")" ]; then
+    printf 'FAIL static  找不到函数 %s\n' "$1" >&2
     static_fail=1
   fi
-fi
-assert_has "POSTINSTALL 调用方案清理" 'Call RimeSyncPruneSchemas'
-assert_fn_has RimeSyncPruneSchemas "清理只调 CLI 子命令" 'prune-schemas'
-assert_fn_has RimeSyncPruneSchemas "CLI 不存在时只跳过" 'rimesync_prune_no_cli'
-assert_fn_no_abort RimeSyncPruneSchemas
-assert_has "清理阶段日志 phase=PRUNE" 'phase=PRUNE'
-assert_has "DONE 行带 prune 状态" 'prune=$RimeSyncPruneState'
-assert_fn_has RimeSyncSeedRimeConfig "模板只从 resources\schemas 读取" 'resources\schemas'
-assert_absent "钩子不把已移除方案写死" 'terra_pinyin'
-assert_absent "钩子不把已移除方案写死（仓颉）" 'cangjie5'
-
-# ---------------------------------------------------------------------------
-# 0.6.20：随包输入法安装器（程序自己修复输入法，不依赖 NSIS 钩子）
-#   227 实测：/S 静默安装时钩子不执行，旧 Weasel 又被卸载器卸掉，机器上没有输入法。
-#   所以安装器必须真的进 Tauri resources（Windows 平台配置），且与 NSIS 钩子内嵌的
-#   是同一个文件、同一个文件名；卸载时也要清掉。
-# ---------------------------------------------------------------------------
-REPO=$(cd "$PKG/.." && pwd)
-WIN_CONF="$REPO/src-tauri/tauri.windows.conf.json"
-CORE_IME="$REPO/crates/core/src/ime.rs"
-WEASEL_NAME="weasel-0.17.4.0-installer.exe"
+}
 
 assert_file_has() { # <说明> <文件> <固定字符串>
   static_count=$((static_count + 1))
@@ -339,19 +173,228 @@ assert_file_has() { # <说明> <文件> <固定字符串>
   fi
 }
 
-assert_file_has "Tauri resources 带随包输入法安装器（Windows 平台配置）" "$WIN_CONF" \
-  '"../packaging/windows/vendor/weasel-0.17.4.0-installer.exe": "resources/weasel/weasel-0.17.4.0-installer.exe"'
-assert_file_has "core 运行时从 resources/weasel 找安装器" "$CORE_IME" \
-  'join("resources").join("weasel")'
-assert_file_has "core 里的安装器文件名与打包一致" "$CORE_IME" \
-  'pub const INSTALLER_FILE: &str = "weasel-0.17.4.0-installer.exe";'
-assert_has "NSIS 卸载清掉 resources\weasel" 'RMDir /r "$INSTDIR\resources\weasel"'
-assert_has "NSIS 兜底也认 resources\weasel" \
-  'IfFileExists "$INSTDIR\resources\weasel\${RIMESYNC_WEASEL_INSTALLER}"'
+# ---------------------------------------------------------------------------
+# 1a) 安装器本职：OS 版本 / WebView2 / 卸旧版 / 快捷方式 / resources
+# ---------------------------------------------------------------------------
+assert_has "PREINSTALL 有系统版本检查"        "Call RimeSyncCheckWindows"
+assert_has "PREINSTALL 有 WebView2 检查"      "Call RimeSyncEnsureWebView2"
+assert_has "PREINSTALL 卸载旧版 rime-sync"    "Call RimeSyncUninstallOldVersion"
+assert_has "PREINSTALL 创建 resources 目录"   'CreateDirectory "$INSTDIR\resources"'
+assert_macro_order NSIS_HOOK_PREINSTALL 'Call RimeSyncCheckWindows' 'Call RimeSyncUninstallOldVersion' \
+  "系统版本检查必须在卸旧版之前（先卸载再 Abort 会留下半装状态）"
+assert_macro_order NSIS_HOOK_PREINSTALL 'Call RimeSyncUninstallOldVersion' 'CreateDirectory "$INSTDIR\resources"' \
+  "resources 目录必须在卸旧版之后创建"
+
+# OS 门槛：Win10 1803，太低 → 弹框 + 退出码 3 + Abort
+assert_has "OS 门槛用 AtLeastWin10"           '${AtLeastWin10}'
+assert_has "OS 门槛构建号 17134"              '!define RIMESYNC_MIN_WIN10_BUILD "17134"'
+assert_fn_has RimeSyncCheckWindows "过低时设退出码 3" 'SetErrorLevel 3'
+assert_fn_has RimeSyncCheckWindows "过低时 Abort"     'Abort'
+
+# WebView2：四个注册表位置 + 文件兜底 + /SKIPWEBVIEW + 离线内嵌
+assert_has "WebView2 GUID 已定义"             '!define RIMESYNC_WEBVIEW_GUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"'
+assert_has "WebView2 在线地址只打印不下载"    '!define RIMESYNC_WEBVIEW_URL "https://go.microsoft.com/fwlink/?linkid=2124703"'
+assert_fn_has RimeSyncFindWebView2 "读 HKLM 64 位视图" 'SetRegView 64'
+assert_fn_has RimeSyncFindWebView2 "读 32 位视图"      'SetRegView 32'
+assert_fn_has RimeSyncFindWebView2 "程序文件兜底"      'msedgewebview2.exe'
+assert_fn_has RimeSyncEnsureWebView2 "/SKIPWEBVIEW 开关" '${GetOptions} $CMDLINE "/SKIPWEBVIEW" $R0'
+assert_fn_has RimeSyncEnsureWebView2 "缺 WebView2 时退出码 4" 'SetErrorLevel 4'
+assert_has "离线变体内嵌 WebView2 安装器"     'File "/oname=${RIMESYNC_WEBVIEW_INSTALLER}" "${RIMESYNC_WEBVIEW_EXE}"'
+assert_has "离线载荷存在性在编译期检查"       '!ifdef RIMESYNC_WEBVIEW_PAYLOAD'
+
+# 升级：静默 + 原地 _?= + 120 秒超时 + 先停进程；失败只记日志
+assert_has "旧 rime-sync：路径带引号 + /S + 原地 _?=" '"$R9" /S _?=$0'
+assert_has "卸载前先 taskkill 同步程序"       "taskkill /IM rime-sync-app.exe /F"
+assert_has "卸载等待有 120 秒超时"            '!define RIMESYNC_UNINSTALL_TIMEOUT_MS "120000"'
+assert_has "超时通过 nsExec /TIMEOUT 生效"    'nsExec::ExecToStack /TIMEOUT=${RIMESYNC_UNINSTALL_TIMEOUT_MS}'
+assert_has "阶段日志 UNINSTALL-OLD"           "phase=UNINSTALL-OLD"
+assert_fn_no_abort RimeSyncUninstallOldRimeSync
+assert_fn_no_abort RimeSyncUninstallOldVersion
+assert_fn_has RimeSyncUninstallOldRimeSync "注册表兜底扫 32 + 64 位视图" '!insertmacro RIMESYNC_SCAN_OUR_UNINST 32'
+
+# 快捷方式：两个入口（主程序 + --setup）；POSTINSTALL 调用一次
+assert_fn_has RimeSyncCreateOwnShortcuts "建主程序快捷方式" '${RIMESYNC_NAME}.lnk"'
+assert_fn_has RimeSyncCreateOwnShortcuts "建 --setup 快捷方式" '"--setup"'
+assert_macro_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 建快捷方式" 'Call RimeSyncCreateOwnShortcuts'
+assert_count "POSTINSTALL 只建自己的快捷方式" 'Call RimeSyncCreateOwnShortcuts' 1
+
+# 卸载：询问用户数据（交互默认否、静默 /PURGEDATA）+ 只删两条明确路径
+assert_fn_has un.RimeSyncAskPurgeUserData "交互询问（默认否）" 'MessageBox MB_YESNO|MB_ICONEXCLAMATION'
+assert_fn_has un.RimeSyncAskPurgeUserData "静默需 /PURGEDATA" '${GetOptions} $CMDLINE "/PURGEDATA"'
+assert_fn_has un.RimeSyncPurgeUserData "删除 %APPDATA%\Rime" 'StrCpy $0 "$1\Rime"'
+assert_fn_has un.RimeSyncPurgeUserData "删除 %APPDATA%\com.rimesync.app" 'StrCpy $0 "$1\com.rimesync.app"'
+assert_macro_has NSIS_HOOK_PREUNINSTALL "卸载时问用户数据" 'Call un.RimeSyncAskPurgeUserData'
+assert_macro_has NSIS_HOOK_PREUNINSTALL "最后才删用户数据" 'Call un.RimeSyncPurgeUserData'
+assert_macro_order NSIS_HOOK_PREUNINSTALL 'Call un.RimeSyncAskPurgeUserData' 'Call un.RimeSyncPurgeUserData' \
+  "先问决定，最后再删"
+assert_fn_no_abort un.RimeSyncPurgeDir
+assert_fn_no_abort un.RimeSyncPurgeUserData
+
+# 安装后自动启动：不勾选 NOTCHECKED（交互安装完成页默认启动程序，首次启动才会自举输入法）
+assert_absent "不再关闭完成页的「运行」复选框" 'MUI_FINISHPAGE_RUN_NOTCHECKED'
+
+# ---------------------------------------------------------------------------
+# 1b) B 方案核心：钩子里不许再有任何输入法判断 / 安装 / 产物 / 自检
+# ---------------------------------------------------------------------------
+# 函数与宏：整套 Weasel 判定、安装、回滚、自检、prebuilt、prune、JSON 解析都不许存在
+for gone in \
+  RimeSyncWeaselReady \
+  RimeSyncWeaselReadyFromDir \
+  RimeSyncWeaselRootFromDir \
+  RimeSyncFindWeaselRoot \
+  RimeSyncFindWeaselGroup \
+  RimeSyncFindWeaselUninstallString \
+  RimeSyncWeaselTsfProbe \
+  RimeSyncWeaselServerRunning \
+  RimeSyncWeaselLogEvidence \
+  RimeSyncWeaselPreflight \
+  RimeSyncInstallWeaselPre \
+  RimeSyncMarkBundledWeasel \
+  RimeSyncRunWeaselInstaller \
+  RimeSyncBackupLeftoverWeasel \
+  RimeSyncBackupLeftoverDir \
+  RimeSyncRollbackWeasel \
+  RimeSyncAbortWeasel \
+  RimeSyncScanDefaultLayout \
+  RimeSyncSeedRimeConfig \
+  RimeSyncWriteConfigFile \
+  RimeSyncLogSeedResult \
+  RimeSyncFileContains \
+  RimeSyncEnsureIme \
+  RimeSyncCheckIme \
+  RimeSyncPrebuiltMode \
+  RimeSyncSelfCheck \
+  RimeSyncPruneSchemas \
+  un.RimeSyncUninstallBundledWeasel; do
+  assert_absent "钩子不再定义 \${gone}" "Function ${gone}"
+  assert_absent "钩子不再调用 \${gone}" "Call ${gone}"
+done
+
+# 关键字匹配：任何 RimeSync* 函数名含输入法相关关键字即禁止（防止换名字绕过枚举）
+assert_absent "钩子里不再有含 IME 关键字的 RimeSync* 函数定义" 'Function RimeSync.*Weasel'
+assert_absent "钩子里不再有 Call RimeSync.*Install" 'Call RimeSync.*Install'
+assert_absent "钩子里不再有 Call RimeSync.*Ime" 'Call RimeSync.*Ime'
+assert_absent "钩子里不再有 Call RimeSync.*Seed" 'Call RimeSync.*Seed'
+
+# 关键字兜底：换名字绕过枚举也必须被抓住（RimeSync* 函数名含输入法关键字即禁止）
+if grep -qE "(Function|Call)[[:space:]]+RimeSync[A-Za-z]*(Weasel|Ime|IME|Tsf|Seed|Prune|SelfCheck|Prebuilt|Deploy|Contains)" "$HOOKS"; then
+  printf "FAIL static  %s\n           不该再匹配：%s\n" "钩子里不再有含输入法关键字的 RimeSync* 函数" "(Function|Call) RimeSync*Weasel|Ime|Seed|Prune|SelfCheck|Prebuilt|Deploy|Contains" >&2
+  static_fail=1
+fi
+static_count=$((static_count + 1))
+# 判据/解析/开关：这些字符串一旦回到钩子里，就说明输入法逻辑又搬回安装器了
+for banned in \
+  'StrStrW' \
+  'rimesync_vnum' \
+  'rimesync_punct' \
+  'ensure-ime' \
+  'check-ime' \
+  'RIMESYNC_PREBUILT' \
+  'prune-schemas' \
+  'RIMESYNC_WEASEL' \
+  'WeaselServer.exe' \
+  'WeaselServer.dll' \
+  'rime.dll' \
+  'WeaselDeployer' \
+  'RIMESYNC_TSF_CLSID' \
+  'SKIPIME' \
+  'KEEPWEASEL' \
+  'BundledWeasel' \
+  'default.custom.yaml' \
+  'weasel.custom.yaml' \
+  'resources\schemas' \
+  'phase=SELF-CHECK' \
+  'phase=IME-CHECK' \
+  'phase=IME-INSTALL' \
+  'phase=PRUNE' \
+  'weasel-ready=' \
+  'build_schemas=' \
+  'WriteRegStr' \
+  'WriteRegExpandStr' \
+  'InProcServer32' \
+  'TextServiceFramework' \
+  'CTF\TIP' \
+  'SOFTWARE\Microsoft\CTF' \
+; do
+  assert_absent "钩子不再出现「${banned}」" "${banned}"
+done
+
+# M4：安装侧绝不允许再出现「跑随包 Weasel 安装器」的任何形状。
+# 只按安装侧扫这两个名字：卸载段要删随包载荷（resources\weasel 与安装器文件本身）。
+for banned in \
+  'weasel-0.17.4.0-installer.exe' \
+  'resources\weasel'; do
+  assert_install_side_absent "安装侧不出现「${banned}」" "${banned}"
+done
+# /NOREBOOT 是随包安装器的参数：钩子里一旦出现就说明安装器又被拉回来了。
+assert_absent "钩子不再出现 /NOREBOOT（Weasel 安装器只由程序跑）" '/NOREBOOT'
+# 安装侧只允许一处 ExecWait：内嵌 WebView2 安装器。Weasel 安装器不是它的活，
+# 把真实安装调用插回 PREINSTALL（或任何安装侧函数）必须在这里变红。
+static_count=$((static_count + 1))
+execwait_lines=$(install_side | grep -vE '^[[:space:]]*;' | grep -nF -- 'ExecWait' || true)
+execwait_count=$(printf '%s\n' "$execwait_lines" | grep -c . || true)
+if [ "${execwait_count:-0}" -ne 1 ] ||
+  ! printf '%s\n' "$execwait_lines" | grep -qF -- '/silent /install'; then
+  printf 'FAIL static  安装侧只允许一处 ExecWait（内嵌 WebView2：ExecWait ... /silent /install），实际 %s 处：\n%s\n' \
+    "${execwait_count:-0}" "$execwait_lines" >&2
+  static_fail=1
+fi
+assert_macro_not_has NSIS_HOOK_PREINSTALL "PREINSTALL 不直接执行程序" 'ExecWait'
+assert_macro_not_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 不直接执行程序" 'ExecWait'
+
+# POSTINSTALL：建完快捷方式就结束 —— 不判定、不弹框、不设退出码
+assert_macro_not_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 不设退出码" 'SetErrorLevel'
+assert_macro_not_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 不弹框"     'MessageBox'
+assert_macro_not_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 不 Abort"   'Abort'
+assert_macro_not_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 不跑输入法自检" 'Call RimeSyncSelfCheck'
+assert_has "成功收尾写 phase=DONE"             'phase=DONE setup finished note=ime-bootstrap-deferred-to-app'
+
+# PREINSTALL 里只留 OS / WebView2 / 卸旧版 / resources
+assert_macro_not_has NSIS_HOOK_PREINSTALL "PREINSTALL 不跑输入法安装" 'Call RimeSyncInstallWeaselPre'
+assert_macro_not_has NSIS_HOOK_PREINSTALL "PREINSTALL 不跑就绪判定"   'Call RimeSyncWeaselReady'
+
+# 失败一律只记日志：这些函数体里不能有 Abort
+for fn in \
+  RimeSyncRunAndWait \
+  RimeSyncNormalizeUninstallPath \
+  RimeSyncUninstallOldRimeSync \
+  RimeSyncUninstallOldVersion; do
+  assert_fn_no_abort "$fn"
+done
+
+# ---------------------------------------------------------------------------
+# 1c) 程序侧必须真的接住了这份责任（否则删钩子 = 功能丢失）
+# ---------------------------------------------------------------------------
+CORE_IME_STATE="$REPO/crates/core/src/ime_state.rs"
+CORE_IME="$REPO/crates/core/src/ime.rs"
+TAURI_BOOT="$REPO/src-tauri/src/prebuilt_cmds.rs"
+assert_file_has "core 里有 ensure 状态机"        "$CORE_IME_STATE" 'pub fn ensure('
+assert_file_has "core 的 Mode 有 Install 入口"    "$CORE_IME_STATE" 'pub fn install() -> Self'
+assert_file_has "core 有 config 模板播种"         "$CORE_IME_STATE" 'pub fn seed_templates('
+assert_file_has "core 会调 ime::ensure（装 Weasel）" "$CORE_IME_STATE" 'ime::ensure('
+assert_file_has "core 安装参数固定 /S /NOREBOOT"  "$CORE_IME" 'pub const INSTALLER_ARGS: [&str; 2] = ["/S", "/NOREBOOT"];'
+assert_file_has "core 安装超时 300 秒"            "$CORE_IME" 'pub const INSTALL_TIMEOUT_SECS: u64 = 300;'
+# M5：启动自举必须是 bootstrap 语义（装输入法 + 播模板，但部署 deferred），
+# 不许再退回安装档 install()（那会每次开机 taskkill / 重载输入法）。
+assert_file_has "程序启动走 ensure(Bootstrap)"    "$TAURI_BOOT" 'ime_state::Options::bootstrap()'
+if grep -qF -- 'ime_state::Options::install()' "$TAURI_BOOT"; then
+  printf 'FAIL static  启动自举又用回 install()（会 taskkill / 打断用户；应当用 bootstrap()）\n' >&2
+  static_fail=1
+fi
+assert_file_has "core 的 bootstrap 语义装输入法"   "$CORE_IME_STATE" 'pub fn bootstrap() -> Self'
+
+# 随包输入法安装器仍必须进 Tauri resources（由程序运行）
+WIN_CONF="$REPO/src-tauri/tauri.windows.conf.json"
+WEASEL_NAME="weasel-0.17.4.0-installer.exe"
+assert_file_has "Tauri resources 带随包输入法安装器" "$WIN_CONF" \
+  "\"../packaging/windows/vendor/$WEASEL_NAME\": \"resources/weasel/$WEASEL_NAME\""
+assert_file_has "core 从 resources/weasel 找安装器" "$CORE_IME" 'join("resources").join("weasel")'
+assert_file_has "core 里的安装器文件名与打包一致"     "$CORE_IME" \
+  "pub const INSTALLER_FILE: &str = \"$WEASEL_NAME\";"
 
 # 12 MB 的 Windows 安装器不能塞进基础配置：Linux 的 deb/AppImage 会白白变大。
 if grep -qF -- "$WEASEL_NAME" "$REPO/src-tauri/tauri.conf.json"; then
-  printf 'FAIL static  基础 tauri.conf.json 不该引用 %s（放进 tauri.windows.conf.json，Linux 包不背这个体积）\n' \
+  printf 'FAIL static  基础 tauri.conf.json 不该引用 %s（放进 tauri.windows.conf.json）\n' \
     "$WEASEL_NAME" >&2
   static_fail=1
 fi
@@ -373,41 +416,40 @@ if [ -f "$vendor_exe" ]; then
     printf 'ok   vendor  %s（%s 字节，MZ 头）\n' "$WEASEL_NAME" "$size"
   fi
 else
-  # 没有本地载荷不算错（Linux 上本来就没有）；但 Tauri 的 Windows 打包需要它，
-  # 所以把「怎么来」写清楚，避免 CI 红了才去猜。
   printf 'note vendor  %s 不在工作区（Windows 打包前需先跑 fetch-weasel.ps1 / 自编译）\n' "$vendor_exe"
 fi
 
-# 失败一律只记日志：这些函数体里不能有 Abort
-for fn in \
-  RimeSyncRunAndWait \
-  RimeSyncRunWeaselInstaller \
-  RimeSyncNormalizeUninstallPath \
-  RimeSyncUninstallOldRimeSync \
-  RimeSyncUninstallOldVersion \
-  RimeSyncWriteConfigFile \
-  RimeSyncSeedRimeConfig \
-  RimeSyncSelfCheck \
-  RimeSyncBackupLeftoverWeasel \
-  RimeSyncBackupLeftoverDir \
-  RimeSyncRollbackWeasel \
-  RimeSyncWeaselPreflight \
-  RimeSyncWeaselLogEvidence \
-  RimeSyncScanDefaultLayout \
-  RimeSyncWeaselReady \
-  RimeSyncFileContains \
-  RimeSyncProbeBuild \
-  RimeSyncPrebuiltMode \
-  RimeSyncCopyPrebuiltDir \
-  RimeSyncEnsurePrebuiltBuild; do
-  assert_fn_no_abort "$fn"
-done
+# ---------------------------------------------------------------------------
+# 1d) 随包方案清单与钩子解耦（清单只属于程序与模板，不再抄进 NSIS）
+# ---------------------------------------------------------------------------
+RETAINED_LIST="$PKG/rime/retained-schemas.txt"
+static_count=$((static_count + 1))
+if [ ! -f "$RETAINED_LIST" ]; then
+  printf 'FAIL static  缺少保留清单 %s\n' "$RETAINED_LIST" >&2
+  static_fail=1
+else
+  want=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$RETAINED_LIST" | sed '/^$/d' | sort)
+  have=$(cd "$PKG/rime/schemas" 2>/dev/null && ls *.custom.yaml 2>/dev/null | sed 's/\.custom\.yaml$//' | sort)
+  if [ "$want" != "$have" ]; then
+    printf 'FAIL static  方案模板与保留清单不一致\n           清单：%s\n           模板：%s\n' \
+      "$(printf '%s' "$want" | tr '\n' ' ')" "$(printf '%s' "$have" | tr '\n' ' ')" >&2
+    static_fail=1
+  fi
+  count=$(printf '%s\n' "$want" | wc -l)
+  if [ "$count" -ne 3 ]; then
+    printf 'FAIL static  保留清单应为 3 个方案，实际 %s\n' "$count" >&2
+    static_fail=1
+  fi
+fi
+assert_absent "钩子不把已移除方案写死" 'terra_pinyin'
+assert_absent "钩子不把已移除方案写死（仓颉）" 'cangjie5'
 
 if [ "$static_fail" -ne 0 ]; then
   echo "check-nsis-hooks: 静态结构断言失败（见上）" >&2
   exit 1
 fi
-printf 'ok   static  %s 条结构断言（就绪判定只认 exe/TSF 只写日志/先判定再卸装/改名留证/回滚/自检硬失败退出码 5/预编译产物兜底/失败不 Abort）\n' "$static_count"
+printf 'ok   static  %s 条结构断言（安装器只管程序本体：OS/WebView2/卸旧版/快捷方式/卸载；输入法判定与安装全部在程序侧 ensure(Install/Bootstrap)）\n' \
+  "$static_count"
 
 # 0.6.22：便携 zip 的静态断言单独成脚本（resources/prebuilt 必带、weasel 安装器、
 # 便携版提示）。这里一并跑，--strict 与非 strict 都会失败。

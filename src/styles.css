@@ -270,7 +270,9 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 }
 
 /* ---------- 离线依赖安装告警（postinst → install-warning.json） ---------- */
-.install-warning {
+/* 输入法红条复用同一套样式（首启自举失败时显示）。 */
+.install-warning,
+.ime-warning {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -284,14 +286,20 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
   color: var(--danger);
   font-size: 12px;
 }
-.install-warning-copy { min-width: 0; }
-.install-warning-copy strong { display: block; font-size: 13px; }
-.install-warning-copy p { margin: 3px 0 0; line-height: 1.5; word-break: break-all; }
+.install-warning-copy,
+.ime-warning-copy { min-width: 0; }
+.install-warning-copy strong,
+.ime-warning-copy strong { display: block; font-size: 13px; }
+.install-warning-copy p,
+.ime-warning-copy p { margin: 3px 0 0; line-height: 1.5; word-break: break-all; }
 .install-warning-error { font-weight: 600; }
-.install-warning-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.install-warning-actions,
+.ime-warning-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 @media (max-width: 620px) {
-  .install-warning { flex-direction: column; align-items: stretch; }
-  .install-warning-actions { justify-content: flex-end; }
+  .install-warning,
+  .ime-warning { flex-direction: column; align-items: stretch; }
+  .install-warning-actions,
+  .ime-warning-actions { justify-content: flex-end; }
 }
 
 .remote-list {

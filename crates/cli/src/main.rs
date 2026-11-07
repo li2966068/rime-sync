@@ -7,10 +7,13 @@ use clap::{Parser, Subcommand};
 use rime_sync_core::backup::{BackupManager, DEFAULT_KEEP};
 use rime_sync_core::config::{self, Config};
 use rime_sync_core::data_patch;
+use rime_sync_core::deploy;
 use rime_sync_core::engine::{Engine, Progress, ProgressSink, Report};
 use rime_sync_core::history;
-use rime_sync_core::ime;
+use rime_sync_core::ime_state;
 use rime_sync_core::index::FileIndex;
+use rime_sync_core::librime;
+use rime_sync_core::linux_deploy;
 use rime_sync_core::lock;
 use rime_sync_core::log;
 use rime_sync_core::network::NetworkPolicy;
@@ -114,6 +117,51 @@ enum Command {
         /// 只铺 build/，不给 Weasel/Linux 的 data 方案打补丁
         #[arg(long)]
         no_data_patch: bool,
+        /// 把 JSON 报告同时写到文件（安装器自检从这里读字段）
+        #[arg(long, value_name = "FILE")]
+        report: Option<PathBuf>,
+    },
+    /// 只读：检查输入法产物是否可用（唯一判据 assess；NSIS 自检解析它的 JSON）
+    #[command(name = "check-ime")]
+    CheckIme {
+        /// 预编译产物目录（只用于判断「payload 里带、用户目录里没有」的方案）
+        #[arg(long, value_name = "DIR")]
+        payload: Option<PathBuf>,
+        /// 把 JSON 报告同时写到文件（NSIS 自检不再自己解析 stdout）
+        #[arg(long, value_name = "FILE")]
+        report: Option<PathBuf>,
+    },
+    /// 安装/修复输入法：唯一状态机 ensure（--mode install 时含输入法本体与模板）
+    #[command(name = "ensure-ime")]
+    EnsureIme {
+        /// 入口身份：install = 安装完成后首次运行（装 Weasel + 播种模板 + 显式部署）；
+        /// fix = 用户显式修复；bootstrap = 应用启动自举（同样装 Weasel + 播种模板，
+        /// 但部署 deferred：绝不 taskkill、不跑部署器、不打断正在打字的用户）。
+        #[arg(long, value_name = "MODE", default_value = "install")]
+        #[arg(value_parser = ["install", "fix", "bootstrap"])]
+        mode: String,
+        /// 覆盖已存在的 build/ 文件（config/*.yaml 永不覆盖）
+        #[arg(long)]
+        force: bool,
+        /// 预编译产物目录；缺省按 exe / AppImage / deb 路径自动定位
+        #[arg(long, value_name = "DIR")]
+        payload: Option<PathBuf>,
+        /// 只铺 build/，不给 Weasel/Linux 的 data 方案打补丁
+        #[arg(long)]
+        no_data_patch: bool,
+        /// 把 JSON 报告同时写到文件（安装器自检从这里读字段）
+        #[arg(long, value_name = "FILE")]
+        report: Option<PathBuf>,
+    },
+    /// 部署输入法：Linux 优先外部 rime_deployer，其次进程内 librime；Windows 停服务后进程内
+    #[command(name = "deploy-ime")]
+    DeployIme {
+        /// shared data 目录（缺省按平台/注册表探测）
+        #[arg(long = "shared-dir", value_name = "DIR")]
+        shared_dir: Option<PathBuf>,
+        /// librime 动态库路径（缺省自动定位：<WeaselRoot>\rime.dll / librime.so.1）
+        #[arg(long = "library", value_name = "PATH")]
+        library: Option<PathBuf>,
     },
     /// 把 Rime 方案裁剪到随包保留清单（安装器/自举用；RIMESYNC_PRUNE_SCHEMAS=0 关闭）
     #[command(name = "prune-schemas")]
@@ -254,10 +302,20 @@ struct FixImeFailed;
 struct FixImeJson<'a> {
     #[serde(flatten)]
     prebuilt: &'a prebuilt::PrebuiltReport,
+    /// 唯一状态机的结论：ok / noop / partial / failed。
+    result: &'a str,
+    /// Partial/Failed 必非空（Ok/Noop 也带 reason 行）。
+    detail: String,
+    /// 本次实际做过的每一步（assess / install / data / deploy）。
+    actions: &'a [ime_state::Action],
+    /// 最终 assess（build_ok / reason / 逐方案状态）。
+    assessment: &'a ime_state::Assessment,
+    /// 本次真正补上的方案 id（与 build_repaired 同义）。
+    repaired: Vec<String>,
     /// 本次真正写入的 data 方案个数（重复执行时为 0）。
     data_patched: usize,
     data: &'a data_patch::DataPatchReport,
-    /// 非保留方案的清理结果（0.6.21）。
+    /// 非保留方案的清理结果（0.6.21 / A-5：裁剪已纳入 ensure）。
     prune: &'a prune::PruneReport,
     /// 输入法（Weasel）健康检查与自举结果（0.6.20）。
     weasel_present: bool,
@@ -269,6 +327,77 @@ struct FixImeJson<'a> {
     weasel_error: Option<String>,
     weasel_needs_elevation: bool,
     weasel_log: String,
+}
+
+/// check-ime 的只读报告（NSIS 自检解析这些字段，不再自己看文件）。
+#[derive(Serialize)]
+struct CheckImeJson<'a> {
+    /// ok / failed（唯一的判据结论；与 build_ok 同步）。
+    result: &'a str,
+    build_ok: bool,
+    reason: &'a str,
+    detail: String,
+    rime_dir: String,
+    payload: String,
+    payload_source: String,
+    /// 找不到预编译产物时的原因（只读探测不因此失败）。
+    payload_error: Option<String>,
+    /// 参与判定的方案个数。
+    targets: usize,
+    schemas: &'a [ime_state::SchemaState],
+    missing: Vec<String>,
+}
+
+/// ensure-ime 的报告：PrebuiltReport 的字段平铺，再加状态机结论与 actions。
+#[derive(Serialize)]
+struct EnsureImeJson<'a> {
+    #[serde(flatten)]
+    report: &'a prebuilt::PrebuiltReport,
+    result: &'a str,
+    ok: bool,
+    detail: String,
+    reason: &'a str,
+    rime_dir: String,
+    payload: String,
+    payload_source: String,
+    payload_error: Option<String>,
+    repaired: Vec<String>,
+    actions: &'a [ime_state::Action],
+    schemas: &'a [ime_state::SchemaState],
+    data_patched: usize,
+    /// 入口身份：install / fix / bootstrap。
+    mode: &'a str,
+    /// 输入法本体（Weasel）检查/安装结果（install / bootstrap 会真的安装）。
+    weasel_present: bool,
+    weasel_installed: bool,
+    weasel_version: String,
+    weasel_install: String,
+    weasel_installer: String,
+    weasel_installer_source: String,
+    weasel_error: Option<String>,
+    weasel_needs_elevation: bool,
+    weasel_log: String,
+    /// config 模板播种结果（install / bootstrap + Windows）。
+    config_seeded: &'a ime_state::SeedReport,
+}
+
+/// 解析 --payload / 自动定位；找不到不是错误（只读探测要照常出报告）。
+fn resolve_check_payload(
+    payload: Option<PathBuf>,
+) -> (Option<prebuilt::PayloadLocation>, Option<String>) {
+    match payload {
+        Some(dir) => (
+            Some(prebuilt::PayloadLocation {
+                path: dir,
+                source: "argument:--payload".to_string(),
+            }),
+            None,
+        ),
+        None => match prebuilt::resolve_payload(exe_dir().as_deref()) {
+            Ok(location) => (Some(location), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        },
+    }
 }
 
 impl std::fmt::Display for FixImeFailed {
@@ -665,6 +794,7 @@ fn run(cli: Cli) -> Result<()> {
             force,
             payload,
             no_data_patch,
+            report,
         } => {
             let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
             let location = match payload {
@@ -674,44 +804,50 @@ fn run(cli: Cli) -> Result<()> {
                 },
                 None => prebuilt::resolve_payload(exe_dir().as_deref())?,
             };
-            let report = prebuilt::install_prebuilt_with(
-                &location.path,
+            let data_dirs = data_patch::data_dirs();
+            // 0.6.23 / A-1：唯一状态机。判据/顺序/结论都在 core 里，CLI 不再自己推。
+            //
+            // A-1：Mode::Fix 现在**自己**负责装输入法本体（Options::fix() 的
+            // install_ime=true），并在装完后重新解析 data_dirs（调用方那份是
+            // 「装之前」的，全新机器上为空 → data 补丁会打在不存在的目录上）。
+            // 所以这里**不再**单独调 ime::ensure —— 那条重复路径已经删掉。
+            let outcome = ime_state::ensure(
                 &rime_dir,
-                prebuilt::InstallOptions { force },
-            )?;
-            // 0.6.18：build/ 可能根本不被引擎使用（227 实测），补丁还要直接写进
-            // Weasel 的 data 方案源文件。失败只提示、不影响 fix-ime 的退出码。
-            let data = if no_data_patch {
-                data_patch::DataPatchReport::default()
-            } else {
-                // 0.6.20：data 目录按「WeaselRoot\data → weasel-*\data → InstallDir
-                // → %ProgramFiles%\Rime\data」逐项探测，报告里带全部候选。
-                // 手动跑 fix-ime = 显式操作，允许触发重载。
-                data_patch::patch_auto(
-                    &data_patch::resolve_version(None),
-                    data_patch::FixSource::Explicit,
-                )
+                Some(location.path.as_path()),
+                &data_dirs,
+                &ime_state::Options::fix()
+                    .with_force(force)
+                    .with_patch_data(!no_data_patch)
+                    .with_exe_dir(exe_dir())
+                    .with_source(location.source.clone()),
+            );
+            // A-5：方案裁剪已纳入 ensure（CLI 与 GUI 同一入口、同一动作序列）。
+            let pruned = &outcome.prune;
+            // 输入法本体的结果由 ensure 内部的 ime::ensure 给出（同一份数据）。
+            let weasel = &outcome.ime;
+            let data = &outcome.data;
+            let report_json = FixImeJson {
+                prebuilt: &outcome.report,
+                result: outcome.result.as_str(),
+                detail: outcome.detail.clone(),
+                actions: &outcome.actions,
+                assessment: &outcome.assessment,
+                repaired: outcome.repaired.clone(),
+                data_patched: data.patched(),
+                data,
+                prune: pruned,
+                weasel_present: weasel.present,
+                weasel_installed: weasel.installed,
+                weasel_version: weasel.version.clone(),
+                weasel_installer: weasel.installer.clone(),
+                weasel_installer_source: weasel.installer_source.clone(),
+                weasel_install: weasel.install.clone(),
+                weasel_error: weasel.error.clone(),
+                weasel_needs_elevation: weasel.needs_elevation,
+                weasel_log: weasel.log.clone(),
             };
-            // 0.6.21：data/用户/build 里不属于保留清单的方案一并清理（幂等、带备份）。
-            let pruned = prune::prune_auto();
-            // 0.6.20：输入法本体不依赖 NSIS 钩子——缺失就用随包安装器装回去。
-            let weasel = ime::ensure(exe_dir().as_deref());
             if cli.json {
-                print_json(&FixImeJson {
-                    prebuilt: &report,
-                    data_patched: data.patched(),
-                    data: &data,
-                    prune: &pruned,
-                    weasel_present: weasel.present,
-                    weasel_installed: weasel.installed,
-                    weasel_version: weasel.version.clone(),
-                    weasel_installer: weasel.installer.clone(),
-                    weasel_installer_source: weasel.installer_source.clone(),
-                    weasel_install: weasel.install.clone(),
-                    weasel_error: weasel.error.clone(),
-                    weasel_needs_elevation: weasel.needs_elevation,
-                    weasel_log: weasel.log.clone(),
-                })?;
+                print_json(&report_json)?;
             } else {
                 println!("rime_dir={}", rime_dir.display());
                 println!(
@@ -720,19 +856,64 @@ fn run(cli: Cli) -> Result<()> {
                     location.source
                 );
                 println!(
-                    "copied={} kept={} overwritten={} config_copied={} failed={} escalated={}",
-                    report.copied,
-                    report.kept,
-                    report.overwritten,
-                    report.config_copied,
-                    report.failed,
-                    report.escalated
+                    "result={} build_ok={} detail={}",
+                    outcome.result.as_str(),
+                    outcome.report.build_ok,
+                    outcome.detail
                 );
                 println!(
-                    "build_ok={} probe_after={}",
-                    report.build_ok, report.probe_after
+                    "copied={} kept={} overwritten={} config_copied={} config_kept={} failed={} escalated={}",
+                    outcome.report.copied,
+                    outcome.report.kept,
+                    outcome.report.overwritten,
+                    outcome.report.config_copied,
+                    outcome.report.config_kept,
+                    outcome.report.failed,
+                    outcome.report.escalated
                 );
-                if let Some(log) = &report.log_path {
+                // B-2：config 被 data 门禁挡下 = 用户拿到的输入法没有 schema_list。
+                // 这条必须在文本输出里出现（CLI 的 --json 之外的可读输出）。
+                println!(
+                    "config_skipped=[{}]",
+                    outcome.report.config_skipped.join(",")
+                );
+                for item in &outcome.report.config_skipped {
+                    eprintln!("warning: config 模板被跳过：{item}（该输入法将没有 schema_list）");
+                }
+                if !outcome.report.manifest_failed.is_empty() {
+                    println!(
+                        "manifest_failed=[{}]",
+                        outcome.report.manifest_failed.join(",")
+                    );
+                    for item in &outcome.report.manifest_failed {
+                        eprintln!("warning: 预编译产物校验失败：{item}");
+                    }
+                }
+                println!(
+                    "build_ok={} probe_after={} build_source={}",
+                    outcome.report.build_ok,
+                    outcome.report.probe_after,
+                    outcome.report.build_source
+                );
+                println!("build_schemas={}", outcome.report.build_schemas_line());
+                println!("build_repaired={}", outcome.report.build_repaired.join(","));
+                println!("build_missing={}", outcome.report.build_missing.join(","));
+                println!(
+                    "deploy_method={} deploy_result={} deploy_ok={} deploy_ms={}",
+                    outcome.report.deploy_method,
+                    outcome.report.deploy_result,
+                    outcome.report.deploy_ok,
+                    outcome.report.deploy_ms
+                );
+                println!("deploy_detail={}", outcome.report.deploy_detail);
+                println!("deploy_inproc={}", outcome.report.deploy_inproc);
+                for action in &outcome.actions {
+                    println!(
+                        "action={} changed={} {}",
+                        action.kind, action.changed, action.detail
+                    );
+                }
+                if let Some(log) = &outcome.report.log_path {
                     println!("log={log}");
                 }
                 if no_data_patch {
@@ -758,7 +939,6 @@ fn run(cli: Cli) -> Result<()> {
                     for item in &data.punctuator_skipped {
                         println!("punctuator_skipped_item={item}");
                     }
-                    // 实际使用的目录（空 = 一个候选都不存在）
                     println!(
                         "data_dir={}",
                         if data.data_dir.is_empty() {
@@ -767,10 +947,8 @@ fn run(cli: Cli) -> Result<()> {
                             data.data_dir.as_str()
                         }
                     );
-                    // 0.6.22：注释版本与「是否降级到用户目录」必须可核对。
                     println!("data_version={}", data.version);
                     println!("data_fallback={}", data.fallback);
-                    // schema = 直接改共享方案；custom = 共享目录只读，写了用户级 custom.yaml。
                     println!("data_mode={}", data.mode);
                     println!("data_deploy={}", data.deploy_triggered);
                     println!("data_skipped_not_retained={}", data.skipped_not_retained);
@@ -810,7 +988,6 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 println!("{}", pruned.summary());
-                // 一行一个键：安装脚本用 sed 's/^prune_removed=//p' 解析。
                 println!("prune_disabled={}", pruned.disabled);
                 println!("prune_removed={}", pruned.removed());
                 println!("prune_backups={}", pruned.backups.len());
@@ -850,10 +1027,250 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            if report.build_ok && weasel.ok() {
+            if let Some(path) = report.as_deref() {
+                write_json_file(path, &report_json)?;
+            }
+            if outcome.result.exit_ok() && weasel.ok() {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))
+            }
+        }
+        Command::CheckIme { payload, report } => {
+            // 只读：不铺文件、不打补丁、不部署。NSIS 自检与 CI 都用它当唯一判据。
+            let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let (payload_location, payload_error) = resolve_check_payload(payload);
+            let data_dirs = data_patch::data_dirs();
+            let keep = ime_state::KeepSet::resolve(
+                &rime_dir,
+                &data_dirs,
+                payload_location
+                    .as_ref()
+                    .map(|location| location.path.as_path()),
+            );
+            let assessment = ime_state::assess(&rime_dir, &data_dirs, &keep);
+            let check = CheckImeJson {
+                result: if assessment.build_ok { "ok" } else { "failed" },
+                build_ok: assessment.build_ok,
+                reason: assessment.reason.as_str(),
+                detail: assessment.detail(),
+                rime_dir: rime_dir.display().to_string(),
+                payload: payload_location
+                    .as_ref()
+                    .map(|location| location.path.display().to_string())
+                    .unwrap_or_default(),
+                payload_source: payload_location
+                    .as_ref()
+                    .map(|location| location.source.clone())
+                    .unwrap_or_default(),
+                payload_error,
+                targets: assessment.schemas.len(),
+                schemas: &assessment.schemas,
+                missing: assessment.missing_ids(),
+            };
+            if cli.json {
+                print_json(&check)?;
+            } else {
+                println!("rime_dir={}", rime_dir.display());
+                println!(
+                    "result={} build_ok={} reason={}",
+                    check.result, check.build_ok, check.reason
+                );
+                println!("detail={}", check.detail);
+                println!("schemas={}", assessment.line());
+                println!("missing={}", check.missing.join(","));
+                if let Some(error) = &check.payload_error {
+                    println!("payload_error={error}");
+                }
+            }
+            if let Some(path) = report.as_deref() {
+                write_json_file(path, &check)?;
+            }
+            if assessment.build_ok {
+                Ok(())
+            } else {
+                Err(anyhow::Error::new(FixImeFailed))
+            }
+        }
+        Command::EnsureIme {
+            mode,
+            force,
+            payload,
+            no_data_patch,
+            report,
+        } => {
+            // --mode install = 安装版首次启动：输入法本体 + config 模板也归它管
+            // （安装器不再装/判输入法）。fix/bootstrap 保持旧语义。
+            let mode = match mode.as_str() {
+                "fix" => ime_state::Mode::Fix,
+                "bootstrap" => ime_state::Mode::Bootstrap,
+                _ => ime_state::Mode::Install,
+            };
+            let options = match mode {
+                ime_state::Mode::Install => ime_state::Options::install(),
+                ime_state::Mode::Fix => ime_state::Options::fix(),
+                ime_state::Mode::Bootstrap => ime_state::Options::bootstrap(),
+            };
+            let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let (payload_location, payload_error) = resolve_check_payload(payload);
+            let data_dirs = data_patch::data_dirs();
+            let outcome = ime_state::ensure(
+                &rime_dir,
+                payload_location
+                    .as_ref()
+                    .map(|location| location.path.as_path()),
+                &data_dirs,
+                &options
+                    .with_force(force)
+                    .with_patch_data(!no_data_patch)
+                    .with_exe_dir(exe_dir())
+                    .with_source(
+                        payload_location
+                            .as_ref()
+                            .map(|location| location.source.clone())
+                            .unwrap_or_default(),
+                    ),
+            );
+            let json = EnsureImeJson {
+                report: &outcome.report,
+                result: outcome.result.as_str(),
+                ok: outcome.ok(),
+                detail: outcome.detail.clone(),
+                reason: outcome.assessment.reason.as_str(),
+                rime_dir: rime_dir.display().to_string(),
+                payload: payload_location
+                    .as_ref()
+                    .map(|location| location.path.display().to_string())
+                    .unwrap_or_default(),
+                payload_source: payload_location
+                    .as_ref()
+                    .map(|location| location.source.clone())
+                    .unwrap_or_default(),
+                payload_error,
+                repaired: outcome.repaired.clone(),
+                actions: &outcome.actions,
+                schemas: &outcome.assessment.schemas,
+                data_patched: outcome.data.patched(),
+                mode: mode.as_str(),
+                weasel_present: outcome.ime.present,
+                weasel_installed: outcome.ime.installed,
+                weasel_version: outcome.ime.version.clone(),
+                weasel_install: outcome.ime.install.clone(),
+                weasel_installer: outcome.ime.installer.clone(),
+                weasel_installer_source: outcome.ime.installer_source.clone(),
+                weasel_error: outcome.ime.error.clone(),
+                weasel_needs_elevation: outcome.ime.needs_elevation,
+                weasel_log: outcome.ime.log.clone(),
+                config_seeded: &outcome.seeded,
+            };
+            if cli.json {
+                print_json(&json)?;
+            } else {
+                println!("rime_dir={}", rime_dir.display());
+                println!(
+                    "result={} ok={} build_ok={} reason={}",
+                    json.result, json.ok, outcome.report.build_ok, json.reason
+                );
+                println!("detail={}", json.detail);
+                println!(
+                    "mode={} weasel_present={} weasel_installed={} weasel_install={}",
+                    json.mode, json.weasel_present, json.weasel_installed, json.weasel_install
+                );
+                println!("config_seeded={}", outcome.seeded.summary());
+                println!("schemas={}", outcome.assessment.line());
+                println!("build_repaired={}", json.repaired.join(","));
+                println!(
+                    "copied={} kept={} overwritten={} config_copied={} failed={}",
+                    outcome.report.copied,
+                    outcome.report.kept,
+                    outcome.report.overwritten,
+                    outcome.report.config_copied,
+                    outcome.report.failed
+                );
+                for action in &outcome.actions {
+                    println!(
+                        "action={} changed={} {}",
+                        action.kind, action.changed, action.detail
+                    );
+                }
+            }
+            if let Some(path) = report.as_deref() {
+                write_json_file(path, &json)?;
+            }
+            if outcome.result.exit_ok() {
+                Ok(())
+            } else {
+                Err(anyhow::Error::new(FixImeFailed))
+            }
+        }
+
+        Command::DeployIme {
+            shared_dir,
+            library,
+        } => {
+            // 0.6.23：进程内 librime 部署。不链接 librime（运行时 dlopen/LoadLibraryW），
+            // 找不到库或符号就返回可读错误，绝不 panic。
+            let user_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let shared = match shared_dir {
+                Some(dir) => dir,
+                None => data_patch::data_dirs()
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| PathBuf::from("/usr/share/rime-data")),
+            };
+            // 0.6.23 d：先停服务（并确认退出）再部署，避免和输入法抢 user.yaml。
+            // Linux：外部 rime_deployer > 输入法在跑则跳过 > 进程内（见 linux_deploy），
+            // 三步都有超时；绝不去杀用户正在用的输入法。
+            let report = if cfg!(windows) {
+                let run = || match &library {
+                    Some(path) => librime::deploy_with_library(
+                        path,
+                        &librime::Traits::for_dirs(&shared, &user_dir),
+                    ),
+                    None => librime::deploy_with_dirs(&shared, &user_dir),
+                };
+                let stop = deploy::stop_before_deploy(&deploy::SystemRunner);
+                match deploy::inproc_after_stop(&stop, run) {
+                    Some(report) => report,
+                    None => bail!(
+                        "结束 WeaselServer 失败（server={} {}），已跳过进程内部署",
+                        stop.state.as_str(),
+                        stop.detail
+                    ),
+                }
+            } else {
+                linux_deploy::deploy(&user_dir, &shared, library.as_deref())
+            };
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("deploy_method={}", report.deploy_method);
+                println!("deploy_ok={}", report.deploy_ok);
+                println!("deploy_ms={}", report.deploy_ms);
+                println!(
+                    "library={}",
+                    if report.library.is_empty() {
+                        "-"
+                    } else {
+                        &report.library
+                    }
+                );
+                println!("shared_data_dir={}", report.shared_data_dir);
+                println!("user_data_dir={}", report.user_data_dir);
+                println!("deploy_detail={}", report.detail);
+            }
+            if report.deploy_ok {
+                Ok(())
+            } else if report.deploy_method == linux_deploy::METHOD_SKIPPED {
+                // 跳过不是失败，但部署确实没发生：退出码非 0，细则里带重试建议。
+                Err(anyhow::anyhow!("deploy skipped: {}", report.detail))
+            } else if report.deploy_method == linux_deploy::METHOD_EXTERNAL_FAILED {
+                Err(anyhow::anyhow!("external deploy failed: {}", report.detail))
+            } else {
+                Err(anyhow::anyhow!(
+                    "in-process deploy failed: {}",
+                    report.detail
+                ))
             }
         }
         Command::PruneSchemas {
@@ -1136,6 +1553,25 @@ fn install_warning_line(warning: &Option<serde_json::Value>) -> String {
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// 把 JSON 报告写到文件（安装器自检读它，不靠被截断的 stdout）。
+///
+/// 用 pretty 格式：每行一个字段，NSIS 逐行做子串匹配（行长短于 NSIS 的 1024 上限）。
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建报告目录失败：{}", parent.display()))?;
+        }
+    }
+    let text = format!(
+        "{}
+",
+        serde_json::to_string_pretty(value)?
+    );
+    fs::write(path, text).with_context(|| format!("写报告失败：{}", path.display()))?;
     Ok(())
 }
 

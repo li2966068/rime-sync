@@ -30,6 +30,7 @@ mod conflict_cmds;
 mod dedupe_cmds;
 mod device_cmds;
 mod diagnostics;
+mod ime_text;
 mod platform_prefs;
 mod prebuilt_cmds;
 mod preset_cmds;
@@ -49,6 +50,8 @@ pub(crate) struct Inner {
     pub(crate) log: Mutex<Vec<String>>,
     pub(crate) secret: Mutex<Option<Arc<SecretSelection>>>,
     pub(crate) watch: Mutex<Option<watch_cmds::WatchSession>>,
+    /// 最近一次启动自举的输入法状态（设置页红条读它）。
+    pub(crate) ime: Mutex<Option<prebuilt_cmds::ImeBootstrapStatus>>,
 }
 
 impl Default for Inner {
@@ -60,6 +63,7 @@ impl Default for Inner {
             log: Mutex::new(Vec::new()),
             secret: Mutex::new(None),
             watch: Mutex::new(None),
+            ime: Mutex::new(None),
         }
     }
 }
@@ -1040,7 +1044,10 @@ pub fn run() {
             cmd_pick_folder,
             cmd_secret_status,
             cmd_first_transport,
+            prebuilt_cmds::cmd_set_locale,
             prebuilt_cmds::cmd_fix_ime,
+            prebuilt_cmds::cmd_ime_status,
+            prebuilt_cmds::cmd_restart_elevated,
             conflict_cmds::cmd_list_conflicts,
             conflict_cmds::cmd_resolve_conflict,
             conflict_cmds::cmd_conflict_remote_sizes,

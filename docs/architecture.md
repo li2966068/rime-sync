@@ -12,7 +12,7 @@
 | plan | 文件分类、shared/snapshot 路径形状校验、硬红线断言、路径穿越防护、glob |
 | merge3 | 文件级三向合并决策（基线/本地/远端），内容版与摘要版 |
 | index | index.json（本地基线）与 shared/manifest.json（远端清单）共用的 FileIndex |
-| platform | RimeTrigger trait：Linux 调 rime_dict_manager/rime_deployer，Windows 调 WeaselDeployer，FakeTrigger 供测试 |
+| platform | RimeTrigger trait：Linux 调 rime_dict_manager/rime_deployer，Windows 结束 WeaselServer（0.6.23 起不再调 WeaselDeployer；显式重部署走 librime 进程内），FakeTrigger 供测试 |
 | engine | transport（只搬文件）与 apply（备份 + transport + 触发 librime + 再 push），进度回调与 Report |
 | backup | BackupManager：apply 前快照、manifest（sha256/size/reason/app_version）、restore 校验后写回、prune 保留 10 份 |
 | secret | SecretStore trait：KeyringStore（keyring crate）+ FileStore（0600）兜底，detect() 首选钥匙串并探测可用性 |
@@ -136,8 +136,12 @@ Manage 权限）。MKCOL 的 405 在 RFC 里既可能是"已存在"也可能是"
 - 本地删除会传播为远端删除；远端删除且本地未改则删本地，本地改过则保留并告警。
 - device_id 优先级：config > installation.yaml > `<hostname>-<6hex>` 并写回。
 - CLI 的本地状态目录 = config.json 所在目录；同机模拟两台设备时要用不同目录。
-- Windows 触发器按 `%ProgramFiles%\Rime\*\WeaselDeployer.exe` 查找，取不到时
-  apply 报错并提示仅 transport 可用；Linux 用 PATH 中的 librime-bin 命令。
+- Windows 触发器按 `%ProgramFiles%\Rime\*\WeaselDeployer.exe` 查找（用户词库同步
+  仍用它）；apply 之后的重新加载改成 `taskkill /IM WeaselServer.exe /F`，不再调用
+  `WeaselDeployer /deploy`（227 实测：返回 0 却不产出）；Linux 用 PATH 中的
+  librime-bin 命令。显式「重新部署」走 `crates/core/src/librime.rs` 的进程内 API，
+  且**先停服务再部署**（0.6.23：librime 与 WeaselServer 会抢 user.yaml；见
+  `docs/PREBUILT-BOOTSTRAP.md` §13.3.1）。
 - 真实 librime 合并、Weasel IPC 未在本机验证的部分由 FakeTrigger 单测覆盖流程顺序。
 - 钥匙串在 headless/无 Secret Service 时的回落路径由 `detect_with` + 失败后端单测
   覆盖；本机若存在 Secret Service，CLI 默认走 Keyring，E2E 用

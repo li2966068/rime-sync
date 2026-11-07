@@ -245,7 +245,11 @@ pub struct ImeReport {
 }
 
 impl ImeReport {
-    /// 是否算「输入法这块没问题」（用户显式关掉自动安装也算）。
+    /// 是否算「输入法这块没问题」（用户显式关掉自动安装也不算失败）。
+    ///
+    /// 注意：这只说「安装这一步没失败」。用户手上到底有没有输入法，界面层还要
+    /// 另判（见 src-tauri 的 ImeBootstrapStatus::from_ime：disabled 且 present=false
+    /// 时不能报成功）。
     pub fn ok(&self) -> bool {
         matches!(
             self.install.as_str(),
@@ -402,6 +406,23 @@ fn run_installer(
     }
 }
 
+/// 重装前先停掉正在运行的输入法服务。
+///
+/// 为什么：安装器要替换 rime.dll / WeaselServer.exe，被占用时会失败；taskkill
+/// 只结束进程，不碰用户数据。找不到进程返回非 0，忽略。
+#[cfg(all(windows, not(test)))]
+fn stop_server() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("taskkill")
+        .args(["/IM", SERVER_EXE, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// 740 = ERROR_ELEVATION_REQUIRED：安装器带 admin manifest，非管理员进程直接起不来。
 #[cfg(windows)]
 fn classify_spawn_error(installer: &Path, error: &std::io::Error) -> InstallError {
@@ -530,6 +551,16 @@ fn ensure_impl(
         installer.display(),
         INSTALLER_ARGS.join(" ")
     ));
+
+    // 重装（缺失 / 不是我们的构建）之前先停掉服务：安装器无法替换被占用的
+    // rime.dll；只结束进程，不动 %APPDATA%\Rime 与任何用户数据。
+    #[cfg(all(windows, not(test)))]
+    {
+        log.push(format!(
+            "stop server before install: taskkill /IM {SERVER_EXE} /F"
+        ));
+        stop_server();
+    }
 
     match runner(
         &installer,

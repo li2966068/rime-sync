@@ -470,15 +470,26 @@ export interface FixImeReport {
   payload: string;
   payload_source: string;
   probe_before: BuildProbe;
-  probe_after: BuildProbe;
+  /// 后端返回的是自由字符串（不止 none/deploy/prebuilt，例如 auto / inproc），
+  /// 这里不写成字面量联合类型，免得以后误当成枚举用。
+  probe_after: string;
+  /// 与 probe_after 同义（安装器/CLI 用同一个字段名）。
+  build_source: string;
   copied: number;
   kept: number;
   overwritten: number;
   config_copied: number;
   config_kept: number;
+  /// B-2：payload config/ 里被 data 门禁挡下的模板（= 该输入法**没有 schema_list**）。
+  /// 非空即意味着结论降级为 partial（result 不会是 ok）。
+  config_skipped: string[];
   failed: number;
   source: string;
   build_ok: boolean;
+  /// 唯一状态机的结论：ok / noop / partial / failed。
+  result: string;
+  /// Partial/Failed 必非空。
+  detail: string;
   escalated: boolean;
   log_path: string | null;
   message: string;
@@ -496,6 +507,53 @@ export interface FixImeReport {
   weasel_needs_elevation: boolean;
   weasel_log: string;
   weasel_message: string;
+  /// 0.6.23：按方案检查结果（retained-schemas.txt 的 3 个主方案）。
+  build_schemas: SchemaBuild[];
+  build_repaired: string[];
+  build_missing: string[];
+  /// none / prebuilt / auto / inproc
+  deploy_method: string;
+  /// ok / failed / skipped
+  deploy_result: string;
+  deploy_ok: boolean;
+  deploy_ms: number;
+  deploy_detail: string;
+  /// 进程内部署的一句话结论（没跑时为 "-"）。
+  deploy_inproc: string;
+}
+
+/// 启动自举的输入法状态（cmd_ime_status / ime://bootstrap 事件）。
+/// B 方案：安装器只交付程序本体，输入法由程序首次启动时自举。
+export interface ImeBootstrapStatus {
+  /// 输入法本体与产物都就绪（红条据此显示/隐藏）。
+  ok: boolean;
+  /// ok / noop / partial / failed / skipped。
+  result: string;
+  /// 失败时给用户看的下一步。
+  detail: string;
+  /// 需要管理员权限（普通用户启动时最常见）。
+  needs_elevation: boolean;
+  /// installed / already-present / skipped(platform) / disabled / failed
+  ime_install: string;
+  ime_error: string | null;
+  ime_version: string;
+  ime_installed: boolean;
+  /// 本次新写入的 config 模板。
+  seeded_written: string[];
+  updated_at: string;
+  /// 自举还在跑（不是失败）。
+  running: boolean;
+  /// 机器可读的失败原因码：ok / noop / partial / install-disabled /
+  /// install-failed / timeout / crashed / failed。前端按它出本地化结论。
+  reason: string;
+}
+
+/// 单个方案的 build 产物状态。
+export interface SchemaBuild {
+  id: string;
+  primary: boolean;
+  /// ok / repaired / missing
+  state: string;
 }
 
 export const api = {
@@ -554,6 +612,11 @@ export const api = {
   setSchemas: (ids: string[]) => invoke<SetSchemasResult>("cmd_set_schemas", { ids }),
   // 输入法产物自举：force = 覆盖已有 build/（config/*.yaml 永不覆盖）。
   fixIme: (force = false) => invoke<FixImeReport>("cmd_fix_ime", { force }),
+  // 首启自举状态（设置页红条）与「以管理员重启」。
+  imeStatus: () => invoke<ImeBootstrapStatus | null>("cmd_ime_status"),
+  // 把界面语言告诉后端：输入法失败对话框是原生窗口，用不到前端 i18n。
+  setLocale: (locale: string) => invoke<void>("cmd_set_locale", { locale }),
+  restartElevated: () => invoke<void>("cmd_restart_elevated"),
 
   pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
 

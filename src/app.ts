@@ -26,6 +26,7 @@ import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui
 import { loadPresets, applyPresetTo } from "./ui/presets";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { runFixIme } from "./ui/fix_ime";
+import { elevateForIme, refreshImeStatus, subscribeImeBootstrap } from "./ui/ime_banner";
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
 import { addDeviceLocalKey, removeDeviceLocalKey } from "./ui/device_keys";
 import { refreshLanguageDependent } from "./ui/language";
@@ -136,6 +137,12 @@ export function bindEvents(): void {
   });
   el.fixImeForce.addEventListener("click", () => {
     void runFixIme(true);
+  });
+  el.imeFix.addEventListener("click", () => {
+    void runFixIme(false);
+  });
+  el.imeElevate.addEventListener("click", () => {
+    void elevateForIme();
   });
   el.schemaList.addEventListener("change", (event) => {
     const input = event.target as HTMLInputElement;
@@ -397,6 +404,8 @@ export function bindEvents(): void {
   el.language.addEventListener("change", () => {
     setLang(el.language.value === "en" ? "en" : "zh");
     applyI18n();
+    // 后端也换语言（原生对话框用不到前端 i18n）。
+    void api.setLocale(getLang());
     refreshLanguageDependent();
   });
 
@@ -478,12 +487,29 @@ export async function subscribe(): Promise<void> {
   await listen<WatchEvent>("sync://watch", (event) => {
     applyWatchEvent(event.payload);
   });
+  // 首启自举完成（可能晚于界面）→ 刷新设置页红条；红条上的「去修复」把窗口带过来。
+  // 两个监听互不依赖：先注册的那个失败不能连累后一个（红条上的「去修复」就靠它
+  // 把窗口带到前台）。Promise.allSettled 让它们各自成败互不影响。
+  const [bootstrap, focus] = await Promise.allSettled([
+    subscribeImeBootstrap(),
+    listen("ime://focus-settings", () => {
+      switchPanel("settings");
+    }),
+  ]);
+  if (bootstrap.status === "rejected") {
+    localLog("输入法状态监听注册失败：" + errorText(bootstrap.reason));
+  }
+  if (focus.status === "rejected") {
+    localLog("设置页聚焦监听注册失败：" + errorText(focus.reason));
+  }
 }
 
 export async function init(): Promise<void> {
   bindEvents();
   el.language.value = getLang();
   applyI18n();
+  // 尽早把界面语言告诉后端（失败对话框是原生窗口，语言要靠后端自己判断）。
+  void api.setLocale(getLang());
   document.title = t("app.name");
   el.progressLabel.textContent = t("sync.progressWaiting");
   el.rimeDirSource.textContent = t("sync.notDetected");
@@ -515,6 +541,7 @@ export async function init(): Promise<void> {
     await loadWatchStatus();
     await loadBackups();
     await loadSchemas();
+    await refreshImeStatus();
     await refreshInstallWarning();
     await loadAutostart();
     localLog("界面已就绪");
@@ -528,5 +555,8 @@ export async function init(): Promise<void> {
     localLog("初始化失败：" + text);
     setFooter(t("footer.backendDown"));
   }
+  // 红条状态独立刷新：即使上面某一步失败，设置页的红条也必须显示出来
+  // （输入法没就绪时它是最重要的提示，不能被其它初始化错误吞掉）。
+  void refreshImeStatus();
   touchLastRun();
 }

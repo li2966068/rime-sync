@@ -27,16 +27,27 @@ release.yml 的 Windows job 从 0.6.9 起要自建 librime 1.17.0（合并 rimes
 **不进缓存**：third_party/librime/{build,deps}、third_party/weasel/msbuild、整个 build/
 （build/cache-manifest.json 是单文件例外）。
 
-key（checkout 之后算一次，存进 RIME_CACHE_KEY，restore 与 save 用同一个值）：
+key 有两个（checkout 之后算一次并写进环境变量，0.6.23 起分开）：
 
 ~~~text
-rime-${{ runner.os }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}-${{ hashFiles('scripts/ime/build-weasel.ps1') }}
+# restore：内容指纹，不带 run_id —— 同样的输入在任意一次运行都能命中
+RIME_CACHE_KEY_RESTORE = rime-${{ runner.os }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-librime-win.ps1') }}-${{ hashFiles('scripts/ime/build-weasel.ps1') }}
+# save：指纹 + run_id —— 永远唯一，绝不与已有 key 冲突
+RIME_CACHE_KEY_SAVE    = $RIME_CACHE_KEY_RESTORE-${{ github.run_id }}
 ~~~
 
 restore-keys：rime-${{ runner.os }}-
 
-> key 只算一次是有原因的：构建会往 third_party/librime 里写 dist\、deps\，save 时重算 hashFiles
+> 指纹只算一次是有原因的：构建会往 third_party/librime 里写 dist\、deps\，save 时重算 hashFiles
 > 会得到另一个字符串，缓存就永远存不到该存的地方。
+>
+> **save 的 key 带 run_id 是 0.6.23 的修复**：restore 用指纹命中、校验判 invalid 之后，这次
+> 重建出来的产物必须写得回缓存；若 save 也用指纹，key 已存在就是 `unable to reserve cache`，
+> 坏缓存永远盖不掉。两个 key 不同不影响命中：save 的 key 以 restore-key 前缀开头，
+> 下一轮 restore-keys 一定捞得到最近一次保存的产物。
+>
+> `RIME_CACHE_KEY` 仍然保留为内容指纹（`verify-win-build-cache.ps1 -Mode write` 会把它写进
+> 清单），restore/save 两个变量是从它派生出来的。
 
 ### Linux ime（release.yml · ime job）
 
@@ -48,13 +59,19 @@ restore-keys：rime-${{ runner.os }}-
 | build/ime-cache/<distro>/root | DESTDIR 安装树（librime.so.1.*、rime.pc、rime_api.h、数据） |
 | build/ime-cache/<distro>/manifest.json | 清单：librime 版本 / 源码树哈希 / 插件哈希 / 构建脚本哈希 / 基础镜像 / libdir / ENABLE_LOGGING / .so 哈希 / 安装树哈希 |
 
-key：
+key（同样分两个，规则与 Windows 侧一致）：
 
 ~~~text
-rime-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-linux.sh', 'scripts/ime/container-build.sh', 'scripts/ime/librime-build-cache.sh', 'scripts/ime/Dockerfile') }}
+# restore：内容指纹
+RIME_CACHE_KEY_RESTORE = rime-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('third_party/librime/**') }}-${{ hashFiles('scripts/ime/build-linux.sh', 'scripts/ime/container-build.sh', 'scripts/ime/librime-build-cache.sh', 'scripts/ime/Dockerfile') }}
+# save：指纹 + run_id
+RIME_CACHE_KEY_SAVE    = $RIME_CACHE_KEY_RESTORE-${{ github.run_id }}
 ~~~
 
 restore-keys：rime-${{ runner.os }}-${{ matrix.distro }}-
+
+> 前缀以 `-` 结尾，所以 `<指纹>` 与 `<指纹>-<run_id>` 两种 key 都在覆盖范围内；
+> 这与 0.6.23 之前的行为一致（那时存的就是指纹本身）。
 
 > 这里不把两个 .ps1 的哈希算进去：容器构建根本不读它们，算进去只会让「改 Windows 脚本」无谓地
 > 作废 Linux 缓存。系列前缀一致，gh cache delete 可以一起清。
@@ -135,13 +152,17 @@ reason=… 并删掉缓存目录重编。
 
 ## 3. 什么时候写缓存
 
-只有「全量构建成功 **且** 清单写入成功」才 save：
+只有「这次真的全量构建了 **且** 清单写入成功」才 save：
 
-- Windows：record ime build cache manifest（-Mode write，失败即不存）→ actions/cache/save@v4；
-- Linux：build input-method deb 成功后 → actions/cache/save@v4。
+- Windows：record ime build cache manifest（-Mode write，失败即不存）→ actions/cache/save@v4，
+  key = `RIME_CACHE_KEY_SAVE`（`<指纹>-<run_id>`）；save 之后紧跟一步打印
+  `cache=saved key=<save key>`（没存则打 `cache=not-saved`）。
+- Linux：容器里的 verify 判 hit 时 `scripts/ime/build-linux.sh` 输出 `cache_status=hit`，不 save；
+  判 invalid（含首次未命中）时 `cache_status=invalid`，容器已删掉旧产物并重编 → save，
+  同样用 `RIME_CACHE_KEY_SAVE`。
 
-命中缓存的那次不重复 save（exact key 已存在），构建失败的那次也不 save，所以**半成品永远进不了
-缓存**。
+命中的那次（cache=hit 且校验通过）没有新产物可存，不重复 save；构建失败的那次也不 save，
+所以**半成品永远进不了缓存**。save 的 key 永远唯一，同一份内容存两次也不会冲突。
 
 ---
 
@@ -161,8 +182,9 @@ reason=… 并删掉缓存目录重编。
 
 ## 5. 失效处理
 
-自动：校验不过 → 删产物 → 全量构建（日志里是 cache=invalid reason=…，清单一并删除，构建完重新写
-清单）。
+自动：校验不过 → 删产物 → 全量构建 → **按新 key 存回**（日志里是 cache=invalid reason=…，
+清单一并删除，构建完重新写清单，save 步打印 cache=saved key=<save key>）。坏缓存因此会被更新的
+key 取代，下一轮 restore-keys 前缀会直接命中它。
 
 手动（换了 runner 镜像、要强制重建、或怀疑缓存被污染时）：
 
@@ -172,10 +194,14 @@ gh cache delete <key> -R li2966068/rime-sync     # 删一个（<key> 就是日�
 gh cache delete --all -R li2966068/rime-sync     # 全删（会连带 rust / pnpm 缓存，慎用）
 ~~~
 
+**不再需要**为了「exact key 命中但判 invalid」去手动 `gh cache delete`：那种情况现在会在同一次
+运行里以 `<指纹>-<run_id>` 存回，下一轮直接命中新产物。
+
 已知边界（都是刻意选的）：
 
-1. **exact key 命中但判 invalid**：因为 key 已经存在，这次重建后的 save 会冲突（日志里是
-   unable to reserve cache），坏缓存不会被覆盖，下一轮仍是 invalid。gh cache delete <key> 一次即恢复。
+1. **旧 key 会按 restore-keys 自然过期**：每次 invalid 重建都写一份新 key，旧条目不会再被 exact
+   匹配到，只会排在 restore-keys 前缀里，最终被仓库级上限（10 GB，最近最少使用）淘汰。
+   不需要人工清理；想立刻省空间可以 `gh cache delete <旧 key>`。
 2. **restore-keys 命中旧 key**：同样要过清单，旧产物一定会被判 invalid 并删除，不会被带进新构建；
    代价只是多下载一份缓存。
 3. **首次启用 / 改了 third_party/librime/**、scripts/ime/build-*.ps1、boost 版本**：必然全量构建
@@ -196,6 +222,9 @@ bash scripts/ime/librime-build-cache.sh verify <cache-dir> "$PWD" lib/x86_64-lin
 
 # 带缓存的 Linux IME 构建（默认关闭，传 CACHE_DIR 才启用）
 CACHE_DIR="$PWD/build/ime-cache/debian-13" bash scripts/ime/build-linux.sh
+
+# 看 key 策略是否生效：save 出来的 key 一定以 -<run_id> 结尾，restore 命中的是内容指纹
+gh cache list -R li2966068/rime-sync | grep 'rime-'
 ~~~
 
 workflow 语法用 actionlint 校验：
@@ -213,5 +242,5 @@ actionlint -shellcheck= .github/workflows/release.yml
 | 冷缓存 / 缓存作废 | 与 0.6.19 持平或略高（46–70 分钟，一次性） | 与现在持平 |
 | 命中（cache=hit） | 15–20 分钟（不再编 boost / librime / Weasel） | 少 3–5 分钟（实测 4 核：librime 199 s → 0 s） |
 
-实际时间以 Actions 日志为准；cache=hit / cache=invalid reason=… 都写在 verify ime build cache 那
-一步，summary 里也有一行。
+实际时间以 Actions 日志为准；cache=hit / cache=invalid reason=… 写在 verify ime build cache
+那一步，cache=saved key=<save key> / cache=not-saved 写在 save 之后那一步，summary 里也有一行。

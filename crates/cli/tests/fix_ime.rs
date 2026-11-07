@@ -43,9 +43,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tmp = TempDir::new();
-        for dir in ["payload/build", "payload/config", "rime", "state"] {
+        for dir in ["payload/build", "payload/config", "rime", "state", "data"] {
             fs::create_dir_all(tmp.path().join(dir)).expect("create dir");
         }
+        // config 门禁（M2）：payload 的 default.custom.yaml 只有在 data 里真有 wubi86
+        // 时才允许铺进用户目录，否则 librime 部署会因缺方案整次失败。
+        fs::write(tmp.path().join("data/wubi86.schema.yaml"), "name: wubi86\n")
+            .expect("write gate schema");
         fs::write(
             tmp.path()
                 .join("payload/build/luna_pinyin_simp.schema.yaml"),
@@ -73,8 +77,13 @@ impl Fixture {
         self.tmp.path().join("rime")
     }
 
+    /// 默认路径：data 目录只用来过 config 门禁（wubi86 必须在），不跑 data 补丁。
     fn run(&self) -> std::process::Output {
-        self.run_with_data(None)
+        self.run_with(Some(&self.data()), true)
+    }
+
+    fn data(&self) -> PathBuf {
+        self.tmp.path().join("data")
     }
 
     /// data 补丁默认关闭（空串）：CI 机器上可能装着真 Weasel，不能改真目录。
@@ -115,7 +124,7 @@ fn fix_ime_json_copies_missing_files() {
     let output = fixture.run();
 
     assert!(
-        output.status.success(),
+        matches!(output.status.code(), Some(0) | Some(1)), // Partial 也会非零退出（0.6.23 语义）
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -126,6 +135,17 @@ fn fix_ime_json_copies_missing_files() {
     assert_eq!(report["config_copied"], 1);
     assert_eq!(report["build_ok"], true);
     assert_eq!(report["probe_after"], "prebuilt");
+    // 0.6.23 A：按方案检查要出现在报告里（payload 只带 luna_pinyin_simp，就只校验它）。
+    assert_eq!(report["build_schemas"][0]["id"], "luna_pinyin_simp");
+    assert_eq!(report["build_schemas"][0]["state"], "repaired");
+    assert_eq!(report["build_repaired"][0], "luna_pinyin_simp");
+    assert!(report["build_missing"]
+        .as_array()
+        .expect("array")
+        .is_empty());
+    // 0.6.23 B：Linux 侧保持原样（部署交给 data_patch），不碰 WeaselDeployer。
+    assert_eq!(report["deploy_method"], "none");
+    assert!(report["deploy_ok"].is_boolean());
     // 0.6.20：输入法状态在报告里；测试环境禁止自动安装，Linux 上直接跳过。
     assert_eq!(report["weasel_installed"], false);
     assert!(report["weasel_present"].is_boolean());
@@ -164,7 +184,7 @@ fn fix_ime_json_keeps_existing_files() {
     let output = fixture.run();
 
     assert!(
-        output.status.success(),
+        matches!(output.status.code(), Some(0) | Some(1)), // Partial 也会非零退出（0.6.23 语义）
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -207,7 +227,7 @@ fn fix_ime_patches_weasel_data_schemas() {
 
     let first = fixture.run_with_data(Some(&data));
     assert!(
-        first.status.success(),
+        matches!(first.status.code(), Some(0) | Some(1)), // Partial 也会非零退出（0.6.23 语义）
         "stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
@@ -235,7 +255,10 @@ fn fix_ime_patches_weasel_data_schemas() {
     assert!(data.join("luna_pinyin.schema.yaml.rimesync-orig").is_file());
 
     let second = fixture.run_with_data(Some(&data));
-    assert!(second.status.success());
+    assert!(
+        matches!(second.status.code(), Some(0) | Some(1)),
+        "第二次运行也允许 Partial"
+    );
     let report: serde_json::Value =
         serde_json::from_slice(&second.stdout).expect("parse report json");
     assert_eq!(report["data_patched"], 0, "重复执行不重复写");
@@ -264,7 +287,7 @@ fn fix_ime_no_data_patch_leaves_the_file_alone() {
     let output = fixture.run_with(Some(&data), true);
 
     assert!(
-        output.status.success(),
+        matches!(output.status.code(), Some(0) | Some(1)), // Partial 也会非零退出（0.6.23 语义）
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

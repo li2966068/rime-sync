@@ -365,6 +365,18 @@
                WeaselDeployer 返回 0 却不写 build 时，由程序自己把随包的预编译产物
                铺进 Rime 用户目录。启动时也会自动跑一次，这里只是手动重试入口。 -->
           <div class="card" id="fix-ime-card">
+            <!-- 首启自举失败时的红条（B 方案）：安装器不再装输入法，程序首次启动
+                 用随包 Weasel 安装器自举；普通用户启动时通常需要管理员权限。 -->
+            <div class="ime-warning" id="ime-warning" role="alert" hidden>
+              <div class="ime-warning-copy">
+                <strong data-i18n="imeBanner.title">输入法未就绪</strong>
+                <p id="ime-warning-detail"></p>
+              </div>
+              <div class="ime-warning-actions">
+                <button class="ghost small" id="btn-ime-elevate" type="button" data-i18n="imeBanner.elevate">以管理员重启</button>
+                <button class="small" id="btn-ime-fix" type="button" data-i18n="imeBanner.fix">修复</button>
+              </div>
+            </div>
             <div class="card-head">
               <h3 data-i18n="fixIme.title">修复输入法</h3>
               <div class="card-actions">

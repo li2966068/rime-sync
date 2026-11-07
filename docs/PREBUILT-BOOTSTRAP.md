@@ -14,18 +14,30 @@ Rime 用户目录。安装器的同名逻辑仍然保留（能跑就跑），程
   build 文件（官方 Weasel 也一样）；
 * 于是「安装器负责铺产物」不可依赖：钩子可能不跑，部署器可能假成功。
 
-## 2. 判据（probe）
+## 2. 判据（assess，0.6.23 起唯一）
 
-只认 **文件在 + 插件标记在**：
+判据只有一处实现：`crate::ime_state::assess`。它按目标方案逐个检查
+`build/<id>.schema.yaml` 与配套 bin，**不再有第二套「双标记 / 单标记 + bin」判据**：
 
-| 状态 | 含义 |
-|---|---|
-| `none` | `<Rime 用户目录>/build/luna_pinyin_simp.schema.yaml` 不存在 |
-| `deploy` | 文件存在，但不同时包含 `rimesync_vnum` 与 `rimesync_punct`（官方部署产物） |
-| `prebuilt` | 文件存在且两个标记都在 —— 我们这套产物，可用 |
+| SchemaState 字段 | 取值 | 含义 |
+|---|---|---|
+| `schema_yaml` | `ok` | 文件在；主方案（`primary`）还必须含 `rimesync_vnum` |
+| | `stale-no-marker` | 文件在，但主方案没有插件标记（官方部署 / 进程内重建产物） |
+| | `missing` | 文件不在 |
+| `bins` | `ok` / `missing` | `*.prism.bin` / `*.table.bin` / `*.reverse.bin` 至少一个在 |
 
-判据与 Windows NSIS 钩子、Linux `postinst` / `install.sh` 完全一致。只有
-`prebuilt` 会被当作可用；`none` 与 `deploy` 都会触发自举。
+`build_ok = 全部目标方案 usable`（schema_yaml=ok 且 bins=ok，且目标集合非空），
+`reason` 是 `ready` / `no-targets` / `schema-missing` / `schema-stale` /
+`bins-missing` / `mixed` 之一。
+
+目标集合（`KeepSet::resolve`）= `retained-schemas.txt` ∪ 依赖闭包，再按
+「这份 payload 或用户目录里真的有该方案的 schema.yaml」过滤 —— 纯 `__include`
+基类（例如 `luna_pinyin`）两边都没有 schema.yaml 时不参与判定（原
+`prebuilt::schema_required` 的豁免规则，现在也只剩这一处）。
+
+`probe_build` 保留为**薄封装**（`none` / `deploy` / `prebuilt` 三态，报告与老调用点
+用），内部同样调用 `assess`；`prebuilt::schema_ready` 同理（薄封装
+`ime_state::schema_ok_in`）。
 
 ## 3. 模块与 API
 
@@ -34,21 +46,47 @@ Rime 用户目录。安装器的同名逻辑仍然保留（能跑就跑），程
 ```rust
 pub enum BuildProbe { None, Deploy, Prebuilt }
 pub struct PayloadLocation { pub path: PathBuf, pub source: String }
-pub struct InstallOptions { pub force: bool }
+pub struct InstallOptions {
+    pub force: bool,
+    pub explicit: bool,
+    // None = 现场探测；ime_state::ensure 传的是「装完输入法之后」重新解析的那份（M1）。
+    pub data_dirs: Option<Vec<PathBuf>>,
+}
+pub struct SchemaBuild { pub id: String, pub primary: bool, pub state: String } // ok/repaired/missing
 pub struct PrebuiltReport {
     pub copied: usize,        // build/ 新铺
     pub kept: usize,          // build/ 已存在跳过
     pub overwritten: usize,   // build/ 被覆盖
     pub config_copied: usize, // 用户目录根下 *.yaml 新铺
     pub config_kept: usize,   // 用户目录根下 *.yaml 已存在跳过
+    pub config_skipped: Vec<String>, // data 里没有该方案 → 门禁跳过（M2）
     pub failed: usize,        // 复制失败个数（不中断）
     pub source: String,       // payload 目录
     pub build_ok: bool,       // 铺完后的判据是否可用
     pub probe_after: String,  // none / deploy / prebuilt
     pub escalated: bool,      // 是否触发 build/ 的第二次机会
     pub log_path: Option<String>,
+    pub build_schemas: Vec<SchemaBuild>, // 3 个主方案的 ok/repaired/missing
+    pub build_repaired: Vec<String>,     // 本次补齐的方案（含依赖）
+    pub build_missing: Vec<String>,      // 补不齐的方案
+    pub deploy_method: String,           // none / prebuilt / auto / inproc / deferred
+    pub deploy_result: String,           // ok / partial / failed / skipped / deferred
+    pub deploy_ok: bool,
+    pub deploy_ms: u64,
+    pub deploy_detail: String,
+    pub deploy_inproc: String,           // 进程内部署的一句话结论
 }
 
+// 唯一判据与唯一状态机（0.6.23）：
+pub fn assess(rime_dir: &Path, data_dirs: &[PathBuf], retained: &KeepSet) -> Assessment;
+pub fn ensure(
+    rime_dir: &Path,
+    payload: Option<&Path>,
+    data_dirs: &[PathBuf],
+    opts: &Options,
+) -> Outcome;
+
+// 兼容薄封装（内部只调 assess）：
 pub fn probe_build(rime_user_dir: &Path) -> BuildProbe;
 pub fn resolve_payload(exe_dir: Option<&Path>) -> Result<PayloadLocation>;
 pub fn install_prebuilt(payload_dir: &Path, rime_user_dir: &Path) -> Result<PrebuiltReport>;
@@ -57,6 +95,15 @@ pub fn install_prebuilt_with(
     rime_user_dir: &Path,
     options: InstallOptions,
 ) -> Result<PrebuiltReport>;
+pub fn target_schemas(data_dirs: &[PathBuf]) -> Vec<TargetSchema>;
+pub fn check_build(user: &Path, payload: Option<&Path>, data_dirs: &[PathBuf]) -> Vec<SchemaBuild>;
+pub fn finish_deploy(
+    report: &mut PrebuiltReport,
+    rime_user_dir: &Path,
+    data_dirs: &[PathBuf],
+    options: FinishOptions, // { explicit, skip_touch, defer }
+    inproc: Option<&librime::InprocReport>,
+) -> deploy::DeployOutcome;
 ```
 
 `install_prebuilt` 是「不覆盖」模式；`install_prebuilt_with(… force: true)`
@@ -179,16 +226,23 @@ pub fn resolve_installer(exe_dir: Option<&Path>) -> Option<(PathBuf, String)>;
 `src-tauri/src/lib.rs` 的 `setup` 里调用 `prebuilt_cmds::bootstrap(&handle)`：
 
 * **后台线程**，`setup` 立即返回 —— 磁盘拷贝绝不阻塞窗口出现；
-* 读配置 → 定位 Rime 用户目录 → `probe_build`；
-  * `prebuilt`：不铺文件，但**每一步仍然写日志**（0.6.17 起，见第 8 节）；
-  * `none` / `deploy`：`install_prebuilt`，结果写应用日志 `[bootstrap] …` 与
-    `bootstrap.log`；
+* 读配置 → 定位 Rime 用户目录 → `ime_state::ensure(Options::bootstrap())`：
+  `Mode::Bootstrap` + `install_ime / seed_templates = true`，但**部署 deferred**
+  （`FinishOptions::bootstrap()` → `deploy::defer_plan`：不 taskkill、不跑部署器、
+  Linux 不跑 `fcitx5-remote -r`，只刷 mtime 让引擎下次启动自己重建）；
+  `Options::install()` 只留给「安装完成后首次运行 / CLI `ensure-ime --mode install`」；
+  * 已可用（assess 通过）：不铺文件，结论 Noop，**每一步仍然写日志**（第 8 节）；
+  * 不可用：assess → 铺 prebuilt → data 补丁 → 部署 → 再 assess，结果写应用
+    日志 `[bootstrap] …` 与 `bootstrap.log`；
 * 任何失败（读配置、定位目录、payload 缺失、复制失败）都只记日志：
   **不弹窗、不退出、不影响同步功能**，并且失败原因一定落在 `bootstrap.log` 里；
 * 开关与安装器一致：`RIMESYNC_PREBUILT=0` 关闭自举；`RIMESYNC_PREBUILT=force`
   覆盖 `build/`。
-* 之后无论 `probe` 是什么都会跑一次 data 方案补丁（第 9 节）：即使 `prebuilt`
-  也会跑，因为 227 的实测是「build 已经对了但引擎不用它」；同样只记日志，不阻塞启动。
+* data 方案补丁（第 9 节）现在也在 ensure 里：build 可用才写（227 的实测是
+  「build 已经对了但引擎不用它」），同样只记日志，不阻塞启动。
+* data 目录在**装完输入法之后**会重新解析一次（M1）：调用方解析时 Weasel 往往
+  还没装上（全新机器上为空），用旧结果做模板门禁会把 `default.custom.yaml` 整份跳过；
+  重新解析后 config 模板与 payload `config/` 的 wubi86 门禁（M2）用的是同一份目录。
 
 ## 7. 手动入口
 
@@ -230,6 +284,49 @@ rime-sync-cli fix-ime --payload /path/to/prebuilt --rime-dir /path/to/Rime
 `--rime-dir` 与 `--json` 是全局参数（写在子命令前后都可以）。`fix-ime`
 不访问 WebDAV、不解析密码（不触发钥匙串探测）。铺完 `build_ok=false` 时退出码为 1
 （JSON 仍会先打印完整报告）。
+
+0.6.23 起 `fix-ime` 只是「ensure + 输入法本体自举 + 方案裁剪」的外壳，产物与部署
+全部走 `ime_state::ensure`。另外两个子命令是给程序/CI 用的（安装器已不再调用它们）：
+
+~~~bash
+# 只读判据（不写任何文件）：设置页诊断、CI 断言都用它
+rime-sync-cli --rime-dir /path/to/Rime check-ime --json --report check.json
+
+# 唯一状态机：assess → 铺 prebuilt → patch data → 部署 → 再 assess
+rime-sync-cli --rime-dir /path/to/Rime ensure-ime --json --report ensure.json
+~~~
+
+`check-ime` 的 JSON：`result`（ok / failed）、`build_ok`、`reason`、`detail`、
+`targets`、`schemas[]{id,primary,schema_yaml,bins}`、`missing[]`。
+`ensure-ime` 的 JSON：平铺 `PrebuiltReport`（`build_ok` / `build_schemas` /
+`build_repaired` / `deploy_*`）+ `result` / `ok` / `detail` / `repaired[]` /
+`actions[]{kind,changed,detail}` / `schemas[]`。
+
+**结论语义（只有一个来源）**：
+
+| result | 含义 | 退出码 |
+|---|---|---|
+| `ok` | 本次改过东西，且最终 `assess().build_ok == true` | 0 |
+| `noop` | 本来就是可用状态，本次一个字节都没改 | 0 |
+| `partial` | 最终可用，但本次有改动失败（`detail` 必非空） | 1 |
+| `failed` | 最终不可用（`detail` 必非空） | 1 |
+
+`--report <FILE>` 把同样的 JSON 落盘（安装器不解析 stdout，避免 NSIS 的
+1024 字符变量上限）。
+
+### 7.3 安装器（NSIS）不再碰输入法
+
+B 方案起，安装器**只交付程序本体**：它不调用 `ensure-ime` / `check-ime`，不判定
+输入法，不铺 prebuilt，不跑部署，也不自检、不设退出码。原来的 SELF-CHECK 整段删除
+（连同 `RimeSyncProbeBuild` / `RimeSyncEnsureIme` / `RimeSyncCheckIme` 等函数）。
+
+产物与部署全部由**程序首次启动**时的 `ime_state::ensure(Mode::Install)` 负责：
+输入法本体 → config 模板 → prebuilt → data → 部署 → assess。安装版首次启动的
+完整语义、失败交互与升级路径见
+[WINDOWS-IME-BOOTSTRAP.md](WINDOWS-IME-BOOTSTRAP.md)。
+
+CLI 的 `ensure-ime --mode install` 与程序走同一个状态机；CI 的 windows-e2e 用它
+模拟「装完后首次启动」，断言 `result=ok` 且 build 里含 `rimesync_vnum`。
 
 ## 8. 日志
 
@@ -622,8 +719,10 @@ weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-ins
 * `/usr/share/rime-sync/prebuilt` 目前由 `packaging/linux/postinst` 引用，但 deb 的
   文件映射里还没有这一份（程序会优先命中 Tauri 资源目录）；两者取其一即可，重复打包
   会白占约 29 MB；
-* 自举只铺产物，不触发重新部署；已运行的 Weasel / fcitx5 需要重启输入法或重新选方案
-  后才会加载新的 `build/`。
+* 自举会装输入法本体、播模板并铺产物，但**部署是 deferred**（不 taskkill、不跑
+  部署器、Linux 不跑 `fcitx5-remote -r`）：已运行的 Weasel / fcitx5 需要重启输入法、
+  点「重新部署」或重新选方案后才会加载新的 `build/`；显式部署只发生在
+  `ensure-ime --mode install|fix` 与设置页「修复输入法」。
 * Linux 的 custom 降级（共享 data 目录不可写 → 用户级 `<schema>.custom.yaml`）在启动
   自举里 **不跑 `fcitx5-remote -r`**：只记 `deploy=deferred` 并在 GUI 日志提示
   「已更新输入法配置，请点『重新部署』或重启输入法」，避免打断正在打字的用户；
@@ -637,3 +736,218 @@ weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-ins
   （只写 `bootstrap.log`，不打扰用户），要在安装期生效需要以 root 跑一次
   `rime-sync-cli fix-ime`；随包 deb 的 `postinst` 目前还没有调用它；
 * 当前没有「一键提权重跑」按钮，提权需要用户自己以管理员身份执行一次 CLI。
+
+## 13. 部署链（0.6.23）：为什么不再依赖 WeaselDeployer
+
+### 13.1 227 实测证据
+
+2026-11-06 在测试机 192.168.61.227（Windows）上逐项核对：
+
+| 证据 | 结果 |
+|---|---|
+| `%APPDATA%\Rime\build` 的 18 个文件时间戳 | 全部停在**铺 prebuilt 的那一刻**（11-06 06:42），之后没有任何新产物 |
+| `build\luna_pinyin_simp.schema.yaml` | **不存在**；而 `<WeaselRoot>\data\luna_pinyin_simp.schema.yaml` 存在 |
+| `WeaselDeployer.exe /deploy` | **恒返回 0**，不写任何 build 文件（用官方 Weasel 安装包同样） |
+| 原因 | 它只是通过 IPC 请求 WeaselServer 部署；非交互会话下请求静默失败，退出码仍是 0 |
+| 后果 | 引擎启动时按时间戳判断 build 是否最新；我们铺的 prebuilt 永远比 data 新，于是「本机部署」这条链**永远不生效** |
+
+结论：**不能再把 WeaselDeployer 当作部署的主要手段**。安装期与自举都不调用它。
+
+### 13.2 现在怎么做
+
+| 场景 | 手段 | deploy_method |
+|---|---|---|
+| 用户显式「重新部署 / 修复输入法」（GUI / `rime-sync-cli fix-ime` / 安装自检） | **进程内**直接调 librime C API（`RimeSetup` → `RimeInitialize` → `RimeStartMaintenance` → `RimeJoinMaintenanceThread` → `RimeFinalize`） | `inproc` |
+| 进程内不可用（找不到库/符号、初始化失败） | 铺随包 prebuilt + 让引擎下次启动自己部署 | `prebuilt` / `auto` |
+| 已经可用、什么都不用做 | —— | `none` |
+
+进程内部署的实现（`crates/core/src/librime.rs`）：
+
+* 库**一律动态加载**（Windows `LoadLibraryW`、Linux `dlopen`），不引入任何编译期
+  链接依赖——CI 上没有 librime 也能构建；
+* traits：`shared_data_dir=<WeaselRoot>\data`、`user_data_dir=%APPDATA%\Rime`、
+  `app_name=rime.sync.deploy`。`RimeTraits` 用 `#[repr(C)]` 镜像结构体表示，
+  `data_size = size_of::<RimeTraitsC>()`（64 位 96 / 32 位 48），**不再手写 96**——
+  字段顺序由单测对着 `third_party/librime/src/rime_api.h` 校验；
+* 符号先找 C 名字（`RimeSetup`），再找 Itanium ABI 的 C++ 名字
+  （`_Z9RimeSetupP13rime_traits_t`，自编译 librime 没加 `extern "C"` 时只剩这个）；
+* 找不到库/符号、初始化失败 → `deploy_method=inproc_failed` + 可读原因，**不 panic**；
+* 失败判据（0.6.23 B1）只有两条，任一成立即 `inproc_failed`：
+  1. `RimeStartMaintenance` 返回 `False`（`Bool` 就是 int，头文件
+     `rime_api_deprecated.h:40`；`RimeJoinMaintenanceThread` 返回 void，不再当 int 读）；
+  2. 调用前后 `build/` 的文件数与 mtime（含目录 mtime）完全没变。
+  `installation.yaml` 只作为旁证写进明细，**不再**当判据、也不短路。
+
+CLI：
+
+```bash
+# 进程内部署（Windows 走 <WeaselRoot>\rime.dll，Linux 走 librime.so.1）
+rime-sync-cli --rime-dir "$APPDATA\Rime" deploy-ime
+rime-sync-cli --rime-dir "$APPDATA\Rime" deploy-ime --json
+# 输出：deploy_method=inproc deploy_ok=true deploy_ms=6030
+```
+
+### 13.3 让「自动部署」的条件成立（纯 mtime 触发）
+
+引擎的真实判据（`third_party/librime/src/rime/lever/deployment_tasks.cc:45-78`）：
+
+```text
+last_modified = max(data 目录自身 mtime,
+                    data 目录下直接子文件的 *.yaml mtime（排除 user.yaml）)
+needs_deploy  = last_modified > user.yaml 的 var/last_build_time
+```
+
+也就是「data 比上一次成功部署的时间新」。`build/` 的 mtime 不参与判定，
+`var/last_build_time` 只由引擎自己在上一次部署结束时写入。铺完 prebuilt / 打完
+data 补丁之后，`prebuilt::finish_deploy` 会把条件做成成立：
+
+1. 把 data 下相关方案的 `*.schema.yaml` 的 mtime 刷成现在（`File::set_modified`）；
+   `deploy::touch_time` 再取「build 最新 mtime + 1s」做下限，保证「build 不比 data 新」
+   这个不变量（时钟回拨 / 预置产物 / FAT 那种粗粒度时间戳都不会把条件弄反）；
+2. 需要时 `taskkill /IM WeaselServer.exe /F` —— 由**系统在用户下次输入时自动拉起**，
+   拉起时引擎看到条件成立就会自己部署。**绝不**从会话 0 `Start-Process` 拉起：那会
+   得到会话 0 的僵尸实例（我们踩过这个坑）。
+
+**不再写 `user.yaml` 的 `var/last_build_time`（0.6.23 c）。** `user.yaml` 属于会跨设备
+同步的文件，把它归零会让其它设备下次启动也多做一次部署；它同时还是输入法运行时正在写
+的文件（见 13.3.1）。触发条件因此只剩 mtime 这一条。
+
+刷 mtime 时的兜底（0.6.23 B2）：共享 data 目录写不进去（Windows 上 `Program Files` 需要
+管理员）时，会再试 `<用户目录>\<方案>.schema.yaml`，两者都失败才算失败，日志列出尝试过的
+路径。显式修复时若本次**没有任何方案被改动**（内容哈希与上次相同），直接跳过刷 mtime，
+免得每点一次「修复输入法」都让引擎全量重建（0.6.23 C8）。
+
+进程内部署已经成功时，第 2 步跳过（`deploy_method=inproc`，不再碰服务）。
+写不进去只记失败，不影响 prebuilt 兜底。
+
+Linux：写方案补丁后的重载仍由 data_patch 负责（`fcitx5-remote -r` → `rime_deployer --build`），
+Bootstrap 仍是 `deploy=deferred`；显式 `deploy-ime` 走 13.3.2 的优先级链。
+
+#### 13.3.1 部署前必须先停服务（0.6.23 d）
+
+进程内 librime 部署会写 `user.yaml` / `installation.yaml`，而常驻的 WeaselServer 也在
+写同两个文件——0.6.22 的顺序是「先部署、后 taskkill」，于是两边抢文件。现在的顺序：
+
+| 步骤 | 动作 | 失败怎么办 |
+|---|---|---|
+| 1 | `taskkill /IM WeaselServer.exe /F`，然后用 `tasklist /FI "IMAGENAME eq WeaselServer.exe" /NH` 每 250 ms 确认一次，最多 3 秒 | 退出码 128（进程本来就不在）= 成功；其它非 0 = 失败 |
+| 2 | 进程内 librime 部署（`RimeSetup` → `RimeInitialize` → `RimeStartMaintenance` → `RimeJoinMaintenanceThread` → `RimeFinalize`） | 失败照旧记 `deploy_inproc`，退回 prebuilt |
+| 3 | 结束，**不拉起服务** | 由系统在用户下次输入时自动拉起 |
+
+服务在 3 秒内仍存活（或 `taskkill` 失败）→ **跳过进程内部署**，降级为 prebuilt：
+日志写 `deploy_method=prebuilt reason=server-alive`、`deploy_inproc=skipped reason=server-alive`。
+此时 data 的 mtime 仍会被刷新，等用户下次重启输入法时由引擎自己部署。
+
+`RIMESYNC_DEPLOY_NO_RESTART=1` 保持原义：完全不碰 WeaselServer（排障用）；此时没有
+「已确认退出」这一步，进程内部署照跑——这是显式打开调试开关的代价。
+
+收尾（引擎 apply 之后的重载）仍走单次 `taskkill`（`deploy::kill_server_once`，不轮询
+确认）：重载是 best-effort，不值得让一次同步多等 3 秒。需要「确认服务已退出再写
+user.yaml」的只有进程内部署，用的是 `deploy::stop_before_deploy`。
+
+taskkill 非 0/128（进程拒绝终止、权限不足……）在**重载**路径上只记 `warning=`，结果仍是
+`ok`，不会让整次 apply 判失败（0.6.23 B3）：重载没做成不影响已经铺好的产物。整次 apply
+只有在「build 不可用且随包产物也补不齐」时才失败。
+
+显式修复的顺序（0.6.23 B4）：**铺随包产物 → 写 data/用户目录补丁 → 再进程内部署 →
+逐方案校验**。进程内部署会把 `build/<id>.schema.yaml` 重写成 librime 自己的产物（不带
+插件标记）；校验到主方案缺标记、或该方案缺任何 `.bin` 时，把该方案的 `schema.yaml`
+与全部 `.bin` **一起**从随包产物重铺（不允许「schema 来自 inproc、bin 来自 prebuilt」
+的混合态），日志写 `build_source=prebuilt` 与 `reverted=[…]`。
+
+覆盖范围：设置页「修复输入法」（`cmd_fix_ime`）、`rime-sync-cli fix-ime`、
+`rime-sync-cli deploy-ime`、WeaselTrigger 的「重新部署」都走同一套
+`deploy::stop_before_deploy` / `deploy::inproc_after_stop`。启动自举不跑进程内
+librime（不写 `user.yaml`），因此没有「部署前停服务」这一步，仍在收尾时按需结束服务。
+
+#### 13.3.2 Linux 显式部署：外部部署器优先（0.6.23）
+
+`rime-sync-cli deploy-ime` 在 Linux 上不再无条件 dlopen librime（fcitx5-rime 可能正
+持着 userdb / 文件锁）。顺序见 `crates/core/src/linux_deploy.rs`，每步都有 120 秒超时：
+
+| 顺序 | 条件 | 动作 | `deploy_method` |
+|---|---|---|---|
+| 1 | 找到 `rime_deployer`，且 fcitx5 **没在跑** | `rime_deployer --build <用户目录> <共享目录>` | `external_ok` / `external_failed` |
+| 2 | 找到部署器但 fcitx5 **在跑**（0.6.23 B5） | 先 `fcitx5-remote -r` **重载**（不杀进程）；重载成功才继续跑 `rime_deployer --build` | `external_ok` / `external_failed` |
+| 3 | 有部署器、fcitx5 在跑、但**重载失败** | 不执行 build，直接跳过 | `skipped`（`reason=ime-running`，detail 写明「未执行 build」） |
+| 4 | 没有部署器，且 `fcitx5-remote` 存在 + fcitx5 在跑 | 不碰用户的输入法，直接跳过 | `skipped`（`reason=ime-running`） |
+| 5 | 两者都不满足 | 进程内 dlopen librime | `inproc` / `inproc_failed` |
+
+`skipped` 时 CLI 退出码非 0，detail 里给出「先退出输入法（`fcitx5-remote -e`）后重试，
+或在托盘菜单点「重新部署」」。两个调试开关：`RIMESYNC_DEPLOY_FORCE_INPROC=1` 强制走
+进程内；`RIMESYNC_DEPLOY_UNSAFE_EXTERNAL=1` 允许在 fcitx5 运行时**直接** build（跳过重载，
+会有抢锁风险，只用于排障）。
+
+外部部署器的输出重定向到临时文件（不是 piped 后不读）——否则写满 64 KiB 管道缓冲区就会
+「部署器卡住」被误判成超时；超时后 `kill` + `wait` 回收，不留僵尸。进程内部署超时按失败
+处理，但会等后台线程自然结束（CLI 退出前一定 join），日志写明「超时后仍可能在后台完成」。
+
+### 13.4 日志字段
+
+```text
+deploy_method=inproc|prebuilt|auto|none   deploy_result=ok|partial|failed|skipped
+deploy_ok=true   deploy_ms=6030   deploy_detail=reason=inproc-deployed server_before=stopped taskkill=exit0 tasklist=gone poll=0 touched=3 auto_failed=0
+deploy_inproc=method=inproc ok=true ms=6030 lib=C:\Program Files\Rime\rime.dll ...
+# 停不下来时（0.6.23 d）：
+deploy_method=prebuilt reason=server-alive ...   deploy_inproc=skipped reason=server-alive (taskkill=exit0 but WeaselServer.exe alive after 3000ms)
+```
+
+安装自检（SELF-CHECK）同样输出 `deploy_method=` / `deploy_result=` / `deploy_ms=`，
+并多一行 `phase=DEPLOY-IME`（进程内部署的退出码与耗时）与 `phase=SERVER-RESTART`
+（taskkill 的退出码）。
+
+### 13.5 build 按方案校验（0.6.23 A）
+
+判据不再只看 `build\luna_pinyin_simp.schema.yaml` 一个文件：
+
+* 目标方案 = `packaging/rime/retained-schemas.txt`（3 个主方案）+ 依赖闭包
+  （`prune::keep_set`：`__include` / `dependencies` / `dictionary`）；
+* 主方案：`build\<id>.schema.yaml` 必须存在且含 `rimesync_vnum`；
+  依赖方案：只要求存在 `build\<id>.schema.yaml`，不要求标记；
+* 两者都要有至少一个 `<id>.prism.bin` / `<id>.table.bin` / `<id>.reverse.bin`；
+* 纯 `__include` 基类（例如 `luna_pinyin`：部署器只合并不落盘 `<id>.schema.yaml`）
+  在用户目录与 payload 里都没有 schema.yaml 时视为「本就不需要」，不参与判定；
+* 缺什么补什么：整树只补缺失文件，主方案的 schema.yaml 存在但缺标记时覆盖一次
+  （build/ 是派生数据）；**已有可用产物一个字节都不动**；
+* 报告：`build_schemas=luna_pinyin_simp:ok,wubi_pinyin:repaired,wubi86:missing`、
+  `build_repaired=`、`build_missing=`；补不齐只告警（CLI 退出码仍按判据文件判定）。
+
+安装自检侧（NSIS）用 `RIMESYNC_BUILD_SCHEMA_1..3` 三个 define 做同一件事，
+`check-nsis-hooks.sh --strict` 会断言这三个值与 `retained-schemas.txt` 逐项一致。
+
+### 13.6 验收命令
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo check --manifest-path src-tauri/Cargo.toml
+pnpm exec tsc --noEmit && pnpm build
+python3 scripts/ime/gen-prebuilt-build.py --check
+bash packaging/windows/check-nsis-hooks.sh --strict
+```
+
+### 13.7 CI 的 Windows 类型检查（0.6.23 a）
+
+`ci.yml` 的 `windows-typecheck` job 与 `release.yml` windows job 的
+`typecheck · cargo check (core + cli, fail fast)` 步骤只做类型检查，不链接、不打包：
+
+```bash
+# CI（ubuntu runner，交叉检查 Windows 专属代码）
+cargo check -p rime-sync-core --target x86_64-pc-windows-gnu
+cargo check -p rime-sync-cli  --target x86_64-pc-windows-gnu
+# release.yml 的 windows job（原生 Windows，不需要交叉工具链）
+cargo check -p rime-sync-core -p rime-sync-cli
+```
+
+为什么不是 `x86_64-pc-windows-msvc`：`core → reqwest → rustls → ring` 的 build.rs 用
+cc-rs 编译 C，msvc 目标需要 MSVC 的 `lib.exe`，ubuntu runner 上不存在；本机实测报错
+`error occurred in cc-rs: failed to find tool "lib.exe"`（ring 0.17.14）。`--no-default-features`
+绕不过去（reqwest 不是可选依赖），只 check「纯 Rust 部分」又会漏掉 Windows 专属代码。
+gnu 目标的 `target_os` 同样是 `windows`，而 `cargo check` 不链接，所以对
+「`cfg(windows)` 代码能否编过」等价；job 里装 `gcc-mingw-w64-x86-64` 只为编 ring 的 C。
+
+本地验证的边界：Linux 开发机上 `cargo check`（宿主）通过；msvc 目标在 ring 处失败
+（如上）；gnu 目标需要 mingw 的 gcc，开发机上没有，因此这条命令只在 CI 上真正跑过。
+若哪天 ring 改了构建方式导致 gnu 也编不动，把 job 改成 `runs-on: windows-latest` +
+原生 `cargo check` 即可（release.yml 里已经是这样）。

@@ -37,7 +37,7 @@
     ]
   },
   "budget_bytes": 62914560,
-  "total_bytes": 30564865,
+  "total_bytes": 30565210,
   "files": [
     {
       "path": "build/default.yaml",
@@ -143,6 +143,11 @@
       "path": "config/luna_pinyin_simp.custom.yaml",
       "bytes": 28254,
       "sha256": "2e1de77d17b439497fa9cdccff9e7f386de511e7486862e1b5310cdf3bc12e7b"
+    },
+    {
+      "path": "config/weasel.custom.yaml",
+      "bytes": 345,
+      "sha256": "f0e4773afc32c43edc6448234181108cbe580876505df9ff64430af8fac60f08"
     },
     {
       "path": "config/wubi86.custom.yaml",

@@ -9,10 +9,14 @@ pub mod cancel;
 pub mod config;
 pub mod data_patch;
 pub mod dedupe;
+pub mod deploy;
 pub mod engine;
 pub mod history;
 pub mod ime;
+pub mod ime_state;
 pub mod index;
+pub mod librime;
+pub mod linux_deploy;
 pub mod lock;
 pub mod log;
 pub mod merge3;
@@ -42,6 +46,10 @@ pub use engine::{
 };
 pub use history::{HistoryEntry, HISTORY_LIMIT};
 pub use ime::{ImeReport, WeaselHealth};
+pub use ime_state::{
+    assess, ensure, Action, Assessment, KeepSet, Mode, Options as EnsureOptions, Outcome,
+    OutcomeResult, Reason, SchemaState, State as SchemaFileState,
+};
 pub use lock::{acquire as acquire_lock, inspect as inspect_lock, LockGuard, LockInfo, LockStatus};
 pub use log::{LogWriter, RotatingLog, DEFAULT_KEEP, DEFAULT_MAX_BYTES};
 pub use network::{NetworkPolicy, NetworkProbe, NetworkState};

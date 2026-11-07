@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rime-sync",
-  "version": "0.6.22",
+  "version": "0.6.24",
   "identifier": "com.rimesync.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -61,9 +61,6 @@
       "../packaging/windows/vendor/GPL-3.0.txt": "resources/GPL-3.0.txt",
       "../packaging/windows/vendor/WEASEL-NOTICE.txt": "resources/WEASEL-NOTICE.txt",
       "../packaging/windows/vendor/README.md": "resources/README.md",
-      "../packaging/rime/default.custom.yaml": "resources/default.custom.yaml",
-      "../packaging/rime/weasel.custom.yaml": "resources/weasel.custom.yaml",
-      "../packaging/rime/schemas/": "resources/schemas/",
       "../packaging/rime/retained-schemas.txt": "resources/retained-schemas.txt",
       "../packaging/rime/prebuilt/": "resources/prebuilt/"
     },
@@ -83,8 +80,7 @@
           "/usr/lib/rime-sync/install-vendor-deps.sh": "../packaging/linux/install-vendor-deps.sh",
           "/usr/lib/rime-sync/uninstall.sh": "../packaging/linux/uninstall.sh",
           "/usr/share/applications/rime-sync-uninstall.desktop": "../packaging/linux/rime-sync-uninstall.desktop",
-          "/usr/bin/rime-sync-status": "../packaging/linux/rime-sync-status",
-          "/usr/bin/rime-sync-cli": "../packaging/linux/rime-sync-cli"
+          "/usr/bin/rime-sync-status": "../packaging/linux/rime-sync-status"
         },
         "postInstallScript": "../packaging/linux/postinst",
         "preRemoveScript": "../packaging/linux/prerm",

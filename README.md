@@ -67,10 +67,13 @@ Linux 上 fcitx5 常驻会持有 userdb 的 LevelDB 锁，所以 apply 必须停
 
 | 形态 | 文件 | 说明 |
 |---|---|---|
-| 安装版 | `rime-sync_<版本>_x64-setup.exe` | NSIS；内嵌 WebView2 **引导器**（`embedBootstrapper`），离线/内网机器也能装，运行时再补 WebView2 |
+| 安装版 | `rime-sync_<版本>_x64-setup.exe` | NSIS。**安装器只交付程序本体**：系统版本、WebView2、卸载旧版 rime-sync、快捷方式；输入法不归它管 |
 | 便携版 | `rime-sync_<版本>_x64-portable.zip` | 解压即用，不写注册表；卸载 = 删目录 |
 
-- 安装后在开始菜单创建 **「Rime 同步」** 程序组；若检测到小狼毫（Weasel）程序组，也会在其中放一份快捷方式。
+- 安装后在开始菜单创建 **「Rime 同步」** 程序组（主程序 + `--setup` 的「同步设置」）。
+- **输入法（小狼毫 / Weasel）由程序首次启动时自举**：Weasel 缺失或不是我们的构建时，用随包安装器静默装回（`/S /NOREBOOT`），再播推荐的 config 模板、铺预编译产物、补 data、部署。安装小狼毫需要管理员权限；普通用户启动时程序会弹阻塞提示 + 设置页红条（「修复 / 以管理员重启」）。详见 [docs/WINDOWS-IME-BOOTSTRAP.md](docs/WINDOWS-IME-BOOTSTRAP.md)。
+- 交互式安装完成后，Tauri 完成页的「运行 rime-sync」**默认勾选**，程序会立刻启动并自举输入法；`/S` 静默安装不会启动程序，要等用户首次手动启动或开机自启（`--autostart`）才装输入法。
+- **升级路径**：旧版卸载器会连带卸掉小狼毫，新版安装器**不会装回**，所以从「升级完成」到「首次启动程序」之间机器上没有输入法。首次启动需要管理员权限才能装回；这是 B 方案的已知取舍。
 - 未做代码签名，SmartScreen 提示时选「更多信息 → 仍要运行」。
 
 ### Linux

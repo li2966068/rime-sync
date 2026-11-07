@@ -1,6 +1,13 @@
-# Windows 打包（自编译小狼毫 + 先装输入法）
+# Windows 打包（自编译小狼毫 + 程序首启自举）
 
-目标：一个安装包装完即有小狼毫，且安装顺序是「先装输入法、再装 Rime 同步」。
+目标：安装包只交付 rime-sync 本体；**输入法（小狼毫）由程序首次启动时自举**。
+
+> ⚠️ B 方案（安装器不再装/判输入法）：构建期仍然要把自编译的
+> `weasel-0.17.4.0-installer.exe` 打进 Tauri resources（`resources/weasel/`），
+> 但运行时由程序的 `ime_state::ensure(Mode::Install)` 调它，而不是 NSIS 钩子。
+> 完整流程、失败交互与升级路径见
+> [`docs/WINDOWS-IME-BOOTSTRAP.md`](../../docs/WINDOWS-IME-BOOTSTRAP.md)。
+> 本文档第 2 节（怎么编出 Weasel / librime）仍然有效；第 3 节已按 B 方案更新。
 
 ## 1. 文件
 
@@ -10,14 +17,14 @@
 | `../../scripts/ime/build-librime-win.ps1` | **0.6.9 起**：从 `third_party/librime`（vendored 1.17.0）自建 librime，把 `plugins/rimesync-extra` 合并进 rime.dll，产出 `lib64/lib/output/output\\Win32/include` 布局 |
 | `fetch-weasel.ps1` | **离线兜底**：下载官方 `weasel-0.17.4.0-installer.exe`，校验大小与 SHA-256 |
 | `vendor/` | 构建产物（`*.exe` 不入库）+ GPLv3 全文 + 来源说明 |
-| `../nsis-hooks.nsh` | NSIS 钩子：PREINSTALL 检查系统版本 → **卸载旧版（同步程序 + 自建输入法）** → 检查/安装 WebView2 → 装输入法并记所有权；POSTINSTALL 建快捷方式 + 按新版无条件写配置（覆盖前备份）；PREUNINSTALL 卸载输入法（仅当是 rime-sync 装的） |
+| `../nsis-hooks.nsh` | NSIS 钩子（B 方案）：PREINSTALL 检查系统版本 → WebView2 → 静默卸载旧版 rime-sync → 建 `resources`；POSTINSTALL 只建快捷方式；PREUNINSTALL 询问/清理用户数据。**不装、不判输入法** |
 | `../nsis-hooks-offline.nsh` | 离线变体：`!define RIMESYNC_EMBED_WEBVIEW` 后 include 主钩子（内嵌 WebView2 Standalone） |
 | `fetch-webview2.ps1` | 下载 WebView2 Evergreen **Standalone**（x64，约 130 MB）供离线包内嵌；3 次重试 + 体积/文件头校验 |
 | `../../src-tauri/tauri.conf.json` | `bundle.resources` 只打包许可证/说明；**`bundle.externalBin` 带 `rime-sync-cli`（0.6.17，见第 14 节）**；`installMode = perMachine`；`webviewInstallMode = skip` |
 | `../../src-tauri/tauri.offline.conf.json` | 离线包覆盖项：只改 `bundle.windows.nsis.installerHooks` 指向离线钩子 |
 
-> 为什么 resources 里没有 `weasel-*.exe`：安装器用 NSIS 的 `File` 指令在**构建期**把
-> 它内嵌进 setup.exe（见第 3 节），再放进 resources 会让同一个 12MB 文件进包两次。
+> 随包 Weasel 安装器的位置：`src-tauri/tauri.windows.conf.json` 把它映射到
+> `resources/weasel/weasel-0.17.4.0-installer.exe`（只进 Windows 包，Linux 包不背这 12 MB）。
 
 ## 2. 构建（CI 由 release.yml 的 windows job 执行）
 
@@ -186,49 +193,44 @@ vendored 树自带的上游 `.gitignore` 忽略了 `output/*.exe`、`output/*.tx
 `7-zip-license.txt`、`rime-install-config.bat` …）。脚本的前置检查会明确列出缺失项并提示
 `git add -f`。
 
-## 3. 安装顺序的实现（证据点）
+## 3. 安装顺序（B 方案）
 
 Tauri 的 NSIS 模板在 `Section Install` 里的顺序是：
 
 ```nsis
 SetOutPath $INSTDIR
-!insertmacro NSIS_HOOK_PREINSTALL     ; ← 我们在这里装输入法
+!insertmacro NSIS_HOOK_PREINSTALL     ; ← OS 版本 / WebView2 / 卸旧版 / 建 resources
 File "${MAINBINARYSRCPATH}"          ; ← 这里才开始拷 rime-sync
-File ...resources...
+File ...resources...                  ; ← resources/weasel、resources/prebuilt 在这里落地
 !insertmacro NSIS_HOOK_POSTINSTALL    ; ← 只建快捷方式
 ```
 
-因此 **PREINSTALL 阶段读不到 `$INSTDIR\resources`**（resources 是后面才解压的）。
-做法：
+因为 PREINSTALL 读不到 `$INSTDIR\resources`，旧版「安装器自己装输入法」的实现才
+不得不用 NSIS `File` 把安装器重复内嵌一次。B 方案把输入法整体交给程序：程序启动时
+`resources/weasel` 已经解压好了，直接跑即可。
 
-1. 钩子里用 `${__FILEDIR__}`（Tauri 把 `installerHooks` canonicalize 成绝对路径再
-   `!include`，所以它等于 `<repo>\packaging`）定位
-   `windows\vendor\weasel-0.17.4.0-installer.exe`；
-2. 在 `PREINSTALL` 里用 NSIS `File` 指令把它解到 `$PLUGINSDIR\rime-sync-weasel\`；
-3. `ExecWait '"...\weasel-....exe" /S' $0` 等输入法装完，再 `SetOutPath $INSTDIR` 交还
-   给 Tauri 继续拷程序文件。
-
-可复核的证据：
+可复核的证据（安装器侧）：
 
 | 证据 | 位置 |
 |---|---|
-| 编译期：内嵌缺失告警 | makensis 输出里的 `rime-sync: vendored weasel installer not found`（`!warning`） |
-| 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-ime-order.log`（单行记录，含 `phase=IME-INSTALL`、`exit=0`、`phase=POSTINSTALL`） |
-| 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，同一份内容 + 阶段名 `OS-CHECK` / `UNINSTALL-OLD` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `IME-INSTALL` / `POSTINSTALL` / `DONE`；失败路径也写） |
+| 运行期：顺序 + 退出码 | `%ProgramFiles%\rime-sync\install-order.log`（含 `phase=UNINSTALL-OLD`、`phase=POSTINSTALL`、`phase=DONE`） |
+| 运行期：统一安装日志 | `%TEMP%\rime-sync-setup.log`（UTF-16LE，阶段名 `OS-CHECK` / `WEBVIEW-CHECK` / `WEBVIEW-INSTALL` / `UNINSTALL-OLD` / `POSTINSTALL` / `DONE`；失败路径也写） |
 | 运行期：安装日志 | `DetailPrint` 里的 `[rime-sync] [YYYY-MM-DD HH:MM:SS] 阶段=...` |
-| 运行期：卸载旧版（0.6.11 / 0.6.14） | `%TEMP%\rime-sync-setup.log` 里的 `phase=UNINSTALL-OLD target=rime-sync exit= ms=`（无卸载器时 `result=none`）。0.6.14 起**不再有** `target=weasel`：输入法由 `phase=IME-CHECK` / `IME-REPAIR` / `WEASEL-ROLLBACK` 负责 |
-| 运行期：配置备份（0.6.11） | 同上日志里的 `seed file=<name> result=backup backup=<path>` 与 `phase=POSTINSTALL seed done configs= backups=` |
-| 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；内嵌的 Weasel 安装器约 12 MiB） |
+| 产物体积 | 最终 `*-setup.exe` ≥ 15 MiB（CI 断言；随包的 Weasel 安装器约 12 MiB） |
 
 静默安装看不到 DetailPrint，所以顺序日志写文件；卸载时删除该文件。
+
+输入法侧的证据（程序自举）在
+[`docs/WINDOWS-IME-BOOTSTRAP.md`](../../docs/WINDOWS-IME-BOOTSTRAP.md)：
+`bootstrap.log` 里的 `ime check …` / `ensure action=weasel …`。
 
 卸载相关的证据：
 
 | 证据 | 位置 |
 |---|---|
-| 所有权标记 | `HKLM\Software\rime-sync` 的 `BundledWeasel` / `WeaselRoot` / `WeaselUninstall` / `BundledAt` |
-| 安装日志 | `%ProgramFiles%\rime-sync\install-ime-order.log` 里的 `phase=PREINSTALL ownership marker written` |
 | 卸载日志 | `%TEMP%\rime-sync-uninstall.log`（卸载后仍在，逐行带 `phase=PREUNINSTALL`） |
+| 用户数据 | 默认保留；交互询问「是否删除」、静默需 `/PURGEDATA`，只删 `%APPDATA%\Rime` 与 `%APPDATA%\com.rimesync.app` |
+| 小狼毫 | **不再随 rime-sync 卸载**（用户自己装卸）；旧版所有权标记在升级时兜底删除 |
 
 ## 4. CI（release.yml · windows job）
 
@@ -972,9 +974,11 @@ scripts/ime/gen-prebuilt-build.py --check
 里连 `phase=DONE` 都没有），所以「安装器负责铺产物」这条路本身不可靠。0.6.16 起把同样的
 逻辑搬进程序：**安装器钩子不跑时由程序自举兜底**。
 
-* 应用启动（tauri `setup`）后在后台线程 `probe_build`：`none` / `deploy`（有文件但没
-  插件标记）→ `install_prebuilt` 铺一遍；`prebuilt` 直接跳过。失败只写日志，
-  不弹窗、不阻塞启动；
+* 应用启动（tauri `setup`）后在后台线程 `ime_state::ensure(Options::bootstrap())`：
+  装输入法本体 + 播 config 模板 → assess →（不满足才）铺 prebuilt → patch data →
+  部署 **deferred** → 再 assess；已可用时 result=noop 且一个字节都不改。
+  bootstrap 绝不 taskkill / 不跑部署器 / Linux 不重载 fcitx5，失败只写日志、
+  不弹窗、不阻塞启动（`Options::install()` 只给「装完首次运行 / CLI --mode install」）；
 * 设置页「修复输入法 / 强制覆盖」= `cmd_fix_ime`，与启动自举同一套
   `crates/core/src/prebuilt.rs`；
 * CLI：`rime-sync-cli fix-ime [--force] [--json] [--payload <DIR>]`；
@@ -996,7 +1000,7 @@ scripts/ime/gen-prebuilt-build.py --check
 | 源文件名 | Tauri 会补 target triple 与扩展名，所以构建机必须准备 `target/release/rime-sync-cli-x86_64-pc-windows-msvc.exe`（Linux：`…-x86_64-unknown-linux-gnu`） |
 | 构建 | Windows：`cargo build -p rime-sync-cli --release --locked --target x86_64-pc-windows-msvc`，再把 `target/x86_64-pc-windows-msvc/release/rime-sync-cli.exe` 复制成上面的名字（release.yml 的 `build CLI sidecar for the bundle`） |
 | 安装位置 | `<安装目录>\rime-sync-cli.exe`（与 `rime-sync-app.exe` 同级）；便携 zip 里同名 |
-| Linux | deb 里是 `/usr/bin/rime-sync-cli`（既有 `bundle.linux.deb.files` 映射）；同一份 sidecar 也让 AppImage 带上 `$APPDIR/usr/bin/rime-sync-cli` |
+| Linux | deb 里是 `/usr/bin/rime-sync-cli`，同样来自 sidecar（0.6.23 起 `bundle.linux.deb.files` 里那条同名映射已删除，避免与 sidecar 双供）；AppImage 里是 `$APPDIR/usr/bin/rime-sync-cli` |
 | 产物断言 | release.yml 的 `assert nsis setup carries CLI and prebuilt schemas` 用 `7z l` 列 setup.exe；`.github/scripts/verify-artifacts.sh` 对在线/离线包各断言一次 |
 
 本机只打安装包时的等价操作：

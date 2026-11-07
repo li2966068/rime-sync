@@ -184,6 +184,24 @@ if ! docker run --rm --network "$DOCKER_NETWORK" \
   echo "!! container build failed; see $STAGING/build.log" >&2
   exit 1
 fi
+
+# 缓存状态要交给 workflow 的 save 步：容器里的 verify 只在日志里说 cache=hit /
+# cache=invalid reason=…，宿主侧必须把它变成 build_ime_deb.outputs.cache_status。
+# save 的 key 带 run_id，判 invalid 时这次重建的产物必须存回去，否则坏缓存会被
+# restore-keys 反复命中，等于每轮都白编一次。
+if [ -n "$CACHE_DIR" ]; then
+  if grep -qx 'cache=hit' "$STAGING/build.log"; then
+    cache_status=hit
+  else
+    cache_status=invalid
+    grep -m1 '^cache=invalid reason=' "$STAGING/build.log" || true
+  fi
+  echo "cache=$cache_status"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "cache_status=$cache_status" >>"$GITHUB_OUTPUT"
+  fi
+fi
+
 ELAPSED=$(($(date +%s) - START))
 
 PLUGIN=$STAGING/root/usr/lib/x86_64-linux-gnu/fcitx5/rime.so

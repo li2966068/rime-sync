@@ -38,6 +38,7 @@ WEASEL_MODE="require"
 WEASEL_STRICT=1
 
 STATUS_HELPER=/usr/bin/rime-sync-status
+SYNC_CLI=/usr/bin/rime-sync-cli
 UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
 LOCALE_MO=usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo
 WEASEL_CAPTION="输入法自建同步"
@@ -199,6 +200,20 @@ check_sync_deb() { # $1=deb $2=workdir
     ok "存在 /usr/bin/rime-sync-app"
   else
     bad "rime-sync deb 里没有 /usr/bin/rime-sync-app"
+  fi
+
+  # 0.6.23：CLI 的唯一来源是 bundle.externalBin sidecar（deb.files 里那条同名映射已删）。
+  # 数 dpkg-deb -c 的 tar 条目：>1 = 双供又回来了，0 = sidecar 没打进 deb（fcitx5 配置页的
+  # 「立即同步」会静默 no-op）。
+  local cli_n
+  cli_n=$(dpkg-deb -c "$deb" | awk -v p="./usr/bin/rime-sync-cli" '$6 == p' | wc -l)
+  if [ "$cli_n" -eq 1 ]; then
+    ok "rime-sync deb 内 $SYNC_CLI 恰好 1 份"
+  else
+    bad "rime-sync deb 内 $SYNC_CLI 应恰好 1 份，实际 $cli_n 份"
+  fi
+  if [ -f "$root$SYNC_CLI" ]; then
+    check_mode "$root$SYNC_CLI" "rime-sync deb 内 $SYNC_CLI" 755 || true
   fi
 }
 
@@ -539,6 +554,8 @@ run_selftest() {
   printf '#!/bin/sh\nexit 0\n' >"$root_sync$STATUS_HELPER"
   chmod 0755 "$root_sync$STATUS_HELPER"
   printf 'mock app' >"$root_sync/usr/bin/rime-sync-app"
+  printf 'mock cli' >"$root_sync$SYNC_CLI"
+  chmod 0755 "$root_sync$SYNC_CLI"
 
   mkdir -p "$base/good/dist"
   build_deb "$root_ime" "$base/good/dist/rime-inputmethod_0.0.0~selftest_amd64.deb" rime-inputmethod 0.0.0
@@ -699,6 +716,11 @@ PY
   rm -f "$base/no-sync-status/sync-root$STATUS_HELPER"
   rebuild "$base/no-sync-status"
   expect_fail "rime-sync deb 缺 rime-sync-status" "$base/no-sync-status" "rime-sync deb 内 /usr/bin/rime-sync-status"
+
+  mutate no-sync-cli
+  rm -f "$base/no-sync-cli/sync-root$SYNC_CLI"
+  rebuild "$base/no-sync-cli"
+  expect_fail "rime-sync deb 缺 rime-sync-cli" "$base/no-sync-cli" "应恰好 1 份"
 
   mutate no-weasel-caption
   python3 - "$base/no-weasel-caption/weasel/WeaselServer.exe" <<'PY'

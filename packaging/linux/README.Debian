@@ -33,6 +33,15 @@ GNOME/Wayland 下还需要在「设置 → 键盘 → 输入源」里加入「Fc
 
 注意：模板只是模板，包不会覆盖用户已有的 default.custom.yaml。
 
+无 GUI 时可以用包里自带的命令行工具排查（与图形界面同一份构建）：
+
+    rime-sync-cli status          # 设备/远端状态
+    rime-sync-cli fix-ime --json  # 检查并修复输入法产物
+    rime-sync-cli prune-schemas   # 清理非保留方案（root）
+
+它由打包时 Tauri 的 sidecar（bundle.externalBin）写入 /usr/bin，**包里只有这一份**；
+不会再有第二份副本覆盖它。
+
 v 数值转中文（v123 / v12.5）与中文标点直出（不按 Shift 出主字符，Shift + 键 取备选）
 需要额外的方案配置，模板在 /usr/share/rime-sync/defaults/schemas/（16 个随包方案各一份）：
 

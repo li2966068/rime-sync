@@ -13,6 +13,14 @@ pub trait RimeTrigger: Send + Sync {
     fn sync_userdb(&self, rime_dir: &Path) -> Result<()>;
     fn deploy(&self, rime_dir: &Path) -> Result<()>;
 
+    /// 用户显式要求「重新部署」时用（保存并重新部署 / 修复输入法）。
+    ///
+    /// 0.6.23 起 Windows 走进程内 librime API（见 crate::librime），不再依赖
+    /// WeaselDeployer——它只用 IPC 请求 WeaselServer，非交互会话下返回 0 却不产出。
+    fn manual_deploy(&self, rime_dir: &Path) -> Result<()> {
+        self.deploy(rime_dir)
+    }
+
     /// apply 期间 Linux 需要让 fcitx5 释放 LevelDB 锁。
     fn stop_ime(&self) -> Result<()> {
         Ok(())
@@ -197,6 +205,21 @@ fn ime_procs_in(proc_root: &Path, name: &str) -> Vec<(u32, char)> {
 #[cfg(target_os = "linux")]
 fn live_ime_procs() -> Vec<(u32, char)> {
     ime_procs_in(Path::new("/proc"), IME_PROCESS)
+}
+
+/// fcitx5 是否正在运行（不含僵尸）。非 Linux 恒 false。
+///
+/// Linux 的部署编排（crate::linux_deploy）用它决定「要不要跳过进程内部署」：
+/// 输入法在跑的时候，librime 部署会和它抢 userdb / 文件锁。
+pub fn ime_running() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !live_ime_procs().is_empty()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// 日志里打印 pid(state)，直接说明「为什么它看起来还在跑」。
@@ -578,8 +601,63 @@ impl RimeTrigger for WeaselTrigger {
         self.run_switch("/sync")
     }
 
+    /// 引擎 apply 之后的重新加载：**不调部署器**，只结束 WeaselServer。
+    ///
+    /// 227 证据：WeaselDeployer.exe /deploy 恒返回 0 却不产出任何 build 文件；
+    /// 而结束服务后系统会在用户下次输入时自动拉起（绝不在会话 0 里 Start-Process，
+    /// 那会得到会话 0 的僵尸实例）。
     fn deploy(&self, _rime_dir: &Path) -> Result<()> {
-        self.run_switch("/deploy")
+        let outcome = crate::deploy::apply(&crate::deploy::reload_plan("engine-apply"));
+        // B3：taskkill 非 0/128（进程拒绝终止、权限不足……）只告警。重载没做成不影响
+        // 已经铺好的产物；整次 apply 只有在「build 不可用且随包产物也补不齐」时才失败，
+        // 那条判据在 prebuilt::finish_deploy 里。这里**绝不** bail。
+        if outcome.result == crate::deploy::RESULT_FAILED {
+            tracing::warn!(
+                "weasel reload after apply failed (best-effort): result={} {}",
+                outcome.result,
+                outcome.detail
+            );
+            return Ok(());
+        }
+        if outcome.has_warning() || outcome.result == crate::deploy::RESULT_PARTIAL {
+            tracing::warn!(
+                "weasel reload after apply degraded: method={} result={} {}",
+                crate::deploy::DeployMethod::Auto,
+                outcome.result,
+                outcome.detail
+            );
+        } else {
+            tracing::info!(
+                "weasel reload after apply: method={} result={} {}",
+                crate::deploy::DeployMethod::Auto,
+                outcome.result,
+                outcome.detail
+            );
+        }
+        Ok(())
+    }
+
+    /// 用户显式「重新部署」：**先停服务**，再在进程内直接调 librime API。
+    ///
+    /// 0.6.23：librime 部署会写 user.yaml / installation.yaml；服务还在跑的时候
+    /// 两边抢同一个文件。停不下来就跳过 inproc（绝不硬上）。
+    fn manual_deploy(&self, rime_dir: &Path) -> Result<()> {
+        let stop = crate::deploy::stop_before_deploy(&crate::deploy::SystemRunner);
+        let Some(report) =
+            crate::deploy::inproc_after_stop(&stop, || crate::librime::deploy(rime_dir))
+        else {
+            bail!(
+                "结束 WeaselServer 失败（server={} {}），已跳过进程内部署",
+                stop.state.as_str(),
+                stop.detail
+            );
+        };
+        if report.deploy_ok {
+            tracing::info!("in-process deploy ok: {}", report.detail);
+            Ok(())
+        } else {
+            bail!("进程内部署失败：{}", report.detail)
+        }
     }
 
     fn name(&self) -> &'static str {
