@@ -9,13 +9,17 @@
 //! 五处补丁（全部幂等，重复执行产出同一份文本）：
 //! 1. engine/translators 首位插入 rimesync_vnum
 //! 2. engine/processors 在 recognizer 之后插入 rimesync_vselect，其后插入 numpad
-//! 3. recognizer/patterns 增加 vnum: '^[vV][0-9.]*$'
+//! 3. recognizer/patterns 增加 vnum: '^[vV][0-9.]*$'（幂等判据是「recognizer 子树
+//!    里只留一份 vnum，而且必须落在 patterns 下」：vnum 可能落在 recognizer 的其它
+//!    层级（那些位置 Rime 不认），补丁器只认 patterns 一个位置时会再插一份，同一个
+//!    映射里出现两个 vnum 键，YAML 直接非法）
 //! 4. punctuator/half_shape 深合并 "\\" -> 、 与 ":" -> ：（0.6.20；只在缺失时注入）
 //! 5. 文件顶部插入 # patched by rime-sync <version>
 //!
 //! 写盘纪律：先备份 <file>.rimesync-orig（只做一次），补丁后用 serde_yaml 重新
 //! 解析确认合法、核对目标状态，再按原换行风格写成 UTF-8（不带 BOM）。权限不足时
-//! 返回可读错误（提示以管理员身份重试），不 panic。
+//! 返回可读错误（提示以管理员身份重试），不 panic。解析失败（文件本来就有重复键
+//! 之类）时给出可读错误并原样保留文件，绝不写坏，也绝不静默跳过。
 //!
 //! 0.6.22：
 //! * 注释版本不再写死 crate 版本（0.1.0）：build.rs 从 src-tauri/tauri.conf.json
@@ -45,6 +49,8 @@ use std::process::Command;
 
 /// 原文件备份后缀：只建一次，重复执行不覆盖。
 pub const BACKUP_SUFFIX: &str = ".rimesync-orig";
+/// 损坏文件现场副本的后缀前缀（同一文件只留一份）。
+pub const BROKEN_PREFIX: &str = ".rimesync-broken";
 /// 顶部标记前缀；实际写入时后面跟版本号。
 pub const MARKER_PREFIX: &str = "# patched by rime-sync";
 /// recognizer/patterns/vnum 的取值：允许中间态 v、v12.，否则点号会被切成标点。
@@ -104,6 +110,9 @@ pub enum PatchOutcome {
     Unchanged,
     /// 结构上不适用（没有 engine / 列表是 flow 风格等），没动。
     Skipped,
+    /// 文件本来是非法 YAML（同一个映射里两遍同一个键），已用同目录的
+    /// *.rimesync-orig 原始备份覆盖回来并重新打了补丁。
+    Recovered,
 }
 
 /// 一批 data 目录的补丁结果。
@@ -140,6 +149,8 @@ pub struct DataPatchReport {
     pub schemas_unchanged: Vec<String>,
     /// 跳过的对象（方案文件或 data 目录），后面括号里是原因。
     pub schemas_skipped: Vec<String>,
+    /// 用 *.rimesync-orig 备份恢复回来并重新打补丁的文件（每条一句人话）。
+    pub recovered: Vec<String>,
     /// 备份所在目录（写第一个备份的 data 目录）；没写过备份时为空。
     pub backup_dir: String,
     /// 可读的失败原因（权限不足时带提权提示）。
@@ -164,6 +175,7 @@ impl Default for DataPatchReport {
             schemas_patched: Vec::new(),
             schemas_unchanged: Vec::new(),
             schemas_skipped: Vec::new(),
+            recovered: Vec::new(),
             backup_dir: String::new(),
             errors: Vec::new(),
         }
@@ -1225,6 +1237,17 @@ pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport {
                         PatchOutcome::Skipped => report
                             .schemas_skipped
                             .push(format!("{}（结构不适用）", file.display())),
+                        PatchOutcome::Recovered => {
+                            report.schemas_patched.push(file.display().to_string());
+                            report.recovered.push(format!(
+                                "{}：已用 {} 备份恢复并重新打补丁",
+                                file.display(),
+                                backup_path(&file).display()
+                            ));
+                            if report.backup_dir.is_empty() {
+                                report.backup_dir = dir.display().to_string();
+                            }
+                        }
                     }
                 }
                 Err(error) => report.errors.push(format!("{}：{error:#}", file.display())),
@@ -1277,12 +1300,39 @@ pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome> {
 /// 比对（相同即 Unchanged，幂等的定义）-> 再次解析 + 核对目标状态 -> 备份（只做
 /// 一次）-> 写回。
 pub fn patch_file_detailed(path: &Path, version: &str) -> Result<(PatchOutcome, PunctuatorPatch)> {
+    patch_file_detailed_inner(path, version, true)
+}
+
+/// 真正的补丁流程。allow_recovery=false 时不走「从备份恢复」那条路（恢复流程自己
+/// 会再调一次本函数，避免递归）。
+fn patch_file_detailed_inner(
+    path: &Path,
+    version: &str,
+    allow_recovery: bool,
+) -> Result<(PatchOutcome, PunctuatorPatch)> {
     let bytes = fs::read(path).with_context(|| format!("读取 {}", path.display()))?;
     let raw = String::from_utf8(bytes.clone()).map_err(|_| anyhow!("文件不是 UTF-8，跳过"))?;
     // 目标是 UTF-8 无 BOM：输入带 BOM 时去掉，写回也不写 BOM。
     let text = raw.strip_prefix(BOM).unwrap_or(&raw);
-    let value: Value = serde_yaml::from_str(text)
-        .with_context(|| format!("{} 不是合法 YAML，跳过", path.display()))?;
+    let value: Value = match serde_yaml::from_str(text) {
+        Ok(value) => value,
+        Err(error) => {
+            // 错因是「同一个映射里两遍同一个键」（典型是升级路径上多出来的一份
+            // vnum）时，先看同目录有没有 rime-sync 留的原始备份：有就把损坏的文件
+            // 另存一份、再用备份覆盖回来重新打补丁（这条路径 227 实测能把不可用的
+            // 方案救回来）；没有备份才报错，不动用户的文件。
+            if allow_recovery && duplicate_key_of(&error.to_string()).is_some() {
+                if let Some(result) = recover_from_backup(path, version, &bytes)? {
+                    return Ok(result);
+                }
+            }
+            return Err(anyhow!(
+                "{} 不是合法 YAML，已跳过补丁：{}",
+                path.display(),
+                yaml_error_hint(&error)
+            ));
+        }
+    };
 
     let mut doc = Doc::parse(text);
     let mut applicable = false;
@@ -1316,7 +1366,7 @@ pub fn patch_file_detailed(path: &Path, version: &str) -> Result<(PatchOutcome, 
     }
 
     // 安全闸：写盘前重新解析 + 核对目标状态，失败就不写。
-    let parsed: Value = serde_yaml::from_str(&patched)
+    let parsed = check_rendered_yaml(&patched)
         .with_context(|| format!("补丁后的 {} 不是合法 YAML，已取消写入", path.display()))?;
     verify(&parsed)
         .with_context(|| format!("补丁后的 {} 没达到目标状态，已取消写入", path.display()))?;
@@ -1347,6 +1397,129 @@ fn io_error(path: &Path, error: &std::io::Error) -> String {
         );
     }
     format!("访问 {} 失败：{error}", path.display())
+}
+
+/// 用同目录的 *.rimesync-orig 原始备份救回损坏的方案文件，并重新打补丁。
+///
+/// 什么时候用：文件本身已经是非法 YAML（同一个映射里两遍同一个键），而同目录
+/// 还有 rime-sync 第一次打补丁时留下的原始备份。这时最有价值的动作不是报错，
+/// 而是把用户现场另存一份、再用原始备份覆盖回来重打补丁 —— 227 实测这条路径能
+/// 把不可用的方案救回来（check-ime 从 failed / missing=[...] 变成 ok / missing=[]）。
+/// 没有备份、或备份自己也不合法，就没什么可救的：返回 None，交给上层报错。
+fn recover_from_backup(
+    path: &Path,
+    version: &str,
+    broken: &[u8],
+) -> Result<Option<(PatchOutcome, PunctuatorPatch)>> {
+    let backup = backup_path(path);
+    if !backup.is_file() {
+        return Ok(None);
+    }
+    let original = fs::read(&backup).with_context(|| format!("读取备份 {}", backup.display()))?;
+    let original_text = String::from_utf8(original.clone())
+        .map_err(|_| anyhow!("备份 {} 不是 UTF-8", backup.display()))?;
+    // 备份自己也要是合法 YAML：备份坏了就没什么可救的，不动用户的文件。
+    let original_text = original_text.strip_prefix(BOM).unwrap_or(&original_text);
+    if serde_yaml::from_str::<Value>(original_text).is_err() {
+        return Ok(None);
+    }
+    // 保留用户现场：损坏的文件另存一份（同一文件只留一份，见 keep_broken_copy）。
+    keep_broken_copy(path, broken)?;
+    // 用原始备份覆盖回来，重新走一次完整补丁流程。
+    fs::write(path, &original).map_err(|error| anyhow!(io_error(path, &error)))?;
+    let (_, punctuator) = patch_file_detailed_inner(path, version, false)?;
+    Ok(Some((PatchOutcome::Recovered, punctuator)))
+}
+
+/// 损坏文件的现场副本：<file>.rimesync-broken-<时间戳>-<内容哈希>。
+///
+/// 同一文件只留一份：第二次 ensure 不再攒新的现场文件，也不覆盖已有的那份。
+fn keep_broken_copy(path: &Path, content: &[u8]) -> Result<Option<PathBuf>> {
+    if let Some(existing) = existing_broken_copy(path) {
+        return Ok(Some(existing));
+    }
+    let target = broken_copy_path(path, content);
+    fs::write(&target, content).map_err(|error| anyhow!(io_error(&target, &error)))?;
+    Ok(Some(target))
+}
+
+/// 同目录里已经存在的现场副本（<file>.rimesync-broken*）。
+fn existing_broken_copy(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let prefix = format!("{name}{BROKEN_PREFIX}");
+    let dir = path.parent()?;
+    let entries = fs::read_dir(dir).ok()?;
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// 现场副本的文件名：时间戳 + 内容哈希，保证不同内容不会互相覆盖。
+fn broken_copy_path(path: &Path, content: &[u8]) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    name.push_str(&format!("{BROKEN_PREFIX}-{nanos}-{:016x}", fnv1a(content)));
+    path.with_file_name(name)
+}
+
+/// FNV-1a：只用来给现场副本起个唯一名字，不需要密码学强度（不新增依赖）。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 写盘前的安全闸：渲染出来的文本必须还是合法 YAML。
+///
+/// serde_yaml 遇到同一个映射里写了两遍的键会直接失败（duplicate entry with key
+/// "vnum"）。这里把它变成一句能看懂的话（哪个键重复、怎么修）并交给上层取消
+/// 写入：宁可不动文件，也不能落一个非法 YAML 下去。
+pub fn check_rendered_yaml(text: &str) -> Result<Value> {
+    serde_yaml::from_str(text).map_err(|error| anyhow!("{}", yaml_error_hint(&error)))
+}
+
+/// YAML 解析失败时的可读原因。
+///
+/// serde_yaml 的重复键报错是 "duplicate entry with key \"vnum\""，用户看不懂
+/// 哪个文件、哪个键坏了：这里把键名点出来，并说清楚怎么修。
+fn yaml_error_hint(error: &serde_yaml::Error) -> String {
+    let message = error.to_string();
+    match duplicate_key_of(&message) {
+        Some(key) => format!(
+            "文件里出现了重复的键 {key}（同一个映射里写了两遍），请删掉多余的那一行后重试；\
+             同目录的 *.rimesync-orig 备份也可以直接覆盖回来"
+        ),
+        None => message,
+    }
+}
+
+/// 从 serde_yaml 的报错里取出重复的键名。
+fn duplicate_key_of(message: &str) -> Option<String> {
+    const MARKER: &str = "duplicate entry with key ";
+    let at = message.find(MARKER)? + MARKER.len();
+    let rest = message[at..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// 补丁后的结构自检。只核对本补丁负责的四处，用户自己的其它配置一律不碰。
@@ -1755,52 +1928,112 @@ impl Doc {
     }
 
     /// recognizer/patterns/vnum。
+    ///
+    /// 幂等判据不能只看「recognizer/patterns 下有没有 vnum」这一个位置：vnum 可能
+    /// 落在 recognizer 的其它层级（那些位置 Rime 不认——vnum 只在
+    /// recognizer/patterns 下生效），但文件里确实已经有了一个 vnum 键。只认
+    /// patterns 一个位置时就会再插一份，两个 vnum 落进同一个映射 → YAML 非法
+    /// （duplicate entry with key "vnum"）→ 方案加载失败。所以这里的规则是：
+    /// recognizer 子树里只留一份 vnum，且必须落在 recognizer/patterns 下；错位的
+    /// 那份原样搬过去（值不改），已经在正确位置的那份一个字节都不动。
     fn ensure_vnum_pattern(&mut self, value: &Value) -> bool {
         let Some(recognizer) = value.get("recognizer") else {
             return false;
         };
-        if recognizer
+        // 目标状态：vnum 已经在 recognizer/patterns 下。
+        let has_proper = recognizer
             .get("patterns")
             .and_then(|patterns| patterns.get("vnum"))
-            .is_some()
-        {
+            .is_some();
+        // 错位状态：vnum 在 recognizer 块首（patterns 之前）。
+        let has_misplaced = recognizer.get("vnum").is_some();
+        if has_proper && !has_misplaced {
             return false;
         }
-        let Some((start, end)) = self.find_block("recognizer", 0) else {
+        let Some(block) = self.find_block("recognizer", 0) else {
             return false;
         };
         // flow 风格（recognizer: {…}）没法按行插，放弃。
-        if is_flow_value(&self.lines[start]) {
+        if is_flow_value(&self.lines[block.0]) {
             return false;
         }
-        let patterns = (start + 1..end).find(|&index| is_key_at(&self.lines[index], "patterns", 2));
-        match patterns {
-            Some(line) => {
-                let Some(block) = self.find_block_from("patterns", 2, line) else {
-                    return false;
-                };
-                let last = (block.0 + 1..block.1)
-                    .rev()
-                    .find(|&index| !is_blank(&self.lines[index]))
-                    .unwrap_or(block.0);
-                if is_flow_value(&self.lines[last]) {
-                    // patterns: {} 之类的 flow 映射，放弃。
-                    return false;
-                }
-                self.lines
-                    .insert(last + 1, format!("    vnum: '{VNUM_PATTERN}'"));
-                self.changed = true;
-                true
-            }
-            None => {
-                // recognizer 块里没有 patterns：插在块首。
-                self.lines.insert(start + 1, "  patterns:".to_string());
-                self.lines
-                    .insert(start + 2, format!("    vnum: '{VNUM_PATTERN}'"));
-                self.changed = true;
-                true
+        // recognizer 子键的实际缩进：方案文件的缩进宽度不是我们能定的（2 格、4 格
+        // 都有人用），按实际值算才不会插出第二个 patterns 键。
+        let child_indent = self.child_indent_of(block);
+        let patterns_line = (block.0 + 1..block.1)
+            .find(|&index| is_key_at(&self.lines[index], "patterns", child_indent));
+        // patterns 是 flow 风格（patterns: {…}）就按行插不了：宁可不改，也不能
+        // 造出第二个 patterns 键（那会让 YAML 直接非法）。
+        if let Some(line) = patterns_line {
+            if is_flow_value(&self.lines[line]) {
+                return false;
             }
         }
+        let misplaced_line = (block.0 + 1..block.1)
+            .find(|&index| is_key_at(&self.lines[index], "vnum", child_indent));
+
+        if !has_proper {
+            // patterns 下还没有 vnum：补一份。错位的那份优先搬过来（值原样保留）。
+            let entry = misplaced_line
+                .map(|index| self.lines[index].trim_start().to_string())
+                .unwrap_or_else(|| format!("vnum: '{VNUM_PATTERN}'"));
+            match patterns_line {
+                Some(line) => {
+                    let Some(inner) = self.find_block_from("patterns", child_indent, line) else {
+                        return false;
+                    };
+                    let indent = (inner.0 + 1..inner.1)
+                        .find(|&index| !is_blank(&self.lines[index]))
+                        .map(|index| indent_of(&self.lines[index]))
+                        .unwrap_or(child_indent + 2);
+                    let last = (inner.0 + 1..inner.1)
+                        .rev()
+                        .find(|&index| !is_blank(&self.lines[index]))
+                        .unwrap_or(inner.0);
+                    self.lines
+                        .insert(last + 1, format!("{}{}", " ".repeat(indent), entry));
+                }
+                None => {
+                    // recognizer 块里没有 patterns：建一个再放 vnum。
+                    let at = block.0 + 1;
+                    self.lines
+                        .insert(at, format!("{}patterns:", " ".repeat(child_indent)));
+                    self.lines.insert(
+                        at + 1,
+                        format!("{}{}", " ".repeat(child_indent + 2), entry),
+                    );
+                }
+            }
+            self.changed = true;
+        }
+        // 错位的那份（recognizer 块首的 vnum）搬走或删掉：recognizer 子树里只留
+        // 一份 vnum，否则升级路径上会出现两个 vnum 键。
+        if misplaced_line.is_some() && self.remove_vnum_at(child_indent) {
+            self.changed = true;
+        }
+        true
+    }
+
+    /// 块内子键的缩进：取块里第一行非空非注释的缩进；空块按 2 算（YAML 惯例）。
+    fn child_indent_of(&self, block: (usize, usize)) -> usize {
+        (block.0 + 1..block.1)
+            .find(|&index| !is_blank(&self.lines[index]) && !is_comment(&self.lines[index]))
+            .map(|index| indent_of(&self.lines[index]))
+            .unwrap_or(2)
+    }
+
+    /// 删掉 recognizer 子键层上的那个 vnum 行（错位的那份）。
+    fn remove_vnum_at(&mut self, indent: usize) -> bool {
+        let Some(block) = self.find_block("recognizer", 0) else {
+            return false;
+        };
+        let Some(index) = (block.0 + 1..block.1)
+            .find(|&index| is_key_at(&self.lines[index], "vnum", indent))
+        else {
+            return false;
+        };
+        self.lines.remove(index);
+        true
     }
 
     /// punctuator 深合并（0.6.20）：保证 half_shape 里有

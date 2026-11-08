@@ -14,6 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -512,13 +513,21 @@ pub fn install_prebuilt_with(
         before
     )];
 
-    // 第一遍：build/ 缺才铺。
-    copy_tree(
+    // 清单（MANIFEST.json）在这里有两个作用：
+    // ① 校验 payload 自己没被截断/篡改（sha256 严格校验，失败照旧进 manifest_failed）；
+    // ② 作为「版本」的参照物：判断用户目录里那份 build 产物是不是旧版本。
+    let manifest = load_manifest(payload_dir);
+    let verified = manifest
+        .as_ref()
+        .map(|manifest| verified_manifest_files(payload_dir, manifest))
+        .unwrap_or_default();
+    // 第一遍：build/ —— 缺才补；**版本对不上就用新版覆盖**（引擎产物是派生数据）。
+    install_build(
         &build_src,
         &rime_user_dir.join("build"),
         options.force,
-        false,
-        None,
+        manifest.as_ref(),
+        &verified,
         &mut report,
         &mut lines,
     )?;
@@ -978,6 +987,97 @@ pub fn copy_payload_config(
     )
 }
 
+/// 铺 build/：缺失才补 + **版本对不上就用新版覆盖**。
+///
+/// 语义：build/ 下装的是**引擎产物**（*.schema.yaml / default.yaml /
+/// *.bin），不是用户数据 —— 用户目录里那份是旧引擎/旧方案编译出来的，用新版覆盖
+/// 是对的（引擎本来也会重建）。config/ 下的用户配置相反：只补缺失、永不覆盖
+/// （见 copy_payload_config）。
+///
+/// 「版本对不上」的判据：
+/// - 有 MANIFEST.json 时，用户目录里那份与 payload 这一份**内容不同**
+///   （YAML 忽略引擎写的 __build_info 构建戳）= 不是同一版产物 = 用新版覆盖；
+/// - 拿来覆盖的 payload 文件必须**通过清单校验**（size + sha256）：清单对不上的
+///   文件不覆盖用户那份好文件（sha256 校验的严格性一点没放宽，只是拒绝拿
+///   可疑内容去覆盖）；
+/// - 没有 MANIFEST.json（旧版 payload）→ 退回「缺失才补」，不覆盖。
+fn install_build(
+    build_src: &Path,
+    user_build: &Path,
+    force: bool,
+    manifest: Option<&Manifest>,
+    verified: &BTreeSet<String>,
+    report: &mut PrebuiltReport,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    if !build_src.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(user_build)
+        .with_context(|| format!("创建目录 {}", user_build.display()))?;
+    let mut files: Vec<PathBuf> = fs::read_dir(build_src)
+        .with_context(|| format!("读取目录 {}", build_src.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort();
+
+    // 先算「哪些方案过期了」：版本载体 = 方案 schema.yaml（default.yaml 单独算）。
+    // 一个方案过期 = 它的 schema.yaml 与 payload 那份不是同一版 → 它的 .bin
+    // 也一并换新（.bin 是按 schema 编译的，schema 换版了 bin 必须跟上）。
+    let mut stale: BTreeSet<String> = BTreeSet::new();
+    for path in &files {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_build_version_file(name) {
+            continue;
+        }
+        let target = user_build.join(name);
+        let (Ok(user_bytes), Ok(payload_bytes)) = (fs::read(&target), fs::read(path)) else {
+            continue;
+        };
+        if !same_build_version(&user_bytes, &payload_bytes, is_yaml(path)) {
+            let scheme = build_scheme_id(name);
+            stale.insert(scheme.clone());
+            lines.push(format!("stale scheme={scheme} file={name}"));
+        }
+    }
+
+    for path in &files {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let target = user_build.join(name);
+        let existed = target.is_file();
+        let rel = format!("build/{name}");
+        // 只有通过清单校验的 payload 文件才允许覆盖用户目录里已有的产物。
+        let trusted = manifest.is_some() && verified.contains(&rel);
+        let overwrite = force || (existed && stale.contains(&build_scheme_id(name)) && trusted);
+        if existed && !overwrite {
+            report.kept += 1;
+            continue;
+        }
+        match fs::copy(path, &target) {
+            Ok(_) => {
+                if existed {
+                    report.overwritten += 1;
+                    lines.push(format!("overwrite {} reason=stale-build", target.display()));
+                } else {
+                    report.copied += 1;
+                    lines.push(format!("copy {}", target.display()));
+                }
+            }
+            Err(error) => {
+                report.failed += 1;
+                lines.push(format!("failed {}: {error}", target.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 逐文件复制（不递归）：payload 的 build/ 与 config/ 都是平铺的。
 fn copy_tree(
     src: &Path,
@@ -1053,19 +1153,117 @@ fn is_yaml(path: &Path) -> bool {
 }
 
 /// MANIFEST.json 里的一条文件记录。
-#[derive(Debug, Deserialize)]
-struct ManifestFile {
-    path: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManifestFile {
+    /// 相对 payload 根的路径（如 build/default.yaml）。
+    pub path: String,
+    /// 文件字节数（清单必须在**最终内容**上算，见 gen-prebuilt-build.py）。
     #[serde(default)]
-    bytes: u64,
-    sha256: String,
+    pub bytes: u64,
+    /// 文件内容的 sha256。
+    pub sha256: String,
 }
 
 /// MANIFEST.json（gen-prebuilt-build.py 产出）。
-#[derive(Debug, Deserialize)]
-struct Manifest {
+#[derive(Debug, Clone, Deserialize)]
+pub struct Manifest {
     #[serde(default)]
-    files: Vec<ManifestFile>,
+    pub files: Vec<ManifestFile>,
+}
+
+impl Manifest {
+    /// 清单里某个相对路径的记录。
+    pub fn file(&self, rel: &str) -> Option<&ManifestFile> {
+        self.files.iter().find(|item| item.path == rel)
+    }
+}
+
+/// 读 payload 的 MANIFEST.json。
+///
+/// 没有清单 = 旧版 payload（0.6.24 及更早）→ None：不做版本判定，
+/// 铺装退回「缺失才补」的旧行为（不会凭空覆盖用户目录里的东西）。
+pub fn load_manifest(payload_dir: &Path) -> Option<Manifest> {
+    let text = fs::read_to_string(payload_dir.join(MANIFEST_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 清单校验**通过**的文件（相对 payload 根的路径）。
+///
+/// 只有这些文件允许去覆盖用户目录里已有的产物：清单对不上的文件
+/// （payload 被截断/篡改，或清单本身是过期的）绝不能覆盖用户那份好文件。
+/// sha256 校验的严格性在这里保持不变 —— 校验不过就是不过。
+fn verified_manifest_files(payload_dir: &Path, manifest: &Manifest) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for item in &manifest.files {
+        let Ok(bytes) = fs::read(payload_dir.join(&item.path)) else {
+            continue;
+        };
+        if item.bytes > 0 && bytes.len() as u64 != item.bytes {
+            continue;
+        }
+        if !sha256_hex(&bytes).eq_ignore_ascii_case(&item.sha256) {
+            continue;
+        }
+        out.insert(item.path.clone());
+    }
+    out
+}
+
+/// 去掉引擎写的 __build_info 构建戳（版本判定用）。
+///
+/// librime 每次部署都会重写 build/<id>.schema.yaml，其中 __build_info 记的是
+/// 源文件的 mtime：同一份内容、不同的构建时刻 = 字节不同但**版本相同**。
+/// 判「用户目录里那份是不是同一版」时必须忽略它，否则每次部署后都会被误判成
+/// 「旧版本」而反复覆盖（引擎产物永远追不上自己的构建戳）。
+fn strip_build_info(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut in_build_info = false;
+    for line in text.lines() {
+        if !in_build_info {
+            if line.starts_with("__build_info:") {
+                in_build_info = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // 顶层键（非缩进、非空行）→ __build_info 块结束。
+        if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            in_build_info = false;
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+/// 两个 build 产物是不是「同一版」。
+///
+/// YAML（schema.yaml / default.yaml）：忽略引擎的 __build_info 构建戳后内容相同
+/// 就算同一版；其余（*.bin）逐字节比较。
+fn same_build_version(user: &[u8], payload: &[u8], yaml: bool) -> bool {
+    if user == payload {
+        return true;
+    }
+    if yaml {
+        return strip_build_info(user) == strip_build_info(payload);
+    }
+    false
+}
+
+/// build/ 里承载「版本」的文件：方案 schema.yaml 与编译出来的 default.yaml。
+fn is_build_version_file(name: &str) -> bool {
+    name == "default.yaml" || name.ends_with(".schema.yaml")
+}
+
+/// build 文件所属的方案 id（default.yaml 单独一个 id，不会撞上方案名）。
+fn build_scheme_id(name: &str) -> String {
+    if name == "default.yaml" {
+        return "\u{0}default".to_string();
+    }
+    name.split('.').next().unwrap_or(name).to_string()
 }
 
 /// 按 MANIFEST.json 的 files 列表校验 payload 里的文件（sha256）。

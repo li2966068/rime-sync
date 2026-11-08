@@ -40,6 +40,10 @@ WEASEL_STRICT=1
 STATUS_HELPER=/usr/bin/rime-sync-status
 SYNC_CLI=/usr/bin/rime-sync-cli
 UNINSTALLER=/usr/lib/rime-sync/uninstall.sh
+# 仓库根（用来调 scripts/ime/gen-prebuilt-build.py --verify-dir 核对 prebuilt 清单）
+SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo ".")
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || echo ".")
+PREBUILT_VERIFY="$REPO_ROOT/scripts/ime/gen-prebuilt-build.py"
 LOCALE_MO=usr/share/locale/zh_CN/LC_MESSAGES/fcitx5-rime.mo
 WEASEL_CAPTION="输入法自建同步"
 
@@ -183,6 +187,13 @@ check_ime_deb() { # $1=deb $2=workdir
   elif [ ! -e "$root$STATUS_HELPER" ]; then
     say "  info $STATUS_HELPER 不在 IME deb 里，改为校验安装后布局（rime-sync deb）"
   fi
+
+  # 0.6.25：随包 prebuilt 的清单必须与产物逐字节一致（对不上 = 首启直接降级）。
+  local prebuilt
+  prebuilt=$(find "$root" -type d -path '*/rime-sync/prebuilt' -print -quit 2>/dev/null)
+  if [ -n "$prebuilt" ]; then
+    check_prebuilt_manifest "$prebuilt" "$(basename "$deb") 的 prebuilt"
+  fi
 }
 
 check_sync_deb() { # $1=deb $2=workdir
@@ -315,6 +326,40 @@ check_rime_components() { # $1=l2 解包目录 $2=caption 命中次数
 
 # 0.6.17：CLI sidecar 与随包预编译产物必须真的在安装包里。
 # 只断言 tauri.conf.json 的 externalBin / resources 配置没有意义：配置对了产物也可能漏。
+# 0.6.25：prebuilt 的 MANIFEST.json 必须与它描述的产物逐字节一致（大小 + sha256）。
+#
+# 为什么这是硬断言：清单与产物对不上 = 随包产物自相矛盾。装到机器上首启时
+# prebuilt::verify_manifest 会把每个对不上的文件算成一次失败（copy_failed=N），
+# ensure 的结论降级成 partial/degraded —— 输入法看着装上了，却打不出字。
+# 失败信息里必须点名**文件 / 期望 / 实际**，否则没法定位是哪一份产物漂了。
+check_prebuilt_manifest() { # $1=prebuilt 目录 $2=标签
+  local dir=$1 label=$2 out rc=0
+  if [ ! -d "$dir" ]; then
+    bad "$label：找不到 prebuilt 目录 $dir"
+    return 1
+  fi
+  if [ ! -f "$dir/MANIFEST.json" ]; then
+    bad "$label：prebuilt 里没有 MANIFEST.json（产物没有清单就无法自检）"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "$label：没有 python3，跳过 prebuilt 清单核对"
+    return 0
+  fi
+  if [ ! -f "$PREBUILT_VERIFY" ]; then
+    warn "$label：找不到 $PREBUILT_VERIFY，跳过 prebuilt 清单核对"
+    return 0
+  fi
+  out=$(python3 "$PREBUILT_VERIFY" --verify-dir "$dir" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "$label：prebuilt 的 MANIFEST.json 与产物逐字节一致（$out）"
+  else
+    bad "$label：prebuilt 的 MANIFEST.json 与产物对不上 —— $out"
+  fi
+  return "$rc"
+}
+
 check_windows_payload() { # $1=解包后的安装包根目录
   local root=$1 cli
   cli=$(find "$root" -type f -iname 'rime-sync-cli.exe' -print -quit 2>/dev/null)
@@ -330,6 +375,13 @@ check_windows_payload() { # $1=解包后的安装包根目录
     ok "setup.exe 带 ${#schemas[@]} 个 resources/prebuilt/**/*.schema.yaml（部署兜底产物在包里）"
   else
     bad "setup.exe 里没有 resources/prebuilt/**/*.schema.yaml：0.6.15 起的预编译产物兜底没打进安装包"
+  fi
+
+  # 0.6.25：prebuilt 的清单必须与产物逐字节一致（对不上 = 首启直接降级）。
+  local prebuilt
+  prebuilt=$(find "$root" -type d -path '*/resources/prebuilt' -print -quit 2>/dev/null)
+  if [ -n "$prebuilt" ]; then
+    check_prebuilt_manifest "$prebuilt" "setup.exe 的 prebuilt"
   fi
 }
 
@@ -585,9 +637,29 @@ PY
   printf 'schema_list: []\n' >"$base/good/resources/prebuilt/build/luna_pinyin_simp.schema.yaml"
   mkdir -p "$base/good/resources"
   mv "$base/good/weasel-0.17.4.0-installer.exe" "$base/good/resources/"
+  # 0.6.25：prebuilt 的清单必须与产物逐字节一致（这里按产物现算一份）。
+  python3 - "$base/good/resources/prebuilt" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+entries = []
+for sub in ("build", "config"):
+    base = os.path.join(root, sub)
+    if not os.path.isdir(base):
+        continue
+    for name in sorted(os.listdir(base)):
+        path = os.path.join(base, name)
+        if not os.path.isfile(path):
+            continue
+        data = open(path, "rb").read()
+        entries.append({"path": sub + "/" + name, "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest()})
+with open(os.path.join(root, "MANIFEST.json"), "w") as handle:
+    handle.write(json.dumps({"files": entries}, indent=2) + "\n")
+PY
   (cd "$base/good" && 7z a -bso0 -bsp0 "$base/good/dist/rime-sync_0.0.0_x64-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml \
+    resources/prebuilt/MANIFEST.json >/dev/null 2>&1)
 
   SELFTEST_ARGS=(--strict-ime-bundle)
   expect_ok() { # $1=label $2=dir
@@ -657,6 +729,7 @@ PY
   (cd "$off" && 7z a -bso0 -bsp0 "$off/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
     resources/prebuilt/build/luna_pinyin_simp.schema.yaml \
+    resources/prebuilt/MANIFEST.json \
     webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe >/dev/null 2>&1)
 
   expect_fail_with "缺离线包" "$base/good" "没有找到离线包" \
@@ -672,7 +745,8 @@ PY
   cp -a "$base/good" "$offbad"
   (cd "$offbad" && 7z a -bso0 -bsp0 "$offbad/dist/rime-sync_0.0.0_x64-offline-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
-    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml \
+    resources/prebuilt/MANIFEST.json >/dev/null 2>&1)
   expect_fail_with "离线包缺 WebView2 载荷" "$offbad" "没有内嵌 MicrosoftEdgeWebView2RuntimeInstallerX64.exe" \
     --strict-ime-bundle --require-offline-setup --min-offline-mib 0
 
@@ -767,6 +841,23 @@ PY
   (cd "$base/no-prebuilt" && 7z a -bso0 -bsp0 "$base/no-prebuilt/dist/rime-sync_0.0.0_x64-setup.exe" \
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe >/dev/null 2>&1)
   expect_fail "setup.exe 缺 resources/prebuilt schema" "$base/no-prebuilt" "没有 resources/prebuilt"
+
+  # 0.6.25：prebuilt 的清单与产物对不上必须红（证明新断言不是摆设）。
+  # 现场故障就是这种形状：清单记的是补丁前的字节，产物是补丁后的字节。
+  mutate stale-prebuilt-manifest
+  python3 - "$base/stale-prebuilt-manifest/resources/prebuilt/MANIFEST.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as handle:
+    data = json.load(handle)
+for entry in data.get("files", []):
+    entry["bytes"] = int(entry.get("bytes", 0)) + 1
+with open(path, "w") as handle:
+    handle.write(json.dumps(data, indent=2) + chr(10))
+PY
+  rm -f "$base/stale-prebuilt-manifest/dist/rime-sync_0.0.0_x64-setup.exe"
+  (cd "$base/stale-prebuilt-manifest" && 7z a -bso0 -bsp0 "$base/stale-prebuilt-manifest/dist/rime-sync_0.0.0_x64-setup.exe" rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe resources/prebuilt/build/luna_pinyin_simp.schema.yaml resources/prebuilt/MANIFEST.json >/dev/null 2>&1)
+  expect_fail "prebuilt 清单与产物对不上" "$base/stale-prebuilt-manifest" "MANIFEST.json 与产物对不上"
 
   printf '\n自检失败 %d 项\n' "$failures"
   rm -rf "$base"

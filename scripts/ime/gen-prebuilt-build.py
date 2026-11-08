@@ -512,19 +512,20 @@ def write_payload(out_dir: Path, build_dir: Path, user_src: Path, schemas: list[
     (out_dir / "build").mkdir(parents=True)
     (out_dir / "config").mkdir(parents=True)
     (out_dir / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
-    files = []
     for src in collect_products(build_dir):
         dst = out_dir / "build" / src.name
         shutil.copyfile(src, dst)
-        files.append({"path": f"build/{src.name}", "bytes": dst.stat().st_size,
-                      "sha256": sha256_file(dst)})
     for name in sorted(os.listdir(user_src)):
         if name.endswith(".custom.yaml") or name == "default.custom.yaml":
             dst = out_dir / "config" / name
             shutil.copyfile(user_src / name, dst)
-            files.append({"path": f"config/{name}", "bytes": dst.stat().st_size,
-                          "sha256": sha256_file(dst)})
     pin_mtimes(out_dir)
+    # 清单必须在**最终落盘的内容**上算：产物文件全部写完之后重新读一遍磁盘再算
+    # 大小/sha256。复制过程中的中间值不算数 —— 之后任何一次改写（rimesync 补丁、
+    # 部署器重写 build/<id>.schema.yaml、固定 mtime 之后的任何编辑）都会让清单
+    # 与产物对不上，而对不上的清单装到机器上就是「自相矛盾」的兜底产物（首启直接
+    # 降级成 partial/degraded）。
+    files = manifest_entries(out_dir)
     # 清单里的 total_bytes 是「整包」体积（build + config），与 --check 的算法一致。
     total = sum(entry["bytes"] for entry in files)
     rime_version = ""
@@ -553,8 +554,71 @@ def write_payload(out_dir: Path, build_dir: Path, user_src: Path, schemas: list[
     }
     (out_dir / "MANIFEST.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # 自检：清单刚落盘就与产物逐字节对一次，不许带着矛盾出门（见 verify_manifest）。
+    fails = verify_manifest(out_dir)
+    if fails:
+        die("MANIFEST.json 与产物不一致：\n  " + "\n  ".join(fails))
     log(f"体积：{human(total)}（预算 {human(budget)}），"
         f"方案：{', '.join(schemas)}，rime {rime_version or '?'}")
+
+
+def manifest_entries(out_dir: Path) -> list[dict]:
+    """按**最终落盘的内容**算清单条目（大小 + sha256）。
+
+    清单必须描述最终产物：任何在复制之后发生的改写（rimesync 补丁、部署器重写
+    build/<id>.schema.yaml、固定 mtime 之后的编辑）都会让复制时的中间值失效。
+    """
+    entries: list[dict] = []
+    for sub in ("build", "config"):
+        base = out_dir / sub
+        if not base.is_dir():
+            continue
+        for path in sorted(base.iterdir()):
+            if not path.is_file():
+                continue
+            entries.append({"path": f"{sub}/{path.name}", "bytes": path.stat().st_size,
+                            "sha256": sha256_file(path)})
+    return entries
+
+
+def verify_manifest(out_dir: Path) -> list[str]:
+    """MANIFEST.json 与产物逐字节对照（大小 + sha256）。
+
+    返回不一致的条目，每条都写清**文件 / 期望 / 实际**：
+    清单与产物对不上 = 产物自相矛盾 = 装到机器上首启就会降级（partial/degraded）。
+    """
+    fail: list[str] = []
+    manifest_path = out_dir / "MANIFEST.json"
+    if not manifest_path.is_file():
+        return [f"{manifest_path} 不存在（产物没有清单就无法自检）"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"MANIFEST.json 不是合法 JSON：{exc}"]
+    listed = {entry["path"]: entry for entry in manifest.get("files", [])}
+    if not listed:
+        return ["MANIFEST.json 的 files 为空"]
+    for rel, entry in sorted(listed.items()):
+        path = out_dir / rel
+        if not path.is_file():
+            fail.append(f"{rel} 缺失（清单 expected={entry.get('bytes')} 字节 "
+                        f"sha256={entry.get('sha256')}）")
+            continue
+        size = path.stat().st_size
+        if size != entry.get("bytes"):
+            fail.append(f"{rel} 大小 expected={entry.get('bytes')} actual={size}")
+            continue
+        digest = sha256_file(path)
+        if digest != entry.get("sha256"):
+            fail.append(f"{rel} sha256 expected={entry.get('sha256')} actual={digest}")
+    # 反向：产物里多出来的文件清单没登记 = 清单没描述全这份产物。
+    skip_names = ("MANIFEST.json", ".gitignore")
+    for path in sorted(out_dir.rglob("*")):
+        if path.is_file() and path.name not in skip_names:
+            rel = str(path.relative_to(out_dir))
+            if rel not in listed:
+                fail.append(f"{rel} 未登记在清单里（清单没描述这份产物）")
+    return fail
 
 
 # --------------------------------------------------------------------------- 校验
@@ -567,27 +631,10 @@ def check_payload(out_dir: Path, budget: int) -> list[str]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return [f"MANIFEST.json 不是合法 JSON：{exc}"]
-    listed = {entry["path"]: entry for entry in manifest.get("files", [])}
-    if not listed:
-        fail.append("MANIFEST.json 的 files 为空")
-    for rel, entry in sorted(listed.items()):
-        path = out_dir / rel
-        if not path.is_file():
-            fail.append(f"清单里的文件不存在：{rel}")
-            continue
-        size = path.stat().st_size
-        if size != entry.get("bytes"):
-            fail.append(f"{rel} 大小 {size} != 清单 {entry.get('bytes')}")
-        digest = sha256_file(path)
-        if digest != entry.get("sha256"):
-            fail.append(f"{rel} sha256 与清单不一致（产物被改过或没重新生成）")
+    # 清单 ↔ 产物逐字节对照（与 --verify-dir 同一份实现）。
+    fail.extend(verify_manifest(out_dir))
     # .gitignore 是本目录的入库胶水（反选 prebuilt/build），不算产物
     skip_names = ("MANIFEST.json", ".gitignore")
-    for path in sorted(out_dir.rglob("*")):
-        if path.is_file() and path.name not in skip_names:
-            rel = str(path.relative_to(out_dir))
-            if rel not in listed:
-                fail.append(f"未登记的文件：{rel}")
     if not (out_dir / ".gitignore").is_file():
         fail.append("缺少 .gitignore（仓库根的 build/ 规则会把预编译产物忽略掉，文件进不了仓库）")
     schemas = manifest.get("schemas") or []
@@ -742,6 +789,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="体积上限 MB，超出就只带第一个方案（默认 60）")
     parser.add_argument("--check", action="store_true",
                         help="只校验已有产物与打包接线（不需要 docker）")
+    parser.add_argument("--verify-dir", default=None,
+                        help="只校验某个已生成的 prebuilt 目录：MANIFEST.json 与产物"
+                             "是否逐字节一致（CI 用来校验发布产物里的 prebuilt）")
     parser.add_argument("--image", default=os.environ.get("RIMESYNC_PREBUILT_IMAGE", DEFAULT_IMAGE),
                         help="部署用的 docker 镜像")
     parser.add_argument("--deployer", default=None, help="rime_deployer 路径（默认自动找 staging）")
@@ -756,6 +806,17 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(args.out).resolve()
     budget = int(args.budget_mb * 1024 * 1024)
+    if args.verify_dir:
+        # 只做一件事：清单与产物逐字节对照（发布产物里的 prebuilt 用这个查）。
+        target = Path(args.verify_dir).resolve()
+        fails = verify_manifest(target)
+        if fails:
+            for item in fails:
+                print(f"FAIL {item}", file=sys.stderr)
+            print(f"verify-prebuilt: {len(fails)} 项不一致（{target}）", file=sys.stderr)
+            return 1
+        print(f"ok   prebuilt 清单与产物逐字节一致（{target}）")
+        return 0
     if args.check:
         fails = check_payload(out_dir, budget) + check_git_ignore(out_dir) + check_wiring()
         if fails:
