@@ -1,21 +1,20 @@
 <#
 .SYNOPSIS
-  Windows e2e：模拟「安装器装完程序后，程序首次启动」的输入法自举。
+  Windows e2e：首次启动自举（ensure-ime --mode install）的报告一致性。
 
 .DESCRIPTION
-  B 方案：NSIS 安装器只交付程序本体，输入法由程序首次启动时
-  ensure(Mode::Install) 装好。本步骤在 CI 上用 CLI 等价子命令跑一遍：
-    rime-sync-cli --rime-dir <fake> ensure-ime --mode install --json --report <file>
+  不装输入法、不需要 librime：只伪造 user dir + payload + data，验证首次启动自举
+    1) 退出码与 ok 字段同口径（ok ⟺ 退出码 0，退出码 0 = 「输入法现在就绪」）；
+    2) 产物铺进 user dir：build 里有带 rimesync_vnum 的 schema.yaml；
+    3) 自动安装被显式关掉（RIMESYNC_INSTALL_IME=0）时，报告写明
+       weasel_install=disabled，并且**没有**把这次自举说成「输入法已就绪」——
+       ok=false、退出码非 0、detail 说清楚是「自动安装已关闭」。
 
-  断言（全部来自 JSON 报告，不解析 stdout 文本）：
-    a) 退出码 0、result=ok、mode=install、build_ok=true；
-    b) build/luna_pinyin_simp.schema.yaml 含 rimesync_vnum（是我们这套产物）；
-    c) 报告带 weasel_* 与 config_seeded 字段（安装版首次启动的完整语义）。
+  假数据必须覆盖全部三个目标方案（luna_pinyin_simp / wubi_pinyin / wubi86）：
+  只造一个方案时 targets 会退化成 1，config 门禁又因 data 里没有 wubi86 而跳过
+  default.custom.yaml，结论必然是 partial —— 那样测到的不是「产物铺好了」。
 
-  输入法本体：CI 机器上不装真实小狼毫（没有随包 12 MB 安装器，也不该改 runner）。
-  用 RIMESYNC_INSTALL_IME=0 显式关闭安装器调用 —— 这正是「用户手动关闭自动安装」
-  的同一条代码路径，weasel_install 会如实报告 disabled，其余步骤（模板/prebuilt/
-  data/部署/assess）全部照常执行。
+  判据口径与 core 的 ImeReport::ready 一致（GUI 与 CLI 共用同一处）。
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -34,7 +33,7 @@ foreach ($dir in @((Join-Path $payload 'build'), (Join-Path $payload 'config'), 
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
-# 随包预编译产物（最小形态：一个主方案 + 一个 bin，schema.yaml 带插件标记）。
+# 随包预编译产物（最小但完整的形态：三个目标方案 + 插件标记）。
 $marked = @"
 patch:
   rimesync_vnum: '['
@@ -44,11 +43,22 @@ $plainConfig = @"
 patch:
   schema_list: []
 "@
-Set-Content -LiteralPath (Join-Path $payload 'build\luna_pinyin_simp.schema.yaml') -Value $marked -NoNewline
-Set-Content -LiteralPath (Join-Path $payload 'build\luna_pinyin_simp.prism.bin') -Value 'prism' -NoNewline
+$weaselConfig = @"
+patch:
+  style:
+    horizontal: true
+"@
+$schemas = @('luna_pinyin_simp', 'wubi_pinyin', 'wubi86')
+foreach ($s in $schemas) {
+    Set-Content -LiteralPath (Join-Path $payload "build\$s.schema.yaml") -Value $marked -NoNewline
+    Set-Content -LiteralPath (Join-Path $payload "build\$s.prism.bin") -Value 'prism' -NoNewline
+    Set-Content -LiteralPath (Join-Path $data "$s.schema.yaml") -Value "schema:`n  schema_id: $s`n" -NoNewline
+}
 Set-Content -LiteralPath (Join-Path $payload 'config\default.custom.yaml') -Value $plainConfig -NoNewline
+Set-Content -LiteralPath (Join-Path $payload 'config\weasel.custom.yaml') -Value $weaselConfig -NoNewline
 
 # 只碰临时目录：不装输入法、不 taskkill、不 prune、不重启任何服务。
+# 自动安装关掉 → 这条路径验证的是「产物铺好但输入法没就绪」时的报告口径。
 $env:RIMESYNC_PREBUILT_DIR = $payload
 $env:RIMESYNC_WEASEL_DATA = $data
 $env:RIMESYNC_INSTALL_IME = '0'
@@ -70,13 +80,24 @@ function Assert-Equal {
     }
 }
 
-Assert-Equal $code 0 'ensure-ime --mode install 退出码'
+# 产物侧：铺好了、可用、config 没被门禁跳过。
 Assert-Equal $json.result 'ok' '首次启动 result'
-Assert-Equal $json.ok $true '首次启动 ok'
-Assert-Equal $json.mode 'install' '入口身份 mode'
 Assert-Equal $json.build_ok $true '首次启动 build_ok'
-# 安装器被显式关闭：这是「自动安装关闭」的合法路径，不是失败。
+if ($null -ne $json.config_skipped -and @($json.config_skipped).Count -ne 0) {
+    throw "首次启动 config 被门禁跳过：$($json.config_skipped -join ',')"
+}
+Assert-Equal $json.mode 'install' '入口身份 mode'
+
+# 就绪侧：自动安装被关掉、机器上又没有输入法 → 不能报成功。
 Assert-Equal $json.weasel_install 'disabled' 'weasel_install（RIMESYNC_INSTALL_IME=0）'
+Assert-Equal $json.weasel_present $false 'weasel_present'
+Assert-Equal $json.ok $false '首次启动 ok（没就绪不能报成功）'
+if ($code -eq 0) {
+    throw "首次启动退出码是 0（输入法没就绪，必须非零）"
+}
+if ([string]$json.detail -notmatch '自动安装已关闭') {
+    throw "首次启动 detail 没说明为什么没就绪：$($json.detail)"
+}
 
 $schemaPath = Join-Path $rime 'build\luna_pinyin_simp.schema.yaml'
 if (-not (Test-Path -LiteralPath $schemaPath)) {
@@ -93,4 +114,4 @@ if (@($json.actions | Where-Object { $_.kind -eq 'weasel' }).Count -lt 1) {
     throw 'actions 里没有 weasel 步骤（首次启动必须先保证输入法本体）'
 }
 
-Write-Host 'windows e2e ok：首次启动自举（ensure-ime --mode install）result=ok 且 build 含 rimesync_vnum'
+Write-Host 'windows e2e ok：首次启动自举（ensure-ime --mode install）产物铺好、build 含 rimesync_vnum，没就绪时不说成功'

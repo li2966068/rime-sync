@@ -86,6 +86,22 @@
    快捷方式与卸载清理；新增 `packaging/windows/test-nsis-hooks-wine.sh`（wine 静默安装 +
    卸载，断言不写 IME 日志）；CI `windows-e2e` 增加
    `ensure-ime --mode install` 的「装完后首次启动」步骤。
+9. **CI 红的两个 job 修掉，顺带把「就绪」的判据统一到一处**：
+   - **wine 冒烟在 CI 必红**：CI 的 wine 6.0.3 默认模拟 Windows 7，NSIS 的
+     `${AtLeastWin10}` 为假 → 安装被系统版本检查拦下（退出码 3，主程序没装上）。
+     现在冒烟脚本显式把 wine 模拟版本设成 win10（`HKCU\Software\Wine\Version`），
+     失败时额外打印 wine 输出与安装日志尾部，方便定位。
+   - **Windows e2e 的期望值是假的**：两个 e2e 脚本的假 payload 只造了一个方案
+     （目标集是三个），config 门禁又因 data 里没有 wubi86 而跳过
+     `default.custom.yaml` → 结论必然是 partial，脚本却按 ok 断言 → 退出码 1。
+     现在假数据补齐三个目标方案与完整 data，断言按真实语义写，并新增一条
+     「用户手上有输入法 → 退出码 0」的覆盖（假 Weasel：注册表 +
+     `WeaselServer.exe` + 带标记的 `rime.dll`）。
+   - **CLI 与 GUI 对「就绪」说法不一致**：CLI 的 `ensure-ime` 只看产物侧结论，
+     自动安装被显式关掉（`RIMESYNC_INSTALL_IME=0`）而机器上又没有输入法时，
+     照样退出 0 —— 脚本会以为「输入法已就绪」。判据统一到 core 的
+     `ImeReport::ready()`（GUI 与 CLI 共用同一处）：没就绪 → `ok=false`、
+     退出码非 0、detail 说清楚是「自动安装已关闭」。
 
 ## v0.6.23 — 2026-11-08
 

@@ -257,6 +257,30 @@ impl ImeReport {
         )
     }
 
+    /// 「用户手上现在有可用的输入法吗」——与界面层（src-tauri 的
+    /// ImeBootstrapStatus::from_ime / reason_of）**同一口径**。
+    ///
+    /// ok() 只说「安装这一步没失败」；自动安装被显式关掉
+    /// （RIMESYNC_INSTALL_IME=0）而输入法又确实不在时，用户手上没有输入法：
+    /// 不能报成功。GUI 与 CLI 都用这一个判据，不各说各话。
+    pub fn ready(&self) -> bool {
+        self.ok() && !(self.install == "disabled" && !self.present)
+    }
+
+    /// 「没就绪」的原因（给用户看的一句话；就绪时返回空串）。
+    pub fn not_ready_reason(&self) -> String {
+        if self.ready() {
+            return String::new();
+        }
+        if self.install == "disabled" && !self.present {
+            return "输入法未就绪：自动安装已关闭（RIMESYNC_INSTALL_IME=0），请手动安装或改回自动安装"
+                .to_string();
+        }
+        self.error
+            .clone()
+            .unwrap_or_else(|| format!("输入法未就绪（{}）", self.summary()))
+    }
+
     /// 一句话结论（界面 / 日志共用）。
     pub fn summary(&self) -> String {
         let version = if self.version.is_empty() {
@@ -683,6 +707,47 @@ mod tests {
             reason: "registry-missing".to_string(),
             ..WeaselHealth::default()
         }
+    }
+
+    #[test]
+    fn ready_needs_an_ime_when_auto_install_is_disabled() {
+        // 自动安装被关掉而输入法又不在：ok() 仍为 true（安装这步没失败），
+        // 但用户手上没有输入法 —— ready() 必须为 false（GUI / CLI 同一口径）。
+        let mut report = ImeReport {
+            install: "disabled".to_string(),
+            ..ImeReport::default()
+        };
+        assert!(report.ok());
+        assert!(!report.ready());
+        assert!(report.not_ready_reason().contains("自动安装已关闭"));
+
+        // 输入法其实在 → 就绪。
+        report.present = true;
+        assert!(report.ready());
+        assert!(report.not_ready_reason().is_empty());
+    }
+
+    #[test]
+    fn ready_is_true_for_installed_or_present_ime() {
+        for install in ["installed", "already-present", "skipped(platform)"] {
+            let report = ImeReport {
+                install: install.to_string(),
+                ..ImeReport::default()
+            };
+            assert!(report.ready(), "{install} 应当算就绪");
+            assert!(report.not_ready_reason().is_empty());
+        }
+    }
+
+    #[test]
+    fn not_ready_reason_reports_install_failure() {
+        let report = ImeReport {
+            install: "failed".to_string(),
+            error: Some("没有随包安装器".to_string()),
+            ..ImeReport::default()
+        };
+        assert!(!report.ready());
+        assert!(report.not_ready_reason().contains("没有随包安装器"));
     }
 
     #[test]

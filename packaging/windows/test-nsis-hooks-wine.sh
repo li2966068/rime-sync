@@ -93,6 +93,16 @@ export WINEDLLOVERRIDES="mscoree,mshtml="
 wineboot -u >/dev/null 2>&1 || true
 wineserver -w >/dev/null 2>&1 || true
 
+# wine 模拟的 Windows 版本必须够新：安装器按设计要求 Win10 1803（build 17134）+，
+# 版本不够会 SetErrorLevel 3 + Abort（退出码 3）—— 那是产品逻辑**正确**，但冒烟跑不下去。
+# wine 6.x 默认模拟 win7、wine 10.x 默认模拟 win10，所以这里显式设成 win10，
+# 让冒烟测的是「装得上、且不碰输入法」这条路径。
+WINE_WIN_VERSION="${RIMESYNC_WINE_VERSION:-win10}"
+wine reg add "HKCU\Software\Wine" /v Version /d "$WINE_WIN_VERSION" /f >/dev/null 2>&1 || true
+WINE_BUILD=$(wine reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuildNumber 2>/dev/null \
+  | tr -d '\r' | awk '/CurrentBuildNumber/{print $NF}')
+echo "test-nsis-hooks-wine: wine 模拟版本=$WINE_WIN_VERSION CurrentBuildNumber=${WINE_BUILD:-（读不到）}"
+
 fail=0
 fail_msg() { printf 'FAIL %s\n' "$1" >&2; fail=1; }
 note_msg() { printf 'NOTE %s\n' "$1" >&2; }
@@ -100,7 +110,22 @@ note_msg() { printf 'NOTE %s\n' "$1" >&2; }
 # ---------- 1) 静默安装 ------------------------------------------------------
 wine "$WORK/out/harness.exe" /S /SKIPWEBVIEW >"$WORK/install.log" 2>&1
 install_code=$?
-[ "$install_code" -eq 0 ] || fail_msg "静默安装退出码 $install_code（应为 0）"
+if [ "$install_code" -ne 0 ]; then
+  fail_msg "静默安装退出码 $install_code（应为 0）"
+  # 诊断必须打出来：退出码 3 = 安装器按设计中止（多半是 wine 模拟的 Windows 版本
+  # 低于 Win10 1803）；其它退出码看 wine 自己的输出。
+  echo "--- wine 输出（尾部）---" >&2
+  tail -n 20 "$WORK/install.log" >&2 || true
+  echo "--- 安装日志（尾部）---" >&2
+  if [ -f "$WORK/setup-utf8.log" ]; then tail -n 20 "$WORK/setup-utf8.log" >&2; fi
+  if [ ! -f "$WORK/setup-utf8.log" ]; then
+    _sl=$(find "$WINEPREFIX/drive_c/users" -maxdepth 6 -name 'rime-sync-setup.log' 2>/dev/null | head -1)
+    if [ -n "$_sl" ] && command -v iconv >/dev/null 2>&1; then
+      iconv -f UTF-16LE -t UTF-8 "$_sl" 2>/dev/null | tail -n 20 >&2 || true
+    fi
+  fi
+  echo "--------------------------" >&2
+fi
 
 DRIVE_C="$WINEPREFIX/drive_c"
 INSTALL_DIR=$(find "$DRIVE_C" -maxdepth 5 -type d -name 'rime-sync-wine-test' 2>/dev/null | head -1)

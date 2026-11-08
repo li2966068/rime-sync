@@ -1030,7 +1030,9 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(path) = report.as_deref() {
                 write_json_file(path, &report_json)?;
             }
-            if outcome.result.exit_ok() && weasel.ok() {
+            // 同 EnsureIme：产物 ok 不等于「用户手上有输入法」
+            // （自动安装被关掉而输入法不在时不能报成功）。
+            if outcome.result.exit_ok() && weasel.ready() {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))
@@ -1131,11 +1133,25 @@ fn run(cli: Cli) -> Result<()> {
                             .unwrap_or_default(),
                     ),
             );
+            // 与 GUI 同一口径（ImeReport::ready）：产物这步 ok ≠ 用户手上有输入法。
+            // 自动安装被显式关掉（RIMESYNC_INSTALL_IME=0）而输入法又确实不在时，
+            // 这一步没有把输入法准备好 —— ok=false、退出码非 0，detail 说清楚为什么。
+            // 不能让脚本看着退出码 0 就以为「输入法已就绪」。
+            let ready = outcome.ok() && outcome.ime.ready();
+            let mut detail = outcome.detail.clone();
+            let not_ready = outcome.ime.not_ready_reason();
+            if !not_ready.is_empty() {
+                detail = if detail.is_empty() {
+                    not_ready
+                } else {
+                    format!("{detail}；{not_ready}")
+                };
+            }
             let json = EnsureImeJson {
                 report: &outcome.report,
                 result: outcome.result.as_str(),
-                ok: outcome.ok(),
-                detail: outcome.detail.clone(),
+                ok: ready,
+                detail,
                 reason: outcome.assessment.reason.as_str(),
                 rime_dir: rime_dir.display().to_string(),
                 payload: payload_location
@@ -1197,7 +1213,8 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(path) = report.as_deref() {
                 write_json_file(path, &json)?;
             }
-            if outcome.result.exit_ok() {
+            // 退出码 = 「输入法现在就绪了吗」：与 ok 字段同口径（见上面的 ready）。
+            if ready {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))

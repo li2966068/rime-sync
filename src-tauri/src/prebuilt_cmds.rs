@@ -621,22 +621,18 @@ impl ImeBootstrapStatus {
     }
 
     fn from_ime(report: &ImeReport) -> Self {
+        // 判据只有一处：core 的 ImeReport::ready（CLI 的 ensure-ime 同一口径）。
         // 「安装这步没失败」≠「用户手上有输入法」：关掉自动安装（RIMESYNC_INSTALL_IME=0）
         // 而输入法又确实不在时，不能报成功 —— 用户手上没有输入法，必须看得见。
         let missing = report.install == "disabled" && !report.present;
+        let ready = report.ready();
         Self {
-            ok: report.ok() && !missing,
-            result: if report.ok() && !missing {
-                "ok"
-            } else {
-                "failed"
-            }
-            .to_string(),
-            detail: if missing {
-                "输入法未就绪：自动安装已关闭（RIMESYNC_INSTALL_IME=0），请手动安装或改回自动安装"
-                    .to_string()
-            } else {
+            ok: ready,
+            result: if ready { "ok" } else { "failed" }.to_string(),
+            detail: if ready {
                 report.summary()
+            } else {
+                report.not_ready_reason()
             },
             needs_elevation: report.needs_elevation,
             ime_install: report.install.clone(),
@@ -648,7 +644,7 @@ impl ImeBootstrapStatus {
             running: false,
             reason: if missing {
                 "install-disabled"
-            } else if report.ok() {
+            } else if ready {
                 "ok"
             } else {
                 "install-failed"
