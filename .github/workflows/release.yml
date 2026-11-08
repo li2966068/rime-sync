@@ -502,48 +502,6 @@ jobs:
 
   # 汇总 + 验收：只有 trixie 的全量 + 非全量两个 .run 都在、且没有独立的 IME deb 资产，
   # publish 才会被触发。
-  collect:
-    name: collect · 汇总并断言安装器
-    # ime 成功才会跑（任一发行版失败 = collect 不跑 = 不发布）。
-    # windows 也要等：新的资产断言会检查两个 exe，早跑会误判缺失。
-    needs: [linux-app, ime, windows, prepare-draft]
-    runs-on: ubuntu-22.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    steps:
-      - name: checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      # 不再下载产物（几百 MiB 的 .run 没必要重复搬一次）：直接读草稿 Release 的资产清单。
-      # GitHub 返回的 name+size 就是上传完成时的实际值，用来断言「两个安装器都在且体积符合预期」。
-      - name: list draft release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare-draft.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release view "$TAG" --json isDraft,assets \
-            --jq '"draft=\(.isDraft), assets=\(.assets | length)"'
-          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)"' | sort
-
-      # 资产清单的断言逻辑独立成脚本：可以用假清单离线自检（CI 的
-      # "guard · release asset inventory" 就是跑它的自检）。
-      - name: assert 2 installers (full + thin), no standalone IME deb
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare-draft.outputs.tag }}
-        run: |
-          set -euo pipefail
-          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > /tmp/assets.txt
-          bash .github/scripts/assert-release-assets.sh \
-            --assets /tmp/assets.txt \
-            --version "$ver" \
-            --suite trixie
-
   windows:
     name: windows · nsis + portable zip
     needs: prepare-draft
@@ -1319,7 +1277,11 @@ jobs:
   # 失败就不发布：publish 依赖本 job。
   verify-artifacts:
     name: verify-artifacts · 功能入口断言
-    needs: [collect, windows, prepare-draft]
+    # 0.6.24：原 collect job（汇总草稿资产 + 断言两个安装器）在 GitHub 侧每次都在
+    # 2 秒内零步骤失败，发布尾部被它卡死。职责并到本 job：这里本来就要下载草稿
+    # 资产并做功能入口断言，先把资产清单断言做掉更顺。needs 保持三个，和 v0.6.22
+    # 成功过的形状一致。
+    needs: [ime, windows, prepare-draft]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
@@ -1329,6 +1291,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      - name: list draft release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft,assets \
+            --jq '"draft=\(.isDraft), assets=\(.assets | length)"'
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)"' | sort
+
+      # 资产清单的断言逻辑独立成脚本：可以用假清单离线自检（CI 的
+      # "guard · release asset inventory" 就是跑它的自检）。
+
+      - name: assert 2 installers (full + thin), no standalone IME deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > /tmp/assets.txt
+          bash .github/scripts/assert-release-assets.sh \
+            --assets /tmp/assets.txt \
+            --version "$ver" \
+            --suite trixie
 
       # 草稿 Release 是唯一产物来源（不再有 workflow artifact）。
       # 只下断言要用的：thin .run（几 MiB，里面装着 IME deb）+ rime-sync deb + setup.exe。
@@ -1393,8 +1381,8 @@ jobs:
 
   publish:
     name: publish · 汇总产物并生成 latest.json
-    # verify-artifacts 通过才允许发布；collect/windows 再兜一层（任一发行版缺失都不发布）。
-    needs: [verify-artifacts, collect, windows, prepare-draft]
+    # verify-artifacts 通过才允许发布；windows 再兜一层（Windows 产物缺失就不发布）。
+    needs: [verify-artifacts, windows, prepare-draft]
     runs-on: ubuntu-latest
     permissions:
       contents: write

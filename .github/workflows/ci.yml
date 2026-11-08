@@ -435,11 +435,11 @@ jobs:
           exit $bad
 
       # 矩阵 + 汇总 job + publish 依赖：trixie 的两个安装器缺席就不能发布。
-      - name: guard · release.yml matrix / collect / publish needs
+      - name: guard · release.yml matrix / verify-artifacts / publish needs
         run: |
           set -euo pipefail
           wf=.github/workflows/release.yml
-          for job in linux-app ime collect; do
+          for job in linux-app ime windows verify-artifacts publish; do
             grep -qE "^  ${job}:" "$wf" || { echo "::error::$wf 缺少 job $job"; exit 1; }
           done
           grep -qE '^    strategy:' "$wf" || { echo "::error::$wf 的 ime job 没有 matrix"; exit 1; }
@@ -474,14 +474,21 @@ jobs:
             *) echo "::error::ime job 必须 needs: linux-app（否则拿不到 rime-sync deb）"; exit 1 ;;
           esac
           pub_needs=$(awk '/^  publish:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
-          for j in collect windows; do
+          # 0.6.24：collect job 已并入 verify-artifacts（它在 GitHub 侧每次都 2 秒零步骤失败）。
+          # publish 必须等 verify-artifacts（它 needs ime）和 windows，缺任一都不发布。
+          for j in verify-artifacts windows; do
             case "$pub_needs" in
               *"$j"*) : ;;
               *) echo "::error::publish 必须 needs $j（保证任一发行版失败就不发布）"; exit 1 ;;
             esac
           done
+          va_needs=$(awk '/^  verify-artifacts:/{f=1;next} f&&/^    needs:/{print;exit}' "$wf")
+          case "$va_needs" in
+            *ime*) : ;;
+            *) echo "::error::verify-artifacts 必须 needs: ime（否则拿不到 thin 安装器）"; exit 1 ;;
+          esac
           # deb 必须先下载到 packaging/out/ 再抓依赖闭包
-          awk '/^  ime:/{f=1} /^  collect:/{f=0} f' "$wf" > /tmp/ime_job.yml
+          awk '/^  ime:/{f=1} /^  windows:/{f=0} f' "$wf" > /tmp/ime_job.yml
           # 产物来源已经从 workflow artifact 换成草稿 Release（gh release download）。
           dl=$(grep -n 'gh release download' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
           fv=$(grep -n 'fetch-vendor-deps.sh "$DISTRO"' /tmp/ime_job.yml | head -n 1 | cut -d: -f1 || true)
