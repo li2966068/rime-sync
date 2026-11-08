@@ -206,7 +206,7 @@ check_sync_deb() { # $1=deb $2=workdir
   # 数 dpkg-deb -c 的 tar 条目：>1 = 双供又回来了，0 = sidecar 没打进 deb（fcitx5 配置页的
   # 「立即同步」会静默 no-op）。
   local cli_n
-  cli_n=$(dpkg-deb -c "$deb" | awk -v p="./usr/bin/rime-sync-cli" '$6 == p' | wc -l)
+  cli_n=$(dpkg-deb -c "$deb" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") c++ } END { print c + 0 }')
   if [ "$cli_n" -eq 1 ]; then
     ok "rime-sync deb 内 $SYNC_CLI 恰好 1 份"
   else

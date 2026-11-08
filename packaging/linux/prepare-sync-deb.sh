@@ -16,7 +16,9 @@ mkdir -p "$(dirname "$out")"
 # 0.6.23：/usr/bin/rime-sync-cli 的唯一来源是 tauri 的 bundle.externalBin sidecar。
 # deb 里出现两份就说明 bundle.linux.deb.files 又映射了同一个路径（两条路写同一个文件，
 # 谁赢取决于 tauri-bundler 内部顺序）。dpkg-deb -c 数 tar 条目，是用户实际装到什么的唯一证据。
-cli_count() { dpkg-deb -c "$1" | awk '$6 == "./usr/bin/rime-sync-cli"' | wc -l; }
+# dpkg-deb -c 的路径列**不带** "./" 前缀（usr/bin/... 而不是 ./usr/bin/...），
+# 比较前先归一化 —— 否则永远数到 0 份（0.6.24 的发布就是这么红的）。
+cli_count() { dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") c++ } END { print c + 0 }'; }
 assert_one_cli() { # <deb>
   local n mode
   n=$(cli_count "$1")
@@ -25,7 +27,7 @@ assert_one_cli() { # <deb>
     dpkg-deb -c "$1" | grep rime-sync-cli >&2 || true
     exit 1
   fi
-  mode=$(dpkg-deb -c "$1" | awk '$6 == "./usr/bin/rime-sync-cli" { print $1 }')
+  mode=$(dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") { print $1; exit } }')
   if [ "$mode" != "-rwxr-xr-x" ]; then
     echo "!! $1: /usr/bin/rime-sync-cli 权限是 $mode（期望 -rwxr-xr-x）" >&2
     exit 1
