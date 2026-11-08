@@ -8,11 +8,20 @@
 
 ### 缺陷一：方案文件里同一个设置写了两遍 → 整个输入法方案加载失败
 
-0.6.18 之前的旧补丁路径与后来的补丁路径会往同一个方案文件里各写一份设置，于是
-`recognizer/patterns` 下出现两份 `vnum`（一份双引号、一份单引号）。YAML 不允许同一个
-映射里出现两个同名键，Rime 读不了这个文件 → **该输入法方案直接废掉**（真机实测：
-`luna_pinyin` 不可用，`check-ime` 报 `missing=[luna_pinyin_simp, wubi_pinyin]`）。
-**从 0.6.19 及更早版本升级的机器必然中招。**
+旧版补丁器的幂等判据只认 `recognizer/patterns` 这一个位置，文本扫描又硬编码按 2 格缩进
+去找 `patterns`。于是有两种情形会写出非法的 YAML：
+
+- `vnum` 已经落在 `recognizer` 子树里、但不在 `patterns` 下 → 补丁器看不见它，又插
+  一份 → 同一个映射里两个 `vnum` 键；
+- 方案文件的缩进不是 2 格 → 补丁器找不到真正的 `patterns`，另插一个 `patterns:` 键
+  → 同一个 `recognizer` 下两个 `patterns` 键。
+
+YAML 不允许同一个映射里出现两个同名键，Rime 读不了这个文件 → **该输入法方案直接废掉**
+（真机实测：`luna_pinyin` 不可用，`check-ime` 报
+`missing=[luna_pinyin_simp, wubi_pinyin]`）。
+
+历史上有机器（真机 227）在 0.6.19 时代就留下了写坏的方案文件；**升级与重装都会把它继承
+下来**，直到本次的自动修复把它治好。
 
 - **幂等判据放宽**：不管 `vnum` 现在落在 `recognizer` 子树的哪一层，最终只保留一份，
   且必须落在 `patterns` 下；错位那份原样搬进 `patterns`（值不改）。
