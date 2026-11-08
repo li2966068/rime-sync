@@ -1,0 +1,15 @@
+# 随包 Rime 产物与配置源必须**逐字节可复现**：任何平台的 checkout 都不能改行尾。
+#
+# 背景（v0.6.25 实测）：GitHub 的 windows runner 上 git 默认 core.autocrlf=true，
+# checkout 会把仓库里的 LF 文本转成 CRLF。随包产物的 MANIFEST.json 记的是 sha256，
+# 文本文件一旦被转成 CRLF，清单与产物立刻对不上 —— 安装期每个对不上的文件都被
+# 记成一次失败（真机实测 copy_failed=11：6 个 build/*.schema.yaml + 5 个
+# config/*.custom.yaml 被污染，13 个 .bin 不受影响），输入法只铺了一半。
+#
+# -text = 不做任何行尾转换（checkout / git add 都不动），清单的 sha256 才是承诺。
+# 范围覆盖整个 packaging/rime/：prebuilt/（产物）+ schemas/ 与 *.custom.yaml
+# （手写源，必须与 prebuilt/config/ 逐字节相同）+ retained-schemas.txt（保留清单）。
+#
+# 注意：**不要**对全仓跑 git add --renormalize —— 那会把故意存 CRLF 的真机夹具
+# （crates/core/tests/fixtures/real227_luna_pinyin.orig.yaml）一起改坏。
+packaging/rime/** -text

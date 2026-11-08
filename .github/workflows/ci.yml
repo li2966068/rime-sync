@@ -93,6 +93,14 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
+      # 0.6.25：Windows runner 的 git 默认 core.autocrlf=true，checkout 会把仓库里的
+      # LF 文本转成 CRLF；随包产物的 MANIFEST.json 记的是 sha256，于是立刻对不上
+      # （v0.6.24 真机 copy_failed=11，v0.6.25 发布产物校验失败）。
+      # 这里就地断言 checkout 之后随包产物逐字节没变 —— 失败要发生在打包之前。
+      - name: payload eol check（checkout 后逐字节校验）
+        shell: bash
+        run: bash .github/scripts/check-rime-payload-eol.sh
+
       - name: setup rust
         uses: dtolnay/rust-toolchain@stable
 

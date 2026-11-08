@@ -567,6 +567,11 @@ def manifest_entries(out_dir: Path) -> list[dict]:
 
     清单必须描述最终产物：任何在复制之后发生的改写（rimesync 补丁、部署器重写
     build/<id>.schema.yaml、固定 mtime 之后的编辑）都会让复制时的中间值失效。
+
+    清单的 sha256 是对「**这些字节原样送到用户机器**」的承诺，所以同一批字节
+    必须在任何平台的 checkout 后都不变 —— 靠仓库根 .gitattributes 对
+    packaging/rime/** 声明 -text 来保证（Windows runner 的 core.autocrlf=true
+    会把 LF 文本转成 CRLF，清单立刻对不上）。
     """
     entries: list[dict] = []
     for sub in ("build", "config"):
@@ -780,6 +785,118 @@ def check_wiring() -> list[str]:
     return fail
 
 
+# 随包预编译产物在仓库里的固定路径。护栏永远针对**仓库里这一份**
+# （发出去的就是它），与 --out 无关。
+PREBUILT_REPO_DIR = "packaging/rime/prebuilt"
+# 需要保证「行尾不被转换」的整棵子树：随包产物 + config 手写源 + 保留清单。
+# 手写源（packaging/rime/schemas/*.custom.yaml）必须与分发副本
+# （packaging/rime/prebuilt/config/*.custom.yaml）逐字节相同，两端都得禁转换，
+# 否则 Windows 侧 check-config-sources.sh 的 cmp 会误报。
+RIME_PAYLOAD_DIR = "packaging/rime"
+
+
+def _git_ls_files(rel: str) -> list[str]:
+    """列出仓库里被跟踪的路径（相对仓库根，NUL 分隔）。"""
+    proc = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", rel],
+                          capture_output=True)
+    if proc.returncode != 0:
+        return []
+    return [p for p in proc.stdout.decode("utf-8", "replace").split("\0") if p]
+
+
+def _git_index_env(worktree: Path) -> dict[str, str]:
+    """让 git **只按索引**里的 .gitattributes 解析属性。
+
+    git 查属性时的顺序是「工作区的 .gitattributes → 索引里的」，所以工作区里
+    一份还没提交的规则会盖住真相：本地怎么测都绿，CI 检出后照样被转成 CRLF。
+    把 GIT_WORK_TREE 指到一个空目录，工作区那份就不可见，只剩索引那一份
+    ——这正是 CI 真正检出的内容。
+
+    （不用 git check-attr --cached：那个选项要 git ≥ 2.40，runner 上是 2.34。）
+    """
+    env = dict(os.environ)
+    env["GIT_WORK_TREE"] = str(worktree)
+    return env
+
+
+def check_rime_payload_eol() -> list[str]:
+    """断言 packaging/rime/ 下每个被跟踪文件都声明了 -text（禁止行尾转换）。
+
+    没有这条规则，Windows runner 上的 git（core.autocrlf=true）会在 checkout 时
+    把 LF 文本转成 CRLF；随包产物的 MANIFEST.json 记的是 sha256，于是立刻对不上。
+
+    判据按**索引**算：CI 检出的是索引里的那份 .gitattributes，工作区里还没提交的
+    规则不算数（否则本地能过、CI 照样炸）。做法是把 GIT_WORK_TREE 指到一个空目录
+    ——工作区那份 .gitattributes 因此不可见，git 只剩索引那一份可用。
+    （不用 git check-attr --cached：那个选项要 git ≥ 2.40，runner 上是 2.34。）
+    """
+    tracked = _git_ls_files(RIME_PAYLOAD_DIR)
+    if not tracked:
+        return [f"{RIME_PAYLOAD_DIR} 下没有被 git 跟踪的文件（护栏无从校验）"]
+    with tempfile.TemporaryDirectory(prefix="rime-attr-") as tmp:
+        worktree = Path(tmp) / "wt"
+        worktree.mkdir()
+        env = _git_index_env(worktree)
+        proc = subprocess.run(["git", "-C", str(REPO_ROOT), "check-attr", "text", "--", *tracked],
+                              capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            return ["git check-attr 失败：" + (proc.stderr or "").strip()]
+    fail: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if not line.endswith(": unset"):
+            fail.append(f"{line}（{RIME_PAYLOAD_DIR}/** 必须声明 -text：禁止行尾转换）")
+    return fail
+
+
+def check_windows_checkout() -> list[str]:
+    """在 Linux 上原样复现 Windows runner 的 checkout，再逐字节比对。
+
+    现场故障（v0.6.24 真机首启降级 + v0.6.25 发布产物校验失败）：
+    Windows runner 的 git 默认 core.autocrlf=true，checkout 时把仓库里的 LF 文本
+    转成 CRLF；随包产物的 MANIFEST.json 记的是 sha256，于是 11 个文本文件
+    （6 个 build/*.schema.yaml + 5 个 config/*.custom.yaml；13 个 .bin 不受影响）
+    与清单对不上 → 安装期每个对不上的文件算一次失败（真机实测 copy_failed=11）
+    → 输入法只铺了一半。
+
+    这里按**索引**里的内容以 core.autocrlf=true 重新落盘一份（等价于一次全新
+    clone 的检出结果），再逐个文件与索引里的字节对照：**任何**一个字节变了就是
+    转换发生了。规则被删掉、被改窄、或只改了工作区没提交，这里立刻红。
+    """
+    tracked = _git_ls_files(RIME_PAYLOAD_DIR)
+    if not tracked:
+        return [f"{RIME_PAYLOAD_DIR} 下没有被 git 跟踪的文件（护栏无从校验）"]
+    payload = b"".join(p.encode("utf-8") + b"\0" for p in tracked)
+    fail: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="rime-winc-") as tmp:
+        out = Path(tmp) / "out"
+        worktree = Path(tmp) / "wt"
+        out.mkdir()
+        worktree.mkdir()
+        env = _git_index_env(worktree)
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "-c", "core.autocrlf=true", "checkout-index",
+             "--force", "--stdin", "-z", "--prefix=" + str(out) + "/"],
+            input=payload, capture_output=True, env=env)
+        if proc.returncode != 0:
+            return ["git checkout-index（模拟 Windows checkout）失败："
+                    + proc.stderr.decode("utf-8", "replace").strip()]
+        # ① 逐字节：checkout 不许改任何文件的任何一个字节。
+        for rel in tracked:
+            sim = out / rel
+            if not sim.is_file():
+                fail.append(f"模拟 Windows checkout 后 {rel} 没有落盘")
+                continue
+            blob = subprocess.run(["git", "-C", str(REPO_ROOT), "cat-file", "blob", ":" + rel],
+                                  capture_output=True, env=env).stdout
+            if sim.read_bytes() != blob:
+                fail.append(f"模拟 Windows checkout 后 {rel} 与索引里的字节不同"
+                            f"（{len(blob)} → {sim.stat().st_size} 字节：行尾被转换了）")
+        # ② 清单：随包产物仍要与 MANIFEST.json 逐字节一致。
+        fail.extend(f"模拟 Windows checkout 后 {item}"
+                    for item in verify_manifest(out / PREBUILT_REPO_DIR))
+    return fail
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成/校验随包分发的预编译 Rime build 产物")
     parser.add_argument("--out", default=str(DEFAULT_OUT), help="输出目录（默认 packaging/rime/prebuilt）")
@@ -818,7 +935,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ok   prebuilt 清单与产物逐字节一致（{target}）")
         return 0
     if args.check:
-        fails = check_payload(out_dir, budget) + check_git_ignore(out_dir) + check_wiring()
+        fails = (check_payload(out_dir, budget) + check_git_ignore(out_dir)
+                 + check_wiring() + check_rime_payload_eol() + check_windows_checkout())
         if fails:
             for item in fails:
                 print(f"FAIL {item}", file=sys.stderr)
@@ -827,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
         files = len(json.loads((out_dir / "MANIFEST.json").read_text(encoding="utf-8"))["files"])
         total = json.loads((out_dir / "MANIFEST.json").read_text(encoding="utf-8"))["total_bytes"]
         print(f"ok   prebuilt {files} 个文件 {human(total)}（预算 {human(budget)}），"
-              "方案标记/清单/打包接线全部一致")
+              "方案标记/清单/打包接线全部一致，Windows checkout 模拟无行尾转换")
         return 0
     return generate(args)
 

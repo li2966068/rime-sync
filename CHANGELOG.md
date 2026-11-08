@@ -37,18 +37,39 @@ YAML 不允许同一个映射里出现两个同名键，Rime 读不了这个文�
 
 ### 缺陷二：安装包里的文件清单与实际文件对不上 → 输入法只铺了一半
 
-构建期算清单的时机错了（文件复制过程中就算，之后产物又被改写却从不复核），于是随包
-产物自相矛盾地发货；安装期把每个对不上的文件记成失败 → 首启判定 `partial/degraded` →
-有方案缺失。`build/` 又是「缺才补」，升级后旧引擎产物留在用户目录 → 继续判失败。
+**根因是行尾转换，不是清单算错**：GitHub 的 Windows runner 上 git 默认
+`core.autocrlf=true`，checkout 会把仓库里的 LF 文本转成 CRLF。仓库里的随包产物
+是 LF 写的，`MANIFEST.json` 记的 sha256 也是对 LF 字节算的 —— 一旦被打成 CRLF，
+清单与产物立刻对不上。
+
+真机实测被污染的正好 **11 个文本文件**（6 个 `build/*.schema.yaml` +
+5 个 `config/*.custom.yaml`），13 个 `.bin` 不受影响 → 安装期每个对不上的文件记一次
+失败（`copy_failed=11`）→ 首启判定 `partial/degraded` → 有方案缺失。
+`build/` 又是「缺才补」，升级后旧引擎产物留在用户目录 → 继续判失败。
 **这个与机器状态无关，每台机器都会中。**
 
+（附带说明：清单本身没问题 —— `v0.6.24` tag 里的 `build/default.yaml` 就是 5294 字节，
+与 `MANIFEST.json` 记的 5294 完全一致；5463 那个数是**被转换之后**的大小。）
+
+- **仓库层**：新增根目录 `.gitattributes`，对 `packaging/rime/**` 声明 `-text`
+  （禁止行尾转换）。范围覆盖整个 `packaging/rime/`（不只是 `prebuilt/`）——
+  否则手写源 `schemas/*.custom.yaml` 被打成 CRLF、而分发源 `prebuilt/config/` 仍是 LF，
+  两份就不一致了。
 - **构建期**：清单改为在**最终落盘内容**上重算，写完立即自检，不一致直接**中止构建**
   （不许带着矛盾出门）；新增 `--verify-dir` 可校验任意已生成目录的清单↔产物一致性。
 - **安装期**：`build/` 改为「缺失才补 + 版本过期才覆盖」（覆盖记 `overwritten`，
   **绝不记失败**）；过期方案的 `.bin` 跟着换新，**当前版本方案的 `.bin` 不动**
   （你的编译词库不受影响）；`config/` 仍是「只补缺失、永不覆盖」。
-- **CI**：新增断言，直接校验**发布产物**里 deb 与 setup.exe 自带的 prebuilt 与清单逐字节
-  一致（双平台同一套逻辑，没有平台分支）。
+- **CI（双平台同口径）**：
+  - Windows runner（`ci.yml` 的 `windows-e2e`、`release.yml` 的 `windows`）在
+    **checkout 之后立刻**跑 `.github/scripts/check-rime-payload-eol.sh` ——
+    就地断言工作区里每个文件逐字节等于索引里的 blob、且清单 24 条逐字节一致。
+    这道闸排在编 Weasel（~25 分钟）**之前**，坏了不用等打包才发现。
+  - Linux 侧 `scripts/ime/gen-prebuilt-build.py --check` 里多了一道**模拟 Windows 检出**
+    的护栏（用 `git -c core.autocrlf=true checkout-index` 复现 Windows 的检出行为），
+    并断言 `.gitattributes` 的规则**已经进索引**（不是只在工作区）。
+  - 另有断言直接校验**发布产物**里 deb 与 setup.exe 自带的 prebuilt 与清单逐字节
+    一致（双平台同一套逻辑，没有平台分支）。
 
 ### 其它
 
@@ -65,10 +86,12 @@ YAML 不允许同一个映射里出现两个同名键，Rime 读不了这个文�
    patch 过」的方案文件上会被再插一份，YAML 变成非法，`luna_pinyin` 方案加载失败
    （日志：`duplicate entry with key "vnum"`）。**从 0.6.19 及更早版本升级的机器
    必然中招**；全新安装也可能因下面的问题导致引擎产物没铺全。
-2. **`prebuilt` 清单与产物自相矛盾**：`resources/prebuilt/MANIFEST.json` 记录的文件
-   大小是打补丁**之前**的值（如 `build/default.yaml` 记 5294、实际 5463），铺装时
-   10 个文件被清单挡下、计入 `failed=16`，引擎产物铺不进去，`build_ok=false`
-   → `schema-stale` → 部署部分失败。**这个与机器状态无关，每台机器都会中。**
+2. **`prebuilt` 清单与产物对不上**：`resources/prebuilt/MANIFEST.json` 记的是 LF 字节的
+   sha256，而 Windows 上打包时随包产物被打成了 CRLF（如 `build/default.yaml` 记 5294、
+   打包后 5463），铺装时 **11 个文本文件**被清单挡下、计入 `copy_failed=11`，
+   引擎产物铺不进去，`build_ok=false` → `schema-stale` → 部署部分失败。
+   （根因是 Windows runner 的 `core.autocrlf=true` 做了行尾转换，清单本身没算错。）
+   **这个与机器状态无关，每台机器都会中。**
 
 临时规避（**已实测有效，仅解除第 1 条**）：用同目录的 `*.rimesync-orig` 备份覆盖回损坏的方案
 文件，再重跑一次 ensure。

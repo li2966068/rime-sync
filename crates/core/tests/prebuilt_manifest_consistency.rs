@@ -1,10 +1,13 @@
 //! prebuilt 清单（MANIFEST.json）与产物的一致性 + 铺制策略的回归测试。
 //!
-//! 现场故障（v0.6.24 真机首启降级）：随包产物的 MANIFEST.json 记的是补丁前的字节，
-//! 产物却是补丁后的字节 —— 安装时 verify_manifest 把每个对不上的文件算成一次失败
-//! （copy_failed=16 / manifest_failed=build/default.yaml:size:expected=5294 actual=5463），
+//! 现场故障（v0.6.24 真机首启降级）：随包产物在 Windows 上打包时被 git 的
+//! core.autocrlf=true 从 LF 转成了 CRLF，而 MANIFEST.json 记的是 LF 字节的 sha256 ——
+//! 清单与产物对不上，安装时 verify_manifest 把每个对不上的文件算成一次失败
+//! （真机实测 copy_failed=11；manifest_failed=build/default.yaml:size:expected=5294 actual=5463；
+//! 被污染的正好是 6 个 build/*.schema.yaml + 5 个 config/*.custom.yaml，13 个 .bin 不受影响），
 //! 结论降级成 partial/degraded；同时 build/ 只补不缺，旧版引擎产物留在用户目录里，
 //! build_ok=false（schema-stale）→ deploy_result=partial。
+//! 清单本身没错：v0.6.24 tag 里的 build/default.yaml 就是 5294 字节，与清单一致。
 //!
 //! 本文件钉住两件事：
 //! 1) 清单必须与产物逐字节一致（大小 + sha256）：仓库里随包的产物也要过这一关；

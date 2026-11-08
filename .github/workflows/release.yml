@@ -523,6 +523,14 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      # 0.6.25：checkout 之后立刻就地校验随包产物逐字节没变。
+      # Windows runner 的 git 默认 core.autocrlf=true，LF→CRLF 会让 MANIFEST.json 的
+      # sha256 对不上（v0.6.24 真机 copy_failed=11，v0.6.25 verify-artifacts 失败）。
+      # 这道闸必须排在编 Weasel（~25 分钟）之前，坏了就别浪费时间往下走。
+      - name: payload eol check（checkout 后逐字节校验）
+        shell: bash
+        run: bash .github/scripts/check-rime-payload-eol.sh
+
       # 模式解析（唯一真源）：
       #   tag 推送              → require：自编译失败直接让 job 失败，绝不用上游包顶替
       #   手动 workflow_dispatch → inputs.weasel_mode（auto 时取仓库变量 vars.RIMESYNC_WEASEL_MODE，缺省 build）
