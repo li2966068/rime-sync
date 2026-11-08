@@ -19,21 +19,26 @@ mkdir -p "$(dirname "$out")"
 # dpkg-deb -c 的路径列**不带** "./" 前缀（usr/bin/... 而不是 ./usr/bin/...），
 # 比较前先归一化 —— 否则永远数到 0 份（0.6.24 的发布就是这么红的）。
 cli_count() { dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") c++ } END { print c + 0 }'; }
-assert_one_cli() { # <deb>
+check_one_cli() { # <deb>：检查不通过返回 1（不退出脚本）
   local n mode
-  n=$(cli_count "$1")
+  n=$(cli_count "$1") || return 1
   if [ "$n" -ne 1 ]; then
     echo "!! $1: /usr/bin/rime-sync-cli 应恰好 1 份，实际 $n 份" >&2
-    dpkg-deb -c "$1" | grep rime-sync-cli >&2 || true
-    exit 1
+    dpkg-deb -c "$1" 2>&1 | grep rime-sync-cli >&2 || true
+    return 1
   fi
-  mode=$(dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") { print $1; exit } }')
+  mode=$(dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") { print $1; exit } }') || return 1
   if [ "$mode" != "-rwxr-xr-x" ]; then
     echo "!! $1: /usr/bin/rime-sync-cli 权限是 $mode（期望 -rwxr-xr-x）" >&2
-    exit 1
+    return 1
   fi
   echo "    ok /usr/bin/rime-sync-cli x1 ($mode)"
+  return 0
 }
+assert_one_cli() { # <deb>：致命版
+  check_one_cli "$1" || exit 1
+}
+echo "==> prepare-sync-deb.sh（ar 兜底版） src=$src out=$out" >&2
 assert_one_cli "$src"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/rime-sync-deb.XXXXXX")
@@ -98,8 +103,20 @@ repack_via_ar() { # <src.deb> <out.deb>：只换控制归档，数据归档原�
   ( cd "$work" && ar r "$o" debian-binary control.tar.gz "$(basename "$data")" ) || return 1
 }
 
-if ! build_with_dpkg_deb "$src" "$out"; then
-  echo "!! dpkg-deb 路径失败，改用 ar 兜底重打包" >&2
+# 只有「打包成功 + 产物可读且 CLI 恰好 1 份」才算数：CI 上出现过 dpkg-deb 退出 0
+# 但产物读不出来的情况（后面 assert_one_cli 读 $out 时才炸）。
+built=0
+if build_with_dpkg_deb "$src" "$out"; then
+  if check_one_cli "$out"; then
+    built=1
+  else
+    echo "!! dpkg-deb 打出来的 deb 读不出来或内容不对" >&2
+  fi
+else
+  echo "!! dpkg-deb --build 失败" >&2
+fi
+if [ "$built" -ne 1 ]; then
+  echo "!! dpkg-deb 路径没产出可用的 deb，改用 ar 兜底重打包" >&2
   dump_env >&2
   repack_via_ar "$src" "$out" || { echo "!! ar 兜底也失败" >&2; exit 1; }
   echo "    (ar 兜底成功：控制归档已替换，数据归档原样保留)" >&2
