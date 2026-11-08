@@ -310,7 +310,11 @@ fn illegal_yaml_that_cannot_be_deduped_is_reported_and_left_untouched() {
         message.contains(&schema.display().to_string()),
         "错误要点名是哪个文件：{message}"
     );
-    assert_eq!(read(&schema), broken, "改不动的坏文件不能被改写");
+    assert_eq!(
+        fs::read(&schema).expect("read"),
+        bytes_before,
+        "改不动的坏文件不能被改写"
+    );
     assert!(
         !data_patch::backup_path(&schema).exists(),
         "没有成功写入就不该留备份"
@@ -455,12 +459,18 @@ fn broken_file_without_backup_is_recovered_by_text_dedupe() {
         "    punct: \"^/([0-9]0?|[A-Za-z]+)$\"\n    vnum: \"^[vV][0-9.]*$\"\n    vnum: '^[vV][0-9.]*$'\n",
     );
     write(&schema, &broken);
+    let bytes_before = fs::read(&schema).expect("read");
 
     data_patch::patch_file(&schema, "0.6.24").expect("没有备份也应当能自愈");
 
     let text = read(&schema);
     assert_eq!(vnum_key_count(&text), 1, "恢复后只能有一份 vnum");
     serde_yaml::from_str::<serde_yaml::Value>(&text).expect("valid yaml");
+    assert_ne!(
+        fs::read(&schema).expect("read"),
+        bytes_before,
+        "损坏文件应当被修好"
+    );
     // 备份是修复之后才写的，且现场副本留一份。
     assert!(data_patch::backup_path(&schema).exists(), "写成功了就该有备份");
     let copies = broken_copies(&schema);
