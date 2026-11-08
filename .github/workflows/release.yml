@@ -217,13 +217,16 @@ jobs:
           # sidecar 与 deb.files 双供（正是这次要根除的状态）。dpkg-deb -c 是用户实际
           # 装到什么的唯一证据，这里直接数 tar 条目。
           listing=$(dpkg-deb -c "${debs[0]}")
-          cli_count=$(printf '%s\n' "$listing" | awk '$6 == "./usr/bin/rime-sync-cli"' | wc -l)
+          # dpkg-deb -c 的路径列**不带** "./" 前缀（是 usr/bin/... 而不是 ./usr/bin/...），
+          # 比较前先归一化，否则这条断言永远数到 0 份（0.6.24 的发布就是这么红的）。
+          cli_entries=$(printf '%s\n' "$listing" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") print $1, $3 }')
+          cli_count=$(printf '%s\n' "$cli_entries" | grep -c . || true)
           if [ "$cli_count" -ne 1 ]; then
             echo "::error::deb 里 /usr/bin/rime-sync-cli 应恰好 1 份，实际 $cli_count 份"
             printf '%s\n' "$listing" | grep rime-sync-cli || true
             exit 1
           fi
-          cli_field=$(printf '%s\n' "$listing" | awk '$6 == "./usr/bin/rime-sync-cli" { print $1, $3 }')
+          cli_field=$(printf '%s\n' "$cli_entries" | head -1)
           cli_size=${cli_field##* }
           case "$cli_field" in
             -rwxr-xr-x\ *) : ;;
