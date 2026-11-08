@@ -174,13 +174,30 @@ else
 fi
 
 # ---------- 2) 假用户数据 ----------------------------------------------------
-APPDATA_DIR=$(find "$DRIVE_C/users" -maxdepth 2 -type d -name 'AppData' 2>/dev/null | head -1 | sed 's|/AppData$||')
-if [ -z "$APPDATA_DIR" ]; then
-  fail_msg "找不到 wine 的 %APPDATA%"
+# 卸载钩子删的是**进程环境里**的 %APPDATA% 下的两条路径（ReadEnvStr APPDATA，
+# 读不到才退回 NSIS 的 $APPDATA）。wine 的 %APPDATA% 在不同 wine 版本里指向不同的
+# 地方：wine 10 是 AppData\Roaming，wine 6 是旧的 \Application Data。
+# 这里直接问 wine 要，保证「造的数据」和「卸载器删的数据」是同一个地方 ——
+# 否则测试会自己骗自己（卸载器报 skip-not-found，目录当然还在）。
+APPDATA_DIR=""
+APPDATA_WIN=$(wine cmd /c "echo %APPDATA%" 2>/dev/null | tr -d '\r' | grep -v '^[[:space:]]*$' | tail -1)
+if [ -n "${APPDATA_WIN:-}" ]; then
+  _rest=${APPDATA_WIN#*:}
+  _rest=${_rest#\\}
+  _rest=${_rest//\\//}
+  APPDATA_DIR="$DRIVE_C/$_rest"
+fi
+if [ -z "$APPDATA_DIR" ] || [ ! -d "$APPDATA_DIR" ]; then
+  # 兜底：wine 没给出可用路径时，沿用目录探测
+  APPDATA_DIR=$(find "$DRIVE_C/users" -maxdepth 2 -type d -name 'AppData' 2>/dev/null | head -1 | sed 's|/AppData$||')/AppData/Roaming
+fi
+if [ -z "$APPDATA_DIR" ] || [ ! -d "$APPDATA_DIR" ]; then
+  fail_msg "找不到 wine 的 %APPDATA%（wine 报的是 '${APPDATA_WIN:-}'）"
 else
-  mkdir -p "$APPDATA_DIR/AppData/Roaming/Rime" "$APPDATA_DIR/AppData/Roaming/com.rimesync.app"
-  printf 'sentinel\n' >"$APPDATA_DIR/AppData/Roaming/Rime/sentinel.txt"
-  printf 'sentinel\n' >"$APPDATA_DIR/AppData/Roaming/com.rimesync.app/sentinel.txt"
+  mkdir -p "$APPDATA_DIR/Rime" "$APPDATA_DIR/com.rimesync.app"
+  printf 'sentinel\n' >"$APPDATA_DIR/Rime/sentinel.txt"
+  printf 'sentinel\n' >"$APPDATA_DIR/com.rimesync.app/sentinel.txt"
+  echo "test-nsis-hooks-wine: 假用户数据放在 $APPDATA_DIR（wine 的 %APPDATA%=${APPDATA_WIN:-?}）"
 fi
 
 # ---------- 3) 静默卸载（带 /PURGEDATA） -------------------------------------
@@ -228,13 +245,19 @@ else
     waited=$((waited + 1))
   done
   if [ -n "${APPDATA_DIR:-}" ]; then
-    [ ! -d "$APPDATA_DIR/AppData/Roaming/Rime" ] || fail_msg "/PURGEDATA 没有删除 %APPDATA%\\Rime"
-    [ ! -d "$APPDATA_DIR/AppData/Roaming/com.rimesync.app" ] || fail_msg "/PURGEDATA 没有删除 %APPDATA%\\com.rimesync.app"
+    [ ! -d "$APPDATA_DIR/Rime" ] || fail_msg "/PURGEDATA 没有删除 %APPDATA%\\Rime（$APPDATA_DIR/Rime 还在）"
+    [ ! -d "$APPDATA_DIR/com.rimesync.app" ] || fail_msg "/PURGEDATA 没有删除 %APPDATA%\\com.rimesync.app（$APPDATA_DIR/com.rimesync.app 还在）"
   fi
   [ ! -f "$INSTALL_DIR/rime-sync-app.exe" ] || fail_msg "卸载后主程序仍在（卸载器没清安装目录）"
 fi
 
 if [ "$fail" -ne 0 ]; then
+  # 卸载日志是 ASCII，直接打出来：断言只说「少了 2 条 removed」，看不出是哪条路径没删。
+  if [ -n "${UNINSTALL_LOG:-}" ] && [ -f "$UNINSTALL_LOG" ]; then
+    echo "--- 卸载日志（尾部）---" >&2
+    tail -n 30 "$UNINSTALL_LOG" >&2 || true
+    echo "--------------------------" >&2
+  fi
   echo "test-nsis-hooks-wine: 运行期断言失败（见上）" >&2
   exit 1
 fi

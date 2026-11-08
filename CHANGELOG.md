@@ -93,6 +93,13 @@
      `HKCU\Software\Wine\Version` 不生效**：wineserver 不读它，实测 build 仍是
      7601），改完重启 wineserver，并断言 build ≥ 17134 —— 版本抬不上去就直接失败
      并说清楚，不再让它以「安装器按设计拒绝安装」的样子混过去。
+   - **冒烟测的假用户数据放错了地方**：卸载钩子删的是**进程环境里**的
+     `%APPDATA%` 下的两条路径，而 wine 6 的 `%APPDATA%` 指向旧的
+     `\Application Data`（wine 10 才是 `AppData\Roaming`）—— 测试造的目录
+     卸载器根本看不到，于是「skip-not-found + 目录还在」。现在直接问 wine 要
+     `%APPDATA%`（`wine cmd /c "echo %APPDATA%"`）来造数据，保证造的和删的是
+     同一个地方；失败时把卸载日志尾部打出来（原来只有「少了 2 条 removed」，
+     看不出是哪条路径没删）。
    - **Windows e2e 的期望值是假的**：两个 e2e 脚本的假 payload 只造了一个方案
      （目标集是三个），config 门禁又因 data 里没有 wubi86 而跳过
      `default.custom.yaml` → 结论必然是 partial，脚本却按 ok 断言 → 退出码 1。
