@@ -28,8 +28,10 @@ struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir()
-            .join(format!("rime-sync-upgrade-idem-{}-{seq}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "rime-sync-upgrade-idem-{}-{seq}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
@@ -163,8 +165,8 @@ fn misplaced_vnum_is_moved_without_changing_its_value() {
     let tmp = TempDir::new();
     let schema = tmp.path().join("luna_pinyin.schema.yaml");
     // 用户自己写的正则（不是我们的默认值）：搬进 patterns 时不能被改写。
-    let original = with_vnum_at_recognizer_head(STOCK)
-        .replace("vnum: \"^[vV][0-9.]*$\"", "vnum: '^v[0-9]+$'");
+    let original =
+        with_vnum_at_recognizer_head(STOCK).replace("vnum: \"^[vV][0-9.]*$\"", "vnum: '^v[0-9]+$'");
     write(&schema, &original);
 
     data_patch::patch_file(&schema, "0.6.25").expect("patch");
@@ -213,7 +215,11 @@ fn patching_twice_is_byte_identical_and_writes_no_second_backup() {
     data_patch::patch_file(&schema, "0.6.25").expect("first patch");
     let first = read(&schema);
     let backup_bytes = fs::read(&backup).expect("backup exists");
-    assert_eq!(backup_bytes, file_with_vnum_at_recognizer_head().as_bytes(), "备份是原始内容");
+    assert_eq!(
+        backup_bytes,
+        file_with_vnum_at_recognizer_head().as_bytes(),
+        "备份是原始内容"
+    );
 
     assert_eq!(
         data_patch::patch_file(&schema, "0.6.25").expect("second patch"),
@@ -298,10 +304,7 @@ fn illegal_yaml_that_cannot_be_deduped_is_reported_and_left_untouched() {
         message.contains("不是合法 YAML"),
         "错误要说清楚是 YAML 不合法：{message}"
     );
-    assert!(
-        message.contains("vnum"),
-        "错误要点名重复的键：{message}"
-    );
+    assert!(message.contains("vnum"), "错误要点名重复的键：{message}");
     assert!(
         message.contains("重复"),
         "错误要说清是重复键（而不是把 serde 的英文报错直接甩给用户）：{message}"
@@ -334,14 +337,8 @@ fn safety_gate_rejects_rendered_text_with_duplicate_keys() {
 ";
     let error = data_patch::check_rendered_yaml(duplicated).expect_err("重复键必须被拦下");
     let message = format!("{error:#}");
-    assert!(
-        message.contains("vnum"),
-        "安全闸要点名重复的键：{message}"
-    );
-    assert!(
-        message.contains("重复"),
-        "安全闸要说清是重复键：{message}"
-    );
+    assert!(message.contains("vnum"), "安全闸要点名重复的键：{message}");
+    assert!(message.contains("重复"), "安全闸要说清是重复键：{message}");
 }
 
 /// 缩进宽度不是 2 格的方案文件（有些发行版用 4 格）：patterns 必须按实际缩进找，
@@ -381,7 +378,11 @@ recognizer:
 
 /// 同目录下 <file>.rimesync-broken* 现场副本（按文件名排序）。
 fn broken_copies(path: &Path) -> Vec<PathBuf> {
-    let name = path.file_name().expect("file name").to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .to_string();
     let prefix = format!("{name}.rimesync-broken");
     let mut found: Vec<PathBuf> = fs::read_dir(path.parent().expect("parent dir"))
         .expect("read dir")
@@ -472,7 +473,10 @@ fn broken_file_without_backup_is_recovered_by_text_dedupe() {
         "损坏文件应当被修好"
     );
     // 备份是修复之后才写的，且现场副本留一份。
-    assert!(data_patch::backup_path(&schema).exists(), "写成功了就该有备份");
+    assert!(
+        data_patch::backup_path(&schema).exists(),
+        "写成功了就该有备份"
+    );
     let copies = broken_copies(&schema);
     assert_eq!(copies.len(), 1, "用户现场要留一份：{copies:?}");
 }

@@ -85,8 +85,14 @@ fn assert_healthy(file: &Path) {
         .map(|m| m.iter().filter(|(k, _)| k.as_str() == Some("vnum")).count())
         .unwrap_or(0);
     assert_eq!(vnum, 1, "recognizer.patterns 下只能有一份 vnum");
-    assert_eq!(count_seq(&v, &["engine", "translators"], "rimesync_vnum"), 1);
-    assert_eq!(count_seq(&v, &["engine", "processors"], "rimesync_vselect"), 1);
+    assert_eq!(
+        count_seq(&v, &["engine", "translators"], "rimesync_vnum"),
+        1
+    );
+    assert_eq!(
+        count_seq(&v, &["engine", "processors"], "rimesync_vselect"),
+        1
+    );
     assert_eq!(count_seq(&v, &["engine", "processors"], "numpad"), 1);
     let half = v
         .get("punctuator")
@@ -165,9 +171,20 @@ fn flow_style_duplicate_key_is_reported_and_untouched() {
     let err = patch_file_detailed(&file, "0.6.25").expect_err("flow 风格应当报错");
     let msg = format!("{}", err);
     assert!(msg.contains("vnum"), "错误信息要点名重复的键：{}", msg);
-    assert!(msg.contains("flow.schema.yaml"), "错误信息要点名文件：{}", msg);
-    assert_eq!(fs::read_to_string(&file).unwrap(), original, "原文件必须不动");
-    assert!(names_with(&dir, ".rimesync-broken").is_empty(), "不该造现场副本");
+    assert!(
+        msg.contains("flow.schema.yaml"),
+        "错误信息要点名文件：{}",
+        msg
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "原文件必须不动"
+    );
+    assert!(
+        names_with(&dir, ".rimesync-broken").is_empty(),
+        "不该造现场副本"
+    );
     assert!(names_with(&dir, ".rimesync-orig").is_empty(), "不该造备份");
 }
 

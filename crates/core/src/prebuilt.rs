@@ -1013,8 +1013,7 @@ fn install_build(
     if !build_src.is_dir() {
         return Ok(());
     }
-    fs::create_dir_all(user_build)
-        .with_context(|| format!("创建目录 {}", user_build.display()))?;
+    fs::create_dir_all(user_build).with_context(|| format!("创建目录 {}", user_build.display()))?;
     let mut files: Vec<PathBuf> = fs::read_dir(build_src)
         .with_context(|| format!("读取目录 {}", build_src.display()))?
         .filter_map(|entry| entry.ok())

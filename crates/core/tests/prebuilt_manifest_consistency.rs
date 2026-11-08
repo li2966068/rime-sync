@@ -264,10 +264,19 @@ fn repo_payload_manifest_matches_payload() {
 fn stale_build_artifact_is_overwritten_and_not_failed() {
     let fixture = Fixture::new("stale-build");
     // 旧版本留下的产物：没有插件标记、bin 也是旧的。
-    fixture.write("rime/build/luna_pinyin_simp.schema.yaml", "# luna_pinyin_simp v1\n");
-    fixture.write("rime/build/luna_pinyin_simp.prism.bin", "bin luna_pinyin_simp v1");
+    fixture.write(
+        "rime/build/luna_pinyin_simp.schema.yaml",
+        "# luna_pinyin_simp v1\n",
+    );
+    fixture.write(
+        "rime/build/luna_pinyin_simp.prism.bin",
+        "bin luna_pinyin_simp v1",
+    );
     // 另一个方案是当前版本：它的编译产物（用户词库）不许被覆盖。
-    fixture.write("rime/build/wubi86.schema.yaml", &format!("# wubi86 v2\n{MARKED}"));
+    fixture.write(
+        "rime/build/wubi86.schema.yaml",
+        &format!("# wubi86 v2\n{MARKED}"),
+    );
     fixture.write("rime/build/wubi86.prism.bin", "user dictionary bin");
 
     let report = fixture.install();
@@ -277,7 +286,11 @@ fn stale_build_artifact_is_overwritten_and_not_failed() {
         "清单与 payload 一致，不该报失败：{:?}",
         report.manifest_failed
     );
-    assert_eq!(report.failed, 0, "铺制不该有失败（failed={}）", report.failed);
+    assert_eq!(
+        report.failed, 0,
+        "铺制不该有失败（failed={}）",
+        report.failed
+    );
     assert!(
         report.overwritten >= 2,
         "旧版本应被覆盖成新版本：overwritten={}",
@@ -309,7 +322,11 @@ fn user_config_is_kept_and_never_failed() {
 
     let report = fixture.install();
 
-    assert_eq!(report.failed, 0, "铺制不该有失败（failed={}）", report.failed);
+    assert_eq!(
+        report.failed, 0,
+        "铺制不该有失败（failed={}）",
+        report.failed
+    );
     assert!(
         report.config_kept >= 1,
         "用户已有的配置应被保留：config_kept={}",
@@ -356,8 +373,14 @@ fn clean_install_ends_ok_without_copy_failed() {
 fn upgrade_from_old_version_ends_ok_without_copy_failed() {
     let fixture = Fixture::new("upgrade");
     for id in SCHEMAS {
-        fixture.write(&format!("rime/build/{id}.schema.yaml"), &format!("# {id} v1\n"));
-        fixture.write(&format!("rime/build/{id}.prism.bin"), &format!("bin {id} v1"));
+        fixture.write(
+            &format!("rime/build/{id}.schema.yaml"),
+            &format!("# {id} v1\n"),
+        );
+        fixture.write(
+            &format!("rime/build/{id}.prism.bin"),
+            &format!("bin {id} v1"),
+        );
     }
     fixture.write("rime/build/default.yaml", "# default v1\n");
     // wubi86 已经是当前版本：它的编译产物（用户词库）不许被顺带覆盖。
@@ -408,11 +431,20 @@ fn upgrade_from_old_version_ends_ok_without_copy_failed() {
 fn corrupt_payload_does_not_overwrite_user_build() {
     let fixture = Fixture::new("corrupt");
     // 用户目录里是好的当前版本。
-    fixture.write("rime/build/luna_pinyin_simp.schema.yaml", &format!("# luna_pinyin_simp v2\n{MARKED}"));
-    fixture.write("rime/build/luna_pinyin_simp.prism.bin", "bin luna_pinyin_simp v2");
+    fixture.write(
+        "rime/build/luna_pinyin_simp.schema.yaml",
+        &format!("# luna_pinyin_simp v2\n{MARKED}"),
+    );
+    fixture.write(
+        "rime/build/luna_pinyin_simp.prism.bin",
+        "bin luna_pinyin_simp v2",
+    );
     // payload 那份被改过：清单对不上（模拟产物被截断/篡改）。
     // 故意**只改一个字节**（长度不变）：这样只有 sha256 校验能抓住它。
-    fixture.write("payload/build/luna_pinyin_simp.schema.yaml", &format!("# luna_pinyin_simp v3\n{MARKED}"));
+    fixture.write(
+        "payload/build/luna_pinyin_simp.schema.yaml",
+        &format!("# luna_pinyin_simp v3\n{MARKED}"),
+    );
 
     let report = fixture.install();
 
@@ -451,11 +483,18 @@ fn payload_without_manifest_keeps_existing_build_files() {
         "rime/build/luna_pinyin_simp.schema.yaml",
         &format!("# luna_pinyin_simp user-build\n{MARKED}"),
     );
-    fixture.write("rime/build/luna_pinyin_simp.prism.bin", "bin luna_pinyin_simp user");
+    fixture.write(
+        "rime/build/luna_pinyin_simp.prism.bin",
+        "bin luna_pinyin_simp user",
+    );
 
     let report = fixture.install();
 
-    assert_eq!(report.failed, 0, "铺制不该有失败（failed={}）", report.failed);
+    assert_eq!(
+        report.failed, 0,
+        "铺制不该有失败（failed={}）",
+        report.failed
+    );
     assert!(
         fixture
             .read("rime/build/luna_pinyin_simp.schema.yaml")
@@ -481,7 +520,11 @@ fn build_info_only_difference_is_not_a_version_change() {
 
     let report = fixture.install();
 
-    assert_eq!(report.failed, 0, "铺制不该有失败（failed={}）", report.failed);
+    assert_eq!(
+        report.failed, 0,
+        "铺制不该有失败（failed={}）",
+        report.failed
+    );
     assert_eq!(
         report.overwritten, 0,
         "只有 __build_info 不同不算版本变化，不该重写用户的产物"

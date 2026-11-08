@@ -2080,10 +2080,8 @@ impl Doc {
                     let at = block.0 + 1;
                     self.lines
                         .insert(at, format!("{}patterns:", " ".repeat(child_indent)));
-                    self.lines.insert(
-                        at + 1,
-                        format!("{}{}", " ".repeat(child_indent + 2), entry),
-                    );
+                    self.lines
+                        .insert(at + 1, format!("{}{}", " ".repeat(child_indent + 2), entry));
                 }
             }
             self.changed = true;
@@ -2109,8 +2107,8 @@ impl Doc {
         let Some(block) = self.find_block("recognizer", 0) else {
             return false;
         };
-        let Some(index) = (block.0 + 1..block.1)
-            .find(|&index| is_key_at(&self.lines[index], "vnum", indent))
+        let Some(index) =
+            (block.0 + 1..block.1).find(|&index| is_key_at(&self.lines[index], "vnum", indent))
         else {
             return false;
         };
