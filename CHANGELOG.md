@@ -2,6 +2,12 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## 未发布
+
+1. **仓库已开源**：README 与许可章节补充开源说明（MIT）、issue / PR 参与方式与
+   本地验证入口（`cargo test -p rime-sync-core`、release 流水线的 `windows` /
+   `verify-artifacts` job）。
+
 ## v0.6.24 — 2026-11-08
 
 1. **B 方案：输入法的一切判断与安装从 NSIS 搬到程序。** 安装器只交付程序本体

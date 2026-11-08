@@ -8,6 +8,10 @@
 
 支持 Rime 发行版：Windows 小狼毫（Weasel）、Linux fcitx5-rime / ibus-rime。
 
+> **本仓库已开源**，采用 MIT 许可（见 §10. 许可）。欢迎提 issue 与 PR：
+> 改代码前先跑 `cargo test -p rime-sync-core`；涉及输入法补丁的改动，请一并覆盖
+> 「全新安装」与「从旧版本升级」两种场景。
+
 ---
 
 ## 截图
@@ -282,3 +286,8 @@ HTTP/HTTPS/SOCKS5 代理配置见 [docs/PROXY.md](docs/PROXY.md)。
 ## 10. 许可
 
 MIT，见 [LICENSE](LICENSE)。版权所有 (c) 2026 li2966068。
+
+本仓库已公开开源，采用 MIT 许可：可自由使用、修改与再分发，保留版权声明即可。
+欢迎通过 issue 反馈问题、通过 PR 参与改进。提交前请确保
+`cargo test -p rime-sync-core` 全绿；涉及打包或签名的改动，还需让 release 流水线的
+`windows` 与 `verify-artifacts` 两个 job 通过。
