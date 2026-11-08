@@ -23,8 +23,18 @@
    10 个文件被清单挡下、计入 `failed=16`，引擎产物铺不进去，`build_ok=false`
    → `schema-stale` → 部署部分失败。**这个与机器状态无关，每台机器都会中。**
 
-临时规避：删掉 `%APPDATA%\Rime` 下的 `*.rimesync-orig` 备份并重新部署可解除第 1 条；
-第 2 条需等新版本。
+临时规避（**已实测有效，仅解除第 1 条**）：用同目录的 `*.rimesync-orig` 备份覆盖回损坏的方案
+文件，再重跑一次 ensure。
+
+1. 进 `C:\Program Files\Rime\weasel-0.17.4\data\`，对每个 `*.schema.yaml`，若同目录存在
+   `*.schema.yaml.rimesync-orig`，用它覆盖同名 `.schema.yaml`；
+2. 以管理员身份运行 `rime-sync-cli ensure-ime --mode install`；
+3. 用 `rime-sync-cli check-ime --json` 确认 `result=ok`。
+
+实测结果：损坏的 `luna_pinyin.schema.yaml` 里重复的 `vnum`（2 份）与 `rimesync_vnum`（2 份）
+恢复为各 1 份，`check-ime` 从 `failed / missing=[luna_pinyin_simp,wubi_pinyin]` 变为
+`ok / missing=[]`。第 2 条（prebuilt 清单）不因此解除——`ensure-ime` 仍会报 `partial`、
+`copy_failed=11`，但 `build_ok=true reason=ready`，输入法可用。
 
 ### 本次改动
 
