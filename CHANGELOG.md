@@ -10,6 +10,24 @@
 
 ## v0.6.24 — 2026-11-08
 
+### 已知问题（将在 v0.6.25 修复）
+
+真机验证（Windows 10 / 小狼毫 0.17.4）发现两个缺陷，装完可能看到「输入法未就绪」：
+
+1. **方案文件出现重复的 `vnum` 键**：`recognizer/patterns` 下的 `vnum` 在「已被旧版本
+   patch 过」的方案文件上会被再插一份，YAML 变成非法，`luna_pinyin` 方案加载失败
+   （日志：`duplicate entry with key "vnum"`）。**从 0.6.19 及更早版本升级的机器
+   必然中招**；全新安装也可能因下面的问题导致引擎产物没铺全。
+2. **`prebuilt` 清单与产物自相矛盾**：`resources/prebuilt/MANIFEST.json` 记录的文件
+   大小是打补丁**之前**的值（如 `build/default.yaml` 记 5294、实际 5463），铺装时
+   10 个文件被清单挡下、计入 `failed=16`，引擎产物铺不进去，`build_ok=false`
+   → `schema-stale` → 部署部分失败。**这个与机器状态无关，每台机器都会中。**
+
+临时规避：删掉 `%APPDATA%\Rime` 下的 `*.rimesync-orig` 备份并重新部署可解除第 1 条；
+第 2 条需等新版本。
+
+### 本次改动
+
 1. **B 方案：输入法的一切判断与安装从 NSIS 搬到程序。** 安装器只交付程序本体
    （Windows 版本门槛、WebView2、卸载旧版 rime-sync、快捷方式、`$INSTDIR\resources`）；
    钩子里的 Weasel 安装调用、config 模板播种、自检、prebuilt 铺设、prune、
