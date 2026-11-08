@@ -38,22 +38,71 @@ assert_one_cli "$src"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/rime-sync-deb.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-dpkg-deb -R "$src" "$tmp/root"
-for s in postinst prerm postrm; do
-  [ -f "$HERE/$s" ] || continue
-  install -m 0755 "$HERE/$s" "$tmp/root/DEBIAN/$s"
-done
-find "$tmp/root" -type d -exec chmod 0755 {} +
-find "$tmp/root" -type f -exec chmod 0644 {} +
-# 恢复可执行位：上面的 0644 会把 /usr/bin/rime-sync-app 变成不可执行（0.5.0 的实测 bug）。
-if [ -d "$tmp/root/usr/bin" ]; then
-  find "$tmp/root/usr/bin" -type f -exec chmod 0755 {} +
+
+# 0.6.24：CI runner 上 dpkg-deb --build 两次都死在「tar 往 stdout 写」这一步
+# （tar: stdout: write error / dpkg-deb: error: tar subprocess returned error exit status 2），
+# 同一个 deb 在本机跑得通 —— 是环境差异，不是 deb 内容问题。所以：
+#   1) 先走 dpkg-deb 正常路径；
+#   2) 失败就打印现场（版本/磁盘/inode/ulimit），再用 ar 直接重打包兜底：
+#      只换控制归档（维护脚本），数据归档原样保留 —— 完全不走 tar 管道，不受这个坑影响。
+dump_env() {
+  # 这段只用于诊断：任何一条命令失败都不许把脚本带崩（set -e 会在此反噬）。
+  echo "---- 重打包现场 ----"
+  echo "dpkg-deb: $(dpkg-deb --version 2>&1 | head -n1 || true)"
+  echo "tar: $(tar --version 2>&1 | head -n1 || true)"
+  echo "xz: $(xz --version 2>&1 | head -n1 || true)"
+  df -h . /tmp 2>&1 | sed 's/^/  /' || true
+  df -i . /tmp 2>&1 | sed 's/^/  /' || true
+  ulimit -a 2>&1 | sed 's/^/  /' || true
+  echo "--------------------"
+}
+
+build_with_dpkg_deb() { # <src.deb> <out.deb>
+  rm -rf "$tmp/root"; mkdir -p "$tmp/root"
+  dpkg-deb -R "$src" "$tmp/root" || return 1
+  for ms in postinst prerm postrm; do
+    [ -f "$HERE/$ms" ] || continue
+    install -m 0755 "$HERE/$ms" "$tmp/root/DEBIAN/$ms"
+  done
+  find "$tmp/root" -type d -exec chmod 0755 {} +
+  find "$tmp/root" -type f -exec chmod 0644 {} +
+  # 恢复可执行位：上面的 0644 会把 /usr/bin/rime-sync-app 变成不可执行（0.5.0 的实测 bug）。
+  if [ -d "$tmp/root/usr/bin" ]; then
+    find "$tmp/root/usr/bin" -type f -exec chmod 0755 {} +
+  fi
+  if [ -d "$tmp/root/usr/lib/rime-sync" ]; then
+    find "$tmp/root/usr/lib/rime-sync" -type f -exec chmod 0755 {} +
+  fi
+  find "$tmp/root/DEBIAN" -type f -name 'post*' -exec chmod 0755 {} +
+  find "$tmp/root/DEBIAN" -type f -name 'pre*' -exec chmod 0755 {} +
+  dpkg-deb --root-owner-group -Zxz --build "$tmp/root" "$out" >/dev/null || return 1
+}
+
+repack_via_ar() { # <src.deb> <out.deb>：只换控制归档，数据归档原样搬过去
+  local s=$1 o=$2 work="$tmp/ar" ctl data ms
+  rm -rf "$work"; mkdir -p "$work/ctl"
+  ( cd "$work" && ar x "$s" ) || return 1
+  ctl=$(ls -1 "$work"/control.tar.* 2>/dev/null | head -n1)
+  data=$(ls -1 "$work"/data.tar.* 2>/dev/null | head -n1)
+  if [ -z "$ctl" ] || [ -z "$data" ]; then
+    echo "!! ar 兜底失败：解不出 control/data 成员" >&2
+    return 1
+  fi
+  tar -xf "$ctl" -C "$work/ctl" || return 1
+  for ms in postinst prerm postrm; do
+    [ -f "$HERE/$ms" ] || continue
+    install -m 0755 "$HERE/$ms" "$work/ctl/$ms" || return 1
+  done
+  tar --owner=root --group=root -czf "$work/control.tar.gz" -C "$work/ctl" . || return 1
+  rm -f "$o"
+  ( cd "$work" && ar r "$o" debian-binary control.tar.gz "$(basename "$data")" ) || return 1
+}
+
+if ! build_with_dpkg_deb "$src" "$out"; then
+  echo "!! dpkg-deb 路径失败，改用 ar 兜底重打包" >&2
+  dump_env >&2
+  repack_via_ar "$src" "$out" || { echo "!! ar 兜底也失败" >&2; exit 1; }
+  echo "    (ar 兜底成功：控制归档已替换，数据归档原样保留)" >&2
 fi
-if [ -d "$tmp/root/usr/lib/rime-sync" ]; then
-  find "$tmp/root/usr/lib/rime-sync" -type f -exec chmod 0755 {} +
-fi
-find "$tmp/root/DEBIAN" -type f -name 'post*' -exec chmod 0755 {} +
-find "$tmp/root/DEBIAN" -type f -name 'pre*' -exec chmod 0755 {} +
-dpkg-deb --root-owner-group -Zxz --build "$tmp/root" "$out" >/dev/null
 assert_one_cli "$out"
 echo "==> $(basename "$out") ($(stat -c %s "$out") bytes, scripts from $HERE)"

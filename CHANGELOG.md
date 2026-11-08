@@ -120,6 +120,18 @@
      照样退出 0 —— 脚本会以为「输入法已就绪」。判据统一到 core 的
      `ImeReport::ready()`（GUI 与 CLI 共用同一处）：没就绪 → `ok=false`、
      退出码非 0、detail 说清楚是「自动安装已关闭」。
+   - **离线安装器在 CI 上打不出 `.run`**：组装 `.run` 时要重打包同步 deb
+     （`prepare-sync-deb.sh`），`dpkg-deb --build` 在 runner 上两次都死在
+     「tar 往 stdout 写」这一步（`tar: stdout: write error` /
+     `dpkg-deb: error: tar subprocess returned error exit status 2`）；
+     同一个 deb 在本机跑得通（磁盘还剩 32 GiB、inode 充足），是环境差异。
+     现在重打包失败就打印现场（dpkg/tar/xz 版本、磁盘、inode、ulimit），
+     并用 `ar` 兜底：只换控制归档（维护脚本），数据归档原样搬过去 ——
+     完全不走 tar 管道，不受这个坑影响；兜底产物同样校验 CLI 恰好 1 份。
+   - **同一个「`./` 前缀」的坑还有两处**：断言「deb 里 CLI 恰好 1 份」在
+     `packaging/linux/prepare-sync-deb.sh` 与 `.github/scripts/verify-artifacts.sh`
+     里各写了一份，都按 `./usr/bin/rime-sync-cli` 比路径 → 永远数到 0 份。
+     三处一起改成先剥掉 `./` 再比，带不带前缀都认。
 
 ## v0.6.23 — 2026-11-08
 
