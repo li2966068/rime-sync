@@ -195,3 +195,8 @@ if (@($check.Json.missing) -notcontains 'luna_pinyin_simp') {
 }
 
 Write-Host 'windows e2e ok：ensure-ime 判据 / 修补 / 就绪退出码 / 失败退出码 / check-ime 一致性'
+
+# GitHub 的 pwsh step 是把脚本 dot-source 进会话再跑，结束时按 $LASTEXITCODE 退出。
+# 脚本里调过 CLI（没就绪时退出码是 1，这是**预期**），不显式 exit 0 会被它带成
+# 「步骤失败」—— 断言明明全过。失败时上面的 throw 会让脚本非零退出，不用管。
+exit 0

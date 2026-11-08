@@ -115,3 +115,7 @@ if (@($json.actions | Where-Object { $_.kind -eq 'weasel' }).Count -lt 1) {
 }
 
 Write-Host 'windows e2e ok：首次启动自举（ensure-ime --mode install）产物铺好、build 含 rimesync_vnum，没就绪时不说成功'
+
+# 同上：CLI 在「没就绪」时退出码是 1（这是**预期**），但 GitHub 的 pwsh step 按
+# $LASTEXITCODE 判定成败，不显式 exit 0 会被带成「步骤失败」。
+exit 0

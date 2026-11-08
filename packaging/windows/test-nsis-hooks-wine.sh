@@ -97,11 +97,27 @@ wineserver -w >/dev/null 2>&1 || true
 # 版本不够会 SetErrorLevel 3 + Abort（退出码 3）—— 那是产品逻辑**正确**，但冒烟跑不下去。
 # wine 6.x 默认模拟 win7、wine 10.x 默认模拟 win10，所以这里显式设成 win10，
 # 让冒烟测的是「装得上、且不碰输入法」这条路径。
+#
+# 注意：直接写 HKCU\Software\Wine\Version **不生效**（wineserver 不读它，
+# 实测 CI 上改完 CurrentBuildNumber 仍是 7601）；winecfg -v 才是有效的入口，
+# 改完要重启 wineserver 才让后续进程看到。
 WINE_WIN_VERSION="${RIMESYNC_WINE_VERSION:-win10}"
-wine reg add "HKCU\Software\Wine" /v Version /d "$WINE_WIN_VERSION" /f >/dev/null 2>&1 || true
+if command -v winecfg >/dev/null 2>&1; then
+  winecfg -v "$WINE_WIN_VERSION" >/dev/null 2>&1 || true
+else
+  wine reg add "HKCU\Software\Wine" /v Version /d "$WINE_WIN_VERSION" /f >/dev/null 2>&1 || true
+fi
+wineserver -k >/dev/null 2>&1 || true
+wineserver -w >/dev/null 2>&1 || true
 WINE_BUILD=$(wine reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuildNumber 2>/dev/null \
   | tr -d '\r' | awk '/CurrentBuildNumber/{print $NF}')
 echo "test-nsis-hooks-wine: wine 模拟版本=$WINE_WIN_VERSION CurrentBuildNumber=${WINE_BUILD:-（读不到）}"
+# 版本没抬上去就别往下跑：那样只测到「安装器按设计拒绝安装」（退出码 3），
+# 冒烟想测的「装得上、且不碰输入法」根本没测到 —— 直接失败并说清楚。
+if [ -z "${WINE_BUILD:-}" ] || [ "$WINE_BUILD" -lt 17134 ]; then
+  echo "FAIL wine 模拟的 Windows 版本不够新（build ${WINE_BUILD:-?} < 17134）：这条冒烟测不到安装路径" >&2
+  exit 1
+fi
 
 fail=0
 fail_msg() { printf 'FAIL %s\n' "$1" >&2; fail=1; }

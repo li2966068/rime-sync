@@ -89,14 +89,20 @@
 9. **CI 红的两个 job 修掉，顺带把「就绪」的判据统一到一处**：
    - **wine 冒烟在 CI 必红**：CI 的 wine 6.0.3 默认模拟 Windows 7，NSIS 的
      `${AtLeastWin10}` 为假 → 安装被系统版本检查拦下（退出码 3，主程序没装上）。
-     现在冒烟脚本显式把 wine 模拟版本设成 win10（`HKCU\Software\Wine\Version`），
-     失败时额外打印 wine 输出与安装日志尾部，方便定位。
+     现在冒烟脚本用 `winecfg -v win10` 把模拟版本抬上去（**直接写注册表
+     `HKCU\Software\Wine\Version` 不生效**：wineserver 不读它，实测 build 仍是
+     7601），改完重启 wineserver，并断言 build ≥ 17134 —— 版本抬不上去就直接失败
+     并说清楚，不再让它以「安装器按设计拒绝安装」的样子混过去。
    - **Windows e2e 的期望值是假的**：两个 e2e 脚本的假 payload 只造了一个方案
      （目标集是三个），config 门禁又因 data 里没有 wubi86 而跳过
      `default.custom.yaml` → 结论必然是 partial，脚本却按 ok 断言 → 退出码 1。
      现在假数据补齐三个目标方案与完整 data，断言按真实语义写，并新增一条
      「用户手上有输入法 → 退出码 0」的覆盖（假 Weasel：注册表 +
      `WeaselServer.exe` + 带标记的 `rime.dll`）。
+   - **e2e 步骤「断言全过却红」**：GitHub 的 pwsh step 把脚本 dot-source 进会话，
+     结束时按 `$LASTEXITCODE` 判定成败 —— 脚本里调过 CLI（没就绪时退出码 1，
+     这是**预期**），不显式 `exit 0` 就会被它带成「步骤失败」。两个脚本末尾都补了
+     `exit 0`（断言失败时 throw，仍然非零退出）。
    - **CLI 与 GUI 对「就绪」说法不一致**：CLI 的 `ensure-ime` 只看产物侧结论，
      自动安装被显式关掉（`RIMESYNC_INSTALL_IME=0`）而机器上又没有输入法时，
      照样退出 0 —— 脚本会以为「输入法已就绪」。判据统一到 core 的
