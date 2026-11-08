@@ -115,6 +115,14 @@
      `dpkg-deb -c` 的路径列**不带** `./` 前缀 → 明明 deb 里有一份 10.9 MB 的
      CLI，断言却数到 0 份，linux-app job 红、整条发布停在那。断言改成先归一化
      前缀再比。
+   - **Windows 的输入法构建缓存从来没命中过**：缓存键是内容指纹（librime 源码 +
+     两个构建脚本的哈希），但命中校验里混进了 `repo_commit`（整个仓库的 HEAD）——
+     也就是说**任何一次提交**都会让 40 分钟的自建缓存作废，改一句 CHANGELOG
+     也一样，0.6.23→0.6.24 三轮每次都全量重编 librime + Weasel
+     （`cache=invalid reason=inputs-changed:repo_commit`）。现在指纹只保留
+     真正决定产物的东西（librime 树、weasel 树、插件源码、两个构建脚本、
+     boost 版本、工具链），仓库 HEAD 与校验脚本自身的哈希降级为**只记录、
+     不比对**的来源信息。
    - **CLI 与 GUI 对「就绪」说法不一致**：CLI 的 `ensure-ime` 只看产物侧结论，
      自动安装被显式关掉（`RIMESYNC_INSTALL_IME=0`）而机器上又没有输入法时，
      照样退出 0 —— 脚本会以为「输入法已就绪」。判据统一到 core 的

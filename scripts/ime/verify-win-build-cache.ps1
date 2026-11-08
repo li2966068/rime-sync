@@ -245,6 +245,12 @@ function Get-ExpectedInputs {
     # 源码指纹一律取 git 树对象 id（HEAD:<path>）：构建过程会往 third_party/librime 里写
     # env.bat、往 third_party/weasel 里写 msbuild\ 与 output\，用「目录内容哈希」会在
     # 构建前后得到不同值（缓存就永远不命中）。树对象 id 只看入库内容，与构建产物无关。
+    #
+    # 这里只放**真正决定产物**的东西：改了它们，重建出来的 rime.dll / Weasel 才不一样。
+    # 仓库的 HEAD（repo_commit）和本脚本自身的哈希**不放这里**：它们跟产物无关，
+    # 却会让「改一句 CHANGELOG」也把 40 分钟的自建缓存作废 —— 0.6.23→0.6.24 三轮
+    # 每次都全量重编 Windows 就是这么来的（cache=invalid reason=inputs-changed:repo_commit）。
+    # 这两项改成写进清单当来源信息（Get-ProvenanceInputs）：只记录、不参与比对。
     $inputs = [ordered]@{
         platform              = 'windows'
         librime_version       = (Get-LibrimeVersion -Path (Join-Path $librimeDir 'CMakeLists.txt'))
@@ -253,12 +259,18 @@ function Get-ExpectedInputs {
         librime_plugin_sha256 = (Get-TreeFingerprint -Path (Join-Path $librimeDir 'plugins\rimesync-extra'))
         librime_script_sha256 = (Get-FileSha256 -Path $librimeScript)
         weasel_script_sha256  = (Get-FileSha256 -Path $weaselScript)
-        verify_script_sha256  = (Get-FileSha256 -Path $selfScript)
         boost_version         = $BoostVersion
         platform_toolset      = $PlatformToolset
-        repo_commit           = (Invoke-GitLine -GitArgs @('rev-parse', 'HEAD'))
     }
     return $inputs
+}
+
+function Get-ProvenanceInputs {
+    # 来源信息：写进清单方便事后排查，但**不参与命中比对**（它们变了也不作废缓存）。
+    return [ordered]@{
+        repo_commit          = (Invoke-GitLine -GitArgs @('rev-parse', 'HEAD'))
+        verify_script_sha256 = (Get-FileSha256 -Path $selfScript)
+    }
 }
 
 function Format-Header {
@@ -385,6 +397,9 @@ function Remove-CacheProducts {
 function Invoke-WriteMode {
     Format-Header -Mode 'write'
     $inputs = Get-ExpectedInputs
+    # 来源信息并进清单（只记录，不参与比对）
+    $provenance = Get-ProvenanceInputs
+    foreach ($k in $provenance.Keys) { $inputs[$k] = $provenance[$k] }
     $artifacts = [ordered]@{}
     foreach ($rel in (Get-RequiredArtifacts)) {
         $abs = Resolve-RepoPath $rel
