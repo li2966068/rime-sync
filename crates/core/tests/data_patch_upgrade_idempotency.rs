@@ -247,16 +247,50 @@ fn file_with_existing_misplaced_vnum_stays_legal_and_single() {
     assert_eq!(read(&schema), before, "换版本号也不会再动文件");
 }
 
+/// 真机现场：recognizer/patterns 里已经有两份 vnum（YAML 直接非法）。
+///
+/// 这类损坏现在应当能自愈，而且**不需要备份**：只删掉多余的那一行，其余内容
+/// （含用户自己写的）全部保留。改不动的情形（不是重复键、或者重复键写在同一行）
+/// 由 illegal_yaml_that_cannot_be_deduped_* 那两条护栏盯着。
 #[test]
-fn already_broken_file_is_reported_with_file_and_key_and_left_alone() {
+fn already_broken_file_is_recovered_by_text_dedupe() {
     let tmp = TempDir::new();
     let schema = tmp.path().join("broken.schema.yaml");
-    // 真机现场：recognizer/patterns 里已经有两份 vnum（YAML 直接非法）。
     let broken = STOCK.replace(
         "    punct: \"^/([0-9]0?|[A-Za-z]+)$\"\n",
         "    punct: \"^/([0-9]0?|[A-Za-z]+)$\"\n    vnum: \"^[vV][0-9.]*$\"\n    vnum: '^[vV][0-9.]*$'\n",
     );
-    write(&schema, &broken);
+    let user_line = "# 用户自己加的一行：不能被自动修复弄丢";
+    write(&schema, &format!("{user_line}\n{broken}"));
+
+    data_patch::patch_file(&schema, "0.6.25").expect("应当自动去重恢复");
+
+    let text = read(&schema);
+    assert_eq!(vnum_key_count(&text), 1, "恢复后只能有一份 vnum");
+    serde_yaml::from_str::<serde_yaml::Value>(&text).expect("valid yaml");
+    assert!(
+        text.contains(user_line),
+        "自动修复只能删多余的那一行，用户自己写的内容要留着"
+    );
+    // 损坏现场留一份，且原样。
+    let copies = broken_copies(&schema);
+    assert_eq!(copies.len(), 1, "用户现场要留一份：{copies:?}");
+    assert!(
+        read(&copies[0]).contains("vnum: \"^[vV][0-9.]*$\"")
+            && read(&copies[0]).contains("vnum: '^[vV][0-9.]*$'"),
+        "现场副本就是坏文件原样"
+    );
+}
+
+/// 重复键写在同一行里（flow 风格）：删行救不了，也不能瞎删 —— 只报错，
+/// 原文件一个字节不动。
+#[test]
+fn illegal_yaml_that_cannot_be_deduped_is_reported_and_left_untouched() {
+    let tmp = TempDir::new();
+    let schema = tmp.path().join("flow.schema.yaml");
+    let broken = "recognizer: {patterns: {vnum: \"a\", vnum: \"b\"}}\n";
+    write(&schema, broken);
+    let bytes_before = fs::read(&schema).expect("read");
 
     let error = data_patch::patch_file(&schema, "0.6.25").expect_err("必须报错，不能静默跳过");
     let message = format!("{error:#}");
@@ -276,10 +310,14 @@ fn already_broken_file_is_reported_with_file_and_key_and_left_alone() {
         message.contains(&schema.display().to_string()),
         "错误要点名是哪个文件：{message}"
     );
-    assert_eq!(read(&schema), broken, "坏文件不能被改写");
+    assert_eq!(read(&schema), broken, "改不动的坏文件不能被改写");
     assert!(
         !data_patch::backup_path(&schema).exists(),
         "没有成功写入就不该留备份"
+    );
+    assert!(
+        broken_copies(&schema).is_empty(),
+        "没有成功写入就不该造现场副本"
     );
 }
 
@@ -406,9 +444,10 @@ fn broken_file_with_backup_is_recovered_and_patched() {
     assert_eq!(read(&copies[0]), broken, "现场副本就是坏文件原样");
 }
 
-/// 没有备份的损坏文件：给出可读错误，原文件一个字节都不动。
+/// 没有备份的损坏文件：靠文本级去重自愈，原文件一个字节都不动是不对的
+/// —— 但修复必须是「只删多余的那一行」，其余内容一个字都不能少。
 #[test]
-fn broken_file_without_backup_is_reported_and_left_untouched() {
+fn broken_file_without_backup_is_recovered_by_text_dedupe() {
     let tmp = TempDir::new();
     let schema = tmp.path().join("broken.schema.yaml");
     let broken = STOCK.replace(
@@ -416,31 +455,16 @@ fn broken_file_without_backup_is_reported_and_left_untouched() {
         "    punct: \"^/([0-9]0?|[A-Za-z]+)$\"\n    vnum: \"^[vV][0-9.]*$\"\n    vnum: '^[vV][0-9.]*$'\n",
     );
     write(&schema, &broken);
-    let bytes_before = fs::read(&schema).expect("read");
 
-    let error = data_patch::patch_file(&schema, "0.6.24").expect_err("没有备份就救不回来");
-    let message = format!("{error:#}");
-    assert!(message.contains("不是合法 YAML"), "{message}");
-    assert!(message.contains("vnum"), "要点名重复的键：{message}");
-    assert!(message.contains("重复"), "要说清是重复键：{message}");
-    assert!(message.contains(&schema.display().to_string()), "要点名文件：{message}");
-    assert!(
-        message.contains(".rimesync-orig"),
-        "要告诉用户可以用备份覆盖回来：{message}"
-    );
-    assert_eq!(
-        fs::read(&schema).expect("read"),
-        bytes_before,
-        "原文件一个字节都不能动"
-    );
-    assert!(
-        broken_copies(&schema).is_empty(),
-        "没有备份就不该造现场副本"
-    );
-    assert!(
-        !data_patch::backup_path(&schema).exists(),
-        "没写成功就不该留备份"
-    );
+    data_patch::patch_file(&schema, "0.6.24").expect("没有备份也应当能自愈");
+
+    let text = read(&schema);
+    assert_eq!(vnum_key_count(&text), 1, "恢复后只能有一份 vnum");
+    serde_yaml::from_str::<serde_yaml::Value>(&text).expect("valid yaml");
+    // 备份是修复之后才写的，且现场副本留一份。
+    assert!(data_patch::backup_path(&schema).exists(), "写成功了就该有备份");
+    let copies = broken_copies(&schema);
+    assert_eq!(copies.len(), 1, "用户现场要留一份：{copies:?}");
 }
 
 /// 恢复之后再来一次 ensure：幂等，不再攒新的现场副本。

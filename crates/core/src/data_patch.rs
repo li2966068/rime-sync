@@ -1317,11 +1317,22 @@ fn patch_file_detailed_inner(
     let value: Value = match serde_yaml::from_str(text) {
         Ok(value) => value,
         Err(error) => {
-            // 错因是「同一个映射里两遍同一个键」（典型是升级路径上多出来的一份
-            // vnum）时，先看同目录有没有 rime-sync 留的原始备份：有就把损坏的文件
-            // 另存一份、再用备份覆盖回来重新打补丁（这条路径 227 实测能把不可用的
-            // 方案救回来）；没有备份才报错，不动用户的文件。
+            // 错因是「同一个映射里两遍同一个键」（0.6.19 时代两条补丁路径各写
+            // 一份 vnum）时，按「零损优先」的顺序自救：
+            // ① 文本级去重：只删掉多余的那一行，文件里其余内容（用户手工改的、
+            //    注释、格式）全部保留 —— 不需要备份，备份被清掉也能自愈；
+            // ② 同目录的 *.rimesync-orig 备份覆盖回来重打补丁（去重不适用时兜底）；
+            // ③ 两条都不行才报错，且原文件一个字节不动。
             if allow_recovery && duplicate_key_of(&error.to_string()).is_some() {
+                if let Some(deduped) = dedupe_duplicate_keys(text) {
+                    // 损坏现场留一份（同目录 <file>.rimesync-broken-*），用户可回溯。
+                    keep_broken_copy(path, &bytes)?;
+                    fs::write(path, deduped.as_bytes())
+                        .map_err(|error| anyhow!(io_error(path, &error)))?;
+                    // 继续走正常流程：幂等判据会把序列里的重复项也归一。
+                    let (_, punctuator) = patch_file_detailed_inner(path, version, false)?;
+                    return Ok((PatchOutcome::Recovered, punctuator));
+                }
                 if let Some(result) = recover_from_backup(path, version, &bytes)? {
                     return Ok(result);
                 }
@@ -1379,6 +1390,76 @@ fn patch_file_detailed_inner(
     }
     fs::write(path, patched.as_bytes()).map_err(|error| anyhow!(io_error(path, &error)))?;
     Ok((PatchOutcome::Patched, punctuator))
+}
+
+/// 文本级去重：把「同一个映射里写了两遍的键」的多余那一份删掉，返回修好的
+/// 文本。删不掉就返回 None，交给上层退回「用备份覆盖回来」那条路。
+///
+/// 为什么要有这条：0.6.19 时代有两条补丁路径同时往同一个方案文件写设置，于是
+/// recognizer/patterns 下出现两份 vnum（一份双引号、一份单引号）。YAML 禁止同
+/// 一个映射里出现两个同名键，serde_yaml 与 librime 都会拒绝，整个方案加载不出来。
+///
+/// 这条路径比「用 *.rimesync-orig 备份覆盖回来」更好在两点：
+/// - 不需要备份就能自愈（备份可能被用户清掉，也可能文件是别处弄坏的）；
+/// - 零损：只删多余的那一行，文件里其余内容（用户手工改的、注释、格式）全部保留。
+///
+/// 安全的边界：每删一行就重新解析一次，删到能解析为止；解析不过、或重复项写在
+/// 同一行里（flow 风格）删不动，就返回 None 走备份那条路，绝不硬改。
+fn dedupe_duplicate_keys(text: &str) -> Option<String> {
+    const MAX_ROUNDS: usize = 16;
+    let mut lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
+    let keep_trailing_newline = text.ends_with('\n');
+    let mut removed = false;
+    for _ in 0..MAX_ROUNDS {
+        let joined = lines.join("\n");
+        let error = match serde_yaml::from_str::<Value>(&joined) {
+            Ok(_) => break,
+            Err(error) => error,
+        };
+        let key = duplicate_key_of(&error.to_string())?;
+        let reported = error.location()?.line().saturating_sub(1);
+        // 该键在文本里出现的所有行（只认「key: 值」这种映射键写法）。
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_carries_key(line, &key))
+            .map(|(index, _)| index)
+            .collect();
+        if hits.len() < 2 {
+            // 不是行级重复（例如两处写在同一行的 flow 风格里）：删行救不了。
+            return None;
+        }
+        // 保留第一份，删后面那份里离报错位置最近的一行。
+        let first = hits[0];
+        let target = hits
+            .iter()
+            .copied()
+            .find(|index| *index != first && index.abs_diff(reported) <= 3)
+            .or_else(|| hits.iter().copied().find(|index| *index != first))?;
+        lines.remove(target);
+        removed = true;
+    }
+    if !removed {
+        return None;
+    }
+    let joined = lines.join("\n");
+    // 最后必须真的能解析：删行有可能破坏结构，这时老老实实退回备份那条路。
+    serde_yaml::from_str::<Value>(&joined).ok()?;
+    Some(if keep_trailing_newline {
+        format!("{joined}\n")
+    } else {
+        joined
+    })
+}
+
+/// 这一行是不是「key: 值」写法的那个键。
+/// 序列项（- key）不算 —— 序列里出现同名项是合法的 YAML，重复键问题只出在映射里。
+fn line_carries_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    match trimmed.strip_prefix(key) {
+        Some(rest) => rest.trim_start().starts_with(':'),
+        None => false,
+    }
 }
 
 /// <file>.rimesync-orig。
@@ -1505,7 +1586,8 @@ fn yaml_error_hint(error: &serde_yaml::Error) -> String {
     let message = error.to_string();
     match duplicate_key_of(&message) {
         Some(key) => format!(
-            "文件里出现了重复的键 {key}（同一个映射里写了两遍），请删掉多余的那一行后重试；\
+            "文件里出现了重复的键 {key}（同一个映射里写了两遍），已尝试自动去重但没能\
+             安全修好，请手动删掉多余的那一行后重试；\
              同目录的 *.rimesync-orig 备份也可以直接覆盖回来"
         ),
         None => message,
