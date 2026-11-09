@@ -95,6 +95,13 @@ Windows：NSIS 钩子（`packaging/nsis-hooks.nsh`）从 `$INSTDIR\resources\sch
 
 删文件后重新部署即可，不需要卸载。
 
+rime-sync 只**增量修补它自己生成的那份** `<方案>.custom.yaml`：文件里有
+`# 由 rime-sync 生成` / `# patched by rime-sync` 标记、并且 rime-sync 的引擎定制
+还开着（文件里还有 `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` 之一）时，
+才会被补上 `numpad` 处理器（先备份成 `<文件>.rimesync-orig`）。你把文件删掉、或把
+`rimesync_*` 都删掉，它就不再动这份文件。规则细节见
+[PREBUILT-BOOTSTRAP 第 14 节](PREBUILT-BOOTSTRAP.md#14-用户-customyaml-增量修补与小键盘常驻判定)。
+
 ## 5. 为什么 punctuator 是整段内联（不是只写 half_shape）
 
 方案里写的是：

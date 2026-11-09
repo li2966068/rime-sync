@@ -19,6 +19,7 @@ pub mod librime;
 pub mod linux_deploy;
 pub mod lock;
 pub mod log;
+pub mod managed_custom;
 pub mod merge3;
 pub mod network;
 pub mod plan;
@@ -35,6 +36,7 @@ pub mod secret;
 pub mod userdb;
 pub mod watch;
 pub mod webdav;
+pub mod yaml_text;
 
 pub use backup::{BackupInfo, BackupManager, BackupManifest, RestoreReport};
 pub use cancel::CancelToken;
@@ -47,8 +49,9 @@ pub use engine::{
 pub use history::{HistoryEntry, HISTORY_LIMIT};
 pub use ime::{ImeReport, WeaselHealth};
 pub use ime_state::{
-    assess, ensure, Action, Assessment, KeepSet, Mode, Options as EnsureOptions, Outcome,
-    OutcomeResult, Reason, SchemaState, State as SchemaFileState,
+    assess, assess_numpad, ensure, Action, Assessment, KeepSet, Mode, NumpadStatus,
+    Options as EnsureOptions, Outcome, OutcomeResult, Reason, SchemaState,
+    State as SchemaFileState,
 };
 pub use lock::{acquire as acquire_lock, inspect as inspect_lock, LockGuard, LockInfo, LockStatus};
 pub use log::{LogWriter, RotatingLog, DEFAULT_KEEP, DEFAULT_MAX_BYTES};

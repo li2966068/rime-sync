@@ -280,6 +280,8 @@ pub struct FixImeReport {
     pub detail: String,
     /// 本次实际做过的每一步。
     pub actions: Vec<ime_state::Action>,
+    /// 小键盘判定（core 的 NumpadStatus 原样带过来：ensure 实际用的那一份，不重算）。
+    pub numpad: ime_state::NumpadStatus,
     /// 最终 assess（逐方案状态）。
     pub assessment: ime_state::Assessment,
     /// B-2：payload config/ 里被 data 门禁挡下的模板（= 用户拿到的输入法**没有**
@@ -473,6 +475,7 @@ fn fix_ime_blocking(
         detail: outcome.detail.clone(),
         // B-2：config 跳过必须出现在报告里（前端据此提示用户）。
         actions: outcome.actions.clone(),
+        numpad: outcome.numpad.clone(),
         assessment: outcome.assessment.clone(),
         report: report.clone(),
     })
@@ -547,9 +550,9 @@ pub struct ImeBootstrapStatus {
     pub updated_at: String,
     /// 自举还在跑（result="running"）：不是失败，别当红条弹。
     pub running: bool,
-    /// 机器可读的失败原因码（ok/noop/partial/install-disabled/install-failed/
-    /// timeout/crashed/failed）。前端按它出**本地化**结论 —— 后端的 detail 是
-    /// 中文技术描述，英文界面下直接显示会中英混排。
+    /// 机器可读的失败原因码（ok/noop/partial/numpad-pending/install-disabled/
+    /// install-failed/timeout/crashed/failed）。前端按它出**本地化**结论 ——
+    /// 后端的 detail 是中文技术描述，英文界面下直接显示会中英混排。
     pub reason: String,
 }
 
@@ -557,8 +560,13 @@ impl ImeBootstrapStatus {
     fn from_outcome(outcome: &ime_state::Outcome) -> Self {
         // 同 from_ime：关掉自动安装 + 输入法确实不在 ⇒ 失败，不是成功。
         let missing = outcome.ime.install == "disabled" && !outcome.ime.present;
+        // 小键盘有没有生效：只看 core 判好的那一份（ensure 实际用的那份），不重算。
+        let reason = reason_of(&outcome.result, &outcome.ime, outcome.numpad.ok);
         Self {
-            ok: outcome.ok() && outcome.ime.ok() && !missing,
+            // 小键盘不可用也不能报「已就绪」：core 保证这种时候结论是 partial
+            // （outcome.ok() 已经是 false），这里再兜一层 —— 结论是 ok/noop 而
+            // 小键盘确实不可用时，也不能让界面说一切就绪。
+            ok: outcome.ok() && outcome.ime.ok() && !missing && outcome.numpad.ok,
             result: if missing {
                 "failed".to_string()
             } else {
@@ -569,6 +577,10 @@ impl ImeBootstrapStatus {
                 // 这才是界面该说的话。
                 "输入法未就绪：自动安装已关闭（RIMESYNC_INSTALL_IME=0），请手动安装或改回自动安装"
                     .to_string()
+            } else if reason == "numpad-pending" {
+                // 小键盘这回事必须让用户看得见（core 一般已经把提示写进 detail，
+                // 这里只做兜底，见 detail_with_numpad）。
+                detail_with_numpad(&outcome.detail, &outcome.numpad.hint)
             } else {
                 outcome.detail.clone()
             },
@@ -580,7 +592,7 @@ impl ImeBootstrapStatus {
             seeded_written: outcome.seeded.written.clone(),
             updated_at: now_stamp(),
             running: false,
-            reason: reason_of(&outcome.result, &outcome.ime).to_string(),
+            reason: reason.to_string(),
         }
     }
 
@@ -590,9 +602,20 @@ impl ImeBootstrapStatus {
     /// 输入法」要单独判（关掉自动安装 + 输入法不在 ⇒ 失败）。
     fn from_fix_report(report: &FixImeReport) -> Self {
         let missing = report.weasel_install == "disabled" && !report.weasel_present;
-        let ok = (report.result == "ok" || report.result == "noop") && !missing;
+        // 小键盘不可用也不能报「已就绪」：core 保证这种时候 result 是 partial，
+        // 这里再兜一层（result 是 ok/noop 而小键盘确实不可用时同样算没就绪）。
+        let ok = (report.result == "ok" || report.result == "noop") && !missing && report.numpad.ok;
         let reason = if missing {
+            // 优先级最高：用户手上没有输入法，比小键盘严重得多。
             "install-disabled"
+        } else if report.result == "failed" {
+            // 失败比小键盘严重：严重失败不许被小键盘覆盖（原有语义：不是
+            // ok/noop/partial 的结论 = 修复/安装这步失败）。
+            "install-failed"
+        } else if !report.numpad.ok {
+            // 小键盘没生效 → 专用原因码（前端据此说人话：重启输入法 / 再修一次）。
+            // 放在 install-disabled / install-failed 之后：那两个更严重。
+            "numpad-pending"
         } else if ok {
             if report.result == "noop" {
                 "noop"
@@ -607,7 +630,11 @@ impl ImeBootstrapStatus {
         Self {
             ok,
             result: report.result.clone(),
-            detail: report.detail.clone(),
+            detail: if reason == "numpad-pending" {
+                detail_with_numpad(&report.detail, &report.numpad.hint)
+            } else {
+                report.detail.clone()
+            },
             needs_elevation: report.weasel_needs_elevation || report.needs_elevation,
             ime_install: report.weasel_install.clone(),
             ime_error: report.weasel_error.clone(),
@@ -680,8 +707,29 @@ fn failed_status_with_reason(result: &str, reason: &str, detail: String) -> ImeB
     }
 }
 
-/// 失败原因码：结论 + 输入法本体状态 → 稳定的原因码（前端据此本地化）。
-fn reason_of(result: &ime_state::OutcomeResult, ime: &ImeReport) -> &'static str {
+/// 小键盘缺口的提示追加到 detail 末尾（只在真需要时）。
+///
+/// core 在小键盘有缺口时已经把 numpad_missing=…（提示）写进 outcome.detail
+/// （crates/core/src/ime_state.rs 里往 problems 推的那一条），所以正常路径
+/// **不需要**这里再拼一遍。只有 detail 里完全看不到小键盘字样时（例如 detail
+/// 被别的内容覆盖）才补上 hint —— 横幅里必须看得出「小键盘这回事」。
+fn detail_with_numpad(detail: &str, hint: &str) -> String {
+    let text = detail.trim();
+    let hint = hint.trim();
+    if hint.is_empty() || text.contains("numpad") {
+        return text.to_string();
+    }
+    if text.is_empty() {
+        hint.to_string()
+    } else {
+        format!("{text}；{hint}")
+    }
+}
+
+/// 失败原因码：结论 + 输入法本体状态 + 小键盘判定 → 稳定的原因码（前端据此本地化）。
+///
+/// numpad_ok = core 判的「小键盘有没有生效」（ensure 实际用的那一份，不重算）。
+fn reason_of(result: &ime_state::OutcomeResult, ime: &ImeReport, numpad_ok: bool) -> &'static str {
     use ime_state::OutcomeResult::{Failed, Noop, Ok, Partial};
     // 顺序要紧：**先**判「用户手上没有输入法」。关掉自动安装（RIMESYNC_INSTALL_IME=0）
     // 而输入法又确实不在时，core 的结论仍是 ok/noop（那是产物那步的结论），但用户
@@ -694,9 +742,33 @@ fn reason_of(result: &ime_state::OutcomeResult, ime: &ImeReport) -> &'static str
         return "install-failed";
     }
     match result {
-        Ok => "ok",
-        Noop => "noop",
-        Partial => "partial",
+        Ok => {
+            // 结论是 ok 而小键盘不可用：按理不该出现（core 保证小键盘有缺口时
+            // 结论降级为 partial）。万一出现，报 "ok" 就是「报 ok 但小键盘其实
+            // 不能用」的静默失败 —— 所以给专用的 numpad-pending。
+            if numpad_ok {
+                "ok"
+            } else {
+                "numpad-pending"
+            }
+        }
+        Noop => {
+            if numpad_ok {
+                "noop"
+            } else {
+                "numpad-pending"
+            }
+        }
+        Partial => {
+            // 小键盘没生效时给专用原因码：用户需要知道「重启输入法 / 再修一次」，
+            // 而不是看到没法行动的笼统「partial」。
+            if numpad_ok {
+                "partial"
+            } else {
+                "numpad-pending"
+            }
+        }
+        // 失败比小键盘严重：严重失败不许被小键盘覆盖。
         Failed => "failed",
     }
 }
@@ -1300,13 +1372,16 @@ mod tests {
             present: false,
             ..ImeReport::default()
         };
-        assert_eq!(reason_of(&OutcomeResult::Ok, &missing), "install-disabled");
         assert_eq!(
-            reason_of(&OutcomeResult::Noop, &missing),
+            reason_of(&OutcomeResult::Ok, &missing, true),
             "install-disabled"
         );
         assert_eq!(
-            reason_of(&OutcomeResult::Partial, &missing),
+            reason_of(&OutcomeResult::Noop, &missing, true),
+            "install-disabled"
+        );
+        assert_eq!(
+            reason_of(&OutcomeResult::Partial, &missing, true),
             "install-disabled"
         );
 
@@ -1315,7 +1390,10 @@ mod tests {
             install: "failed".to_string(),
             ..ImeReport::default()
         };
-        assert_eq!(reason_of(&OutcomeResult::Failed, &broken), "install-failed");
+        assert_eq!(
+            reason_of(&OutcomeResult::Failed, &broken, true),
+            "install-failed"
+        );
 
         // 正常路径：按结论映射。
         let fine = ImeReport {
@@ -1323,10 +1401,10 @@ mod tests {
             present: true,
             ..ImeReport::default()
         };
-        assert_eq!(reason_of(&OutcomeResult::Ok, &fine), "ok");
-        assert_eq!(reason_of(&OutcomeResult::Noop, &fine), "noop");
-        assert_eq!(reason_of(&OutcomeResult::Partial, &fine), "partial");
-        assert_eq!(reason_of(&OutcomeResult::Failed, &fine), "failed");
+        assert_eq!(reason_of(&OutcomeResult::Ok, &fine, true), "ok");
+        assert_eq!(reason_of(&OutcomeResult::Noop, &fine, true), "noop");
+        assert_eq!(reason_of(&OutcomeResult::Partial, &fine, true), "partial");
+        assert_eq!(reason_of(&OutcomeResult::Failed, &fine, true), "failed");
     }
 
     #[test]
@@ -1383,6 +1461,7 @@ mod tests {
             result: "partial".to_string(),
             detail: "config_skipped=[default.custom.yaml:no-wubi86-in-data]".to_string(),
             actions: Vec::new(),
+            numpad: numpad_status(true),
             assessment: ime_state::Assessment {
                 schemas: Vec::new(),
                 build_ok: true,
@@ -1516,5 +1595,187 @@ mod tests {
         assert_eq!(result, Ok(Err::<(), &'static str>("boom")));
         assert!(!flag.load(Ordering::SeqCst));
         assert!(try_acquire(&flag).is_some());
+    }
+
+    /// core 的 NumpadStatus 的最小构造（ok / 不 ok 两档）。
+    fn numpad_status(ok: bool) -> ime_state::NumpadStatus {
+        if ok {
+            ime_state::NumpadStatus {
+                ok: true,
+                missing: Vec::new(),
+                detail: vec!["wubi86=ok".to_string()],
+                hint: String::new(),
+            }
+        } else {
+            ime_state::NumpadStatus {
+                ok: false,
+                missing: vec!["wubi86=artifact-stale".to_string()],
+                detail: vec!["wubi86=artifact-stale".to_string()],
+                hint: "小键盘处理器（numpad）还没编译进产物（wubi86=artifact-stale）：请重启一次输入法。"
+                    .to_string(),
+            }
+        }
+    }
+
+    /// 造一份 FixImeReport（只填跟小键盘/结论有关的字段）。
+    fn sample_fix_report(result: &str, numpad_ok: bool) -> FixImeReport {
+        FixImeReport {
+            rime_dir: "/tmp/rime".to_string(),
+            payload: "/tmp/payload".to_string(),
+            payload_source: "test".to_string(),
+            probe_before: "none".to_string(),
+            message: "m".to_string(),
+            data_patched: 0,
+            needs_elevation: false,
+            data: DataPatchReport::default(),
+            weasel_present: true,
+            weasel_installed: true,
+            weasel_version: "1.0".to_string(),
+            weasel_installer: String::new(),
+            weasel_installer_source: String::new(),
+            weasel_install: "installed".to_string(),
+            weasel_error: None,
+            weasel_needs_elevation: false,
+            weasel_log: String::new(),
+            weasel_message: String::new(),
+            result: result.to_string(),
+            detail: "numpad_missing=wubi86=artifact-stale (小键盘处理器还没编译进产物)".to_string(),
+            actions: Vec::new(),
+            numpad: numpad_status(numpad_ok),
+            assessment: ime_state::Assessment {
+                schemas: Vec::new(),
+                build_ok: true,
+                reason: ime_state::Reason::Ready,
+            },
+            report: PrebuiltReport::empty("test"),
+        }
+    }
+
+    /// 小键盘原因码：只在「结论是 partial 且小键盘确实没生效」时给 numpad-pending，
+    /// 而且不许盖掉更严重的原因码（输入法不在 / 安装失败 / 整体失败）。
+    #[test]
+    fn reason_of_reports_numpad_pending_only_when_the_keypad_is_broken() {
+        use ime_state::OutcomeResult;
+        let fine = ImeReport {
+            install: "installed".to_string(),
+            present: true,
+            ..ImeReport::default()
+        };
+        // a. partial + 小键盘没生效 → 专用原因码（不是笼统的 partial）。
+        assert_eq!(
+            reason_of(&OutcomeResult::Partial, &fine, false),
+            "numpad-pending"
+        );
+        // b. partial + 小键盘好着 → 仍然是 partial（不误判）。
+        assert_eq!(reason_of(&OutcomeResult::Partial, &fine, true), "partial");
+        // c. failed → 严重失败优先：小键盘不许覆盖它。
+        assert_eq!(reason_of(&OutcomeResult::Failed, &fine, false), "failed");
+        // d. 输入法不在（install-disabled）→ 优先级最高，小键盘也不许盖。
+        let missing = ImeReport {
+            install: "disabled".to_string(),
+            present: false,
+            ..ImeReport::default()
+        };
+        assert_eq!(
+            reason_of(&OutcomeResult::Partial, &missing, false),
+            "install-disabled"
+        );
+        // 输入法本体这步失败 → install-failed（也比小键盘严重）。
+        let broken = ImeReport {
+            install: "failed".to_string(),
+            ..ImeReport::default()
+        };
+        assert_eq!(
+            reason_of(&OutcomeResult::Partial, &broken, false),
+            "install-failed"
+        );
+        // e. result=ok 而小键盘没生效：这种组合按理不该出现（core 保证小键盘
+        //    有缺口时结论降级成 partial），但万一出现**不许**报 "ok" ——
+        //    那正是缺陷三当初的静默失败（报 ok、小键盘其实用不了）。
+        //    所以给专用的 numpad-pending。
+        assert_eq!(
+            reason_of(&OutcomeResult::Ok, &fine, false),
+            "numpad-pending"
+        );
+        assert_eq!(reason_of(&OutcomeResult::Ok, &fine, true), "ok");
+        assert_eq!(reason_of(&OutcomeResult::Noop, &fine, true), "noop");
+    }
+
+    /// 提权修复那条路径（from_fix_report）用同一套小键盘原因码。
+    #[test]
+    fn fix_report_uses_the_numpad_pending_reason_code() {
+        // partial + 小键盘没生效 → numpad-pending，红条要亮。
+        let status = ImeBootstrapStatus::from_fix_report(&sample_fix_report("partial", false));
+        assert_eq!(status.reason, "numpad-pending");
+        assert!(!status.ok, "小键盘不可用时不能报「已就绪」");
+        // detail 里必须看得出小键盘这回事（core 已经写了 numpad_missing=…）。
+        assert!(
+            status.detail.contains("numpad"),
+            "detail 里看不到小键盘：{}",
+            status.detail
+        );
+
+        // partial + 小键盘好着 → 仍然是 partial（不误判）。
+        let status = ImeBootstrapStatus::from_fix_report(&sample_fix_report("partial", true));
+        assert_eq!(status.reason, "partial");
+
+        // failed → 严重失败优先（这条路径的原有语义是 install-failed），小键盘不许盖。
+        let status = ImeBootstrapStatus::from_fix_report(&sample_fix_report("failed", false));
+        assert_eq!(status.reason, "install-failed");
+
+        // 输入法不在 → 优先级最高。
+        let mut report = sample_fix_report("partial", false);
+        report.weasel_install = "disabled".to_string();
+        report.weasel_present = false;
+        let status = ImeBootstrapStatus::from_fix_report(&report);
+        assert_eq!(status.reason, "install-disabled");
+
+        // result=ok 而小键盘没生效：按理不该出现，但不许报「已就绪」。
+        let status = ImeBootstrapStatus::from_fix_report(&sample_fix_report("ok", false));
+        assert_eq!(status.reason, "numpad-pending");
+        assert!(!status.ok);
+    }
+
+    /// core 忘了往 detail 里写小键盘提示时，GUI 侧兜底把 hint 追加到末尾
+    /// （不能把原话改坏，只在末尾追加）。
+    #[test]
+    fn detail_gets_the_numpad_hint_appended_when_core_did_not_write_it() {
+        let mut report = sample_fix_report("partial", false);
+        report.detail = "配置有点问题".to_string();
+        let status = ImeBootstrapStatus::from_fix_report(&report);
+        assert_eq!(status.reason, "numpad-pending");
+        assert!(status.detail.starts_with("配置有点问题"));
+        assert!(status.detail.contains("numpad"));
+        // core 写过的时候不许重复追加。
+        let status = ImeBootstrapStatus::from_fix_report(&sample_fix_report("partial", false));
+        assert_eq!(
+            status.detail.matches("numpad").count(),
+            1,
+            "detail: {}",
+            status.detail
+        );
+    }
+
+    /// FixImeReport 序列化后必须带 numpad 段（前端按这个名字读）。
+    #[test]
+    fn fix_ime_report_json_contains_the_numpad_section() {
+        let report = sample_fix_report("partial", false);
+        let text = serde_json::to_string(&report).expect("serialize");
+        assert!(text.contains("\"numpad\":"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let numpad = value.get("numpad").expect("numpad 段");
+        assert_eq!(numpad.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            numpad
+                .get("missing")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(1)
+        );
+        assert!(numpad
+            .get("hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("numpad"));
     }
 }

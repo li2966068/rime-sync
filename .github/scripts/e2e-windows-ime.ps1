@@ -10,7 +10,10 @@
     c) 用户手上有输入法（假 Weasel：注册表 + WeaselServer.exe + rime.dll）：
        ok=true、退出码 0 —— 退出码 0 的含义是「输入法现在就绪」；
     d) payload 缺文件：result=Failed、退出码非 0、detail 非空；
-    e) 只读判据（check-ime，NSIS 自检用的就是它）与 ensure 结论一致。
+    e) 只读判据（check-ime，NSIS 自检用的就是它）与 ensure 结论一致；
+    f) 227 形状的旧 custom.yaml（vselect、无 numpad）：ensure 把它修好，
+       常驻小键盘判定报出 artifact-stale（结论 partial），check-ime 只读地
+       报出同一个缺口（非零退出、用户目录一个字节都不变）。
 
   假数据必须覆盖全部三个目标方案（luna_pinyin_simp / wubi_pinyin / wubi86）：
   只造一个方案时 targets 会退化成 1，config 门禁又因 data 里没有 wubi86 而跳过
@@ -35,10 +38,21 @@ foreach ($dir in @((Join-Path $payload 'build'), (Join-Path $payload 'config'), 
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
+# 随包产物的真实形态：engine/processors 里带 numpad（小键盘归一化处理器）。
+# 少了 numpad 的假产物会被「常驻小键盘判定」当成「引擎还没重编译」→ 误报成
+# partial，把 a~c 里「result 期望 ok/noop」的断言带崩。
+# 正确做法是让假数据更真（跟真实随包产物一致），不是放宽断言。
 $marked = @"
 patch:
   rimesync_vnum: '['
   rimesync_punct: ']'
+engine:
+  processors:
+    - ascii_composer
+    - rimesync_punct
+    - rimesync_vselect
+    - numpad
+    - selector
 "@
 $plainConfig = @"
 patch:
@@ -76,6 +90,25 @@ function Invoke-ImeCli {
     )
     Remove-Item -LiteralPath $ReportPath -Force -ErrorAction SilentlyContinue
     $full = @('--rime-dir', $rime) + $Arguments + @('--json', '--report', $ReportPath)
+    & $cli @full | Out-Null
+    $code = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $ReportPath)) {
+        throw "CLI 没有写 JSON 报告（exit=$code）：$ReportPath"
+    }
+    $json = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
+    [pscustomobject]@{ Code = $code; Json = $json; Path = $ReportPath }
+}
+
+# 与 Invoke-ImeCli 流程完全相同，唯一差别：rime 目录可指定。
+# case f 必须用它自己的临时 rime 目录（a~e 那份 $rime 的状态不许被影响）。
+function Invoke-ImeCliIn {
+    param(
+        [Parameter(Mandatory = $true)][string]$RimeDir,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$ReportPath
+    )
+    Remove-Item -LiteralPath $ReportPath -Force -ErrorAction SilentlyContinue
+    $full = @('--rime-dir', $RimeDir) + $Arguments + @('--json', '--report', $ReportPath)
     & $cli @full | Out-Null
     $code = $LASTEXITCODE
     if (-not (Test-Path -LiteralPath $ReportPath)) {
@@ -194,7 +227,127 @@ if (@($check.Json.missing) -notcontains 'luna_pinyin_simp') {
     throw "check-ime missing 不含 luna_pinyin_simp：$($check.Json.missing -join ',')"
 }
 
-Write-Host 'windows e2e ok：ensure-ime 判据 / 修补 / 就绪退出码 / 失败退出码 / check-ime 一致性'
+# --- f) 227 形状：旧 custom.yaml → 修好 + 常驻小键盘判定 ------------------------
+# 单独用自己的临时目录：绝不污染上面那份 $rime（a~e 的状态不许被影响）。
+$fRoot = Join-Path $root 'case-f'
+$fPayload = Join-Path $fRoot 'payload'
+$fRime = Join-Path $fRoot 'rime'
+$fData = Join-Path $fRoot 'data'
+foreach ($dir in @((Join-Path $fPayload 'build'), $fRime, $fData)) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+# 227 形状的编译产物：有 rime-sync 定制，但**没有** numpad（= 引擎还没重编译）。
+$staleArtifact = @"
+patch:
+  rimesync_vnum: '['
+  rimesync_punct: ']'
+engine:
+  processors:
+    - ascii_composer
+    - rimesync_vselect
+    - selector
+"@
+
+# 227 形状的用户 custom.yaml：带 rime-sync 标记、有 rimesync_vselect、**没有 numpad**。
+$oldCustom = @"
+# 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
+# schema: wubi86
+patch:
+  engine/processors:
+    - ascii_composer
+    - recognizer
+    - rimesync_punct
+    - rimesync_vselect
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+  engine/translators:
+    - rimesync_vnum
+    - punct_translator
+"@
+
+foreach ($s in $schemas) {
+    Set-Content -LiteralPath (Join-Path $fPayload "build\$s.schema.yaml") -Value $staleArtifact -NoNewline
+    Set-Content -LiteralPath (Join-Path $fPayload "build\$s.prism.bin") -Value 'prism' -NoNewline
+    Set-Content -LiteralPath (Join-Path $fData "$s.schema.yaml") -Value "schema:`n  schema_id: $s`n" -NoNewline
+}
+$fCustom = Join-Path $fRime 'wubi86.custom.yaml'
+Set-Content -LiteralPath $fCustom -Value $oldCustom -NoNewline
+
+# bootstrap 模式：铺产物但不跑部署（部署一跑就会重编译，227 形状就没了）。
+$fEnsure = Invoke-ImeCliIn -RimeDir $fRime -Arguments @('ensure-ime', '--mode', 'bootstrap', '--no-data-patch', '--payload', $fPayload) -ReportPath (Join-Path $root 'case-f-ensure.json')
+
+# 1) 文件被修好了：numpad 紧跟 rimesync_vselect，而且只有一份。
+$fLines = Get-Content -LiteralPath $fCustom
+$vselectMatch = $fLines | Select-String -SimpleMatch '- rimesync_vselect' | Select-Object -First 1
+$numpadMatch = $fLines | Select-String -SimpleMatch '- numpad' | Select-Object -First 1
+if ($null -eq $vselectMatch -or $null -eq $numpadMatch) {
+    throw "custom.yaml 没修好（缺 rimesync_vselect 或 numpad）：$($fLines -join '|')"
+}
+$vselectLine = $vselectMatch.LineNumber
+$numpadLine = $numpadMatch.LineNumber
+if ($numpadLine -ne ($vselectLine + 1)) {
+    throw "numpad 没紧跟 rimesync_vselect（vselect=$vselectLine numpad=$numpadLine）：$($fLines -join '|')"
+}
+$numpadCount = @($fLines | Select-String -SimpleMatch '- numpad').Count
+if ($numpadCount -ne 1) {
+    throw "numpad 必须只有一份（实际 $numpadCount）：$($fLines -join '|')"
+}
+
+# 2) actions 里有 custom-repair（且 changed=true：改了才算数）。
+$repair = @($fEnsure.Json.actions | Where-Object { $_.kind -eq 'custom-repair' })
+if ($repair.Count -lt 1) {
+    throw "ensure-ime 的 actions 里没有 custom-repair：$($fEnsure.Json.actions | ConvertTo-Json -Compress)"
+}
+if (-not $repair[0].changed) {
+    throw 'custom-repair 必须 changed=true（改了文件才算修过）'
+}
+
+# 3) 报告里有 numpad 段，且结论是 partial + detail 指名 artifact-stale。
+if (-not ($fEnsure.Json.PSObject.Properties.Name -contains 'numpad')) {
+    throw 'ensure-ime 的报告里没有 numpad 段'
+}
+Assert-Equal $fEnsure.Json.numpad.ok $false 'ensure-ime #f numpad.ok'
+if (@($fEnsure.Json.numpad.missing) -notcontains 'wubi86=artifact-stale') {
+    throw "numpad.missing 不含 wubi86=artifact-stale：$($fEnsure.Json.numpad.missing -join ',')"
+}
+Assert-Equal $fEnsure.Json.result 'partial' 'ensure-ime #f result'
+if ([string]$fEnsure.Json.detail -notmatch 'artifact-stale') {
+    throw "ensure-ime #f 的 detail 没点名 artifact-stale：$($fEnsure.Json.detail)"
+}
+
+# 4) check-ime：只读地报出同一个缺口，非零退出，用户目录一个字节都不变。
+$beforeBytes = [System.IO.File]::ReadAllBytes($fCustom)
+$beforeTime = (Get-Item -LiteralPath $fCustom).LastWriteTimeUtc
+$fCheck = Invoke-ImeCliIn -RimeDir $fRime -Arguments @('check-ime', '--payload', $fPayload) -ReportPath (Join-Path $root 'case-f-check.json')
+if ($fCheck.Code -eq 0) {
+    throw 'check-ime 报出小键盘缺口时必须非零退出'
+}
+Assert-Equal $fCheck.Json.result 'partial' 'check-ime #f result'
+Assert-Equal $fCheck.Json.numpad.ok $false 'check-ime #f numpad.ok'
+if (@($fCheck.Json.numpad.missing) -notcontains 'wubi86=artifact-stale') {
+    throw "check-ime 的 numpad.missing 不含 wubi86=artifact-stale：$($fCheck.Json.numpad.missing -join ',')"
+}
+if ((@($fCheck.Json.numpad.missing) -join ',') -ne (@($fEnsure.Json.numpad.missing) -join ',')) {
+    throw "check-ime 与 ensure-ime 的结论必须一致：$($fCheck.Json.numpad.missing -join ',') vs $($fEnsure.Json.numpad.missing -join ',')"
+}
+$afterBytes = [System.IO.File]::ReadAllBytes($fCustom)
+$afterTime = (Get-Item -LiteralPath $fCustom).LastWriteTimeUtc
+if ($beforeBytes.Length -ne $afterBytes.Length) {
+    throw "check-ime 改了用户目录的文件长度：$($beforeBytes.Length) -> $($afterBytes.Length)"
+}
+for ($i = 0; $i -lt $beforeBytes.Length; $i++) {
+    if ($beforeBytes[$i] -ne $afterBytes[$i]) {
+        throw "check-ime 改了用户目录的文件字节（偏移 $i）"
+    }
+}
+if ($beforeTime -ne $afterTime) {
+    throw "check-ime 改了用户目录的文件 mtime：$beforeTime -> $afterTime"
+}
+
+Write-Host 'windows e2e ok：ensure-ime 判据 / 修补 / 就绪退出码 / 失败退出码 / check-ime 一致性 / 227 形状的小键盘缺口'
 
 # GitHub 的 pwsh step 是把脚本 dot-source 进会话再跑，结束时按 $LASTEXITCODE 退出。
 # 脚本里调过 CLI（没就绪时退出码是 1，这是**预期**），不显式 exit 0 会被它带成

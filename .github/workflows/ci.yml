@@ -717,6 +717,13 @@ jobs:
       - name: config sources check
         run: bash packaging/windows/check-config-sources.sh
 
+      # 0.6.26：方案模板必须带 numpad —— 用户目录里那份旧 custom.yaml 缺了它，
+      # 就会把 data 方案里的 numpad 整段顶掉（小键盘数字键失效的根因）。
+      # 以前**从没**在 CI 里校验过模板内容，只能等用户在真机上才发现。
+      # 这个检查只读模板，不写任何文件。
+      - name: schema custom template check
+        run: python3 scripts/ime/gen-schema-custom.py --check
+
   # 0.6.24：NSIS 钩子的**运行期**冒烟 —— wine 跑的就是发布用的那个 Windows
   # 二进制（NSIS stub + 钩子），验的是静态断言看不出来的东西：静默安装/卸载的
   # 退出码、/PURGEDATA 有没有生效、两条用户数据目录删没删、卸载日志写没写全。

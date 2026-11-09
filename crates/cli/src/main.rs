@@ -108,7 +108,8 @@ enum Command {
     /// 铺入随包的预编译 build 产物（安装器钩子没跑 / WeaselDeployer 不产出时的兜底）
     #[command(name = "fix-ime")]
     FixIme {
-        /// 覆盖已存在的 build/ 文件（config/*.yaml 永不覆盖）
+        /// 覆盖已存在的 build/ 文件（default/weasel 的 *.custom.yaml 永不覆盖；
+        /// rime-sync 自己生成的 <id>.custom.yaml 会被增量修补并先备份，用户自己改过的不动）
         #[arg(long)]
         force: bool,
         /// 预编译产物目录；缺省按 exe / AppImage / deb 路径自动定位
@@ -140,7 +141,8 @@ enum Command {
         #[arg(long, value_name = "MODE", default_value = "install")]
         #[arg(value_parser = ["install", "fix", "bootstrap"])]
         mode: String,
-        /// 覆盖已存在的 build/ 文件（config/*.yaml 永不覆盖）
+        /// 覆盖已存在的 build/ 文件（default/weasel 的 *.custom.yaml 永不覆盖；
+        /// rime-sync 自己生成的 <id>.custom.yaml 会被增量修补并先备份，用户自己改过的不动）
         #[arg(long)]
         force: bool,
         /// 预编译产物目录；缺省按 exe / AppImage / deb 路径自动定位
@@ -327,12 +329,16 @@ struct FixImeJson<'a> {
     weasel_error: Option<String>,
     weasel_needs_elevation: bool,
     weasel_log: String,
+    /// 常驻小键盘判定（CLI/GUI 都读这一份，不许自己再算）。
+    numpad: &'a ime_state::NumpadStatus,
 }
 
 /// check-ime 的只读报告（NSIS 自检解析这些字段，不再自己看文件）。
 #[derive(Serialize)]
 struct CheckImeJson<'a> {
-    /// ok / failed（唯一的判据结论；与 build_ok 同步）。
+    /// ok / partial / failed（结论口径与 ensure-ime 一致）。
+    /// build_ok=false → failed；有小键盘缺口 → partial；其余 → ok。
+    /// （build_ok 字段本身的语义没变，NSIS 侧照旧读它。）
     result: &'a str,
     build_ok: bool,
     reason: &'a str,
@@ -346,6 +352,8 @@ struct CheckImeJson<'a> {
     targets: usize,
     schemas: &'a [ime_state::SchemaState],
     missing: Vec<String>,
+    /// 常驻小键盘判定（与 ensure-ime 同一份判据）。
+    numpad: &'a ime_state::NumpadStatus,
 }
 
 /// ensure-ime 的报告：PrebuiltReport 的字段平铺，再加状态机结论与 actions。
@@ -379,6 +387,8 @@ struct EnsureImeJson<'a> {
     weasel_log: String,
     /// config 模板播种结果（install / bootstrap + Windows）。
     config_seeded: &'a ime_state::SeedReport,
+    /// 常驻小键盘判定（与 fix-ime / check-ime 同一份判据）。
+    numpad: &'a ime_state::NumpadStatus,
 }
 
 /// 解析 --payload / 自动定位；找不到不是错误（只读探测要照常出报告）。
@@ -398,6 +408,14 @@ fn resolve_check_payload(
             Err(error) => (None, Some(format!("{error:#}"))),
         },
     }
+}
+
+/// 小键盘判定的文本呈现：一行人话，不是把 detail 原样倒出来。
+fn numpad_line(numpad: &ime_state::NumpadStatus) -> String {
+    if numpad.ok {
+        return "ok".to_string();
+    }
+    format!("问题 {}（{}）", numpad.missing.join(" "), numpad.hint)
 }
 
 impl std::fmt::Display for FixImeFailed {
@@ -845,6 +863,7 @@ fn run(cli: Cli) -> Result<()> {
                 weasel_error: weasel.error.clone(),
                 weasel_needs_elevation: weasel.needs_elevation,
                 weasel_log: weasel.log.clone(),
+                numpad: &outcome.numpad,
             };
             if cli.json {
                 print_json(&report_json)?;
@@ -898,6 +917,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("build_schemas={}", outcome.report.build_schemas_line());
                 println!("build_repaired={}", outcome.report.build_repaired.join(","));
                 println!("build_missing={}", outcome.report.build_missing.join(","));
+                println!("numpad={}", numpad_line(&outcome.numpad));
                 println!(
                     "deploy_method={} deploy_result={} deploy_ok={} deploy_ms={}",
                     outcome.report.deploy_method,
@@ -1051,11 +1071,31 @@ fn run(cli: Cli) -> Result<()> {
                     .map(|location| location.path.as_path()),
             );
             let assessment = ime_state::assess(&rime_dir, &data_dirs, &keep);
+            // 常驻小键盘判定：与 ensure-ime 用的是**同一个**函数（只读判据 =
+            // 写路径的结论），不允许这里自己再判一套。
+            let numpad = ime_state::assess_numpad(&rime_dir, &data_dirs);
+            // 结论口径与 ensure-ime 一致：产物不可用 = failed；有缺口 = partial；
+            // 其余 = ok。partial 与 failed 都必须非零退出。
+            let result = if !assessment.build_ok {
+                "failed"
+            } else if !numpad.ok {
+                "partial"
+            } else {
+                "ok"
+            };
+            let mut detail = assessment.detail();
+            if !numpad.ok {
+                detail = format!(
+                    "{detail} numpad_missing={}（{}）",
+                    numpad.missing.join(","),
+                    numpad.hint
+                );
+            }
             let check = CheckImeJson {
-                result: if assessment.build_ok { "ok" } else { "failed" },
+                result,
                 build_ok: assessment.build_ok,
                 reason: assessment.reason.as_str(),
-                detail: assessment.detail(),
+                detail,
                 rime_dir: rime_dir.display().to_string(),
                 payload: payload_location
                     .as_ref()
@@ -1069,6 +1109,7 @@ fn run(cli: Cli) -> Result<()> {
                 targets: assessment.schemas.len(),
                 schemas: &assessment.schemas,
                 missing: assessment.missing_ids(),
+                numpad: &numpad,
             };
             if cli.json {
                 print_json(&check)?;
@@ -1081,6 +1122,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("detail={}", check.detail);
                 println!("schemas={}", assessment.line());
                 println!("missing={}", check.missing.join(","));
+                println!("numpad={}", numpad_line(&numpad));
                 if let Some(error) = &check.payload_error {
                     println!("payload_error={error}");
                 }
@@ -1088,7 +1130,8 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(path) = report.as_deref() {
                 write_json_file(path, &check)?;
             }
-            if assessment.build_ok {
+            // partial 与 failed 一样必须非零退出："小键盘不能用"不是成功。
+            if assessment.build_ok && numpad.ok {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))
@@ -1178,6 +1221,7 @@ fn run(cli: Cli) -> Result<()> {
                 weasel_needs_elevation: outcome.ime.needs_elevation,
                 weasel_log: outcome.ime.log.clone(),
                 config_seeded: &outcome.seeded,
+                numpad: &outcome.numpad,
             };
             if cli.json {
                 print_json(&json)?;
@@ -1194,6 +1238,7 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 println!("config_seeded={}", outcome.seeded.summary());
                 println!("schemas={}", outcome.assessment.line());
+                println!("numpad={}", numpad_line(&outcome.numpad));
                 println!("build_repaired={}", json.repaired.join(","));
                 println!(
                     "copied={} kept={} overwritten={} config_copied={} failed={}",

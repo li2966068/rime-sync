@@ -12,13 +12,22 @@
 > 改代码前先跑 `cargo test -p rime-sync-core`；涉及输入法补丁的改动，请一并覆盖
 > 「全新安装」与「从旧版本升级」两种场景。
 
-> ⚠️ **v0.6.24 已知问题**：Windows 上从 0.6.19 及更早版本升级时，`luna_pinyin` 方案可能因
-> `vnum` 键重复而加载失败（`duplicate entry with key "vnum"`），程序会显示「输入法未就绪」。
-> 原因是方案补丁在「已被旧版本改过」的文件上不幂等，另有一处 `prebuilt` 清单与产物
-> 对不上（Windows 打包时随包文本被转成了 CRLF，11 个文件铺不进去）导致引擎产物铺不全。
-> **两个缺陷都将在 v0.6.25 修复**；详见
-> [CHANGELOG](CHANGELOG.md#v0624--2026-11-08) 的「已知问题」小节，那里有一份**实测过的
-> 临时规避步骤**（用 `*.rimesync-orig` 备份覆盖回方案文件，再重跑 `ensure-ime`）。
+> ✅ **v0.6.26 修好了小键盘**：Windows 上从 **0.6.8 ~ 0.6.17** 时代用 rime-sync 的机器，
+> **小键盘的数字键（KP_0..KP_9 / KP_Decimal）打不出数字**，主键盘数字正常。
+> 原因是用户 Rime 目录里那份 `<schema>.custom.yaml`（rime-sync 自己生成的、那时还没有
+> `numpad`）会**整段替换**方案的 `engine/processors`，把 `numpad` 顶掉；安装策略是
+> 「已存在的一律沿用（不覆盖）」，所以重装、升级都不会自己好。
+> v0.6.26 起 `ensure` 会**自动增量修补**那份文件（改前先备份成 `.rimesync-orig`），
+> 并且每轮都**常驻判定**小键盘是不是真的可用（`check-ime` 的结论多一档 `partial`：
+> 有缺口就是 partial，且与 failed 一样非零退出）。
+> ⚠️ **升级须知**：请把所有设备都升级到 v0.6.26，并**各自跑一次「修复输入法」**——
+> 没升级的旧设备参与同步时会把修复撤销掉。详见
+> [CHANGELOG](CHANGELOG.md) 的 v0.6.26 小节与
+> [PREBUILT-BOOTSTRAP 第 14 节](docs/PREBUILT-BOOTSTRAP.md#14-用户-customyaml-增量修补与小键盘常驻判定)。
+>
+> v0.6.24 的两个已知问题（方案文件 `vnum` 键重复导致方案加载失败、`prebuilt` 清单与
+> 产物对不上）**已在 v0.6.25 修复**，见
+> [CHANGELOG](CHANGELOG.md#v0625--2026-11-08)。
 
 ---
 

@@ -13,3 +13,8 @@
 # 注意：**不要**对全仓跑 git add --renormalize —— 那会把故意存 CRLF 的真机夹具
 # （crates/core/tests/fixtures/real227_luna_pinyin.orig.yaml）一起改坏。
 packaging/rime/** -text
+
+# 真机手动测试夹具：Windows 记事本保存的 UTF-8(带 BOM) + CRLF/LF 混合行尾。
+# -text 保证 checkout/add 都不改字节，回归测试要按真机原样解析。
+scripts/ime/manual-test/*.txt -text
+crates/core/tests/fixtures/real227_*.yaml -text

@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rime_sync_core::ime_state::{self, Mode, Options, Outcome, OutcomeResult};
 
 const SCHEMA: &str = "luna_pinyin_simp";
-const MARKED: &str = "patch:\n  rimesync_vnum: '['\n  rimesync_punct: ']'\n";
+// 随包产物的真实形态：engine/processors 里带 numpad（小键盘归一化处理器）。
+// 少了 numpad 的假产物会被「常驻小键盘判定」当成「还没重编译」→ 误报成 partial，
+// 所以假数据必须与真实随包产物一致（让假数据更真，而不是放宽断言）。
+const MARKED: &str = "patch:\n  rimesync_vnum: '['\n  rimesync_punct: ']'\nengine:\n  processors:\n    - ascii_composer\n    - rimesync_punct\n    - rimesync_vselect\n    - numpad\n    - selector\n";
 const PLAIN: &str = "name: luna_pinyin_simp\nversion: '1.0'\n";
 const DATA_SAMPLE: &str = "\
 engine:

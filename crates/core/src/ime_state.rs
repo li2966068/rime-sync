@@ -31,6 +31,7 @@ use serde::Serialize;
 use crate::data_patch::{self, DataPatchReport, FixSource};
 use crate::deploy;
 use crate::ime::{self, ImeReport};
+use crate::managed_custom;
 use crate::prebuilt::{self, InstallOptions, PrebuiltReport, SchemaBuild};
 use crate::prune;
 
@@ -311,6 +312,172 @@ pub fn assess(rime_dir: &Path, data_dirs: &[PathBuf], retained: &KeepSet) -> Ass
         schemas,
         build_ok,
         reason,
+    }
+}
+
+// ---- 常驻小键盘判定（缺陷三：小键盘）---------------------------------------
+
+/// 逐方案状态：一切正常。
+const NUMPAD_OK: &str = "ok";
+/// 逐方案状态：来源侧就坏（用户 custom.yaml 自己定义的 processors 里没有 numpad）。
+const NUMPAD_SOURCE_STALE: &str = "source-stale";
+/// 逐方案状态：来源侧没问题，但编译产物里没有 numpad（还没重编译）。
+const NUMPAD_ARTIFACT_STALE: &str = "artifact-stale";
+/// 逐方案状态：压根没有编译产物（还没编译过，不算缺口）。
+const NUMPAD_NO_ARTIFACT: &str = "no-artifact";
+/// 逐方案状态：没有 rime-sync 的引擎定制 → 不判定、不报缺口。
+const NUMPAD_SKIPPED: &str = "skipped";
+
+/// 小键盘判定结果（只读；序列化给 CLI/GUI 用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct NumpadStatus {
+    /// 是否一切正常（没有缺口）。
+    pub ok: bool,
+    /// 有缺口的方案：形如 "wubi86=artifact-stale"。
+    pub missing: Vec<String>,
+    /// 逐方案状态：形如 "wubi86=artifact-stale" / "wubi86=ok" /
+    /// "wubi86=no-artifact" / "wubi86=skipped"。
+    pub detail: Vec<String>,
+    /// 人话结论（可执行的下一步），例如 "小键盘处理器尚未编译进产物，请重启一次输入法"。
+    pub hint: String,
+}
+
+impl NumpadStatus {
+    /// 某个方案的状态（"<id>=<state>" 里 "<state>" 那部分）。
+    pub fn state_of(&self, id: &str) -> Option<&str> {
+        let prefix = format!("{id}=");
+        self.detail
+            .iter()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+    }
+}
+
+/// 常驻小键盘判定：检查保留主方案的编译产物是否含 numpad 处理器。
+/// 只读；不写任何文件。
+///
+/// **每轮都重新判**，不依赖「本轮是否修过文件」：修完用户 custom.yaml 之后
+/// 引擎一直没重编译的话，后续轮次必须继续报 —— 否则又回到缺陷三当初那种
+/// 「报告说 ok、小键盘其实用不了」的静默失败。
+///
+/// 只查保留的主方案（prune::retained_schemas）：依赖方案的产物本来就没有 numpad。
+/// 判定口径（每一档都是为了防误报）：
+/// * 来源侧 = 用户目录的 `<id>.custom.yaml`：是 rime-sync 管理的、定制还开着，
+///   并且**自己定义了** processors 列表却少了 numpad → source-stale（可修）；
+/// * 产物侧 = 用户目录的 `build/<id>.schema.yaml`（引擎真正加载的东西）：
+///   产物在、但没有 numpad → artifact-stale（还没重编译）；
+/// * 产物压根不存在 → no-artifact（还没编译过，不算缺口）；
+/// * 用户自己改过的文件 / 用户关掉了定制 → skipped（既不改也不报）。
+pub fn assess_numpad(rime_dir: &Path, data_dirs: &[PathBuf]) -> NumpadStatus {
+    let mut detail = Vec::new();
+    let mut missing = Vec::new();
+    for id in prune::retained_schemas() {
+        let state = numpad_state(rime_dir, data_dirs, id);
+        detail.push(format!("{id}={state}"));
+        if state == NUMPAD_SOURCE_STALE || state == NUMPAD_ARTIFACT_STALE {
+            missing.push(format!("{id}={state}"));
+        }
+    }
+    let ok = missing.is_empty();
+    let hint = if ok {
+        String::new()
+    } else {
+        numpad_hint(&missing)
+    };
+    NumpadStatus {
+        ok,
+        missing,
+        detail,
+        hint,
+    }
+}
+
+/// 单个方案的逐档判定（只读）。
+fn numpad_state(rime_dir: &Path, data_dirs: &[PathBuf], id: &str) -> &'static str {
+    let custom_text = fs::read(rime_dir.join(format!("{id}.custom.yaml")))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    // 来源侧：这份 custom.yaml 是不是 rime-sync 管的、定制是不是还开着。
+    let source_active = custom_text
+        .as_deref()
+        .map(|text| managed_custom::is_managed(text) && managed_custom::customization_active(text))
+        == Some(true);
+    if custom_text.is_some() && !source_active {
+        // 用户自己写的 / 用户主动关掉了定制：既不改，也不报缺口。
+        return NUMPAD_SKIPPED;
+    }
+    let artifact_text = fs::read(rime_dir.join("build").join(format!("{id}.schema.yaml")))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    // 产物侧信号：rime-sync 的定制确实编译进产物了。
+    let artifact_active = artifact_text
+        .as_deref()
+        .map(|text| text.contains("rimesync_vnum") || text.contains("rimesync_punct"))
+        == Some(true);
+    if !source_active && !artifact_active {
+        // 用户没开 rime-sync 的引擎定制 → 不预期 → 一律不报。
+        return NUMPAD_SKIPPED;
+    }
+    if source_active {
+        // 只有「这份文件自己定义了 processors 列表」才归 source-stale；
+        // 没定义的话处理器列表来自共享方案，不在这里下结论。
+        if let Some(list) = custom_text
+            .as_deref()
+            .and_then(managed_custom::source_processors)
+        {
+            if !list.iter().any(|name| name == data_patch::NUMPAD_PROCESSOR) {
+                return NUMPAD_SOURCE_STALE;
+            }
+        }
+    }
+    match artifact_text.as_deref() {
+        None => {
+            // 产物压根没有 = 还没编译过，不算缺口（build 不可用由 assess 判）。
+            if data_dirs
+                .iter()
+                .any(|dir| dir.join(format!("{id}.schema.yaml")).is_file())
+            {
+                NUMPAD_NO_ARTIFACT
+            } else {
+                NUMPAD_SKIPPED
+            }
+        }
+        Some(text) => {
+            if managed_custom::artifact_text_has_numpad(text) {
+                NUMPAD_OK
+            } else {
+                NUMPAD_ARTIFACT_STALE
+            }
+        }
+    }
+}
+
+/// 缺口的人话下一步（用户照着就能做）。
+fn numpad_hint(missing: &[String]) -> String {
+    let source: Vec<&str> = missing
+        .iter()
+        .filter(|item| item.ends_with(NUMPAD_SOURCE_STALE))
+        .map(String::as_str)
+        .collect();
+    let artifact: Vec<&str> = missing
+        .iter()
+        .filter(|item| item.ends_with(NUMPAD_ARTIFACT_STALE))
+        .map(String::as_str)
+        .collect();
+    if !source.is_empty() {
+        return format!(
+            "用户 custom.yaml（{}）里还缺 numpad 处理器：再点一次「修复输入法」把它补上（补上后还需要重编译一次）。",
+            source.join(" ")
+        );
+    }
+    let ids = artifact.join(" ");
+    if cfg!(windows) {
+        format!(
+            "小键盘处理器（numpad）还没编译进产物（{ids}）：请再点一次「修复输入法」，它会触发进程内部署重编译。"
+        )
+    } else {
+        format!(
+            "小键盘处理器（numpad）还没编译进产物（{ids}）：请重启一次输入法，引擎启动/维护时会自动重编译。"
+        )
     }
 }
 
@@ -749,6 +916,8 @@ pub struct Outcome {
     pub config_skipped: Vec<String>,
     /// A-5：方案裁剪结果（ensure 内部跑的；Bootstrap 模式下是空报告）。
     pub prune: prune::PruneReport,
+    /// 常驻小键盘判定（部署之后判的；CLI/GUI 都读这一份，不许自己再算一遍）。
+    pub numpad: NumpadStatus,
 }
 
 impl Outcome {
@@ -834,6 +1003,7 @@ fn failed_outcome(
         seeded,
         config_skipped: Vec::new(),
         prune: prune::PruneReport::default(),
+        numpad: assess_numpad(rime_dir, data_dirs),
     }
 }
 
@@ -854,6 +1024,43 @@ pub fn resolve_data_dirs(opts: &Options) -> Vec<PathBuf> {
         Some(resolver) => resolver(),
         None => data_patch::data_dirs(),
     }
+}
+
+/// 修用户目录里的 `<id>.custom.yaml`（缺陷三：小键盘）。
+///
+/// 返回 (是否真的写了盘, 本次修好的方案 id, 每个文件的结果明细, 失败列表)。
+/// 单个文件失败不中断整体：失败项进 `errors`，由调用方降级结论。
+fn repair_user_customs(rime_dir: &Path) -> (bool, Vec<String>, Vec<String>, Vec<String>) {
+    let mut changed = false;
+    let mut repaired = Vec::new();
+    let mut details = Vec::new();
+    let mut errors = Vec::new();
+    for id in managed_custom::list_user_customs(rime_dir) {
+        let path = rime_dir.join(format!("{id}.custom.yaml"));
+        match managed_custom::repair_file(&path) {
+            Ok(managed_custom::RepairOutcome::Repaired { backup }) => {
+                changed = true;
+                repaired.push(id.clone());
+                let backup = match backup {
+                    Some(value) => format!(" backup={}", value.display()),
+                    None => String::new(),
+                };
+                details.push(format!("{id}=repaired{backup}"));
+            }
+            Ok(managed_custom::RepairOutcome::Unchanged) => {
+                details.push(format!("{id}=unchanged"));
+            }
+            Ok(managed_custom::RepairOutcome::Skipped(reason)) => {
+                details.push(format!("{id}=skipped({reason})"));
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                errors.push(format!("{id}: {text}"));
+                details.push(format!("{id}=failed({text})"));
+            }
+        }
+    }
+    (changed, repaired, details, errors)
 }
 
 /// **唯一入口**：assess → （不满足才）铺 prebuilt → （需要才）patch data →
@@ -994,6 +1201,59 @@ pub fn ensure(
                     seeded.summary().to_string(),
                 ));
             }
+        }
+
+        // B1：用户目录 default.custom.yaml 的 schema_list **增量补齐**。
+        //
+        // 顺序：**seed 之后 → 补齐 → prune → assess**（补齐必须在 prune 之前）。
+        //
+        // 为什么放在这里：
+        // * seed_templates 只写「缺失才写」的模板，用户已有的 default.custom.yaml
+        //   一律沿用（2026-11-02 定的安装策略）—— 升级用户的 schema_list 因此可能
+        //   长期只有一两个方案，而 librime 只按 schema_list 生成 build，全量重新
+        //   部署时保留方案的产物就没了（用户方案「凭空消失」）。
+        // * **补齐在 prune 之前**：prune 会把不在保留清单里的条目删掉（真机 227
+        //   的 luna_pinyin 就不在清单里）。先补齐再裁剪 → 最终列表正好是三个保留
+        //   方案、顺序就是保留清单的顺序；反过来（先 prune 后补齐）会留下清单外的
+        //   条目，而且每次 ensure 都会被「删一次 + 补一次」地改写一遍（churn）。
+        //   先补齐再裁剪是幂等的：第二轮补齐发现三个都在 → Unchanged，prune 没有
+        //   可删的 → dropped == 0 直接返回，一个字节都不动。
+        // * 平台无关：seed_templates 只在 Windows 调用（ensure 里 cfg!(windows)），
+        //   补齐必须两端一致，所以放在 ensure 这一层而不是 seed_templates 内部。
+        //
+        // 门禁：只补 data 目录里**真实存在**的保留方案 —— 补一个不存在的方案会让
+        // librime 部署把缺失方案计成 failure、整次部署失败（与
+        // prebuilt::config_gate_skip 同一个道理）。
+        {
+            let allowed: Vec<String> = prune::retained_schemas()
+                .iter()
+                .filter(|id| {
+                    prebuilt::data_has_schema(&data_dirs, id)
+                        || payload
+                            .map(|dir| {
+                                dir.join("build")
+                                    .join(format!("{id}.schema.yaml"))
+                                    .is_file()
+                            })
+                            .unwrap_or(false)
+                })
+                .map(|id| id.to_string())
+                .collect();
+            let outcome = managed_custom::repair_default_schema_list_in(rime_dir, Some(&allowed));
+            let (changed, detail) = match outcome {
+                Ok(managed_custom::RepairOutcome::Repaired { backup }) => {
+                    let backup = backup
+                        .map(|value| format!(" backup={}", value.display()))
+                        .unwrap_or_default();
+                    (true, format!("repaired{backup}"))
+                }
+                Ok(managed_custom::RepairOutcome::Unchanged) => (false, "unchanged".to_string()),
+                Ok(managed_custom::RepairOutcome::Skipped(reason)) => {
+                    (false, format!("skipped({reason})"))
+                }
+                Err(error) => (false, format!("failed({error:#})")),
+            };
+            actions.push(Action::new("schema-list", changed, detail));
         }
 
         // A-5：方案裁剪纳入 ensure（Install/Fix），位置在 seed 之后、assess 之前。
@@ -1195,14 +1455,38 @@ pub fn ensure(
         ));
     }
 
+    // ---- 用户级 custom.yaml 修复（缺陷三：小键盘）--------------------------
+    // 位置：prune 之后、install/data 之后、deploy 之前。
+    // * prune 之后：裁剪会清掉非保留方案的残留，先裁再修；
+    // * install 之后：铺随包产物只补缺失、永不覆盖 config/，但顺序上「先铺后修」
+    //   才能保证修完的就是最终态；
+    // * deploy 之前：修完立刻部署，重编译才能看到新内容（librime 的
+    //   ConfigNeedsUpdate 会比对用户 custom.yaml 的 mtime）。
+    let (custom_repair_changed, custom_repaired_ids, custom_repair_details, custom_repair_errors) =
+        repair_user_customs(rime_dir);
+    actions.push(Action::new(
+        "custom-repair",
+        custom_repair_changed,
+        format!(
+            "files={} repaired=[{}] {}",
+            custom_repair_details.len(),
+            custom_repaired_ids.join(","),
+            custom_repair_details.join(" ")
+        ),
+    ));
+
     // changed = 「本次确实动了磁盘」。四条来源都要算：
     //   installed_changed —— 铺随包产物 / 补 config（install 分支 + always_config 分支）
     //   changed_data      —— 给 data 方案打补丁
     //   seeded.changed()  —— 播种 config 模板（写了文件）
     //   prune_report.removed() —— 裁掉了非保留方案
     // 漏掉任何一条都会把「做了事」报成 Noop。
-    let changed =
-        installed_changed || changed_data || seeded.changed() || prune_report.removed() > 0;
+    let changed = installed_changed
+        || changed_data
+        || seeded.changed()
+        || prune_report.removed() > 0
+        // 用户 custom.yaml 被修 = 真的要重编译（否则 deploy 分支会被 no-changes 跳过）。
+        || custom_repair_changed;
     let mut deploy_detail = String::new();
     if !opts.deploy {
         actions.push(Action::new("deploy", false, "skipped reason=disabled"));
@@ -1251,6 +1535,28 @@ pub fn ensure(
                 report.deploy_detail
             ),
         ));
+    }
+
+    // ---- 常驻小键盘判定（缺陷三）--------------------------------------------
+    // 每轮都重新判，不看「本轮修过谁」：修完用户 custom.yaml 之后引擎一直没
+    // 重编译的话，后续轮次必须继续报 —— 否则又回到「报告说 ok、小键盘其实用不了」
+    // 的静默失败（缺陷三当初就是这么悄悄发布出去的）。
+    let numpad = assess_numpad(rime_dir, &data_dirs);
+    actions.push(Action::new("numpad", false, numpad.detail.join(" ")));
+    // 兼容旧动作名：本轮修过的方案，产物里有没有 numpad。
+    // 取值来自同一份判定结果，不另做一套判据。
+    if !custom_repaired_ids.is_empty() {
+        let mut checks = Vec::new();
+        for id in &custom_repaired_ids {
+            let state = numpad.state_of(id).unwrap_or(NUMPAD_SKIPPED);
+            let token = match state {
+                NUMPAD_OK => "yes",
+                NUMPAD_NO_ARTIFACT => "no-artifact",
+                _ => "no",
+            };
+            checks.push(format!("{id}={token}"));
+        }
+        actions.push(Action::new("numpad-check", false, checks.join(" ")));
     }
 
     // 最终判据：**只有** assess 说话。
@@ -1310,6 +1616,22 @@ pub fn ensure(
         //
         // 这里单独判一次（不只依赖 finish_deploy 的 problems）：finish_deploy 只在
         // 「本次有改动」时才会跑，config 全被跳过（= 没改动）时那一层根本不会执行。
+        // 用户 custom.yaml 修失败：修了但没修成，小键盘还是用不了 → 降级。
+        if !custom_repair_errors.is_empty() {
+            problems.push(format!(
+                "custom_repair_failed={}",
+                custom_repair_errors.join(" | ")
+            ));
+        }
+        // 小键盘没生效：产物里没有 numpad 处理器 = 用户按小键盘还是打不出数字。
+        // 不降级就会报 ok —— 那正是缺陷三当初的静默失败。
+        if !numpad.ok {
+            problems.push(format!(
+                "numpad_missing={} ({})",
+                numpad.missing.join(","),
+                numpad.hint
+            ));
+        }
         if !report.config_skipped.is_empty() {
             problems.push(format!(
                 "config_skipped={}",
@@ -1390,6 +1712,7 @@ pub fn ensure(
         seeded,
         config_skipped,
         prune: prune_report,
+        numpad,
     }
 }
 

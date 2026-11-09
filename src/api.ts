@@ -520,6 +520,13 @@ export interface FixImeReport {
   deploy_detail: string;
   /// 进程内部署的一句话结论（没跑时为 "-"）。
   deploy_inproc: string;
+  /// 本次实际做过的每一步（Rust: ime_state::Action）。可选字段：老后端没有它。
+  actions?: { kind: string; changed: boolean; detail: string }[];
+  /// 小键盘（numpad）判定（Rust: ime_state::NumpadStatus）。
+  /// 可选字段：老后端没有它 → 前端不显示小键盘行（不等于"坏了"）。
+  /// ok=没问题；missing=有缺口的方案（形如 "wubi86=artifact-stale"）；
+  /// detail=逐方案状态；hint=一句人话的下一步（后端是中文，界面里只当技术细节）。
+  numpad?: { ok: boolean; missing: string[]; detail: string[]; hint: string };
 }
 
 /// 启动自举的输入法状态（cmd_ime_status / ime://bootstrap 事件）。
@@ -610,7 +617,8 @@ export const api = {
 
   listSchemas: () => invoke<SchemaEntry[]>("cmd_list_schemas"),
   setSchemas: (ids: string[]) => invoke<SetSchemasResult>("cmd_set_schemas", { ids }),
-  // 输入法产物自举：force = 覆盖已有 build/（config/*.yaml 永不覆盖）。
+  // 输入法产物自举：force = 覆盖已有 build/（default/weasel 的 *.custom.yaml 永不覆盖；
+  // rime-sync 自己生成的 <id>.custom.yaml 会被增量修补并先备份，用户自己改过的不动）。
   fixIme: (force = false) => invoke<FixImeReport>("cmd_fix_ime", { force }),
   // 首启自举状态（设置页红条）与「以管理员重启」。
   imeStatus: () => invoke<ImeBootstrapStatus | null>("cmd_ime_status"),

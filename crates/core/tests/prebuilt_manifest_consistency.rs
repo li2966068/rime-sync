@@ -24,7 +24,10 @@ use rime_sync_core::prebuilt;
 /// 随包保留的三个方案（packaging/rime/retained-schemas.txt 的同一份清单）。
 const SCHEMAS: [&str; 3] = ["luna_pinyin_simp", "wubi_pinyin", "wubi86"];
 /// 随包插件标记：没有它，引擎产物会被判成 stale（schema-stale）。
-const MARKED: &str = "patch:\n  rimesync_vnum: '['\n  rimesync_punct: ']'\n";
+///
+/// 形态必须与真实随包产物一致：engine/processors 里带 numpad（小键盘归一化处理器）。
+/// 少了 numpad 的假产物会被「常驻小键盘判定」当成「还没重编译」→ 误报成 partial。
+const MARKED: &str = "patch:\n  rimesync_vnum: '['\n  rimesync_punct: ']'\nengine:\n  processors:\n    - ascii_composer\n    - rimesync_punct\n    - rimesync_vselect\n    - numpad\n    - selector\n";
 const DATA_SAMPLE: &str = "\
 engine:
   processors:

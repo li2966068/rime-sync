@@ -34,10 +34,20 @@ foreach ($dir in @((Join-Path $payload 'build'), (Join-Path $payload 'config'), 
 }
 
 # 随包预编译产物（最小但完整的形态：三个目标方案 + 插件标记）。
+# engine/processors 里必须带 numpad：真实随包产物就是这个形态。少了它会被「常驻小键盘判定」
+# 判成「引擎还没重编译」（artifact-stale）→ 结论从 ok 掉成 partial，把下面「首次启动 result 期望 ok」
+# 那条断言带崩。正确做法是让假数据更真（跟真实随包产物一致），不是放宽断言。
 $marked = @"
 patch:
   rimesync_vnum: '['
   rimesync_punct: ']'
+engine:
+  processors:
+    - ascii_composer
+    - rimesync_punct
+    - rimesync_vselect
+    - numpad
+    - selector
 "@
 $plainConfig = @"
 patch:

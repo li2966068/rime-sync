@@ -31,7 +31,9 @@ export async function runFixIme(force = false): Promise<void> {
     // B-2：config 模板被跳过 = 该输入法**没有 schema_list**（用户没有方案可选）。
     // 这条必须单独说，不能埋在明细里。
     const configMessage = configSkippedLine(report);
-    const message = [buildMessage, weaselMessage, configMessage]
+    // 小键盘的结论也要进 toast：用户往往只看到这条气泡。
+    const numpadMessage = numpadConclusion(report);
+    const message = [buildMessage, weaselMessage, configMessage, numpadMessage]
       .filter(Boolean)
       .join("；");
     toast(message);
@@ -114,8 +116,26 @@ function describe(report: FixImeReport): string {
     parts.push(configLine);
   }
   parts.push(weaselLine(report));
+  // 小键盘：后端给了常驻判定就如实呈现（好也说、好坏也说）；老后端没有这字段就不添这一行。
+  const numpad = report.numpad;
+  if (numpad) {
+    parts.push(numpad.ok ? t("fixIme.numpadOk") : t("fixIme.numpadBad", { list: numpadSchemaIds(numpad.missing ?? []).join(", ") }));
+    if (!numpad.ok) {
+      // 坏了必须说清下一步做什么，否则用户只看到"坏了"却不知道怎么办。
+      parts.push(t("fixIme.numpadNext"));
+      const technical = numpadTechnicalText(numpad);
+      if (technical) {
+        parts.push(t("fixIme.numpadDetail", { text: technical }));
+      }
+    }
+  }
   if (report.result === "partial" || report.result === "failed") {
-    parts.push(t("fixIme.resultLine", { result: report.result, detail: report.detail }));
+    // 后端 detail 是中文技术描述：标成"技术细节"，英文界面下不当正文。
+    parts.push(
+      report.detail
+        ? t("fixIme.resultLineDetail", { result: report.result, text: report.detail })
+        : t("fixIme.resultLine", { result: report.result, detail: "-" }),
+    );
   }
   if (report.needs_elevation || report.weasel_needs_elevation) {
     parts.push(t("fixIme.needsElevation"));
@@ -164,4 +184,42 @@ function weaselLine(report: FixImeReport): string {
         error: report.weasel_error || report.weasel_install,
       });
   }
+}
+
+/// 小键盘结论（给 toast 用）：本地化的一句话结论。
+///
+/// 老后端没有 numpad 字段 → 空串（不当成"坏了"，也不添乱）。
+function numpadConclusion(report: FixImeReport): string {
+  const numpad = report.numpad;
+  if (!numpad) {
+    return "";
+  }
+  if (numpad.ok) {
+    return t("fixIme.numpadOk");
+  }
+  // 坏了就把下一步一起给出去：toast 是用户唯一会看的地方，不能只说"坏了"。
+  return [
+    t("fixIme.numpadBad", { list: numpadSchemaIds(numpad.missing ?? []).join(", ") }),
+    t("fixIme.numpadNext"),
+  ].join(" · ");
+}
+
+/// missing 里每项形如 "<id>=<state>"；正文只报方案 id，state 属于技术细节。
+function numpadSchemaIds(missing: string[]): string[] {
+  return missing.map((entry) => entry.split("=")[0] || entry);
+}
+
+/// 小键盘的技术细节：后端 hint 与逐方案状态。
+///
+/// 后端是中文，只能当"技术细节"出现，英文界面下不当正文。
+function numpadTechnicalText(numpad: NonNullable<FixImeReport["numpad"]>): string {
+  const parts: string[] = [];
+  if (numpad.hint) {
+    parts.push(numpad.hint);
+  }
+  const raw = numpad.missing?.length ? numpad.missing : numpad.detail ?? [];
+  if (raw.length > 0) {
+    parts.push(raw.join(", "));
+  }
+  return parts.join(" · ");
 }

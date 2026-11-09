@@ -195,6 +195,9 @@ pub fn resolve_installer(exe_dir: Option<&Path>) -> Option<(PathBuf, String)>;
 
 1. `build/`：**缺才铺**。目标已存在就计入 `kept`，不动。
 2. `config/*.yaml`：**只补缺**，任何模式下都不覆盖（用户配置）。
+   - 例外见 [第 14 节](#14-用户-customyaml-增量修补与小键盘常驻判定)：用户目录里
+     **rime-sync 自己生成**的那份 `<方案>.custom.yaml` 会被**增量修补**（先备份成
+     `<文件>.rimesync-orig`）；用户自己写过的文件一个字都不动。
 3. **第二次机会**：第一遍铺完 `probe_build` 仍不是 `prebuilt`（典型：
    用户目录里本来就有旧部署产物、没有插件标记，「缺才铺」把它们跳过去了）→ 只对
    `build/` **覆盖一次**（`escalated=true`）。`build/` 是部署器随时重写的
@@ -268,7 +271,8 @@ AppImage 在 `$APPDIR/usr/bin/rime-sync-cli`。
 # 自动定位 payload（安装目录 / deb / AppImage）
 rime-sync-cli fix-ime
 
-# 覆盖已存在的 build/（config 永不覆盖）
+# 覆盖已存在的 build/（default/weasel 的 *.custom.yaml 永不覆盖；
+# rime-sync 自己生成的 <方案>.custom.yaml 会被增量修补并先备份，用户自己改过的不动）
 rime-sync-cli fix-ime --force
 
 # 只铺 build/，不给 data 方案打补丁
@@ -440,6 +444,11 @@ Test-Path "$env:ProgramFiles\rime-sync\rime-sync-cli.exe"
 `numpad` 是 0.6.18 新增的插件组件（见 `third_party/librime/PLUGINS.md` 第 4 节）：
 把 `KP_0..KP_9` / `KP_Decimal` 归一化成 `0..9` / `.` 后交回引擎，**不改任何
 schema 的 alphabet**，对普通拼音输入同样生效。
+
+注意这份列表写在 **data 目录**（共享方案）里，而用户目录那份 `<方案>.custom.yaml`
+也会 `patch:` 同一个 `engine/processors` 列表 —— librime 对列表是**整体替换**，
+所以用户目录里那份会**整段顶掉**这里的列表（含 `numpad`）。详见
+[第 14 节](#14-用户-customyaml-增量修补与小键盘常驻判定)。
 
 0.6.19 起 `KP_Decimal` 有一个唯一的例外：**没有组字时直接上屏 ASCII 句点
 `.`**（`engine_->CommitText`，不再交回标点处理器），所以中文态也是 `.` 而不是
@@ -676,6 +685,8 @@ weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-ins
 * `crates/core/src/prebuilt.rs` 单测（8 个）：缺文件铺、已有文件跳过、旧产物无标记触发
   build 覆盖、config 永不覆盖、force 只影响 build、payload 缺失的可读错误、
   probe 三态、exe 相对定位；
+  （这里的「config 永不覆盖」说的是 **prebuilt.rs 的铺入路径**；用户 custom.yaml 的
+  增量修补是**另一条路径**（`managed_custom.rs`，见[第 14 节](#14-用户-customyaml-增量修补与小键盘常驻判定)）。）
 * `crates/core/src/data_patch.rs` 单测（12 个）：注册表输出解析（WeaselRoot +
   InstallDir 都保留、只有 InstallDir、非 REG_SZ 忽略）、`weasel-*` 版本解析与排序、
   data 目录解析 5 条路径（WeaselRoot 命中 / WeaselRoot 没有 data 走版本目录（227 形状）/
@@ -692,6 +703,25 @@ weasel_installer=C:\Program Files\rime-sync\resources\weasel\weasel-0.17.4.0-ins
   vnum 不被改写、目录级计数与 `backup_dir`、权限错误可读、缺 recognizer 的合成方案；
   0.6.20 起另有 6 个 punctuator 用例：段缺失 / 标量 / 已是映射三种形态都能注入、
   已有 `"\\"` 或 `":"` 时不覆盖且文件不变、重复执行逐字节相同、CRLF + 无 BOM 保持；
+* `crates/core/tests/managed_custom_repair.rs` 集成测试（16 个）：旧模板被修好且
+  `numpad` 紧跟在 `rimesync_vselect` 后面、已修好的文件不再写、用户自己写的文件跳过、
+  用户关掉 rime-sync 定制后跳过、文件里没有任何 rimesync 名字就跳过、幂等且备份只写一次、
+  CRLF 保持、BOM 保持、`numpad` 位置不对时挪到 `rimesync_vselect` 后面、没有
+  `rimesync_vselect` 就跳过、嵌套的 processors 列表也支持、没有 processors 列表就跳过、
+  坏输入只报错不 panic、两种 rime-sync 标记都认得出来、批量扫描与逐方案报告、
+  批量修时缺失文件跳过；
+* `crates/core/tests/ime_custom_repair_flow.rs` 集成测试（5 个）：ensure 修好 227 形状的
+  旧 custom.yaml、用户自己写的文件不动、用户关掉定制的文件不动、对 custom 修补幂等、
+  修补算作「本次改了磁盘」（否则会误判成什么都没做、跳过部署）；
+* `crates/core/tests/numpad_assess.rs` 集成测试（12 个）：旧 custom 修好后仍报
+  artifact-stale、第二轮 ensure 仍然报缺口、产物里有 numpad 就是 ok、关掉定制既不改也不报、
+  用户自己的文件既不改也不报、判定只读不改文件、没有 processors 列表不算来源侧缺口、
+  没有产物不算缺口、只判保留主方案、产物缺失但方案存在 = no-artifact、状态可序列化、
+  每个保留方案都有逐项状态；
+* `crates/cli/tests/numpad_report.rs` 集成测试（7 个）：check-ime 报缺口且只读、
+  check-ime 与 ensure-ime 结论一致、产物里有 numpad 时 check-ime 是 ok、文本模式打印
+  人能看懂的 numpad 行、ensure-ime 的 JSON 带 numpad 段、空目录上 check-ime 不 panic、
+  check-ime 不动用户目录里任何文件；
 * `crates/cli/tests/fix_ime.rs` 集成测试（4 个）：假 payload + 临时目录跑
   `fix-ime --json`，校验 JSON 计数、真实落盘文件与 `--no-data-patch`；
 * `scripts/ime/rime-vmode-smoke.cc`（容器 smoke，手工跑）：在真实部署过的 data
@@ -951,3 +981,119 @@ gnu 目标的 `target_os` 同样是 `windows`，而 `cargo check` 不链接，�
 （如上）；gnu 目标需要 mingw 的 gcc，开发机上没有，因此这条命令只在 CI 上真正跑过。
 若哪天 ring 改了构建方式导致 gnu 也编不动，把 job 改成 `runs-on: windows-latest` +
 原生 `cargo check` 即可（release.yml 里已经是这样）。
+
+## 14. 用户 custom.yaml 增量修补与小键盘常驻判定
+
+（本节描述 0.6.26 引入的行为。）
+
+这一节说明缺陷三（小键盘数字键失效）的完整机制与修法。
+
+### 14.1 现象与根因
+
+现象：装好 rime-sync 后，**小键盘**的数字键（KP_0..KP_9、KP_Decimal）打不出数字，
+主键盘数字正常。
+
+根因是 librime 的 `patch:` 语义**不是合并，而是整段替换**：
+`PatchLiteral::Resolve()` 对 list 类型的值直接 `*target = value`。
+而 `AutoPatchConfigPlugin::ReviewCompileOutput()` 会自动追加一条
+`PatchReference(<schema>.custom, "patch", true)` —— 也就是**用户目录下的
+`<schema>.custom.yaml` 一定会参与这次 patch**。于是链条是这样断的：
+
+1. rime-sync 往 data 目录的 `engine/processors` 里插了 `numpad`（见[第 9 节](#9-data-方案补丁0618)）；
+2. 但用户目录里那份 `<schema>.custom.yaml` 里**也**写了一份 `engine/processors`
+   （rime-sync 自己生成的模板，见 `packaging/rime/schemas/*.custom.yaml`），
+   它是整段替换，把上一步插进去的 `numpad` 一起顶掉了；
+3. 编译产物里就没有 `numpad` 这个 processor，小键盘数字键失效。
+
+而「用户目录里那份 custom.yaml 是旧的」是常态：安装策略是「已存在的一律沿用
+（不覆盖）」，所以 **v0.6.8 ~ v0.6.17 期间生成的老 custom.yaml 会一直留在用户目录里**，
+永远等不到新模板。v0.6.18 才把 `numpad` 加进模板，但老文件不会被替换。
+
+模板历史（`packaging/rime/schemas/*.custom.yaml`）：
+
+| 版本 | `rimesync_vselect` | `numpad` |
+|---|---|---|
+| v0.6.7 | 无 | 无 |
+| v0.6.8 ~ v0.6.17 | 有 | **无** |
+| v0.6.18 起 | 有 | 有 |
+
+所以：**从 v0.6.8 ~ v0.6.17 装过、并且一直沿用旧文件的机器，小键盘是坏的**，
+而且重装、升级、重跑 `ensure` 都不会自己好。
+
+### 14.2 修法：只增量修补 rime-sync 自己生成的那一份
+
+新增 `crates/core/src/managed_custom.rs`（配套 `crates/core/src/yaml_text.rs`
+做纯文本 YAML 编辑）。规则（`repair_file`）：
+
+| 情况 | 结果 |
+|---|---|
+| 文件没有 rime-sync 标记 | `Skipped("not-managed")` —— 用户自己写的，一个字节都不动 |
+| 有标记，但定制已关闭（`rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` 都不在） | `Skipped("rimesync-disabled")` |
+| 有标记、定制开着，但没有 `engine/processors` 列表 | `Skipped("no-processors-list")` |
+| 有 `rimesync_vselect` 但没有 `numpad` | **在 `rimesync_vselect` 后面紧接着插入 `numpad`** |
+| 已有 `numpad`（且位置正确） | `Unchanged` —— **完全不写盘** |
+
+配套纪律：
+
+* **先备份再改**：备份成 `<文件>.rimesync-orig`，**只备份一次**（已存在就不覆盖，
+  保住最初那份）；
+* **纯文本编辑**（`yaml_text.rs`）：CRLF/LF、结尾换行、BOM、注释、缩进都原样保留，
+  不重新序列化整个 YAML；
+* **写盘前复查**：改完重新用 serde_yaml 解析，并确认 `rimesync_vselect` 与
+  `numpad` 仍然相邻；任何一项不成立就**放弃写入**（不写半成品）；
+* **幂等**：跑第二遍是 `Unchanged`，也不产生第二次备份。
+
+「rime-sync 自己的文件」的判据是**文件里有 rime-sync 的标记**
+（文件里有任一行以 `# 由 rime-sync 生成` 或 `# patched by rime-sync` 开头）**且定制还开着**
+（文件里还有 `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` 之一）。
+用户照 [INPUT-ENHANCEMENTS 第 4 节](INPUT-ENHANCEMENTS.md#4-怎么关闭) 关掉定制
+（删掉文件、或删掉 `rimesync_*` 那几行）之后，rime-sync 就不再碰它。
+
+`default.custom.yaml` / `weasel.custom.yaml` **永远不参与**：它们没有 rime-sync 标记。
+
+### 14.3 常驻判定：每轮都重新判，不靠「这轮有没有改过文件」
+
+`ime_state::assess_numpad(rime_dir, data_dirs)`（只读）给每个**保留主方案**
+一个状态：
+
+| 状态 | 含义 | 算缺口吗 |
+|---|---|---|
+| `ok` | 产物里有 numpad | 否 |
+| `source-stale` | 来源侧就坏：用户 custom.yaml 自己定义的 `engine/processors` 里没有 numpad | 是（可修） |
+| `artifact-stale` | 来源侧没问题，但 `build/<id>.schema.yaml` 里没有 numpad（还没重编译） | 是 |
+| `no-artifact` | 压根没有编译产物（还没编译过） | 否（产物可用性由 `assess` 判） |
+| `skipped` | 用户自己改过的文件，或用户关掉了定制 | 否 |
+
+**为什么必须常驻判**：修完用户 custom.yaml 之后，引擎可能一直没重编译。
+如果判定只挂在「本轮改没改过文件」上，第二轮就会报 ok —— 又回到缺陷三当初
+那种「报告说 ok、小键盘其实用不了」的静默失败。所以 `assess_numpad` **每轮都重新跑**，
+只看**当前磁盘状态**。只判保留主方案（依赖方案的产物本来就没有 numpad）。
+
+### 14.4 报告与出口
+
+* CLI（`check-ime` / `ensure-ime` / `fix-ime`）的 JSON 报告都多一个 `numpad` 段：
+  `{ ok, missing: ["<id>=<state>"], detail: ["<id>=<state>"], hint }`；
+  文本模式多一行 `numpad=ok` 或 `numpad=问题 <ids>（<hint>）`。
+* `check-ime` 的结论口径：`build_ok=false` → `failed`；有小键盘缺口 → `partial`；
+  其余 → `ok`。**`partial` 与 `failed` 一样非零退出** —— 「小键盘不能用」不算成功。
+* GUI：「修复输入法」的报告带同一段 `numpad`；启动自举的状态里多一个原因码
+  `numpad-pending`（`imeBanner.reasonNumpadPending`）。
+* `ensure` 的动作日志里有一条 `custom-repair`（改了哪些文件、备份在哪），
+  修补算「本次改了磁盘」→ 会继续走部署。
+
+### 14.5 重编译的时机：Windows 与 Linux 不一样
+
+判定挂在产物上，所以**产物里出现 numpad 才算修好**，而产物要等引擎重编译。
+librime 决定要不要重编译看的是 `ConfigNeedsUpdate()`：拿
+`__build_info.timestamps[resource_id]` 和 `resolver->ResolvePath(resource_id)`
+的 mtime 比 —— resolver 的根是**用户数据目录**，所以被比的就是**用户目录里那份
+`<id>.custom.yaml`**。我们改的正是这个文件，因此改完就满足了「需要重编译」。
+
+* **Windows**：`ensure` 会走进程内部署（`deploy::decide` → `DeployMethod::Inproc`），
+  部署即重编译，所以**修完这一轮产物里就有 numpad**。若仍报 `artifact-stale`，
+  再点一次「修复输入法」即可。
+* **Linux**：`ensure` 不在进程内部署（`deploy::decide` 直接返回
+  `platform:linux-keeps-existing-deploy`），重编译交给 librime 自己在下次引擎
+  启动 / 维护时做（`DetectModifications` 比较用户 + 共享目录里所有 `.yaml` 的
+  最大 mtime 与 `var/last_build_time`）。所以 **Linux 上第一轮多半还是 partial，
+  重启输入法后的下一轮才干净**。这是平台固有的差异，不是 bug。

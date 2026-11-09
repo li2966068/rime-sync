@@ -20,6 +20,8 @@ const REASON_KEYS: Record<string, MessageKey> = {
   ok: "imeBanner.reasonOk",
   noop: "imeBanner.reasonNoop",
   partial: "imeBanner.reasonPartial",
+  // 后端只在「结论是 partial 且唯一原因是小键盘」时给这个码。
+  "numpad-pending": "imeBanner.reasonNumpadPending",
   "install-disabled": "imeBanner.reasonInstallDisabled",
   "install-failed": "imeBanner.reasonInstallFailed",
   timeout: "imeBanner.reasonTimeout",

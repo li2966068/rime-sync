@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::data_patch;
 use crate::rime_dir;
+use crate::yaml_text::RawLines;
 
 /// 保留清单（编译期嵌入，与 Python/安装脚本共用同一份文件）。
 pub const RETAINED_SCHEMAS_TXT: &str = include_str!("../../../packaging/rime/retained-schemas.txt");
@@ -489,20 +490,28 @@ fn prune_schema_list_file(
     options: PruneOptions,
     report: &mut PruneReport,
 ) {
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(bytes) = fs::read(path) else {
         return;
     };
-    let mut out: Vec<&str> = Vec::new();
+    let Ok(text) = String::from_utf8(bytes) else {
+        return;
+    };
+    // 逐行保真：BOM、每一行原有的行尾、文件末尾「有没有空行」这个属性全部原样
+    // 保留（真机 227 的 default.custom.yaml 就是 BOM + 混合行尾：正文 LF、末尾
+    // CRLF 空行）。以前的 join("\n") 会把所有 CRLF 统一成 LF、还会丢掉末尾
+    // 空行 —— 那是改用户自己的文件，不该发生。
+    let doc = RawLines::parse(&text);
+    let mut kept: Vec<usize> = Vec::new();
     let mut in_list = false;
     let mut key_indent = 0usize;
     let mut dropped = 0usize;
-    for line in text.lines() {
+    for (index, line) in doc.lines.iter().enumerate() {
         let trimmed = line.trim();
         let indent = line.len() - line.trim_start().len();
         if !in_list && trimmed == "schema_list:" {
             in_list = true;
             key_indent = indent;
-            out.push(line);
+            kept.push(index);
             continue;
         }
         if in_list && !trimmed.is_empty() && !trimmed.starts_with('-') && indent <= key_indent {
@@ -516,7 +525,7 @@ fn prune_schema_list_file(
                 }
             }
         }
-        out.push(line);
+        kept.push(index);
     }
     if dropped == 0 {
         return;
@@ -537,10 +546,8 @@ fn prune_schema_list_file(
         report.failures.push(format!("{}: {error}", path.display()));
         return;
     }
-    let mut body = out.join("\n");
-    if text.ends_with('\n') {
-        body.push('\n');
-    }
+    // 按原行尾逐行拼回去（不统一行尾、不丢末尾空行）。
+    let body = doc.select(&kept).render();
     match fs::write(path, body) {
         Ok(()) => report.removed.push(format!(
             "{name}: schema_list -{dropped}（{}）",
