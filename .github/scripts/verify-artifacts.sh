@@ -280,6 +280,25 @@ print(data.count(sys.argv[2].encode('utf-8')))
 PY
 }
 
+# 组件判定按「候选字节串列表」：任一候选命中即算该组件存在。
+# 为什么不能只搜一个字符串：组件注册名（rimesync_vnum 之类）是短字面量，
+# 编译器可能把它变成立即数而不留连续字节；类符号（NumpadProcessor 等）
+# 在 Itanium mangling 后仍含类名，所以两个都留着才算稳。
+component_present() { # $1=file $2=候选串列表（'|' 分隔）；命中则 echo 命中的候选
+  local file=$1 list=$2 cand n
+  local -a cands=()
+  IFS='|' read -r -a cands <<<"$list"
+  for cand in "${cands[@]}"; do
+    [ -n "$cand" ] || continue
+    n=$(count_ascii "$file" "$cand" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # 0.6.9 起 Windows 包里的 rime.dll 必须是自建 librime（合并 plugins/rimesync-extra）。
 # 三个组件名是 registry 注册用的普通字符串常量，合并进 rime.dll 后就是明文。
 # 判定分两种：
@@ -300,18 +319,22 @@ check_rime_components() { # $1=l2 解包目录 $2=caption 命中次数
     return
   fi
 
+  # 四个组件都按「候选字节串列表」判定（任一命中即算存在）：
+  # rimesync_vnum / rimesync_punct / rimesync_vselect / numpad。
+  # numpad 给两个候选：小写注册名 numpad 与类名 NumpadProcessor —— Windows 的
+  # rime.dll 两者都有，Linux 的 librime.so 可能只剩类名。
   local missing=()
   for dll in "${dlls[@]}"; do
-    for comp in rimesync_vnum rimesync_punct rimesync_vselect; do
-      n=$(count_ascii "$dll" "$comp" 2>/dev/null || echo 0)
-      if [ "${n:-0}" -le 0 ]; then
-        missing+=("$(basename "$(dirname "$dll")")/$(basename "$dll"):$comp")
+    for comp in "rimesync_vnum|rimesync_vnum" "rimesync_punct|rimesync_punct" \
+                "rimesync_vselect|rimesync_vselect" "numpad|numpad|NumpadProcessor"; do
+      if [ -z "$(component_present "$dll" "$comp" 2>/dev/null || true)" ]; then
+        missing+=("$(basename "$(dirname "$dll")")/$(basename "$dll"):${comp%%|*}")
       fi
     done
   done
 
   if [ "${#missing[@]}" -eq 0 ]; then
-    ok "rime.dll 含 rimesync_vnum / rimesync_punct / rimesync_vselect（${#dlls[@]} 个架构，输入增强插件已编进 librime）"
+    ok "rime.dll 含 rimesync_vnum / rimesync_punct / rimesync_vselect / numpad（${#dlls[@]} 个架构，输入增强插件已编进 librime）"
     return
   fi
 
@@ -322,6 +345,58 @@ check_rime_components() { # $1=l2 解包目录 $2=caption 命中次数
     warn "$msg（按 --weasel-mode=$WEASEL_MODE 放行：上游 Weasel 回退包不带插件）"
     summary "> **Windows 版 rime.dll 不含 rimesync-extra**：本版没有输入增强插件（v 模式 / 标点 Shift 备选 / a-h 选词）。"
   fi
+}
+
+# Linux 侧守卫：rime-inputmethod deb 自带的 librime.so 必须含 rime-sync 自研的
+# 四个输入增强组件（numpad / rimesync_vnum / rimesync_punct / rimesync_vselect）。
+# 这四个组件不是 librime 上游的，是 rime-sync 自研、编进 librime 的
+# （third_party/librime/plugins/rimesync-extra，构建开关 BUILD_MERGED_PLUGINS=ON）。
+# 发行版或旧版自建的 librime 永远没有它们 —— 装上去输入法看着能打字，
+# 但小键盘不生效（引擎报 error creating processor: 'numpad'），
+# 标点 Shift 备选与 a-h 选词同样失效。
+check_librime_components() { # $1=rime-inputmethod_*.deb
+  local deb=$1 tmp so comp
+  local -a sos=() missing=()
+  if ! command -v dpkg-deb >/dev/null 2>&1; then
+    warn "缺少 dpkg-deb，跳过 Linux librime 组件检查"
+    return 0
+  fi
+  tmp=$(mktemp -d)
+  if ! dpkg-deb -x "$deb" "$tmp" 2>/dev/null; then
+    rm -rf "$tmp"
+    bad "无法解开 deb 以检查 librime 组件：$(basename "$deb")"
+    return 1
+  fi
+  mapfile -t sos < <(find "$tmp/usr/lib" -name 'librime.so*' 2>/dev/null | sort)
+  if [ "${#sos[@]}" -eq 0 ]; then
+    rm -rf "$tmp"
+    bad "$(basename "$deb") 里没有 usr/lib/x86_64-linux-gnu/librime.so*：Linux 端小键盘 / 输入增强组件无法保证（numpad / rimesync_vnum / rimesync_punct / rimesync_vselect）"
+    return 1
+  fi
+
+  # 四个组件各自的判定字节串（任一命中即算该组件存在）：
+  #   rimesync_vnum    → rimesync_vnum   / VnumTranslator
+  #   rimesync_punct   → rimesync_punct  / PunctProcessor
+  #   rimesync_vselect → rimesync_vselect / VselectProcessor
+  #   numpad           → numpad          / NumpadProcessor
+  for so in "${sos[@]}"; do
+    for comp in "rimesync_vnum|rimesync_vnum|VnumTranslator" \
+                "rimesync_punct|rimesync_punct|PunctProcessor" \
+                "rimesync_vselect|rimesync_vselect|VselectProcessor" \
+                "numpad|numpad|NumpadProcessor"; do
+      if [ -z "$(component_present "$so" "$comp" 2>/dev/null || true)" ]; then
+        missing+=("$(basename "$so"):${comp%%|*}")
+      fi
+    done
+  done
+  rm -rf "$tmp"
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    ok "librime.so 含 numpad / rimesync_vnum / rimesync_punct / rimesync_vselect（${#sos[@]} 个 so，Linux 端小键盘与输入增强可用）"
+    return 0
+  fi
+  bad "librime.so 里搜不到插件组件名：${missing[*]} —— Linux 端小键盘 / 输入增强不生效（numpad 缺失时引擎报 error creating processor: 'numpad'，标点 Shift 备选与 a-h 选词一起失效）"
+  return 1
 }
 
 # 0.6.17：CLI sidecar 与随包预编译产物必须真的在安装包里。
@@ -527,6 +602,8 @@ verify_dir() {
   for deb in "${ime_debs[@]}"; do
     i=$((i + 1))
     check_ime_deb "$deb" "$work/ime-$i"
+    # Linux 侧守卫：deb 自带的 librime.so 必须含 rime-sync 自研的四个输入增强组件。
+    check_librime_components "$deb"
   done
 
   local sync_root=""
@@ -599,6 +676,10 @@ run_selftest() {
     "$root_ime/usr/bin" "$root_ime/usr/lib/rime-sync" \
     "$root_sync/usr/bin"
   printf 'prefix\0/usr/bin/rime-sync-status\0suffix\0' >"$root_ime/usr/lib/x86_64-linux-gnu/fcitx5/rime.so"
+  # Linux 侧：deb 自带的 librime.so 必须含 rime-sync 自研的四个输入增强组件
+  # （numpad / rimesync_vnum / rimesync_punct / rimesync_vselect）。
+  printf 'mock librime.so\0rimesync_vnum\0rimesync_punct\0rimesync_vselect\0numpad\0' \
+    >"$root_ime/usr/lib/x86_64-linux-gnu/librime.so.1.17.0"
   printf 'mock mo\0' >"$root_ime/$LOCALE_MO"
   printf '#!/bin/sh\nexit 0\n' >"$root_ime$STATUS_HELPER"
   printf '#!/bin/sh\nexit 0\n' >"$root_ime$UNINSTALLER"
@@ -626,7 +707,7 @@ PY
   mkdir -p "$weasel_dir/Win32"
   python3 - "$weasel_dir/rime.dll" "$weasel_dir/Win32/rime.dll" <<'PY'
 import sys
-payload = b'MZ' + b'\0' * 64 + b'rimesync_vnum' + b'rimesync_punct' + b'rimesync_vselect'
+payload = b'MZ' + b'\0' * 64 + b'rimesync_vnum' + b'rimesync_punct' + b'rimesync_vselect' + b'numpad'
 for path in sys.argv[1:]:
     open(path, 'wb').write(payload)
 PY
@@ -687,6 +768,8 @@ PY
   }
 
   expect_ok "完整产物应通过" "$base/good"
+  # Linux 侧正向样本：deb 自带的 librime.so 带齐四个输入增强组件时守卫必须放行。
+  expect_ok "librime.so 含 numpad / rimesync_vnum / rimesync_punct / rimesync_vselect 应通过" "$base/good"
 
   # ---- 离线包（0.6.5）：缺包 / 体积不足 / 缺 WebView2 载荷都必须红，齐了才通过 ----
   expect_ok_with() { # $1=label $2=dir $3...=verify 参数
@@ -825,6 +908,34 @@ PY
     rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
     resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
   expect_fail "rime.dll 没合并 rimesync-extra" "$base/no-rime-components" "rimesync_punct"
+
+  # 0.6.26：rime.dll 少了 numpad（小键盘组件）同样必须红 —— 以前这里只查三个组件。
+  mutate no-rime-numpad
+  python3 - "$base/no-rime-numpad/weasel/rime.dll" "$base/no-rime-numpad/weasel/Win32/rime.dll" <<'PY'
+import sys
+# 三个 rimesync-* 组件都在，numpad（小键盘）缺席
+payload = b'MZ' + b'\0' * 64 + b'rimesync_vnum' + b'rimesync_punct' + b'rimesync_vselect'
+for path in sys.argv[1:]:
+    open(path, 'wb').write(payload)
+PY
+  (cd "$base/no-rime-numpad/weasel" && 7z a -bso0 -bsp0 "$base/no-rime-numpad/resources/weasel-0.17.4.0-installer.exe" WeaselServer.exe rime.dll Win32 >/dev/null 2>&1)
+  rm -f "$base/no-rime-numpad/dist/"*-setup.exe
+  (cd "$base/no-rime-numpad" && 7z a -bso0 -bsp0 "$base/no-rime-numpad/dist/rime-sync_0.0.0_x64-setup.exe" \
+    rime-sync-cli.exe resources/weasel-0.17.4.0-installer.exe \
+    resources/prebuilt/build/luna_pinyin_simp.schema.yaml >/dev/null 2>&1)
+  expect_fail "rime.dll 缺 numpad 组件" "$base/no-rime-numpad" ":numpad"
+
+  # Linux 侧守卫：deb 自带的 librime.so 缺组件必须红
+  # （发行版 / 旧版自建的 librime 永远没有 rimesync-extra 组件，Linux 端等于零守卫）。
+  mutate no-librime-components
+  python3 - "$base/no-librime-components/ime-root/usr/lib/x86_64-linux-gnu/librime.so.1.17.0" <<'PY'
+import sys
+# 只留 rimesync_vnum：模拟发行版 / 旧版自建的 librime（没有 rimesync-extra 组件）
+payload = b'\x7fELF' + b'\0' * 64 + b'rimesync_vnum'
+open(sys.argv[1], 'wb').write(payload)
+PY
+  rebuild "$base/no-librime-components"
+  expect_fail "librime.so 没合并 rimesync-extra" "$base/no-librime-components" "搜不到插件组件名"
 
   # 0.6.17：CLI sidecar / prebuilt 产物缺失必须红（证明新断言不是摆设）
   mutate no-cli
