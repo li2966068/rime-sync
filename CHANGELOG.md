@@ -2,6 +2,136 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.6.26 — 2026-11-09
+
+修掉 v0.6.25 之后发现的两个缺陷：**小键盘数字键失效**、**保留方案在重新部署后消失**。
+
+> ⚠️ **升级须知**：请把所有设备都升级到 v0.6.26，并**各自跑一次「修复输入法」**。
+> 修复是通过同步传播的，没升级的旧设备参与同步会把修复撤销掉。
+
+### 缺陷三：用户目录里的旧 custom.yaml 把小键盘处理器顶掉了
+
+**现象**：Windows 上从 0.6.8 ~ 0.6.17 时代用 rime-sync 的机器，装上带小键盘的版本后，
+**小键盘的数字键（KP_0..KP_9 / KP_Decimal）打不出数字**，主键盘数字正常。
+真机（227）上复现，用户目录里那份 `wubi86.custom.yaml` 有 `rimesync_vselect`、没有 `numpad`。
+
+**根因**：librime 的 `patch:` 对**列表**是**整段替换**（`PatchLiteral::Resolve()` 直接
+`*target = value`），不是逐项合并；而 `AutoPatchConfigPlugin::ReviewCompileOutput()`
+会自动追加 `PatchReference(<schema>.custom, "patch", true)` —— **用户目录下的
+`<schema>.custom.yaml` 一定会参与这次 patch**。于是：
+
+1. rime-sync 往 data 目录的 `engine/processors` 里插了 `numpad`；
+2. 用户目录里那份 `<schema>.custom.yaml` 里**也**写了一份 `engine/processors`，
+   它整段替换，把上一步插进去的 `numpad` 一起顶掉了；
+3. 编译产物里没有 `numpad` 这个 processor → 小键盘数字键失效。
+
+**为什么老文件会一直在**：安装策略是「已存在的一律沿用（不覆盖）」，
+v0.6.18 才把 `numpad` 加进模板，但 v0.6.8 ~ v0.6.17 留下的老 custom.yaml 不会被替换，
+所以重装、升级、重跑 `ensure` 都不会自己好。
+
+### 修法
+
+1. **增量修补用户目录的 custom.yaml**（`crates/core/src/managed_custom.rs`，新增）：
+   只动**rime-sync 自己生成**的那份（文件里有 `# 由 rime-sync 生成` /
+   `# patched by rime-sync` 标记）、且 rime-sync 的引擎定制**还开着**（文件里还有
+   `rimesync_vnum` / `rimesync_punct` / `rimesync_vselect` 之一）时，把 `numpad`
+   插到 `rimesync_vselect` 后面。改之前先备份成 `<文件>.rimesync-orig`（只备份一次）；
+   纯文本编辑，保留 CRLF / BOM / 注释 / 缩进；写盘前重新解析并复核相邻关系，
+   不满足就放弃写入；幂等，第二次跑不写盘。用户自己改过的文件、
+   用户主动关掉定制的文件、`default.custom.yaml` / `weasel.custom.yaml` 一个字节都不动。
+2. **常驻判定**（`ime_state::assess_numpad`，新增，只读）：**每轮都重新判**，
+   不依赖「本轮改没改过文件」—— 修完源文件但引擎一直没重编译时，后续轮次必须继续报，
+   免得又回到「报告说 ok、小键盘其实用不了」的静默失败。逐方案五档：
+   `ok` / `source-stale`（源文件缺，可修）/ `artifact-stale`（源文件已好、产物还没重编译）/
+   `no-artifact`（还没编译过，不算缺口）/ `skipped`（用户自己的文件或已关定制）。
+   只判保留主方案。
+3. **报告口径**：CLI 的 `check-ime` / `ensure-ime` / `fix-ime` 的 JSON 多一个
+   `numpad` 段（`ok` / `missing` / `detail` / `hint`），文本模式多一行 `numpad=...`；
+   `check-ime` 的结论从 `ok / failed` 扩成 `ok / partial / failed`，
+   **有小键盘缺口就是 `partial`，且与 `failed` 一样非零退出**。
+   GUI 的「修复输入法」报告带同一段，启动自举多一个原因码 `numpad-pending`。
+4. **重编译时机是平台固有的**：Windows 上 `ensure` 走进程内部署，改完这一轮产物里就有
+   `numpad`；Linux 上 `ensure` 不在进程内部署，重编译交给 librime 在下次引擎启动/维护时做，
+   所以**第一轮多半还是 `partial`，重启输入法后的下一轮才干净**。
+
+完整机制与判据见 [docs/PREBUILT-BOOTSTRAP.md 第 14 节](docs/PREBUILT-BOOTSTRAP.md#14-用户-customyaml-增量修补与小键盘常驻判定)。
+
+### 影响面与临时规避
+
+* 受影响的是**用户目录里还留着 v0.6.8 ~ v0.6.17 生成的 `<schema>.custom.yaml`** 的机器；
+  全新安装、或用户目录里没有这份文件的机器不受影响。
+* 本版发布前的临时规避：在用户 Rime 目录里那份 `<schema>.custom.yaml` 的
+  `engine/processors` 列表中，紧跟着 `- rimesync_vselect` 补一行 `- numpad`
+  （这就是本版的自动修补动作），保存后重新部署输入法即可生效。
+  另一种走法是删掉那份旧文件再让 rime-sync 重新铺一份带 `numpad` 的模板
+  （Windows：`%APPDATA%\Rime`；Linux：fcitx5 是 `~/.local/share/fcitx5/rime`，
+  ibus 是 `~/.local/share/ibus/rime`）。
+* 本版之后不需要人工干预：`ensure` 会自动增量修补它自己生成的那份文件。
+
+### 缺陷四：旧 default.custom.yaml 只列一个方案，保留方案在重新部署后消失
+
+**现象**：用户目录里的 `default.custom.yaml` 里 `patch.schema_list` 只列了一两个方案
+（真机 227 上只有 `luna_pinyin`）时，一旦发生**全量重新部署**，librime 只按
+`schema_list` 生成 build —— `luna_pinyin_simp` / `wubi_pinyin` / `wubi86` 的编译产物
+不再生成，用户正在用的方案会「凭空消失」。
+
+**根因**：随包的 `packaging/rime/prebuilt/config/default.custom.yaml` 里
+`schema_list` 是正确的三个保留方案，但安装策略是「已存在的一律沿用（不覆盖）」，
+`seed_templates()` 遇到用户已有的 `default.custom.yaml` 就跳过；
+而 `prune_schema_list_file()` **只删不增** —— 它把不在保留清单里的条目删掉，
+却从不把保留清单里的方案补回去。两头一夹，老用户的 `schema_list` 永远停在旧样子。
+
+**修法**：新增 `managed_custom::repair_default_schema_list_in()`，在 `ensure` 里
+**seed 之后、prune 之前**增量补齐：
+
+* 只补**保留清单**（`packaging/rime/retained-schemas.txt`，唯一真相源）里缺的那些；
+* 用户自己加的方案**原样保留、原顺序不动**，缺的**追加到列表末尾**；
+* 只改 `schema_list` 这一段，文件里其它内容（注释、缩进、`menu`/`punctuator`、
+  **BOM**、**CRLF/LF 混合行尾**、末尾空行）**逐字节不变**；
+* 改之前先备份 `<文件>.rimesync-orig`（已存在不覆盖）；
+* 幂等：已齐全则一个字节都不动；文件不存在则**不创建**（那是模板播种的职责）；
+* 文件里没有 `schema_list` → 跳过并说明原因，不凭空造一个。
+
+**为什么必须放在 prune 之前**：`prune` 会删掉不在保留清单里的条目
+（`luna_pinyin` 就不在清单里）。先补齐再裁剪 ⇒ 最终列表**恰好是三个保留方案**、
+顺序 = 保留清单顺序，且第二次 `ensure` 时补齐与裁剪都无事可做 ⇒ **文件逐字节不变**
+（反过来则每次 `ensure` 都「删一次 + 补一次」地反复改用户的文件）。
+
+**顺带修掉 prune 的一个字节保真问题**：`prune_schema_list_file()` 以前用
+`out.join("\n")` 写回，会把用户文件里所有 CRLF 统一成 LF、末尾的空行也丢掉。
+现在改成逐行保真（`yaml_text::RawLines`），`data/default.yaml` 与
+用户 `default.custom.yaml` 共用同一套逻辑。
+
+### 真机验证（227）
+
+* **A/B 对照**：同一份 `rime.dll`、同一份共享 data，只改用户目录里那份
+  `<schema>.custom.yaml` 的 `engine/processors` 是否含 `numpad` ——
+  「缺 numpad」时 6 条小键盘断言全败（输入行只剩 `v`、小键盘小数点把 `v` 顶上去），
+  「补上 numpad」时 **25/25 全过**。编译产物 `build/<schema>.schema.yaml` 对比显示
+  缺 numpad 时它在 `engine/processors` 里**整条消失**，位置正是 rime-sync 写入
+  `rimesync_vselect` 之后的插入点。
+* **build 为什么会长期过期**：librime 的 `ConfigNeedsUpdate()` 比较
+  `build_info.timestamps` 与**用户目录 `<id>.custom.yaml` 的 mtime**，相等即判定
+  「不用重编译」。同步把远端那份**旧版本 custom.yaml** 写回本机时，会把 mtime 改成
+  远端文件的旧时间戳（真机上是 11-04，比 build 的 11-08 还旧）⇒ 引擎**永远不重编译**
+  ⇒ build 长期停留在旧内容。真机上正是这个组合导致「小键盘能用但标点不直出」。
+* **标点直出同样是 build 过期的症状**：真机 build 里的 `punctuator` 是 librime 默认预设
+  （`"\\": ["、", "＼"]` 是候选列表，所以要按空格才上屏），而当前 `custom.yaml` 里
+  已经有 rime-sync 的直出表（`\: {commit: 、}`）。重新编译后即恢复。
+
+### 升级须知（重要）
+
+1. **所有设备都要升级到本版，并各自跑一次「修复输入法」**。
+   原因是修复通过**三向合并**传播：`engine/processors` 走普通三向合并
+   （只有 `schema_list` 有并集特例），本地没改过时取远端 ⇒ 一台设备修好、
+   同步上去，其它设备也会拿到 `numpad`；但**未升级的旧设备**参与同步时会把修复撤销。
+2. 升级后**必须重新编译**才会生效：Windows 上「修复输入法」走进程内部署，
+   改完这轮产物里就有 `numpad`；Linux 上重编译交给 librime 在下次引擎启动/维护时做，
+   所以第一轮多半还报 `partial`，**重启输入法后的下一轮才干净**。
+3. `check-ime` 的结论新增 `partial` 一档（有小键盘缺口就是 `partial`，非零退出），
+   避免再出现「报告说 ok、小键盘其实用不了」的静默失败。
+
+
 ## v0.6.25 — 2026-11-08
 
 修掉 v0.6.24 已知问题里的两个缺陷（背景见上一节）。
