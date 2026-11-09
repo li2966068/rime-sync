@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -95,6 +96,30 @@ bool HasCandidates(RimeApi* api, RimeSessionId session) {
   return has;
 }
 
+// 取当前会话的候选列表文本（Shift 备选菜单靠它断言）。
+// librime 的迭代器语义（rime_api_impl.h:373-410）：begin 把 index 置为 -1，
+// 每次 next 前进一格并返回该格的候选，所以「begin 之后先 next 一次」拿到的
+// 就是第一个候选。
+std::vector<std::string> Candidates(RimeApi* api, RimeSessionId session) {
+  std::vector<std::string> out;
+  RimeCandidateListIterator iterator{};
+  if (!api->candidate_list_begin(session, &iterator))
+    return out;
+  while (api->candidate_list_next(&iterator)) {
+    if (iterator.candidate.text)
+      out.push_back(iterator.candidate.text);
+  }
+  api->candidate_list_end(&iterator);
+  return out;
+}
+
+// 带修饰键的按键。mask 用 librime 自己的 kShiftMask（key_table.h:15）。
+// 返回引擎是否接管了这个键。
+Bool PressWithMask(RimeApi* api, RimeSessionId session, int keycode,
+                    int mask) {
+  return api->process_key(session, keycode, mask);
+}
+
 void Press(RimeApi* api, RimeSessionId session, int keycode) {
   api->process_key(session, keycode, 0);
 }
@@ -120,7 +145,16 @@ const int kNumpadDigits[] = {0xffb1, 0xffb2, 0xffb3, 0xffb4};
 int main(int argc, char** argv) {
   const char* shared = argc > 1 ? argv[1] : "/usr/share/rime-data";
   const char* user = argc > 2 ? argv[2] : "/tmp/rime-vmode-user";
-  const bool no_deploy = argc > 3 && std::strcmp(argv[3], "--no-deploy") == 0;
+  // --no-deploy 可以出现在任何位置；方案名是第一个非开关参数。
+  bool no_deploy = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--no-deploy") == 0)
+      no_deploy = true;
+  }
+  // 方案名可覆盖：容器里跑的是 luna_pinyin_simp（rime-sync 的保留方案，
+  // 用户目录里摆 packaging/rime/schemas/luna_pinyin_simp.custom.yaml 才有
+  // rimesync_vnum / rimesync_punct / rimesync_vselect / numpad 这几个处理器）。
+  const char* schema = argc > 3 ? argv[3] : "luna_pinyin_simp";
 
   RimeApi* api = rime_get_api();
   if (!api) {
@@ -161,8 +195,8 @@ int main(int argc, char** argv) {
     api->finalize();
     return 3;
   }
-  if (!api->select_schema(session, "luna_pinyin")) {
-    std::printf("FAIL: select_schema(luna_pinyin)\n");
+  if (!api->select_schema(session, schema)) {
+    std::printf("FAIL: select_schema(%s)\n", schema);
     api->destroy_session(session);
     api->finalize();
     return 3;
@@ -407,6 +441,60 @@ int main(int argc, char** argv) {
   CheckText(dot_commit, u8"。", "chinese: main '.' still commits 。");
   Check(dot_commit != ".", "chinese: main '.' is not the numpad rule",
         BytesOf(dot_commit));
+
+  // 11. Shift 备选菜单（rimesync_punct 的 alternatives）。
+  //     语义见 third_party/librime/plugins/rimesync-extra/punct_processor.cc：
+  //     表按「字符」索引；Shift 时给出「这个键所属按键的备选」——菜单 = 该条目
+  //     的 alternatives，**含 Shift 孪生（第一个）、不含本键的 main 符号**。
+  //     librime 送来的 keycode 已经是移位后的 keysym（X11 约定，注释见
+  //     punct_processor.cc 头部），所以 Shift+\\ 的 keycode 是 '|' (0x7C)，
+  //     不是 '\\' (0x5C)；BaseKeyOf('|') = '\\' 才查得到表里那一项。
+  //     '/' 故意不在表里，所以 Shift+/ 不弹菜单、直接上屏「？」。
+  const int kShiftMask = 1 << 0;  // librime/src/rime/key_table.h:15
+  struct ShiftCase {
+    int keycode;
+    const char* name;
+    const char* base;  // 本键的 main 符号，必须不在菜单里
+    std::vector<const char*> expected;
+  };
+  const std::vector<ShiftCase> kShiftCases = {
+      {'|', "Shift+backslash", u8"、", {u8"·", u8"＼", u8"｜"}},
+      {':', "Shift+semicolon", u8"；", {u8"：", u8"…"}},
+      {'<', "Shift+comma", u8"，", {u8"《", u8"〈", u8"＜"}},
+      {'>', "Shift+period", u8"。", {u8"》", u8"〉", u8"．"}},
+      {'{', "Shift+lbracket", u8"「", {u8"『", u8"［"}},
+  };
+  for (const ShiftCase& c : kShiftCases) {
+    Reset(api, session);
+    const Bool handled = PressWithMask(api, session, c.keycode, kShiftMask) != 0;
+    const std::vector<std::string> menu = Candidates(api, session);
+    std::string joined;
+    for (size_t i = 0; i < menu.size(); ++i) {
+      if (i)
+        joined += ",";
+      joined += menu[i];
+    }
+    Check(handled, "shift alternatives: the key is intercepted",
+          std::string("process_key=") + (handled ? "true" : "false"));
+    Check(menu.size() == c.expected.size(),
+          "shift alternatives: the menu has the expected size", joined);
+    bool content_ok = menu.size() == c.expected.size();
+    for (size_t i = 0; content_ok && i < menu.size(); ++i) {
+      if (menu[i] != c.expected[i])
+        content_ok = false;
+    }
+    Check(content_ok, "shift alternatives: the menu content matches", joined);
+    bool has_base = false;
+    for (const std::string& item : menu) {
+      if (item == c.base)
+        has_base = true;
+    }
+    Check(!has_base, "shift alternatives: the menu excludes the base symbol",
+          joined + " base=" + c.base);
+    Check(!menu.empty() && menu[0] == c.expected[0],
+          "shift alternatives: the first item is the Shift twin", joined);
+    std::printf("     %s: menu=[%s]\n", c.name, joined.c_str());
+  }
 
   api->destroy_session(session);
   api->finalize();
