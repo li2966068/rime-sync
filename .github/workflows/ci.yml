@@ -319,6 +319,23 @@ jobs:
           for f in "${files[@]}"; do bash -n "$f"; done
           echo "bash -n OK: ${#files[@]} 个脚本"
 
+
+      # postinst 必须按 fcitx5-rime 的 UserDataDirPath 解析 Rime 用户目录：
+      # 硬编码 ~/.local/share/fcitx5/rime 会把受管 custom.yaml 与预编译产物
+      # seed 到没人读的目录，用户真正在用的目录反而缺文件（切不到五笔）。
+      - name: postinst resolves the real Rime user dir
+        run: |
+          set -euo pipefail
+          bash packaging/linux/test/test-postinst-rime-dir.sh
+          if grep -q 'RIME_USER_DIR=\$TARGET_HOME/\.local/share/fcitx5/rime' packaging/linux/postinst; then
+            echo "::error::postinst 不得硬编码 Rime 用户目录，必须走 resolve_rime_user_dir"
+            exit 1
+          fi
+          grep -q 'resolve_rime_user_dir' packaging/linux/postinst || {
+            echo "::error::postinst 缺少 resolve_rime_user_dir"
+            exit 1
+          }
+
       # 改名 / 删步 / 换顺序时这里立刻红：离线安装器静默缺席比构建失败更难查。
       - name: release.yml + offline-verify.yml still wire the offline pipeline
         run: |

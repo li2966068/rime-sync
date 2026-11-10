@@ -80,8 +80,50 @@ target_home() {
     printf ''
 }
 
+# ---------------------------------------------------------------- Rime 用户目录
+# fcitx5-rime 可以在 ~/.config/fcitx5/conf/rime.conf 里用 UserDataDirPath 指定
+# 用户数据目录（自建 fcitx5-rime 新增的选项）。fcitx5 真正读写的正是那个目录，
+# 不是默认的 ~/.local/share/fcitx5/rime。
+# 解析规则与 crates/core/src/rime_dir.rs 的 parse_fcitx5_user_data_dir 保持一致
+#（key=value / key: value、引号、~ 展开、空值视为未设置）。
+# 以前这里硬编码默认目录，于是受管 custom.yaml 与预编译产物都 seed 到了没人读的
+# 目录，用户真正在用的目录反而缺文件（表现为「切不到五笔 / check-ime 恒 failed」）。
+resolve_rime_user_dir() { # $1=目标用户的 HOME
+    local home=$1 conf value=""
+    [ -n "$home" ] || { printf '' ""; return 0; }
+    conf=$home/.config/fcitx5/conf/rime.conf
+    if [ -f "$conf" ]; then
+        value=$(sed -n -E 's/^[[:space:]]*UserDataDirPath[[:space:]]*[=:][[:space:]]*(.*)$/\1/p' "$conf" 2>/dev/null | head -1)
+        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    fi
+    local out=""
+    if [ -n "$value" ]; then
+        # 注意：bash 的 case pattern 与 ${var#pattern} 都会先做 tilde 展开，
+        # 连双引号包住的 ~ 也不例外（pattern 里的 ~ 会被换成 HOME），所以
+        # 这里一律不用 glob，改用字符串切片判断前缀。
+        if [ "$value" = "~" ]; then
+            out=$home
+        elif [ "${value:0:2}" = "~/" ]; then
+            out=$home/${value:2}
+        else
+            out=$value
+        fi
+    else
+        out=$home/.local/share/fcitx5/rime
+    fi
+    # 去掉末尾多余的 /（根目录除外），免得拼路径时出现双斜杠。
+    # Rust 侧是 PathBuf，尾斜杠在语义上等价；这里只是让打印与拼接更干净。
+    case "$out" in
+        /) : ;;
+        */) out=${out%/} ;;
+    esac
+    printf '%s' "$out"
+}
+
 TARGET_USER=$(pick_target_user)
 TARGET_HOME=$(target_home "$TARGET_USER")
+RIME_USER_DIR=$(resolve_rime_user_dir "$TARGET_HOME")
+[ -n "$RIME_USER_DIR" ] || RIME_USER_DIR="~/.local/share/fcitx5/rime"
 WARN_DIR=""
 WARN_FILE=""
 if [ -n "$TARGET_HOME" ]; then
@@ -396,7 +438,7 @@ prune_extra_schemas() { # 参数 1 = Rime 用户目录（可为空）
 }
 
 if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
-    RIME_USER_DIR=$TARGET_HOME/.local/share/fcitx5/rime
+    say "Rime 用户目录：$RIME_USER_DIR"
     [ -n "${2:-}" ] && say "升级安装（原版本 $2）：只补缺失的输入法配置，已有文件一律沿用"
     [ "${RIMESYNC_WITH_SCHEMA_TWEAKS:-0}" = "1" ] && \
         say "（RIMESYNC_WITH_SCHEMA_TWEAKS=1：0.6.12 起始终只补缺失文件，该变量不再改变行为）"
@@ -415,7 +457,7 @@ fi
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/share/applications >/dev/null 2>&1
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1
 
-cat <<'EOM'
+cat <<EOM
 
 ----------------------------------------------------------------
  Rime 同步 安装完成。可在应用菜单打开「Rime 同步（完成设置）」。
@@ -427,8 +469,8 @@ cat <<'EOM'
       GNOME/Wayland 还需在「设置 → 键盘 → 输入源」里加入「Fcitx 5」。
 
    2. 首次使用把默认方案模板放进用户目录（需要时才做）：
-        install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \
-            ~/.local/share/fcitx5/rime/default.custom.yaml
+        install -Dm644 /usr/share/rime-sync/defaults/default.custom.yaml \\
+            $RIME_USER_DIR/default.custom.yaml
         fcitx5-remote -r
       注意：模板只列 3 个保留方案（朙月拼音·简化字 / 五笔拼音 / 五笔86，见
       /usr/share/rime-sync/retained-schemas.txt）。只有 /usr/share/rime-data 来自随包
@@ -439,7 +481,7 @@ cat <<'EOM'
    /usr/share/rime-sync/defaults/schemas/*.custom.yaml 提供。缺失才补，用户目录里
    已有同名文件一律沿用（不覆盖、不改名、不备份），升级同样如此
    （日志里可见 seed file=<name> result=new|reuse）。手动补：
-        cp /usr/share/rime-sync/defaults/schemas/*.custom.yaml ~/.local/share/fcitx5/rime/
+        cp /usr/share/rime-sync/defaults/schemas/*.custom.yaml $RIME_USER_DIR/
         fcitx5-remote -r
    关闭：删掉用户目录里对应的 *.custom.yaml 再重新部署。
 
