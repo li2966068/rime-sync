@@ -2,6 +2,80 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.6.27 — 2026-11-10
+
+修掉四个缺陷：**方案里同缩进的列表被读成空**、**Debian 13 首次安装失败**、
+**命令行版本号显示 0.1.0**、**发布出的二进制可能与源码不一致**。
+
+> ⚠️ **升级须知**：Linux 上装过 0.6.26 及更早版本的机器，如果 fcitx5-rime 配了
+> `UserDataDirPath`（自建 fcitx5-rime 新增的选项），旧版 CLI 会把受管文件写进
+> `~/.local/share/fcitx5/rime/`——那不是 fcitx5 真正读的目录。升级到本版后
+> **跑一次「修复输入法」**即可把文件归位、同时把五笔方案补回方案列表。
+
+### 缺陷四：方案里写在父键同缩进的列表，被读成空列表
+
+**现象**：用户在方案文件里这样写处理器列表——
+
+```yaml
+patch:
+  engine/processors:
+  - ascii_composer
+  - recognizer
+  - numpad
+```
+
+（列表项与 `engine/processors:` **同缩进**，这是 YAML 允许的写法。）
+`check-ime` 会把它读成「空列表」，于是判定该方案的小键盘「来源侧已损坏」（`source-stale`），
+而「修复输入法」又因为「没什么可修的」而什么都不做。
+
+**根因**：`crates/core/src/yaml_text.rs` 的块扫描器判断「块结束」的条件是
+「缩进 ≤ 父键缩进就结束」，没有考虑 YAML 允许**缩进式序列（indentless sequence）**
+与父键同缩进。
+
+**修法**：块扫描器（`block_end`）与读取侧（`find_block_from`）统一收敛到
+`crates/core/src/yaml_text.rs` 一处实现，`crates/core/src/managed_custom.rs`
+删掉自己那份重复实现；同缩进的序列现在算作块内容。
+回归测试：`crates/core/tests/managed_custom_indent.rs`
+（2 空格缩进 / 4 空格缩进 / 已修复不重复改，三个用例）。
+
+### 缺陷五：Debian 13 上首次安装输入法 deb 包退出码 3
+
+**根因**：Debian 13（trixie）把发行版的 Rime 数据包拆成了新命名的 `rime-data-*` 包
+（Debian 12 是 `rime-data` / `rime-prelude` / `rime-essay`…），
+而 deb 的 `Conflicts`/`Replaces` 与安装脚本的清理列表里没有这些新名字，
+旧包与随包文件同时存在 → dpkg 冲突。
+
+**修法**：`scripts/ime/package-ime-deb.sh` 与 `packaging/linux/install.sh`
+补上与随包文件重叠的 4 个包：`rime-data-luna-pinyin`、`rime-data-pinyin-simp`、
+`rime-data-stroke`、`rime-data-wubi`。其余发行版方案（bopomofo / cangjie5 /
+terra-pinyin / array30…）与随包文件不重叠，**故意不列**，以免误删用户自己的方案。
+
+### 缺陷六：命令行版本号一直显示 0.1.0
+
+**根因**：根 `Cargo.toml` 的 `[workspace.package] version` 一直停留在建仓时的初值
+`0.1.0`，发布时没改；CLI 从这个 workspace 构建，于是二进制里编进去的就是 0.1.0。
+
+**修法**：workspace 版本号与两个 `Cargo.lock` 一起对齐到发布号。
+
+### 缺陷七：发布出去的二进制可能与源码不一致
+
+**现象**：没有任何机制保证「GitHub Actions 打出来的 CLI 二进制」与「仓库里的源码」是同一份。
+
+**修法**：新增 `scripts/ci/assert-cli-matches-source.sh`，三重断言：
+
+1. `--version` 的版本号 == `Cargo.toml` 里 workspace 的版本号；
+2. `nm -C` 里能找到当前源码才有的符号（`rime_sync_core::managed_custom::verify_repaired` 等）；
+3. 真的跑一次二进制：`check-ime --json` 的输出里不得出现 `source-stale`。
+
+接入 `ci.yml` 的 `cli-matches-source` job 与 `release.yml` 的发布前一步。
+
+> **为什么不用字节搜索 / `strings` 统计字符串常量**：Rust/LLVM 会把短字符串常量拆成
+> 8 字节立即数内嵌进指令流（实测 `not-managed` 实际存成 `not-mana`+`aged`，
+> `custom-repair` 存成 `custom-r`+`m-repair`），所以「搜不到」不能证明「没有」，
+> 那样的断言既漏报又误报。可靠的只有「符号名」与「运行时输出」两种原语。
+
+---
+
 ## v0.6.26 — 2026-11-09
 
 修掉 v0.6.25 之后发现的两个缺陷：**小键盘数字键失效**、**保留方案在重新部署后消失**。
