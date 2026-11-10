@@ -83,7 +83,22 @@ DEPS=$(printf '%s' "$DEPS" | sed -E \
 # same files under /usr/share/rime-data, so apt (unlike plain dpkg -i) would
 # fail with "trying to overwrite ... default.yaml". Keep this list in sync with
 # the recipes vendored under third_party/rime-data.
-CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data, rime-data, rime-prelude, rime-essay, rime-luna-pinyin, rime-cangjie, rime-stroke, rime-terra-pinyin, rime-bopomofo, rime-wubi"}
+#
+# 2026-11-10 修：Debian 13 把词库拆成了**新名字**的 rime-data-* 包（Debian 12 是
+# rime-data / rime-prelude / rime-essay / rime-luna-pinyin 这种老名字），老名单里
+# 一个新名字都没有，于是第一次安装在 Debian 13 上直接失败（apt 报
+# "trying to overwrite '/usr/share/rime-data/stroke.dict.yaml', which is also in
+# package rime-data-stroke"，退出码 3）。
+# 下面这 4 个是**实测文件级重叠**的包（2026-11-10 用 dpkg-deb --fsys-tarfile
+# 逐包比对随包 17 个文件算出来的，不是按名字猜的）：
+#   rime-data-luna-pinyin : luna_pinyin.dict.yaml luna_pinyin.schema.yaml
+#                            luna_pinyin_simp.schema.yaml pinyin.yaml
+#   rime-data-pinyin-simp : pinyin_simp.dict.yaml pinyin_simp.schema.yaml
+#   rime-data-stroke      : stroke.dict.yaml stroke.schema.yaml
+#   rime-data-wubi        : wubi86.dict.yaml wubi86.schema.yaml wubi_pinyin.schema.yaml
+# 其余 rime-data-*（bopomofo / cangjie5 / terra-pinyin / array30 …）与随包文件
+# **不重叠**，故意不列进来：列了会平白 purge 掉用户装的注音/仓颉/粤拼词库。
+CONFLICTS=${CONFLICTS:-"fcitx5-rime, librime1, librime1t64, librime-data, rime-data, rime-prelude, rime-essay, rime-luna-pinyin, rime-cangjie, rime-stroke, rime-terra-pinyin, rime-bopomofo, rime-wubi, rime-data-luna-pinyin, rime-data-pinyin-simp, rime-data-stroke, rime-data-wubi"}
 if [ -f "$STAGING/conflicts-extra.txt" ]; then
   while read -r extra; do
     [ -n "$extra" ] || continue

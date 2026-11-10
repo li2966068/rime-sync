@@ -189,6 +189,11 @@ jobs:
           file "target/release/rime-sync-cli-$triple"
           ls -l target/release/rime-sync-cli
 
+      # 发布前最后一道关：这个 CLI 二进制必须与当前源码一致
+      # （版本号 / 关键符号 / 运行时行为）。详见 scripts/ci/assert-cli-matches-source.sh。
+      - name: assert CLI matches source
+        run: bash scripts/ci/assert-cli-matches-source.sh target/release/rime-sync-cli
+
       - name: build bundles (deb + AppImage)
         timeout-minutes: 45
         env:

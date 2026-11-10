@@ -48,6 +48,39 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --all-targets
 
+  # 护栏：发布出去的 CLI 二进制必须与当前源码一致。
+  #
+  # 为什么不直接 grep 二进制里的字符串：Rust/LLVM 会把短字符串常量拆成 8 字节
+  # 立即数内嵌进指令流（not-managed 实际存成 not-mana + aged），字节搜索查不到
+  # **不能证明**没有，所以那种断言既会漏报也会误报。
+  # scripts/ci/assert-cli-matches-source.sh 改用三样可靠的东西：
+  #   1. --version 的版本号 == Cargo.toml 的 workspace 版本；
+  #   2. nm -C 的符号名（当前源码才有的函数）；
+  #   3. 真的跑一次二进制，检查 check-ime 的 JSON 输出对不对。
+  cli-matches-source:
+    name: cli · 发布二进制与源码一致
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: build CLI (release)
+        run: cargo build -p rime-sync-cli --release --locked
+
+      - name: assert CLI matches source
+        run: bash scripts/ci/assert-cli-matches-source.sh target/release/rime-sync-cli
+
   # CI 防回归：Windows 专属代码（cfg(windows)）每次 push/PR 都过一遍 cargo check。
   #
   # 目标平台用 x86_64-pc-windows-gnu 而不是 msvc：core → reqwest → rustls → ring

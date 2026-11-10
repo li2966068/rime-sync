@@ -62,6 +62,60 @@ pub(crate) fn yaml_key(key: &str) -> String {
     format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// 序列项（列表项）判定：`- foo`（`-` 后至少一个空格）。
+///
+/// YAML 里列表项可以与父键**同级**（缩进相同），也可以比父键多缩进。
+/// 两种写法都要认，否则会把用户的 custom.yaml 误判成「没有这个列表」。
+pub(crate) fn is_seq_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ") || trimmed == "-"
+}
+
+/// 块的结束行（不含）。
+///
+/// 收尾规则（读侧与写侧共用这一份实现，改一处即可）：
+/// * 空行 / 注释行：跳过，继续往后看；
+/// * 缩进 > indent：还在块里；
+/// * 缩进 == indent：
+///   - 是**序列项** → 还在块里（YAML 允许序列与父键同级）；
+///   - 不是序列项 → 块结束（同级的下一个键）；
+/// * 缩进 < indent：块结束（回到更外层）。
+///
+/// 2026-11-10 修：旧实现在「缩进 <= indent」时一律收尾，于是**与父键同级的
+/// 序列项**被当成块外内容 —— 用户真实 custom.yaml 里 engine/processors: 与
+/// 它的列表项同缩进（2），列表因此被读成空，rime-sync 误判「缺 numpad」。
+pub(crate) fn block_end(lines: &[String], start: usize, indent: usize) -> usize {
+    let mut end = start + 1;
+    while end < lines.len() {
+        let line = &lines[end];
+        if is_blank(line) || is_comment(line) {
+            end += 1;
+            continue;
+        }
+        let line_indent = indent_of(line);
+        if line_indent > indent {
+            end += 1;
+            continue;
+        }
+        if line_indent == indent && is_seq_item(line) {
+            // 与父键同级的序列项：YAML 合法，属于本块。
+            end += 1;
+            continue;
+        }
+        break;
+    }
+    // 块尾的空行 / 同级注释不算块内容。
+    while end > start + 1 {
+        let line = &lines[end - 1];
+        if is_blank(line) || (is_comment(line) && indent_of(line) <= indent) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 /// 简单标量的写法：普通标识符原样，其余用双引号包起来。
 pub(crate) fn yaml_scalar(value: &str) -> String {
     let plain = !value.is_empty()
@@ -139,27 +193,7 @@ impl Doc {
     ) -> Option<(usize, usize)> {
         let start =
             (from..self.lines.len()).find(|&index| is_key_at(&self.lines[index], key, indent))?;
-        let mut end = start + 1;
-        while end < self.lines.len() {
-            let line = &self.lines[end];
-            if is_blank(line) || is_comment(line) {
-                end += 1;
-                continue;
-            }
-            if indent_of(line) <= indent {
-                break;
-            }
-            end += 1;
-        }
-        // 块尾的空行/同级注释不算块内容。
-        while end > start + 1 {
-            let line = &self.lines[end - 1];
-            if is_blank(line) || (is_comment(line) && indent_of(line) <= indent) {
-                end -= 1;
-            } else {
-                break;
-            }
-        }
+        let end = block_end(&self.lines, start, indent);
         Some((start, end))
     }
 
@@ -171,7 +205,7 @@ impl Doc {
         (block.0 + 1..block.1)
             .filter(|&index| {
                 let line = &self.lines[index];
-                !is_comment(line) && line.trim_start().starts_with("- ")
+                !is_comment(line) && is_seq_item(line)
             })
             .collect()
     }

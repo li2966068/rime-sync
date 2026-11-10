@@ -354,7 +354,22 @@ $refs"
 fi
 
 # --------------------------------------------------- remove conflicting pkgs
-for p in fcitx5-rime librime1t64 librime1 librime-data; do
+# rime-data-luna-pinyin / rime-data-pinyin-simp / rime-data-stroke / rime-data-wubi
+# 是 Debian 13 拆分词库后的**新包名**（Debian 12 是 rime-data / rime-prelude /
+# rime-essay / rime-luna-pinyin 这类老名字，已在上面处理）。2026-11-10 现场：
+# 第一次安装在 Debian 13 上就是被它们挡下来的 —— apt 报
+#   trying to overwrite '/usr/share/rime-data/stroke.dict.yaml', which is also in
+#   package rime-data-stroke
+# 退出码 3，安装直接失败。这 4 个包与我们的随包文件**实测重叠**：
+#   rime-data-luna-pinyin : luna_pinyin.dict.yaml luna_pinyin.schema.yaml
+#                            luna_pinyin_simp.schema.yaml pinyin.yaml
+#   rime-data-pinyin-simp : pinyin_simp.dict.yaml pinyin_simp.schema.yaml
+#   rime-data-stroke      : stroke.dict.yaml stroke.schema.yaml
+#   rime-data-wubi        : wubi86.dict.yaml wubi86.schema.yaml wubi_pinyin.schema.yaml
+# 其余 rime-data-*（bopomofo / cangjie5 / terra-pinyin / array30 …）与随包文件
+# **不重叠**，故意不 purge：purge 掉会平白删掉用户装的注音/仓颉/粤拼词库。
+for p in fcitx5-rime librime1t64 librime1 librime-data \
+         rime-data-luna-pinyin rime-data-pinyin-simp rime-data-stroke rime-data-wubi; do
   if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed'; then
     say "移除与自带 librime/数据冲突的发行版包：$p"
     step "purge conflicting $p"

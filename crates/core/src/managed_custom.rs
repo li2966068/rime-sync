@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 
 use crate::data_patch::{backup_path, NUMPAD_PROCESSOR, VSELECT_PROCESSOR};
 use crate::yaml_text::{
-    indent_of, is_blank, is_comment, is_flow_value, is_key_at, item_name, Doc, RawLines,
+    block_end, indent_of, is_blank, is_comment, is_flow_value, is_key_at, is_seq_item, item_name,
+    Doc, RawLines,
 };
 
 /// 模板文件首行的标记（packaging/rime/schemas/*.custom.yaml）。
@@ -126,32 +127,6 @@ struct ProcessorsList {
     item_indent: usize,
 }
 
-/// 块的结束行（不含）：与 yaml_text 里 find_block_from 的收尾逻辑一致。
-fn block_end(lines: &[String], start: usize, indent: usize) -> usize {
-    let mut end = start + 1;
-    while end < lines.len() {
-        let line = &lines[end];
-        if is_blank(line) || is_comment(line) {
-            end += 1;
-            continue;
-        }
-        if indent_of(line) <= indent {
-            break;
-        }
-        end += 1;
-    }
-    // 块尾的空行 / 同级注释不算块内容。
-    while end > start + 1 {
-        let line = &lines[end - 1];
-        if is_blank(line) || (is_comment(line) && indent_of(line) <= indent) {
-            end -= 1;
-        } else {
-            break;
-        }
-    }
-    end
-}
-
 /// 在 [from, to) 里找「缩进 indent 的 key:」。
 fn find_key_in(
     lines: &[String],
@@ -177,7 +152,7 @@ fn collect_items(lines: &[String], key_index: usize, end: usize) -> Vec<usize> {
     (key_index + 1..end)
         .filter(|&index| {
             let line = &lines[index];
-            !is_comment(line) && line.trim_start().starts_with("- ")
+            !is_comment(line) && is_seq_item(line)
         })
         .collect()
 }
