@@ -841,7 +841,13 @@ function Render-Props {
 function Invoke-WeaselBuild {
     param([string]$Platform)
     Write-Step "msbuild weasel.sln（Release | $Platform）"
-    $line = 'msbuild.exe weasel.sln /t:Build /m /nologo /v:minimal /p:Configuration=Release /p:Platform=' + $Platform
+    # /m:1（串行）而不是 /m（不限并行）：weasel.sln 里的多个 vcxproj（WeaselTSF / WeaselIME /
+    # WeaselDeployer / RimeWithWeasel）**并行链接到同一个 output 目录**，会互相抢占
+    # weaselx64.exp / weaselx64.ime，偶发 LNK1104「cannot open file ... weaselx64.exp」。
+    # 2026-11-10 的 v0.6.27 首次发布就撞上了（weasel 构建缓存未命中 → 走全量编译 → 多个项目
+    # 同时链接 → 抢同一个 .exp 文件）。串行构建从根上消除竞态；代价是慢几分钟，
+    # 换来发布不再随机失败。
+    $line = 'msbuild.exe weasel.sln /t:Build /m:1 /nologo /v:minimal /p:Configuration=Release /p:Platform=' + $Platform
     Invoke-InDevShell -Arch 'amd64' -WorkDir $script:WeaselDir -CommandLine $line | Out-Null
 }
 

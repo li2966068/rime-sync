@@ -74,6 +74,18 @@ terra-pinyin / array30…）与随包文件不重叠，**故意不列**，以免
 > `custom-repair` 存成 `custom-r`+`m-repair`），所以「搜不到」不能证明「没有」，
 > 那样的断言既漏报又误报。可靠的只有「符号名」与「运行时输出」两种原语。
 
+### 顺带修掉：发布时自编译 Weasel 的并行链接竞态
+
+**现象**：v0.6.27 第一次发布时，Windows 构建挂在 WeaselTSF.vcxproj：
+LINK : fatal error LNK1104: cannot open file ... weaselx64.exp。
+
+**根因**：weasel.sln 里多个 vcxproj **并行链接到同一个 output 目录**，
+互相抢占 weaselx64.exp / weaselx64.ime。构建缓存命中时不暴露，
+缓存未命中走全量编译时必现 —— 所以这是一个随机失败（flaky）。
+
+**修法**：scripts/ime/build-weasel.ps1 的 msbuild 调用从 /m（不限并行）改成 /m:1（串行），
+从根上消除竞态；代价是构建慢几分钟，换来发布不再随机失败。
+
 ---
 
 ## v0.6.26 — 2026-11-09
