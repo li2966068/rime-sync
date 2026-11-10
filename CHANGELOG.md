@@ -2,6 +2,32 @@
 
 本项目遵循语义化版本；日期为发布日（UTC+8）。
 
+## v0.6.28 — 2026-11-10
+
+修掉一个缺陷：**Linux 安装/升级时，输入法配置被写进一个 fcitx5 根本不读的目录**。
+只影响 Linux 的安装与升级路径，Windows 端与功能代码没有改动；
+用户无需做任何操作，升级后安装器会自己找对目录。
+
+### 缺陷八：Linux 安装器把 Rime 用户目录写死成默认路径
+
+**现象**：在配了 `UserDataDirPath` 的 fcitx5-rime 上（自建 fcitx5-rime 新增的选项，
+用来指定输入法把用户数据放在哪个目录），安装或升级同步程序之后，输入法配置
+仍然缺文件、方案列表里也没有五笔，`check-ime` 一直报 `failed`。
+
+**根因**：`packaging/linux/postinst` 把 Rime 用户目录**硬编码**成
+`~/.local/share/fcitx5/rime`。但 fcitx5-rime 配了 `UserDataDirPath` 时，
+fcitx5 真正读写的正是那个自定义目录 —— 命令行版早就解析对了
+（`crates/core/src/rime_dir.rs`），只有安装脚本没跟上，两端规则不一致。
+结果受管的 `*.custom.yaml` 与预编译产物全被 seed 到一个**没人读的目录**，
+用户真正在用的目录反而缺文件。
+
+**修法**：`postinst` 新增 `resolve_rime_user_dir()`，解析
+`~/.config/fcitx5/conf/rime.conf` 里的 `UserDataDirPath`，规则与命令行版的
+`parse_fcitx5_user_data_dir` 完全一致（`key=value` / `key: value`、引号、
+`~` 展开、空值视为未设置）；安装完成提示里显示的路径也跟着改成真实目录。
+回归测试：`packaging/linux/test/test-postinst-rime-dir.sh`（12 个用例），
+并在 CI 里加了一条断言，防止以后退回硬编码。
+
 ## v0.6.27 — 2026-11-10
 
 修掉四个缺陷：**方案里同缩进的列表被读成空**、**Debian 13 首次安装失败**、
