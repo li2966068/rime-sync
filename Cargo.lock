@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "rime-sync-cli"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "clap",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "rime-sync-core"
-version = "0.6.28"
+version = "0.6.29"
 dependencies = [
  "anyhow",
  "keyring",

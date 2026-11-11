@@ -8,7 +8,7 @@ exclude = ["src-tauri", "src", "packaging", "scripts", ".github"]
 # 2026-11-10 起跟桌面端（src-tauri/tauri.conf.json）保持同一版本号。
 # 之前这里一直是 0.1.0，导致 `rime-sync-cli --version` 显示 0.1.0，
 # 和用户实际安装的 0.6.x 对不上（2026-11-10 修）。
-version = "0.6.28"
+version = "0.6.29"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
