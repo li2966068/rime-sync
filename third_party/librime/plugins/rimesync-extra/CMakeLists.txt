@@ -39,19 +39,27 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
     numpad_key.cc)
   target_include_directories(rimesync_extra_numpad_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_executable(rimesync_extra_punct_test
+    test/punct_table_test.cc)
+  target_include_directories(rimesync_extra_punct_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(MSVC)
     target_compile_options(rimesync_extra_vnum_test PRIVATE /utf-8)
     target_compile_options(rimesync_extra_numpad_test PRIVATE /utf-8)
+    target_compile_options(rimesync_extra_punct_test PRIVATE /utf-8)
   endif()
   add_custom_target(check-rimesync-extra
     COMMAND $<TARGET_FILE:rimesync_extra_vnum_test>
     COMMAND $<TARGET_FILE:rimesync_extra_numpad_test>
-    DEPENDS rimesync_extra_vnum_test rimesync_extra_numpad_test
+    COMMAND $<TARGET_FILE:rimesync_extra_punct_test>
+    DEPENDS rimesync_extra_vnum_test rimesync_extra_numpad_test rimesync_extra_punct_test
     COMMENT "Running rimesync-extra unit tests")
   if(BUILD_TEST)
     add_test(NAME rimesync_extra_vnum_test COMMAND rimesync_extra_vnum_test)
     add_test(NAME rimesync_extra_numpad_test
       COMMAND rimesync_extra_numpad_test)
+    add_test(NAME rimesync_extra_punct_test
+      COMMAND rimesync_extra_punct_test)
   endif()
 endif()
 

@@ -14,17 +14,14 @@
 #include <rime/common.h>
 #include <rime/processor.h>
 
+#include "punct_table.h"
+
 namespace rime {
 class Context;
 class KeyEvent;
 }  // namespace rime
 
 namespace rimesync {
-
-struct PunctEntry {
-  std::string main;
-  std::vector<std::string> alternatives;
-};
 
 class PunctProcessor : public rime::Processor {
  public:

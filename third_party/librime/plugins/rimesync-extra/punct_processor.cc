@@ -82,38 +82,11 @@ bool IsMenuNavigationKey(int keycode) {
   }
 }
 
-std::map<char, PunctEntry> DefaultTable() {
-  std::map<char, PunctEntry> table;
-  // Key             main      alternatives (first one is the Shift twin)
-  table['\\'] = PunctEntry{u8"、", {u8"·", u8"＼", u8"｜"}};
-  // '/' is deliberately absent: it is Rime's symbol prefix (/fh, /dn, ...)
-  // and Rime's own punctuator already offers 「、」 as a candidate for it.
-  // The key still works: '/' is pushed by punctuator, and '?' (Shift+/) is
-  // committed directly by the entry below.
-  table[';'] = PunctEntry{u8"；", {u8"：", u8"…"}};
-  table[','] = PunctEntry{u8"，", {u8"《", u8"〈", u8"＜"}};
-  table['.'] = PunctEntry{u8"。", {u8"》", u8"〉", u8"．"}};
-  table['['] = PunctEntry{u8"「", {u8"『", u8"［"}};
-  table[']'] = PunctEntry{u8"」", {u8"』", u8"］"}};
-  table['<'] = PunctEntry{u8"《", {u8"〈", u8"＜"}};
-  table['>'] = PunctEntry{u8"》", {u8"〉", u8"＞"}};
-  table['{'] = PunctEntry{u8"『", {u8"｛"}};
-  table['}'] = PunctEntry{u8"』", {u8"｝"}};
-  table['|'] = PunctEntry{u8"·", {u8"｜"}};
-  table['%'] = PunctEntry{u8"％", {u8"‰", u8"%"}};
-  table['$'] = PunctEntry{u8"￥", {u8"＄", u8"€"}};
-  table['*'] = PunctEntry{u8"×", {u8"＊", u8"·"}};
-  table['~'] = PunctEntry{u8"～", {u8"〜", u8"~"}};
-  table['!'] = PunctEntry{u8"！", {u8"¡", u8"!"}};
-  table['?'] = PunctEntry{u8"？", {u8"?"}};
-  table[':'] = PunctEntry{u8"：", {u8"∶", u8"︰"}};
-  return table;
-}
 
 }  // namespace
 
 PunctProcessor::PunctProcessor(const Ticket& ticket) : Processor(ticket) {
-  table_ = DefaultTable();
+  table_ = DefaultPunctTable();
   LoadConfig();
 }
 
