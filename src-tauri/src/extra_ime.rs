@@ -86,7 +86,7 @@ pub fn cmd_install_extra_ime(app: AppHandle, package_path: String) -> Result<Str
     }
     let path = package_path.trim().to_string();
     if path.is_empty() {
-        return Err("请先选一个完整安装包（就是包含输入法的那个大安装包）。".to_string());
+        return Err("请先选一个安装包（完整包和精简包都行，两个都自带输入法）。".to_string());
     }
     let package = Path::new(&path);
     if !package.exists() {

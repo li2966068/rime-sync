@@ -172,8 +172,8 @@ for d in "$BUNDLE"/debian-13 "$BUNDLE"/*/debian-13; do
   fi
 done
 if [ -z "$DISTRO_DIR" ]; then
-  say "安装包里找不到 rime-inputmethod_*.deb（完整安装包必须自带输入法本体）。"
-  say "请改用「完整包」（full），而不是只带同步程序的精简包（thin）。"
+  say "安装包里找不到 rime-inputmethod_*.deb（安装包必须自带输入法本体）。"
+  say "完整包（full）和精简包（thin）都自带输入法，随便哪个都行；请检查是不是选错了文件、或者文件没下完整。"
   exit 66
 fi
 say "安装集目录：$DISTRO_DIR"
