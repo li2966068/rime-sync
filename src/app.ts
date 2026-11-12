@@ -26,7 +26,14 @@ import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui
 import { loadPresets, applyPresetTo } from "./ui/presets";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { runFixIme } from "./ui/fix_ime";
-import { elevateForIme, refreshImeStatus, subscribeImeBootstrap } from "./ui/ime_banner";
+import {
+  elevateForIme,
+  pickExtraPackage,
+  refreshExtraSupport,
+  refreshImeStatus,
+  runExtraInstall,
+  subscribeImeBootstrap,
+} from "./ui/ime_banner";
 import { setWizardPolicy, setWizardStep, openWizard, autoDetectWizard, wizardTest, wizardNext, wizardBack } from "./ui/wizard";
 import { addDeviceLocalKey, removeDeviceLocalKey } from "./ui/device_keys";
 import { refreshLanguageDependent } from "./ui/language";
@@ -137,6 +144,13 @@ export function bindEvents(): void {
   });
   el.fixImeForce.addEventListener("click", () => {
     void runFixIme(true);
+  });
+  // 输入法增强功能：Linux 上的一键换装（Windows 不显示这两个按钮）。
+  el.extraBrowse.addEventListener("click", () => {
+    void pickExtraPackage();
+  });
+  el.extraInstall.addEventListener("click", () => {
+    void runExtraInstall();
   });
   el.imeFix.addEventListener("click", () => {
     void runFixIme(false);
@@ -404,6 +418,8 @@ export function bindEvents(): void {
   el.language.addEventListener("change", () => {
     setLang(el.language.value === "en" ? "en" : "zh");
     applyI18n();
+    // 增强功能面板的结论/建议是 JS 生成的（t(key)），切语言后要重新生成一次。
+    void refreshExtraSupport();
     // 后端也换语言（原生对话框用不到前端 i18n）。
     void api.setLocale(getLang());
     refreshLanguageDependent();

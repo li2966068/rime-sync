@@ -30,6 +30,7 @@ mod conflict_cmds;
 mod dedupe_cmds;
 mod device_cmds;
 mod diagnostics;
+mod extra_ime;
 mod ime_text;
 mod platform_prefs;
 mod prebuilt_cmds;
@@ -1074,6 +1075,10 @@ pub fn run() {
             // 离线依赖安装告警（packaging/linux/postinst 写 install-warning.json）
             diagnostics::cmd_install_warning,
             diagnostics::cmd_retry_install_deps,
+            // 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）检测与 Linux 一键换装。
+            extra_ime::cmd_extra_support,
+            extra_ime::cmd_install_extra_ime,
+            extra_ime::cmd_pick_extra_package,
             watch_cmds::cmd_watch_start,
             watch_cmds::cmd_watch_stop,
             watch_cmds::cmd_watch_status,

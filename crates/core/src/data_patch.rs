@@ -598,6 +598,37 @@ fn deploy_outcome_with(
     }
 }
 
+/// 写完用户 custom.yaml 后立刻重编译 build/（Linux）。
+///
+/// 只跑 rime_deployer --build，**不**先试 fcitx5-remote -r：实测（2026-11-11，
+/// 228）reload 不会触发 librime 重编译，只有 builder 会。先 reload 再返回，
+/// 会让「配置写了却没生效」。
+#[cfg(not(windows))]
+pub fn rebuild_after_config_change(user_dir: &Path, shared_dir: &Path) -> DeployOutcome {
+    rebuild_after_config_change_with(&run_command, user_dir, shared_dir)
+}
+
+/// rebuild_after_config_change 的实现（命令执行器可注入）。
+#[cfg(not(windows))]
+fn rebuild_after_config_change_with(
+    run: &dyn Fn(&str, &[&OsStr]) -> RunResult,
+    user_dir: &Path,
+    shared_dir: &Path,
+) -> DeployOutcome {
+    match run(
+        DEPLOY_BUILDER,
+        &[
+            OsStr::new("--build"),
+            user_dir.as_os_str(),
+            shared_dir.as_os_str(),
+        ],
+    ) {
+        RunResult::Ok => DeployOutcome::Ok,
+        RunResult::Missing => DeployOutcome::Skipped,
+        RunResult::Failed => DeployOutcome::Failed,
+    }
+}
+
 /// 单个方案的 custom.yaml 结果。
 #[cfg(not(windows))]
 enum CustomOutcome {

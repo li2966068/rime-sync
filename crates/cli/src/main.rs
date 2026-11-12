@@ -16,6 +16,7 @@ use rime_sync_core::librime;
 use rime_sync_core::linux_deploy;
 use rime_sync_core::lock;
 use rime_sync_core::log;
+use rime_sync_core::managed_custom;
 use rime_sync_core::network::NetworkPolicy;
 use rime_sync_core::plan;
 use rime_sync_core::platform;
@@ -166,6 +167,11 @@ enum Command {
         library: Option<PathBuf>,
     },
     /// 把 Rime 方案裁剪到随包保留清单（安装器/自举用；RIMESYNC_PRUNE_SCHEMAS=0 关闭）
+    /// 只增量修补用户目录里已有的 <schema>.custom.yaml：补上后来才加的增强组件
+    /// （小键盘 / 中文标点直出 / v 转数字）。用户自己改过的文件一律不动。
+    /// 不铺 build/、不部署、不碰公共目录 —— 安装或更新后调用它，老设备也能拿到新组件。
+    #[command(name = "repair-customs")]
+    RepairCustoms,
     #[command(name = "prune-schemas")]
     PruneSchemas {
         /// 只报告将删除什么，不落盘
@@ -299,6 +305,21 @@ struct ProbeFailed;
 #[derive(Debug)]
 struct FixImeFailed;
 
+/// repair-customs 的 JSON 报告。
+#[derive(Serialize)]
+struct RepairCustomsJson {
+    rime_dir: String,
+    /// 补上了新组件的方案。
+    repaired: Vec<String>,
+    /// 本来就是最新的，一个字节没动。
+    unchanged: Vec<String>,
+    /// 不该动（非 rime-sync 管理的文件 / 结构不符预期）。
+    skipped: Vec<String>,
+    /// 处理失败。
+    failed: Vec<String>,
+    ok: bool,
+}
+
 /// fix-ime 的 JSON 报告：PrebuiltReport 的字段平铺，再补 data 补丁与输入法结果。
 #[derive(Serialize)]
 struct FixImeJson<'a> {
@@ -331,6 +352,9 @@ struct FixImeJson<'a> {
     weasel_log: String,
     /// 常驻小键盘判定（CLI/GUI 都读这一份，不许自己再算）。
     numpad: &'a ime_state::NumpadStatus,
+    /// 本机引擎是否带 rime-sync 自研的增强组件（数字小键盘 / 中文标点直出 / v 转数字）：
+    /// supported（确定可用）/ unsupported（确定没有，多半装的是发行版输入法）/ unknown（判断不了）。
+    extra_support: &'a str,
 }
 
 /// check-ime 的只读报告（NSIS 自检解析这些字段，不再自己看文件）。
@@ -354,6 +378,9 @@ struct CheckImeJson<'a> {
     missing: Vec<String>,
     /// 常驻小键盘判定（与 ensure-ime 同一份判据）。
     numpad: &'a ime_state::NumpadStatus,
+    /// 本机引擎是否带 rime-sync 自研的增强组件（数字小键盘 / 中文标点直出 / v 转数字）：
+    /// supported（确定可用）/ unsupported（确定没有，多半装的是发行版输入法）/ unknown（判断不了）。
+    extra_support: &'a str,
 }
 
 /// ensure-ime 的报告：PrebuiltReport 的字段平铺，再加状态机结论与 actions。
@@ -408,6 +435,16 @@ fn resolve_check_payload(
             Err(error) => (None, Some(format!("{error:#}"))),
         },
     }
+}
+
+/// 增强组件可用性的文本呈现：一行 extra_support=<值>，
+/// 不可用（或判断不了）时再附上 core 写的建议原文（不另编一套说法）。
+fn extra_support_lines(support: &ime_state::ExtraSupport) -> Vec<String> {
+    let mut lines = vec![format!("extra_support={}", support.as_str())];
+    if !support.usable() {
+        lines.push(support.advice().to_string());
+    }
+    lines
 }
 
 /// 小键盘判定的文本呈现：一行人话，不是把 detail 原样倒出来。
@@ -844,6 +881,8 @@ fn run(cli: Cli) -> Result<()> {
             // 输入法本体的结果由 ensure 内部的 ime::ensure 给出（同一份数据）。
             let weasel = &outcome.ime;
             let data = &outcome.data;
+            // 本机引擎是否带 rime-sync 自研的增强组件（core 判定；CLI 不自己再算一遍）。
+            let extra_support = ime_state::assess_extra_support(&rime_dir);
             let report_json = FixImeJson {
                 prebuilt: &outcome.report,
                 result: outcome.result.as_str(),
@@ -864,6 +903,7 @@ fn run(cli: Cli) -> Result<()> {
                 weasel_needs_elevation: weasel.needs_elevation,
                 weasel_log: weasel.log.clone(),
                 numpad: &outcome.numpad,
+                extra_support: extra_support.as_str(),
             };
             if cli.json {
                 print_json(&report_json)?;
@@ -918,6 +958,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("build_repaired={}", outcome.report.build_repaired.join(","));
                 println!("build_missing={}", outcome.report.build_missing.join(","));
                 println!("numpad={}", numpad_line(&outcome.numpad));
+                for line in extra_support_lines(&extra_support) {
+                    println!("{line}");
+                }
                 println!(
                     "deploy_method={} deploy_result={} deploy_ok={} deploy_ms={}",
                     outcome.report.deploy_method,
@@ -1074,6 +1117,8 @@ fn run(cli: Cli) -> Result<()> {
             // 常驻小键盘判定：与 ensure-ime 用的是**同一个**函数（只读判据 =
             // 写路径的结论），不允许这里自己再判一套。
             let numpad = ime_state::assess_numpad(&rime_dir, &data_dirs);
+            // 本机引擎是否带 rime-sync 自研的增强组件（core 判定；CLI 不自己再算一遍）。
+            let extra_support = ime_state::assess_extra_support(&rime_dir);
             // 结论口径与 ensure-ime 一致：产物不可用 = failed；有缺口 = partial；
             // 其余 = ok。partial 与 failed 都必须非零退出。
             let result = if !assessment.build_ok {
@@ -1110,6 +1155,7 @@ fn run(cli: Cli) -> Result<()> {
                 schemas: &assessment.schemas,
                 missing: assessment.missing_ids(),
                 numpad: &numpad,
+                extra_support: extra_support.as_str(),
             };
             if cli.json {
                 print_json(&check)?;
@@ -1123,6 +1169,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("schemas={}", assessment.line());
                 println!("missing={}", check.missing.join(","));
                 println!("numpad={}", numpad_line(&numpad));
+                for line in extra_support_lines(&extra_support) {
+                    println!("{line}");
+                }
                 if let Some(error) = &check.payload_error {
                     println!("payload_error={error}");
                 }
@@ -1334,6 +1383,61 @@ fn run(cli: Cli) -> Result<()> {
                     report.detail
                 ))
             }
+        }
+        Command::RepairCustoms => {
+            // 只做一件事：把用户目录里已有的 <schema>.custom.yaml 补到最新形态。
+            // 不铺 build/、不部署、不碰公共目录 —— 安装/更新后调用是安全的。
+            let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
+            let mut repaired = Vec::new();
+            let mut unchanged = Vec::new();
+            let mut skipped = Vec::new();
+            let mut failed = Vec::new();
+            for id in managed_custom::list_user_customs(&rime_dir) {
+                let path = rime_dir.join(format!("{id}.custom.yaml"));
+                match managed_custom::repair_file(&path) {
+                    Ok(managed_custom::RepairOutcome::Repaired { backup }) => {
+                        repaired.push(id.clone());
+                        if let Some(backup) = backup {
+                            println!("repair_backup={}", backup.display());
+                        }
+                    }
+                    Ok(managed_custom::RepairOutcome::Unchanged) => unchanged.push(id.clone()),
+                    Ok(managed_custom::RepairOutcome::Skipped(reason)) => {
+                        skipped.push(format!("{id}:{reason}"));
+                    }
+                    Err(error) => failed.push(format!("{id}:{error:#}")),
+                }
+            }
+            let report = RepairCustomsJson {
+                rime_dir: rime_dir.display().to_string(),
+                repaired,
+                unchanged,
+                skipped,
+                failed,
+                ok: true,
+            };
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("rime_dir={}", report.rime_dir);
+                println!("repair_repaired={}", report.repaired.len());
+                println!("repair_unchanged={}", report.unchanged.len());
+                println!("repair_skipped={}", report.skipped.len());
+                println!("repair_failed={}", report.failed.len());
+                for id in &report.repaired {
+                    println!("repair_repaired_file={id}");
+                }
+                for item in &report.skipped {
+                    println!("repair_skipped_file={item}");
+                }
+                for item in &report.failed {
+                    eprintln!("warning: {item}");
+                }
+            }
+            if !report.failed.is_empty() {
+                bail!("有 {} 个 custom.yaml 修补失败", report.failed.len());
+            }
+            Ok(())
         }
         Command::PruneSchemas {
             dry_run,
@@ -1764,6 +1868,23 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("创建临时目录");
         dir
+    }
+
+    /// 增强组件不可用 / 判断不了时，文本输出必须带上 core 写的建议原文。
+    #[test]
+    fn extra_support_text_carries_the_core_advice_when_unusable() {
+        let supported = extra_support_lines(&ime_state::ExtraSupport::Supported);
+        assert_eq!(supported, vec!["extra_support=supported".to_string()]);
+
+        for support in [
+            ime_state::ExtraSupport::Unsupported,
+            ime_state::ExtraSupport::Unknown,
+        ] {
+            let lines = extra_support_lines(&support);
+            assert_eq!(lines[0], format!("extra_support={}", support.as_str()));
+            assert_eq!(lines.len(), 2, "不可用/判断不了时必须多打一句建议");
+            assert_eq!(lines[1], support.advice(), "建议必须原样打出来");
+        }
     }
 
     /// status 的 install_warning 必须在 JSON 与文本两条路径上都能看到；

@@ -21,6 +21,26 @@ pub trait RimeTrigger: Send + Sync {
         self.deploy(rime_dir)
     }
 
+    /// 这次的部署要不要「真的重编译」（而不是只重启服务）。
+    ///
+    /// apply 的部署序列默认走 deploy：Linux 是 rime_deployer --build（会重编译），
+    /// Windows 是结束 WeaselServer（**不会**重编译）。
+    /// 所以 Windows 上如果这轮改了配置类文件（比如新写了合并词典指针），
+    /// 就必须改走 manual_deploy —— 进程内跑一次 librime 部署，配置才真的生效。
+    fn deploy_recompiles(&self) -> bool {
+        false
+    }
+
+    /// 写完配置类文件（*.custom.yaml）后「立刻重新部署」，让新配置马上生效。
+    ///
+    /// 与 apply 的差别：apply 要合并词库，必须停输入法；这里只是改了配置，
+    /// 所以优先走「重载」而不是「杀进程重启」，尽量不打断用户。
+    ///
+    /// 默认走 manual_deploy（Windows：进程内 librime 部署 + 结束 WeaselServer）。
+    fn redeploy_after_config_change(&self, rime_dir: &Path) -> Result<()> {
+        self.manual_deploy(rime_dir)
+    }
+
     /// apply 期间 Linux 需要让 fcitx5 释放 LevelDB 锁。
     fn stop_ime(&self) -> Result<()> {
         Ok(())
@@ -123,6 +143,10 @@ impl LinuxTrigger {
 /// fcitx5 主进程名（对应 /proc/<pid>/comm）。
 #[cfg(target_os = "linux")]
 const IME_PROCESS: &str = "fcitx5";
+
+/// 让 fcitx5 重新加载配置（-r = reload），不杀进程。
+#[cfg(target_os = "linux")]
+const RELOAD_PROGRAM: &str = "fcitx5-remote";
 
 /// 僵尸/已死状态（Z=zombie、X/x=dead）：它们已释放所有 fd，不能算「还在运行」。
 #[cfg(target_os = "linux")]
@@ -457,6 +481,45 @@ impl RimeTrigger for LinuxTrigger {
             .context("rime_deployer --build failed")
     }
 
+    /// Linux 的 deploy 就是 rime_deployer --build，本来就会重编译，
+    /// 所以配置类文件改了之后走普通 deploy 即可。
+    fn deploy_recompiles(&self) -> bool {
+        true
+    }
+
+    fn redeploy_after_config_change(&self, rime_dir: &Path) -> Result<()> {
+        // 顺序是硬要求（2026-11-11 在 228 上实测）：
+        //   * fcitx5-remote -r、以及 DBus 的 ReloadConfig **都不会**让 librime
+        //     重编译 —— build/ 产物 mtime 不变，引擎日志里也没有重编译记录；
+        //   * rime_deployer --build 才会真正重编译（build/ 产物 mtime 与
+        //     user.yaml 的 last_build_time 一起更新）。
+        // 所以「先 reload、成功就返回」是错的：配置写进了 custom.yaml，
+        // 却永远编译不进产物，用户看到的就是「配了没生效」。
+        if self.stop_fcitx5 {
+            // 完整重启（与 apply 同一条路）：停 fcitx5 让出 build/ 与 LevelDB →
+            // rime_deployer --build 重建 → 拉回来。新 build/ 立刻生效，
+            // 不用等用户下次重启输入法。
+            if let Err(error) = self.stop_ime() {
+                tracing::warn!("stop fcitx5 before pointer redeploy failed: {error:#}");
+            }
+            let build = self.deploy(rime_dir);
+            // 无论重建成败都要把输入法拉回来，不能让用户没输入法可用。
+            if let Err(error) = self.start_ime() {
+                tracing::warn!("restart fcitx5 after pointer redeploy failed: {error:#}");
+            }
+            return build;
+        }
+        // 不停输入法：先重编译 build/（这步才是「生效」的关键），再尽力让
+        // fcitx5 重载一次，好让正在跑的引擎尽快读到新产物。
+        let build = self.deploy(rime_dir);
+        if command_exists(RELOAD_PROGRAM) {
+            if let Err(error) = run(RELOAD_PROGRAM, &["-r"], &[]) {
+                tracing::warn!("{RELOAD_PROGRAM} -r failed: {error:#}");
+            }
+        }
+        build
+    }
+
     fn stop_ime(&self) -> Result<()> {
         if !self.stop_fcitx5 {
             tracing::debug!("stop_fcitx5_during_apply=false; leaving fcitx5 alone");
@@ -601,6 +664,12 @@ impl RimeTrigger for WeaselTrigger {
         self.run_switch("/sync")
     }
 
+    /// Windows 的 deploy 只结束 WeaselServer，不重编译；
+    /// 配置类文件变了必须走 manual_deploy（进程内 librime 部署）才生效。
+    fn deploy_recompiles(&self) -> bool {
+        false
+    }
+
     /// 引擎 apply 之后的重新加载：**不调部署器**，只结束 WeaselServer。
     ///
     /// 227 证据：WeaselDeployer.exe /deploy 恒返回 0 却不产出任何 build 文件；
@@ -705,11 +774,17 @@ pub struct FakeTrigger {
     calls: Arc<Mutex<Vec<String>>>,
     fail_on: Mutex<Option<String>>,
     userdb_entries: Mutex<Vec<String>>,
+    /// 模拟「这次部署会不会重编译」。Linux 的 deploy 就是 rime_deployer --build
+    /// （会重编译），Windows 的 deploy 只结束服务（不重编译）。
+    recompiles: bool,
 }
 
 impl FakeTrigger {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            recompiles: true,
+            ..Self::default()
+        }
     }
 
     pub fn failing(step: &str) -> Self {
@@ -717,7 +792,16 @@ impl FakeTrigger {
             calls: Arc::new(Mutex::new(Vec::new())),
             fail_on: Mutex::new(Some(step.to_string())),
             userdb_entries: Mutex::new(Vec::new()),
+            recompiles: true,
         }
+    }
+
+    /// 模拟 Windows：deploy 只结束服务、不重编译。
+    ///
+    /// 这时「改了配置类文件」必须改走 manual_deploy，否则配置不会生效。
+    pub fn with_no_recompile(mut self) -> Self {
+        self.recompiles = false;
+        self
     }
 
     /// 跨线程共享的调用记录：Engine 会拿走 Box<dyn RimeTrigger>，测试仍能事后断言顺序。
@@ -759,6 +843,18 @@ impl RimeTrigger for FakeTrigger {
 
     fn deploy(&self, _rime_dir: &Path) -> Result<()> {
         self.record("deploy")
+    }
+
+    fn redeploy_after_config_change(&self, _rime_dir: &Path) -> Result<()> {
+        self.record("redeploy_after_config_change")
+    }
+
+    fn manual_deploy(&self, _rime_dir: &Path) -> Result<()> {
+        self.record("manual_deploy")
+    }
+
+    fn deploy_recompiles(&self) -> bool {
+        self.recompiles
     }
 
     fn stop_ime(&self) -> Result<()> {

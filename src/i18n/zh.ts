@@ -529,6 +529,27 @@ export const zh = {
   "fixIme.numpadNext": "重启输入法后再点一次「修复输入法」",
   "fixIme.numpadDetail": "小键盘技术细节：{text}",
 
+  // 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）：
+  // 只有 rime-sync 自建的输入法才有；装的是发行版 Rime 就没有。
+  "extraIme.title": "输入法增强功能",
+  "extraIme.supported": "增强功能正常：数字小键盘、中文标点直出、v 转数字都能用。",
+  "extraIme.unsupported": "你的输入法没有增强功能：数字小键盘、中文标点直出、v 转数字都用不了。",
+  "extraIme.unknown": "暂时判断不了本机输入法有没有增强功能。",
+  "extraIme.advice": "原因与建议：{text}",
+  "extraIme.linuxHint": "怎么换：把下载好的完整安装包选出来（就是包含输入法的那个大安装包），点「一键换装」，系统会弹管理员授权窗口，输完密码就会自动换成我们的输入法。",
+  "extraIme.windowsHint": "怎么换：Windows 上不用手动装，点上面的「修复输入法」，程序会自动换成我们的输入法，换完重启输入法即可。",
+  "extraIme.packageLabel": "完整安装包",
+  "extraIme.packagePlaceholder": "选一个包含输入法的完整安装包（也可以直接把路径粘进来）",
+  "extraIme.browse": "选择安装包…",
+  "extraIme.install": "一键换装",
+  "extraIme.working": "换装中…",
+  "extraIme.noScript": "当前这个程序里没有换装功能（多半是 AppImage 版本）：请改用完整安装包手动安装 —— 先卸载原来的输入法，再运行完整安装包。",
+  "extraIme.needPackage": "请先选一个完整安装包（可以点「选择安装包…」，也可以直接把路径粘进来）。",
+  "extraIme.packageMissing": "找不到你给的安装包：{path}",
+  "extraIme.started": "已启动换装：系统会弹出管理员授权窗口，输完密码就会自动替换输入法；换装完成后重启输入法即可。",
+  "extraIme.failed": "换装失败：{error}",
+  "extraIme.detectFailed": "检测本机输入法的增强功能失败：{error}",
+
   "imeBanner.title": "输入法未就绪",
   "imeBanner.state": "最近一次自举：{install}",
   "imeBanner.needsElevation": "安装小狼毫需要管理员权限",

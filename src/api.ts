@@ -207,6 +207,22 @@ export interface InstallWarning {
   retry_command?: string | null;
 }
 
+/** 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）状态。
+ * 后端判据在 core 的 ime_state::assess_extra_support，这里只做用户界面展示。
+ */
+export interface ExtraSupportView {
+  /** supported / unsupported / unknown。 */
+  support: string;
+  /** 一句中文人话建议（原因 + 怎么办），直接给用户看。 */
+  advice: string;
+  /** 平台：linux / windows / …（前端据此决定要不要给换装按钮）。 */
+  platform: string;
+  /** 本机能不能一键换装（Linux 且换装脚本在位；AppImage 为 false）。 */
+  can_reinstall: boolean;
+  /** 换装脚本路径（不在位时也报出来，方便排查）。 */
+  script_path: string;
+}
+
 export interface DeviceInfo {
   id: string;
   hostname: string;
@@ -632,6 +648,14 @@ export const api = {
 
   installWarning: () => invoke<InstallWarning>("cmd_install_warning"),
   retryInstallDeps: () => invoke<string>("cmd_retry_install_deps"),
+
+  // 输入法增强功能状态：supported / unsupported / unknown。
+  extraSupport: () => invoke<ExtraSupportView>("cmd_extra_support"),
+  // Linux 一键换装：pkexec 调换装脚本，会弹管理员授权窗口（脱离进程，不等结果）。
+  installExtraIme: (packagePath: string) =>
+    invoke<string>("cmd_install_extra_ime", { packagePath }),
+  // 让用户挑一个本地完整安装包（后端直接调系统文件选择器）。
+  pickExtraPackage: () => invoke<string | null>("cmd_pick_extra_package"),
 
   watchStart: () => invoke<WatchStatus>("cmd_watch_start"),
   watchStop: () => invoke<WatchStatus>("cmd_watch_stop"),

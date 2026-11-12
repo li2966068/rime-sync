@@ -21,6 +21,7 @@ pub mod lock;
 pub mod log;
 pub mod managed_custom;
 pub mod merge3;
+pub mod merged_dict;
 pub mod network;
 pub mod plan;
 pub mod platform;

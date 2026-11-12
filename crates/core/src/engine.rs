@@ -80,6 +80,10 @@ pub struct Report {
     /// 否则改动不会生效。
     #[serde(default)]
     pub config_changed: bool,
+    /// 本轮写入了合并词典指针（<schema>.custom.yaml 的 translator/dictionary）：
+    /// 写了就必须重新部署，否则 librime 不会重编译、指针不生效。
+    #[serde(default)]
+    pub merged_pointer_written: bool,
     /// 本轮拉到新的/变化的 *.userdb.txt：transport 只搬文件，必须再跑 apply
     /// （rime_dict_manager --sync）才算真正合并进本地词库。
     #[serde(default)]
@@ -396,7 +400,7 @@ impl Engine {
     /// 首次接入（本地无 index 且远端已有数据）按 first_sync_policy 只拉不推。
     pub fn transport(&mut self) -> Report {
         let report = match self.lock() {
-            Ok(_guard) => self.transport_inner(),
+            Ok(_guard) => self.transport_inner(true),
             Err(error) => self.locked_report(error),
         };
         self.record_history("transport", &report);
@@ -416,7 +420,10 @@ impl Engine {
         }
     }
 
-    fn transport_inner(&mut self) -> Report {
+    /// redeploy_pointer：本次 transport 结束后是否要为「刚写入的合并词典指针」
+    /// 立刻重新部署。apply 走同一条 transport_inner，但 apply 自己有完整的
+    /// 部署序列（停输入法 → 合并 → 部署 → 起输入法），所以传 false 避免重复。
+    fn transport_inner(&mut self, redeploy_pointer: bool) -> Report {
         let started = Instant::now();
         let mut report = Report {
             ok: true,
@@ -430,6 +437,10 @@ impl Engine {
             report.error = Some(format!("{error:#}"));
             tracing::error!("transport failed: {error:#}");
         }
+        // 新设备接入：把合并词典指针补进本机各方案的 custom.yaml（只在键缺失时写）。
+        if report.ok {
+            self.write_merged_dict_pointer(&mut report);
+        }
         match self.index.save(&self.index_path) {
             Ok(()) => self.index_existed = true,
             Err(error) => {
@@ -441,7 +452,7 @@ impl Engine {
         }
         // Windows：配置类文件（*.custom.yaml）落到本地后必须让 Weasel 重新部署，
         // 否则用户要手动「重新部署」才生效。Linux/macOS 不触发（会打断输入法）。
-        if report.ok && report.config_changed && cfg!(windows) {
+        if report.ok && report.config_changed && cfg!(windows) && !report.merged_pointer_written {
             self.emit("deploy", 0, 0, "deploying weasel configuration");
             match self.trigger.deploy(&self.rime_dir) {
                 Ok(()) => tracing::info!("weasel deploy triggered after custom yaml update"),
@@ -449,6 +460,12 @@ impl Engine {
                     "weasel deploy after config sync failed (config files are still on disk): {error:#}"
                 ),
             }
+        }
+        // 写了合并词典指针 → 立刻重新部署（Linux/Windows 两端一致）。
+        // Windows：结束 WeaselServer + 进程内 librime 部署（立刻重编译）；
+        // Linux：停 fcitx5 → rime_deployer --build → 重启 fcitx5。
+        if report.ok && redeploy_pointer {
+            self.redeploy_after_pointer_if_needed(&report);
         }
         dedupe(&mut report.conflicts);
         dedupe(&mut report.skipped);
@@ -466,6 +483,76 @@ impl Engine {
             ),
         );
         report
+    }
+
+    /// 新设备接入：把合并词典指针补进本机各方案的 custom.yaml。
+    ///
+    /// 只在键缺失时写（用户手写的 translator/dictionary 一律保留）；
+    /// 写完必须重新部署才生效（librime 比对用户 custom.yaml 的 mtime 决定重编译）。
+    fn write_merged_dict_pointer(&mut self, report: &mut Report) {
+        let mut data_dirs = crate::data_patch::data_dirs();
+        // 用户目录里也可能有自建方案，一并作为查表来源。
+        // 注意：即使系统 data 目录一个都没找到，也不能就此放弃 ——
+        // 用户目录本身就是合法的查表来源，少了它指针就永远写不进去。
+        data_dirs.push(self.rime_dir.clone());
+        // 模板目录：桌面程序靠可执行文件旁的 resources/prebuilt/config，
+        // Linux 靠安装器铺的 /usr/share/rime-sync/defaults/schemas。
+        let template_dirs = crate::merged_dict::template_dirs(None);
+        self.write_merged_dict_pointer_with(&data_dirs, &template_dirs, report);
+    }
+
+    /// 指针写入的可测版本：查表来源与模板目录由调用方给定。
+    fn write_merged_dict_pointer_with(
+        &mut self,
+        data_dirs: &[PathBuf],
+        template_dirs: &[PathBuf],
+        report: &mut Report,
+    ) {
+        let changes =
+            crate::merged_dict::ensure_pointers_with(&self.rime_dir, data_dirs, template_dirs);
+        for change in &changes {
+            match change {
+                crate::merged_dict::PointerChange::Written { schema, path } => {
+                    report.merged_pointer_written = true;
+                    report.config_changed = true;
+                    tracing::info!(
+                        "merged dictionary pointer written: {schema} -> {}",
+                        path.display()
+                    );
+                }
+                crate::merged_dict::PointerChange::Present { schema } => {
+                    tracing::debug!("merged dictionary pointer already present: {schema}");
+                }
+                crate::merged_dict::PointerChange::Skipped { schema, reason } => {
+                    tracing::debug!("merged dictionary pointer skipped: {schema} ({reason})");
+                }
+            }
+        }
+    }
+
+    /// 只有这轮真的写了指针才重新部署（没写就别白折腾一次编译）。
+    fn redeploy_after_pointer_if_needed(&mut self, report: &Report) {
+        if report.merged_pointer_written {
+            self.redeploy_after_pointer();
+        }
+    }
+
+    /// 写完合并词典指针后的立刻重新部署（两端一致）。
+    fn redeploy_after_pointer(&mut self) {
+        self.emit(
+            "deploy",
+            0,
+            0,
+            "redeploying after merged dictionary pointer",
+        );
+        // 平台差异收在 RimeTrigger 里：Windows 走进程内 librime 部署（结束
+        // WeaselServer + 立刻重编译），Linux 走 fcitx5 重载 / rime_deployer 重建。
+        match self.trigger.redeploy_after_config_change(&self.rime_dir) {
+            Ok(()) => tracing::info!("redeploy after merged dictionary pointer ok"),
+            Err(error) => tracing::warn!(
+                "redeploy after merged dictionary pointer failed (config is still on disk): {error:#}"
+            ),
+        }
     }
 
     /// 预演（dry-run）：完整跑一遍 transport 的判定链路，但所有写动作只记录不执行。
@@ -614,7 +701,7 @@ impl Engine {
         if let Err(error) = backups.prune(self.config.backup_keep as usize) {
             tracing::warn!("prune backups: {error:#}");
         }
-        let mut report = self.transport_inner();
+        let mut report = self.transport_inner(false);
         report.backup_id = Some(backup_id);
         if !report.ok {
             report.duration_ms = started.elapsed().as_millis() as u64;
@@ -660,7 +747,18 @@ impl Engine {
         }
         if deploy_error.is_none() {
             self.emit("deploy", 2, 4, "rime_deployer --build");
-            if let Err(error) = self.trigger.deploy(&self.rime_dir) {
+            // 这一轮写了合并词典指针的话，配置必须真的重编译才生效。
+            // Linux 的 deploy 就是 rime_deployer --build（会重编译）；
+            // Windows 的 deploy 只结束 WeaselServer（不重编译），
+            // 所以那边改走 manual_deploy（进程内 librime 部署）。
+            let needs_recompile =
+                report.merged_pointer_written && !self.trigger.deploy_recompiles();
+            let outcome = if needs_recompile {
+                self.trigger.manual_deploy(&self.rime_dir)
+            } else {
+                self.trigger.deploy(&self.rime_dir)
+            };
+            if let Err(error) = outcome {
                 deploy_error = Some(error);
             }
         }
@@ -2163,6 +2261,24 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::FakeTrigger;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 测试用的临时目录（每个用例一个，避免互相干扰）。
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-pointer-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
 
     #[test]
     fn conflict_name_lands_next_to_original() {
@@ -2195,6 +2311,7 @@ mod tests {
                 sample: vec!["-a".into()],
             }]),
             config_changed: true,
+            merged_pointer_written: true,
             pending_merge: true,
             merged_entries: Some(42),
         };
@@ -2202,6 +2319,7 @@ mod tests {
         assert_eq!(json["pushed"], 2);
         assert_eq!(json["pending_merge"], true);
         assert_eq!(json["config_changed"], true);
+        assert_eq!(json["merged_pointer_written"], true);
         assert_eq!(json["merged_entries"], 42);
         assert_eq!(json["conflicts"][0], "a");
         assert_eq!(json["backup_id"], "20240101-000000");
@@ -2209,6 +2327,247 @@ mod tests {
         assert_eq!(json["mode"], "pull-only");
         assert_eq!(json["conflict_details"][0]["both_changed"], 3);
         assert_eq!(json["notes"][0], "default.custom.yaml: schema_list union");
+    }
+
+    /// 新设备接入：拉到合并词典后自动补指针，并立刻重新部署。
+    ///
+    /// 指针写进 custom.yaml 只是第一步，不重新部署就不会编译进 build/ 产物，
+    /// 用户看到的就是「配了没生效」。这条测试把两件事钉在一起。
+    #[test]
+    fn merged_pointer_is_written_and_triggers_a_redeploy() {
+        let root = temp_test_dir("pointer-written");
+        let rime = root.join("rime");
+        let data = root.join("data");
+        fs::create_dir_all(&rime).expect("rime");
+        fs::create_dir_all(&data).expect("data");
+        // 方案本体在 data 目录（跟真机一致）。
+        fs::write(
+            data.join("luna_pinyin_simp.schema.yaml"),
+            b"schema:\n  schema_id: luna_pinyin_simp\ntranslator:\n  dictionary: luna_pinyin\n",
+        )
+        .expect("schema");
+        // 合并词典在用户目录顶层（shared 树的文件就落在这儿）。
+        fs::write(
+            rime.join("merged.dict.yaml"),
+            b"name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+        )
+        .expect("merged dict");
+        // 用户手写的 custom.yaml：没有 translator/dictionary 这个键。
+        let custom = rime.join("luna_pinyin_simp.custom.yaml");
+        fs::write(&custom, b"patch:\n  menu/page_size: 8\n").expect("custom");
+
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state");
+        let mut config = Config::default();
+        config.webdav.url = "http://127.0.0.1:1/dav".to_string();
+        config.device_id = "new-device".to_string();
+        let trigger = FakeTrigger::new();
+        let calls = trigger.calls_shared();
+        let mut engine =
+            Engine::new(config, rime.clone(), state, Box::new(trigger)).expect("engine");
+
+        let mut report = Report::default();
+        engine.write_merged_dict_pointer_with(&[data], &[], &mut report);
+
+        assert!(report.merged_pointer_written, "pointer must be written");
+        assert!(report.config_changed, "pointer write is a config change");
+        let text = fs::read_to_string(&custom).expect("custom");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("yaml");
+        assert_eq!(
+            doc.get("patch")
+                .and_then(|patch| patch.get("translator/dictionary"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("merged"),
+            "custom.yaml must point at the merged dictionary"
+        );
+
+        // 指针写完必须重新部署，否则不会编译进 build/ 产物。
+        engine.redeploy_after_pointer_if_needed(&report);
+        let recorded = calls.lock().expect("calls lock").clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|step| step == "redeploy_after_config_change"),
+            "must redeploy after writing the pointer, got {recorded:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 系统 data 目录一个都没有时，也要把用户目录当查表来源。
+    ///
+    /// 之前这里直接 return，指针就永远写不进去 ——
+    /// 而「系统 data 目录不存在」正是自建方案用户的环境。
+    #[test]
+    fn pointer_is_written_even_without_any_system_data_dir() {
+        let root = temp_test_dir("pointer-no-data-dir");
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        // 自建方案与合并词典都在用户目录里。
+        fs::write(
+            rime.join("myschema.schema.yaml"),
+            b"schema:\n  schema_id: myschema\ntranslator:\n  dictionary: luna_pinyin\n",
+        )
+        .expect("schema");
+        fs::write(
+            rime.join("merged.dict.yaml"),
+            b"name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+        )
+        .expect("merged dict");
+        let custom = rime.join("myschema.custom.yaml");
+        fs::write(&custom, b"patch:\n  menu/page_size: 8\n").expect("custom");
+
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state");
+        let mut config = Config::default();
+        config.webdav.url = "http://127.0.0.1:1/dav".to_string();
+        config.device_id = "no-data-dir".to_string();
+        let trigger = FakeTrigger::new();
+        let mut engine =
+            Engine::new(config, rime.clone(), state, Box::new(trigger)).expect("engine");
+
+        let mut report = Report::default();
+        // 只给用户目录一个查表来源 —— 系统 data 目录一个都没有。
+        engine.write_merged_dict_pointer_with(std::slice::from_ref(&rime), &[], &mut report);
+
+        assert!(
+            report.merged_pointer_written,
+            "the user dir alone is a valid lookup source"
+        );
+        let text = fs::read_to_string(&custom).expect("custom");
+        assert!(
+            text.contains("merged"),
+            "the pointer must point at the merged dictionary: {text}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 方案没有 custom.yaml 时，用模板建一份完整的出来（增强功能 + 指针）。
+    ///
+    /// 这是「新设备接入时自动写好」的最后一环：自建方案在公共目录里没有数据，
+    /// 安装器因此跳过了模板铺设，方案在用户目录里连 custom.yaml 都没有。
+    #[test]
+    fn a_missing_custom_file_is_seeded_from_the_template() {
+        let root = temp_test_dir("pointer-seed-from-template");
+        let rime = root.join("rime");
+        let data = root.join("data");
+        let templates = root.join("templates");
+        for dir in [&rime, &data, &templates] {
+            fs::create_dir_all(dir).expect("mkdir");
+        }
+        fs::write(
+            data.join("myschema.schema.yaml"),
+            b"schema:\n  schema_id: myschema\ntranslator:\n  dictionary: luna_pinyin\n",
+        )
+        .expect("schema");
+        fs::write(
+            rime.join("merged.dict.yaml"),
+            b"name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+        )
+        .expect("merged dict");
+        // 随包模板：带增强组件。
+        fs::write(
+            templates.join("myschema.custom.yaml"),
+            b"patch:\n  engine/processors:\n    - rimesync_punct\n    - numpad\n  engine/translators:\n    - rimesync_vnum\n",
+        )
+        .expect("template");
+        // 这台机器的引擎支持增强组件（build 产物里有 rimesync 标记）。
+        fs::create_dir_all(rime.join("build")).expect("build dir");
+        fs::write(
+            rime.join("build").join("myschema.schema.yaml"),
+            b"engine:\n  processors:\n    - rimesync_vnum\n",
+        )
+        .expect("build");
+
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state");
+        let mut config = Config::default();
+        config.webdav.url = "http://127.0.0.1:1/dav".to_string();
+        config.device_id = "seed-from-template".to_string();
+        let trigger = FakeTrigger::new();
+        let mut engine =
+            Engine::new(config, rime.clone(), state, Box::new(trigger)).expect("engine");
+
+        let mut report = Report::default();
+        engine.write_merged_dict_pointer_with(
+            std::slice::from_ref(&data),
+            std::slice::from_ref(&templates),
+            &mut report,
+        );
+
+        assert!(
+            report.merged_pointer_written,
+            "the pointer must be written into the freshly seeded file"
+        );
+        let custom = rime.join("myschema.custom.yaml");
+        let text = fs::read_to_string(&custom).expect("custom");
+        assert!(
+            text.contains("translator/dictionary"),
+            "the pointer must be present: {text}"
+        );
+        assert!(
+            text.contains("rimesync_vnum"),
+            "the seeded file must keep the enhancement components: {text}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 用户自己写好的指针一个字都不许动，也不该触发重新部署。
+    #[test]
+    fn existing_user_pointer_is_never_overwritten() {
+        let root = temp_test_dir("pointer-kept");
+        let rime = root.join("rime");
+        let data = root.join("data");
+        fs::create_dir_all(&rime).expect("rime");
+        fs::create_dir_all(&data).expect("data");
+        fs::write(
+            data.join("luna_pinyin_simp.schema.yaml"),
+            b"schema:\n  schema_id: luna_pinyin_simp\ntranslator:\n  dictionary: luna_pinyin\n",
+        )
+        .expect("schema");
+        fs::write(
+            rime.join("merged.dict.yaml"),
+            b"name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+        )
+        .expect("merged dict");
+        let custom = rime.join("luna_pinyin_simp.custom.yaml");
+        fs::write(
+            &custom,
+            b"patch:\n  \"translator/dictionary\": luna_pinyin_extra\n  menu/page_size: 8\n",
+        )
+        .expect("custom");
+
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state");
+        let mut config = Config::default();
+        config.webdav.url = "http://127.0.0.1:1/dav".to_string();
+        config.device_id = "keep-pointer".to_string();
+        let trigger = FakeTrigger::new();
+        let calls = trigger.calls_shared();
+        let mut engine =
+            Engine::new(config, rime.clone(), state, Box::new(trigger)).expect("engine");
+
+        let mut report = Report::default();
+        engine.write_merged_dict_pointer_with(&[data], &[], &mut report);
+
+        assert!(!report.merged_pointer_written, "must not claim a write");
+        let text = fs::read_to_string(&custom).expect("custom");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("yaml");
+        assert_eq!(
+            doc.get("patch")
+                .and_then(|patch| patch.get("translator/dictionary"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("luna_pinyin_extra"),
+            "user's own pointer must survive"
+        );
+        engine.redeploy_after_pointer_if_needed(&report);
+        let recorded = calls.lock().expect("calls lock").clone();
+        assert!(
+            !recorded
+                .iter()
+                .any(|step| step == "redeploy_after_config_change"),
+            "no pointer written -> no redeploy, got {recorded:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { api, type ImeBootstrapStatus } from "../api";
+import { api, type ExtraSupportView, type ImeBootstrapStatus } from "../api";
 import { t, type MessageKey } from "../i18n";
 import { el } from "./dom";
 import { errorText } from "./format";
@@ -81,6 +81,9 @@ export async function refreshImeStatus(): Promise<void> {
     // 读不到状态就当作没有告警：设置页本身必须始终可用。
     renderImeBanner(null);
   }
+  // 增强功能（数字小键盘 / 中文标点直出 / v 转数字）是另一件事：它不靠自举，
+  // 靠本机装的引擎是不是我们的自建版，所以单独查一次。
+  void refreshExtraSupport();
 }
 
 /// 后台自举完成时（可能晚于界面加载）刷新红条并提示一次。
@@ -111,5 +114,115 @@ export async function elevateForIme(): Promise<void> {
     toast(t("imeBanner.elevateFailed", { error: errorText(error) }));
   } finally {
     el.imeElevate.disabled = false;
+  }
+}
+
+// ── 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）────────────────────
+//
+// 增强组件是 rime-sync 自研、编进输入法引擎本体的，发行版 Rime 里没有：
+// 方案一旦引用它们就直接报错，整个输入法用不了。
+// 判据全在后端（core 的 ime_state::assess_extra_support），这里只负责两件事：
+// 1. 把结论翻译成用户看得懂的大白话；
+// 2. Linux 上给出「一键换装」按钮（Windows 不给按钮：点一次「修复输入法」
+//    程序会自动换 Weasel）。
+//
+// 面板在 index.html 里静态声明（#extra-ime-panel）：固定文案走 data-i18n，
+// 结论/建议这类由后端判据生成的文字走 t(key) —— 切语言时 app.ts 会再刷一次。
+
+let extraState: ExtraSupportView | null = null;
+
+/// 按后端结论渲染增强功能区块（文案全走 i18n，后端只给判据与人话建议）。
+function renderExtraSupport(): void {
+  const state = extraState;
+  if (!state) {
+    el.extraPanel.hidden = true;
+    return;
+  }
+  el.extraPanel.hidden = false;
+  const supported = state.support === "supported";
+  el.extraSummary.textContent = supported
+    ? t("extraIme.supported")
+    : state.support === "unsupported"
+      ? t("extraIme.unsupported")
+      : t("extraIme.unknown");
+  el.extraAdvice.textContent = t("extraIme.advice", { text: state.advice });
+  const linux = state.platform === "linux";
+  // 换装入口只给 Linux（且换装脚本在位）；Windows 由「修复输入法」自动换。
+  el.extraAction.hidden = supported || !linux || !state.can_reinstall;
+  if (supported) {
+    el.extraHint.hidden = true;
+    el.extraHint.textContent = "";
+    el.extraStatus.textContent = "";
+    return;
+  }
+  el.extraHint.hidden = false;
+  if (!linux) {
+    el.extraHint.textContent = t("extraIme.windowsHint");
+  } else if (!state.can_reinstall) {
+    // AppImage 之类没有换装脚本的版本：只能让用户手动用完整安装包装。
+    el.extraHint.textContent = t("extraIme.noScript");
+  } else {
+    el.extraHint.textContent = t("extraIme.linuxHint");
+  }
+}
+
+/// 读取本机输入法的增强功能状态并刷新界面。
+export async function refreshExtraSupport(): Promise<void> {
+  try {
+    extraState = await api.extraSupport();
+  } catch (error) {
+    // 读不到状态也要把原因说清楚，不能悄悄装没这回事。
+    extraState = null;
+    el.extraPanel.hidden = false;
+    el.extraSummary.textContent = t("extraIme.detectFailed", { error: errorText(error) });
+    el.extraAdvice.textContent = "";
+    el.extraHint.textContent = "";
+    el.extraHint.hidden = true;
+    el.extraAction.hidden = true;
+    el.extraStatus.textContent = "";
+    return;
+  }
+  renderExtraSupport();
+}
+
+/// 让用户挑一个本地完整安装包（后端直接调系统文件选择器）。
+export async function pickExtraPackage(): Promise<void> {
+  try {
+    const picked = await api.pickExtraPackage();
+    if (picked) {
+      el.extraPackage.value = picked;
+      el.extraStatus.textContent = "";
+    }
+  } catch (error) {
+    el.extraStatus.textContent = t("extraIme.failed", { error: errorText(error) });
+  }
+}
+
+/// 「一键换装」：把用户选的完整安装包交给后端，后端用 pkexec 调换装脚本。
+/// pkexec 会弹管理员授权窗口，换装要几分钟，所以界面不等它跑完。
+export async function runExtraInstall(): Promise<void> {
+  const path = el.extraPackage.value.trim();
+  if (!path) {
+    el.extraStatus.textContent = t("extraIme.needPackage");
+    return;
+  }
+  el.extraInstall.disabled = true;
+  el.extraBrowse.disabled = true;
+  el.extraInstall.textContent = t("extraIme.working");
+  try {
+    const message = await api.installExtraIme(path);
+    el.extraStatus.textContent = message;
+    toast(message);
+    localLog(message);
+  } catch (error) {
+    // 后端已经把错误翻成中文了，这里只包一层，不把原始 Err 抛给用户。
+    const text = t("extraIme.failed", { error: errorText(error) });
+    el.extraStatus.textContent = text;
+    toast(text);
+    localLog(text);
+  } finally {
+    el.extraInstall.disabled = false;
+    el.extraBrowse.disabled = false;
+    el.extraInstall.textContent = t("extraIme.install");
   }
 }

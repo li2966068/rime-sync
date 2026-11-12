@@ -386,6 +386,31 @@
             </div>
             <p class="hint" data-i18n="fixIme.desc"></p>
             <p class="hint" id="fix-ime-status" role="status"></p>
+            <!-- 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）：只有 rime-sync
+                 自建的输入法才有；装的是发行版 Rime 就没有。Linux 上给「一键换装」，
+                 Windows 上只说明（点「修复输入法」程序会自动换 Weasel）。 -->
+            <div class="extra-ime" id="extra-ime-panel" hidden>
+              <strong data-i18n="extraIme.title">输入法增强功能</strong>
+              <p class="hint" id="extra-ime-summary"></p>
+              <p class="hint" id="extra-ime-advice"></p>
+              <p class="hint" id="extra-ime-hint"></p>
+              <div class="field" id="extra-ime-action" hidden>
+                <label for="extra-ime-package" data-i18n="extraIme.packageLabel">完整安装包</label>
+                <div class="input-with-action">
+                  <input
+                    id="extra-ime-package"
+                    type="text"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="选一个包含输入法的完整安装包（也可以直接把路径粘进来）"
+                    data-i18n-placeholder="extraIme.packagePlaceholder"
+                  />
+                  <button class="ghost small" id="btn-extra-browse" type="button" data-i18n="extraIme.browse">选择安装包…</button>
+                  <button class="small" id="btn-extra-install" type="button" data-i18n="extraIme.install">一键换装</button>
+                </div>
+              </div>
+              <p class="hint" id="extra-ime-status" role="status"></p>
+            </div>
           </div>
 
           <!-- 设备本地键：这些 patch 键只存本机、不上传（默认 schema_list），

@@ -305,6 +305,23 @@ seed_schema_customs() { # $1=Rime 用户目录
         "$(date '+%F %T')" "$wrote" "$kept" "$no_data" "$rime_dir" >>"$SCHEMA_SEED_LOG" 2>/dev/null || true
 }
 
+# ---------------------------------------------------- 用户 custom.yaml 增量修补
+# 更新到新版本后，老设备「沿用」的旧 custom.yaml 可能缺后来才加的增强组件
+# （比如此键盘 / 中文标点直出 / v 转数字）。这里补齐：只补缺的那几项，
+# 用户改过的内容原样保留（非 rime-sync 管理的文件一律跳过）。
+repair_user_customs() { # $1=Rime 用户目录
+    local rime_dir=$1 owner=${TARGET_USER:-root} group
+    group=$(id -gn "$owner" 2>/dev/null || echo "$owner")
+    [ -x "$CLI_HELPER" ] || return 0
+    [ -d "$rime_dir" ] || return 0
+    "$CLI_HELPER" repair-customs --rime-dir "$rime_dir" >/dev/null 2>&1 || true
+    # CLI 以 root 身份跑，写出来的文件属主会变成 root —— 补回给用户。
+    for f in "$rime_dir"/*.custom.yaml "$rime_dir"/*.custom.yaml.rimesync-orig; do
+        [ -f "$f" ] || continue
+        chown "$owner:$group" "$f" 2>/dev/null || true
+    done
+    say "用户方案配置：已增量补齐缺失的增强组件（你改过的内容原样保留）"
+}
 # ---------------------------------------------------- 预编译 build 产物兜底
 # 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy 返回 0
 # 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。随 IME 包带的
@@ -447,6 +464,8 @@ if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     seed_prebuilt_build "$RIME_USER_DIR"
     # 0.6.21：清掉非保留方案的 data / 用户 custom.yaml / build 产物（幂等、带备份）
     prune_extra_schemas "$RIME_USER_DIR"
+    # 0.6.30：补齐老设备 custom.yaml 里缺失的新增强组件（只补缺，绝不覆盖用户改动）
+    repair_user_customs "$RIME_USER_DIR"
 fi
 # 用户目录不可用时只清 data（root 期；Linux 的 /usr/share/rime-data 属 root）
 if [ "${1:-}" = "configure" ] && [ -z "$TARGET_HOME" ]; then

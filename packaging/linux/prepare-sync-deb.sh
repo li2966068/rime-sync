@@ -62,6 +62,16 @@ dump_env() {
   echo "--------------------"
 }
 
+# 「重装增强输入法」脚本要和 uninstall.sh 放在同一目录（/usr/lib/rime-sync/），
+# GUI 侧用 pkexec 调用 /usr/lib/rime-sync/install-extra-ime.sh。
+EXTRA_SCRIPT=install-extra-ime.sh
+install_extra_script() { # <数据归档解出来的根目录>
+  local root=$1
+  [ -f "$HERE/$EXTRA_SCRIPT" ] || return 0
+  mkdir -p "$root/usr/lib/rime-sync"
+  install -m 0755 "$HERE/$EXTRA_SCRIPT" "$root/usr/lib/rime-sync/$EXTRA_SCRIPT"
+}
+
 build_with_dpkg_deb() { # <src.deb> <out.deb>
   rm -rf "$tmp/root"; mkdir -p "$tmp/root"
   dpkg-deb -R "$src" "$tmp/root" || return 1
@@ -69,6 +79,7 @@ build_with_dpkg_deb() { # <src.deb> <out.deb>
     [ -f "$HERE/$ms" ] || continue
     install -m 0755 "$HERE/$ms" "$tmp/root/DEBIAN/$ms"
   done
+  install_extra_script "$tmp/root"
   find "$tmp/root" -type d -exec chmod 0755 {} +
   find "$tmp/root" -type f -exec chmod 0644 {} +
   # 恢复可执行位：上面的 0644 会把 /usr/bin/rime-sync-app 变成不可执行（0.5.0 的实测 bug）。
@@ -99,8 +110,18 @@ repack_via_ar() { # <src.deb> <out.deb>：只换控制归档，数据归档原�
     install -m 0755 "$HERE/$ms" "$work/ctl/$ms" || return 1
   done
   tar --owner=root --group=root -czf "$work/control.tar.gz" -C "$work/ctl" . || return 1
+  # 数据归档默认原样搬过去；但「重装增强输入法」脚本是新加的文件，
+  # 原样搬过去就丢了，所以这里要把数据归档解开、放进脚本、重新打包。
+  data_member="$(basename "$data")"
+  if [ -f "$HERE/$EXTRA_SCRIPT" ]; then
+    mkdir -p "$work/data"
+    tar -xf "$data" -C "$work/data" || return 1
+    install_extra_script "$work/data" || return 1
+    tar --owner=root --group=root -czf "$work/data.tar.gz" -C "$work/data" . || return 1
+    data_member=data.tar.gz
+  fi
   rm -f "$o"
-  ( cd "$work" && ar r "$o" debian-binary control.tar.gz "$(basename "$data")" ) || return 1
+  ( cd "$work" && ar r "$o" debian-binary control.tar.gz "$data_member" ) || return 1
 }
 
 # 只有「打包成功 + 产物可读且 CLI 恰好 1 份」才算数：CI 上出现过 dpkg-deb 退出 0

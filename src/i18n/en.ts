@@ -532,6 +532,27 @@ export const en: Record<keyof Dict, string> = {
   "fixIme.numpadNext": "Restart the input method, then click Repair input method again",
   "fixIme.numpadDetail": "Numeric keypad technical details: {text}",
 
+  // Input method extras (numeric keypad / direct Chinese punctuation / v-to-number):
+  // only the rime-sync build has them; a distro Rime does not.
+  "extraIme.title": "Input method extras",
+  "extraIme.supported": "Extras work: numeric keypad, direct Chinese punctuation and v-to-number are all available.",
+  "extraIme.unsupported": "Your input method has no extras: the numeric keypad, direct Chinese punctuation and v-to-number are unavailable.",
+  "extraIme.unknown": "Cannot tell yet whether this input method has the extras.",
+  "extraIme.advice": "Reason and what to do: {text}",
+  "extraIme.linuxHint": "How to switch: pick the full installer package you downloaded (the big package that contains the input method), then click ‘Switch to ours’; the system asks for the administrator password and the input method is replaced automatically.",
+  "extraIme.windowsHint": "How to switch: on Windows there is nothing to install by hand — click ‘Repair input method’ above and the app replaces the input method for you; restart the input method afterwards.",
+  "extraIme.packageLabel": "Full installer package",
+  "extraIme.packagePlaceholder": "Pick the full package that contains the input method (or paste its path)",
+  "extraIme.browse": "Pick package…",
+  "extraIme.install": "Switch to ours",
+  "extraIme.working": "Switching…",
+  "extraIme.noScript": "This build has no switching helper (most likely the AppImage build): install the full package by hand instead — uninstall the old input method first, then run the full package.",
+  "extraIme.needPackage": "Pick a full installer package first (use ‘Pick package…’, or paste the path directly).",
+  "extraIme.packageMissing": "Cannot find the package you picked: {path}",
+  "extraIme.started": "Switching started: the system asks for the administrator password, then the input method is replaced; restart the input method afterwards.",
+  "extraIme.failed": "Switching failed: {error}",
+  "extraIme.detectFailed": "Cannot check the extras of this input method: {error}",
+
   "imeBanner.title": "Input method is not ready",
   "imeBanner.state": "Last bootstrap: {install}",
   "imeBanner.needsElevation": "Installing Weasel requires administrator rights",

@@ -319,6 +319,282 @@ pub fn assess(rime_dir: &Path, data_dirs: &[PathBuf], retained: &KeepSet) -> Ass
 
 /// 逐方案状态：一切正常。
 const NUMPAD_OK: &str = "ok";
+/// 增强组件（数字小键盘 / 中文标点直出 / v 转数字）在本机是否可用。
+///
+/// 这四个组件是 rime-sync 自研、编进 librime 本体的（不是上游组件）。
+/// 发行版 librime 里没有它们，方案里一引用就报
+/// `error creating processor: 'numpad'`，**整个方案直接不可用**。
+///
+/// 所以「机器上装的是不是我们的自建输入法」必须能查出来，
+/// 否则用户只会看到「同步程序装上了，可小键盘怎么没有」，却没人告诉他原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtraSupport {
+    /// 引擎里有我们的组件 → 增强功能可用。
+    Supported,
+    /// 引擎确定没有 → 增强功能不可用，需要换装我们的输入法。
+    Unsupported,
+    /// 找不到引擎，判断不了。
+    Unknown,
+}
+
+impl ExtraSupport {
+    /// 报告里的机器可读值。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtraSupport::Supported => "supported",
+            ExtraSupport::Unsupported => "unsupported",
+            ExtraSupport::Unknown => "unknown",
+        }
+    }
+
+    /// 增强功能是不是确定可用。
+    pub fn usable(&self) -> bool {
+        matches!(self, ExtraSupport::Supported)
+    }
+
+    /// 一句人话建议（直接给用户看，别让用户猜术语）。
+    pub fn advice(&self) -> &'static str {
+        match self {
+            ExtraSupport::Supported => "增强功能可用（数字小键盘 / 中文标点直出 / v 转数字）。",
+            ExtraSupport::Unsupported => {
+                "当前输入法不是 rime-sync 自建版，引擎里没有增强组件（数字小键盘 / 中文标点直出 / v 转数字），方案引用它们会直接报错，整个输入法用不了。需要「删除原来的输入法，全新安装我们的输入法」：Linux 用完整安装包重装，Windows 点一次「修复输入法」程序会自动换上。"
+            }
+            ExtraSupport::Unknown => {
+                "暂时判断不了本机输入法是否带增强功能。点一次「修复输入法」让它重新检查并补齐；若仍提示没有，请用完整安装包重装。"
+            }
+        }
+    }
+}
+
+/// 引擎库里的标记：我们的自建 librime 里有这个字符串，发行版没有。
+const EXTRA_ENGINE_MARKER: &[u8] = b"rimesync";
+
+/// 二进制文件里有没有这个标记（流式读，不把整库读进内存）。
+fn file_has_marker(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let Ok(read) = file.read(&mut buf) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        let mut window = tail.clone();
+        window.extend_from_slice(&buf[..read]);
+        if window
+            .windows(EXTRA_ENGINE_MARKER.len())
+            .any(|part| part == EXTRA_ENGINE_MARKER)
+        {
+            return true;
+        }
+        // 保留尾巴，避免标记横跨两块时被漏掉。
+        let keep = EXTRA_ENGINE_MARKER
+            .len()
+            .saturating_sub(1)
+            .min(window.len());
+        tail = window[window.len() - keep..].to_vec();
+    }
+}
+
+/// 一次引擎库扫描的目标：目录 + 文件名前缀 + 递归深度。
+pub struct EngineLibTarget {
+    /// 要扫的目录。
+    pub dir: PathBuf,
+    /// 库文件名前缀（Unix 侧 librime.so，Windows 侧 rime.dll）。
+    pub prefix: &'static str,
+    /// 往子目录里再扫几层：0 = 只看本目录，1 = 再看一级子目录，2 = 再看两级。
+    pub depth: usize,
+}
+
+/// 一次扫描最多访问多少个目录（防御性上限）。
+///
+/// 为什么要有它：扫描会递归 read_dir 每一个子目录，万一目标目录异常庞大
+/// （比如误把构建产物目录 target/debug 当成了候选，那底下有成千上万个子目录），
+/// 光遍历就能把「检查输入法」拖成卡死。超过上限就停止下钻，
+/// 把已经找到的结果原样返回 —— 少找到几个候选库，最坏也只是退回「判断不了」，
+/// 绝不会把程序卡死。
+const ENGINE_LIB_SCAN_BUDGET: usize = 2048;
+
+/// 目录里（以及 depth 层子目录里）文件名以 prefix 开头的库文件。
+///
+/// 纯函数：不看平台、不读环境变量，只认传进来的参数，
+/// 所以「能不能扫到两级子目录里的 rime.dll」这件事，
+/// 在 Linux 上用临时目录就能测出来，不必真有一台 Windows 机器。
+pub fn engine_libs_under(dir: &Path, prefix: &str, depth: usize) -> Vec<PathBuf> {
+    let mut budget = ENGINE_LIB_SCAN_BUDGET;
+    engine_libs_scan(dir, prefix, depth, &mut budget)
+}
+
+/// 同 engine_libs_under，但目录访问预算由调用方给定。
+///
+/// budget = 最多还能访问几个目录（0 表示一个都不许访问，直接返回空）。
+pub fn engine_libs_under_with_budget(
+    dir: &Path,
+    prefix: &str,
+    depth: usize,
+    budget: usize,
+) -> Vec<PathBuf> {
+    let mut left = budget;
+    engine_libs_scan(dir, prefix, depth, &mut left)
+}
+
+/// 真正的递归扫描（budget 是「还能访问几个目录」的计数器，跨递归共享）。
+fn engine_libs_scan(dir: &Path, prefix: &str, depth: usize, budget: &mut usize) -> Vec<PathBuf> {
+    if *budget == 0 {
+        return Vec::new();
+    }
+    // 访问本目录也算掉一份预算。
+    *budget -= 1;
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(prefix) {
+            if path.is_file() {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    if depth > 0 {
+        for sub in subdirs {
+            // 预算用完就停止下钻，已经找到的结果照常返回。
+            if *budget == 0 {
+                break;
+            }
+            out.extend(engine_libs_scan(&sub, prefix, depth - 1, budget));
+        }
+    }
+    out
+}
+
+/// 本机可能装着引擎库的候选位置。
+///
+/// 平台只影响这张候选表（目录、前缀、扫几层），扫描代码只有一份：
+/// * Windows：Program Files 下的 Rime 目录（官方 Weasel 与自建版都装这儿，
+///   扫两层足够覆盖 Rime/weasel-版本号/rime.dll），以及当前可执行文件的同级目录
+///   （可执行文件本身可能就装在 weasel-版本号 那一层里）；
+/// * Unix：发行版 / 自建 librime 的常见落点（/usr/lib 等 + 一级子目录）。
+///
+/// Unix 侧刻意**不扫可执行文件所在目录**：那边是构建目录（target/debug），
+/// 底下有成千上万个子目录，扫它纯属白费力气，而引擎库根本不会装在那儿。
+///
+/// 非 Windows 上通常读不到 ProgramFiles，读不到就跳过（不报错、不 panic）。
+pub fn engine_lib_targets() -> Vec<EngineLibTarget> {
+    let mut targets = Vec::new();
+    // Program Files 下的 Rime 目录（32 位安装走 ProgramFiles(x86)）。
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(base) = std::env::var(var) {
+            if !base.trim().is_empty() {
+                targets.push(EngineLibTarget {
+                    dir: Path::new(&base).join("Rime"),
+                    prefix: "rime.dll",
+                    depth: 2,
+                });
+            }
+        }
+    }
+    // Windows：当前可执行文件的同级目录（只扫这一层，不上溯到 Program Files 顶层，
+    // 那一层太宽，ProgramFiles/Rime 那一项已经能覆盖 Weasel 的真实位置）。
+    #[cfg(windows)]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                targets.push(EngineLibTarget {
+                    dir: dir.to_path_buf(),
+                    prefix: "rime.dll",
+                    depth: 1,
+                });
+            }
+        }
+    }
+    // Unix 侧系统库目录（一级子目录足够：x86_64-linux-gnu 之类）。
+    #[cfg(unix)]
+    for base in ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/local/lib"] {
+        targets.push(EngineLibTarget {
+            dir: PathBuf::from(base),
+            prefix: "librime.so",
+            depth: 1,
+        });
+    }
+    targets
+}
+
+/// 本机可能正在用的引擎库（跨平台一套扫描逻辑，全程共用一份目录预算）。
+fn system_engine_libs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut budget = ENGINE_LIB_SCAN_BUDGET;
+    for target in engine_lib_targets() {
+        out.extend(engine_libs_scan(
+            &target.dir,
+            target.prefix,
+            target.depth,
+            &mut budget,
+        ));
+    }
+    out
+}
+
+/// 本机引擎是否带增强组件。
+///
+/// 判据（按可信度排序）：
+///
+/// 1. 系统里正在用的 librime 库里有我们的标记 → 确定支持（发行版没有）；
+/// 2. 已编译产物 / 用户配置里有我们的标记 → 确定支持；
+/// 3. 都查不到 → 判断不了（可能是没编译过，也可能是发行版引擎）。
+pub fn assess_extra_support(rime_dir: &Path) -> ExtraSupport {
+    let system_libs = system_engine_libs();
+    for lib in &system_libs {
+        if file_has_marker(lib) {
+            return ExtraSupport::Supported;
+        }
+    }
+    // 产物侧信号：我们的定制确实编译进去过。
+    if let Ok(entries) = fs::read_dir(rime_dir.join("build")) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                if let Ok(bytes) = fs::read(entry.path()) {
+                    if bytes
+                        .windows(EXTRA_ENGINE_MARKER.len())
+                        .any(|part| part == EXTRA_ENGINE_MARKER)
+                    {
+                        return ExtraSupport::Supported;
+                    }
+                }
+            }
+        }
+    }
+    // 用户配置侧信号：装输入法时铺的模板里有我们的组件。
+    for id in crate::managed_custom::list_user_customs(rime_dir) {
+        let path = rime_dir.join(format!("{id}.custom.yaml"));
+        if let Ok(bytes) = fs::read(&path) {
+            if bytes
+                .windows(EXTRA_ENGINE_MARKER.len())
+                .any(|part| part == EXTRA_ENGINE_MARKER)
+            {
+                return ExtraSupport::Supported;
+            }
+        }
+    }
+    // 找到了系统引擎库却没标记 → 确定不支持。
+    // （Windows 上装的是官方 Weasel 而不是我们的自建版，就是这个情况。）
+    if !system_libs.is_empty() {
+        return ExtraSupport::Unsupported;
+    }
+    ExtraSupport::Unknown
+}
+
 /// 逐方案状态：来源侧就坏（用户 custom.yaml 自己定义的 processors 里没有 numpad）。
 const NUMPAD_SOURCE_STALE: &str = "source-stale";
 /// 逐方案状态：来源侧没问题，但编译产物里没有 numpad（还没重编译）。
@@ -1464,6 +1740,58 @@ pub fn ensure(
     //   ConfigNeedsUpdate 会比对用户 custom.yaml 的 mtime）。
     let (custom_repair_changed, custom_repaired_ids, custom_repair_details, custom_repair_errors) =
         repair_user_customs(rime_dir);
+    // 合并词典指针：只在键缺失时补（用户手写的一律保留）。
+    // 查表来源 = 系统 data 目录 + 用户目录（自建方案只存在于用户目录）。
+    let mut pointer_data_dirs = data_dirs.clone();
+    pointer_data_dirs.push(rime_dir.to_path_buf());
+    // 模板目录：payload 的 config/（Windows）+ 安装器铺的 defaults/schemas（Linux）。
+    let pointer_template_dirs = crate::merged_dict::template_dirs(payload);
+    let pointer_changes = crate::merged_dict::ensure_pointers_with(
+        rime_dir,
+        &pointer_data_dirs,
+        &pointer_template_dirs,
+    );
+    let pointer_changed = pointer_changes.iter().any(|change| change.wrote());
+    if pointer_changed {
+        let detail = pointer_changes
+            .iter()
+            .map(|change| match change {
+                crate::merged_dict::PointerChange::Written { schema, path } => {
+                    format!("{schema}=written({})", path.display())
+                }
+                crate::merged_dict::PointerChange::Present { schema } => {
+                    format!("{schema}=present")
+                }
+                crate::merged_dict::PointerChange::Skipped { schema, reason } => {
+                    format!("{schema}=skipped({reason})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        actions.push(Action::new("merged-pointer", true, detail));
+    }
+
+    // 指针写进 custom.yaml 之后必须重编译 build/ 才算真的生效。
+    //
+    // Windows 不用在这里管：部署闸门把 pointer_changed 算进 changed，走进程内
+    // 部署（crate::librime::deploy）时会顺带重编译。
+    // Linux 的部署闸门是 no-op（platform:linux-keeps-existing-deploy），所以
+    // 这里显式跑一次 rime_deployer --build。
+    //
+    // 2026-11-11 在 228 上实测：fcitx5-remote -r 与 DBus 的 ReloadConfig 都
+    // 不会让 librime 重编译（build/ 产物 mtime 不变、引擎日志零新增），只有
+    // rime_deployer --build 会。所以这里不用 reload。
+    #[cfg(not(windows))]
+    if pointer_changed && opts.deploy && opts.mode != Mode::Bootstrap {
+        if let Some(shared) = data_dirs.first() {
+            let outcome = crate::data_patch::rebuild_after_config_change(rime_dir, shared);
+            actions.push(Action::new(
+                "merged-pointer-rebuild",
+                outcome == crate::data_patch::DeployOutcome::Ok,
+                format!("result={}", outcome.as_str()),
+            ));
+        }
+    }
     actions.push(Action::new(
         "custom-repair",
         custom_repair_changed,
@@ -1486,7 +1814,9 @@ pub fn ensure(
         || seeded.changed()
         || prune_report.removed() > 0
         // 用户 custom.yaml 被修 = 真的要重编译（否则 deploy 分支会被 no-changes 跳过）。
-        || custom_repair_changed;
+        || custom_repair_changed
+        // 合并词典指针写入 = 用户 custom.yaml 变了 = 也要重编译。
+        || pointer_changed;
     let mut deploy_detail = String::new();
     if !opts.deploy {
         actions.push(Action::new("deploy", false, "skipped reason=disabled"));
@@ -1718,6 +2048,55 @@ pub fn ensure(
 
 #[cfg(test)]
 mod tests {
+    fn tmp_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-extra-support-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn the_marker_is_found_across_read_blocks() {
+        let dir = tmp_file("marker");
+        let path = dir.join("lib.so");
+        // 标记故意放在 64KB 块边界上：前面塞满 0 字节，标记紧随其后。
+        let mut bytes = vec![0u8; 64 * 1024 - 3];
+        bytes.extend_from_slice(b"rimesync");
+        bytes.extend_from_slice(&[0u8; 32]);
+        fs::write(&path, &bytes).expect("write");
+        assert!(
+            super::file_has_marker(&path),
+            "a marker spanning two read blocks must still be found"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_without_the_marker_is_not_supported() {
+        let dir = tmp_file("no-marker");
+        let path = dir.join("lib.so");
+        fs::write(&path, vec![0u8; 200 * 1024]).expect("write");
+        assert!(!super::file_has_marker(&path));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extra_support_reports_a_machine_readable_value() {
+        assert_eq!(super::ExtraSupport::Supported.as_str(), "supported");
+        assert_eq!(super::ExtraSupport::Unsupported.as_str(), "unsupported");
+        assert_eq!(super::ExtraSupport::Unknown.as_str(), "unknown");
+        assert!(super::ExtraSupport::Supported.usable());
+        assert!(!super::ExtraSupport::Unsupported.usable());
+        assert!(!super::ExtraSupport::Unknown.usable());
+    }
+
     use super::*;
 
     struct TempDir {
