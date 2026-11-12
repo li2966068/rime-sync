@@ -100,8 +100,10 @@ fn new_device_gets_the_pointer_automatically() {
     // 里面还没有合并词典指针 —— 这正是「新设备接入时自动写好」要处理的场景。
     write(&rime.join(CUSTOM), "patch:\n  \"menu/page_size\": 8\n");
 
-    let data = root.join("data");
-    write_schema(&data);
+    // 查表来源必须自带：真实机器上方案的 schema.yaml 在 /usr/share/rime-data，
+    // 那是宿主机的东西，测试不能依赖（CI 的 runner 上根本没有那个目录）。
+    // Engine 把用户目录本身也算作合法查表来源，所以把 schema 放进 rime 目录。
+    write_schema(&rime);
 
     let (mut engine, calls) = engine_for(&dav, &rime, &state);
     let report = engine.transport();
@@ -158,8 +160,10 @@ fn a_users_own_pointer_is_never_overwritten() {
         "patch:\n  \"translator/dictionary\": luna_pinyin_extra\n  \"menu/page_size\": 8\n";
     write(&rime.join(CUSTOM), original);
 
-    let data = root.join("data");
-    write_schema(&data);
+    // 查表来源必须自带：真实机器上方案的 schema.yaml 在 /usr/share/rime-data，
+    // 那是宿主机的东西，测试不能依赖（CI 的 runner 上根本没有那个目录）。
+    // Engine 把用户目录本身也算作合法查表来源，所以把 schema 放进 rime 目录。
+    write_schema(&rime);
 
     let (mut engine, calls) = engine_for(&dav, &rime, &state);
     let report = engine.transport();
@@ -202,8 +206,10 @@ fn apply_recompiles_when_the_pointer_was_written() {
 
     // 本地有 custom.yaml（无指针）+ 方案用 luna_pinyin。
     write(&rime.join(CUSTOM), "patch:\n  \"menu/page_size\": 8\n");
-    let data = root.join("data");
-    write_schema(&data);
+    // 查表来源必须自带：真实机器上方案的 schema.yaml 在 /usr/share/rime-data，
+    // 那是宿主机的东西，测试不能依赖（CI 的 runner 上根本没有那个目录）。
+    // Engine 把用户目录本身也算作合法查表来源，所以把 schema 放进 rime 目录。
+    write_schema(&rime);
 
     // 模拟 Windows：deploy 不重编译。
     let trigger = FakeTrigger::new().with_no_recompile();
