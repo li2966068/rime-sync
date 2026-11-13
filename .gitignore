@@ -42,3 +42,7 @@ build/
 .DS_Store
 Thumbs.db
 packaging/linux/rime-sync-cli
+
+# 跑 rimesync-extra 冒烟测试时 librime 会把 user.yaml 写在当前工作目录
+# （v0.6.8 时误提交进仓库的就是它），别让它再进版本库
+/user.yaml
