@@ -55,13 +55,15 @@ v 数值转中文（v123 / v12.5）与中文标点直出（不按 Shift 出主�
 本包也不包含任何 Rime 词典数据（体积原因）；词典由 librime-data 提供，
 用户自定义词库请用 rime-sync 的 WebDAV 同步。
 
-三、安装包的两种形态（全量 / 非全量）
+三、安装包的两种形态（离线安装包 / 在线安装包）
 ------------------------------------
 0.6.6 起 Linux 只发布 Debian 13（trixie）的两个 .run，两者都是
 「输入法本体 + 同步工具」，安装顺序都是先 IME 后 sync：
 
-    rime-sync-installer_<ver>.trixie.run        全量：自带依赖闭包（约 170 MB）
-    rime-sync-installer_<ver>.trixie.thin.run   非全量：依赖由 apt 从系统仓库装
+    rime-sync-installer_<ver>.trixie.offline.run   离线安装包：自带依赖闭包（约 170 MB）
+    rime-sync-installer_<ver>.trixie.online.run    在线安装包：依赖由 apt 从系统仓库装
+
+> 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 
 不再单独发布 rime-inputmethod 的 deb：它只是这两个 .run 的载荷。
 本 deb（rime-sync）本身的 postinst 仍保留旧行为——装到

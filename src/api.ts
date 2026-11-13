@@ -654,7 +654,7 @@ export const api = {
   // Linux 一键换装：pkexec 调换装脚本，会弹管理员授权窗口（脱离进程，不等结果）。
   installExtraIme: (packagePath: string) =>
     invoke<string>("cmd_install_extra_ime", { packagePath }),
-  // 让用户挑一个本地完整安装包（后端直接调系统文件选择器）。
+  // 让用户挑一个本地安装包（后端直接调系统文件选择器）。
   pickExtraPackage: () => invoke<string | null>("cmd_pick_extra_package"),
 
   watchStart: () => invoke<WatchStatus>("cmd_watch_start"),

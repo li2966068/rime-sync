@@ -185,5 +185,5 @@ fn advice_text_keeps_key_points() {
 
     let unknown = ExtraSupport::Unknown.advice();
     assert!(unknown.contains("修复输入法"));
-    assert!(unknown.contains("完整安装包"));
+    assert!(unknown.contains("安装包"));
 }

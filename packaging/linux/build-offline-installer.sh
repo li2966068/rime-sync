@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # build-offline-installer.sh -- assemble the "input method + sync tool" installer
-# for a distribution, in a full (bundled dependency closure) and/or thin
+# for a distribution, in an offline (bundled dependency closure) and/or online
 # (dependencies resolved by apt at install time) variant.
 #
-#   packaging/linux/build-offline-installer.sh                 # trixie, both variants
-#   packaging/linux/build-offline-installer.sh --thin          # thin only
-#   packaging/linux/build-offline-installer.sh --full          # full only
-#   packaging/linux/build-offline-installer.sh --skip-deps     # alias of --thin
+#   packaging/linux/build-offline-installer.sh                  # trixie, both variants
+#   packaging/linux/build-offline-installer.sh --online         # online only
+#   packaging/linux/build-offline-installer.sh --offline        # offline only
+#   兼容旧包/旧写法：--full = --offline，--thin / --skip-deps = --online（仍可用，不报错）
 #   SYNC_DEB=packaging/out/rime-sync_0.3.0_amd64.deb ...
 #   IME_DEB=build/deb/debian-13/rime-inputmethod_0.4.0~trixie_amd64.deb ...
 #
+# 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
+#
 # Products (Linux is built for trixie only; the distro key stays a parameter):
-#   packaging/linux/out/offline/<distro>/...       directory bundle (full)
-#   packaging/linux/out/offline/<distro>-thin/...  directory bundle (thin)
-#   packaging/linux/out/offline/install.sh         shared installer
-#   packaging/linux/out/rime-sync-installer_<ver>.<suite>.run
-#                                                  full: IME + sync + dependency closure
-#   packaging/linux/out/rime-sync-installer_<ver>.<suite>.thin.run
-#                                                  thin: IME + sync, deps via apt
+#   packaging/linux/out/offline/<distro>/...        directory bundle (offline)
+#   packaging/linux/out/offline/<distro>-online/... directory bundle (online)
+#   packaging/linux/out/offline/install.sh          shared installer
+#   packaging/linux/out/rime-sync-installer_<ver>.<suite>.offline.run
+#                                                  offline: IME + sync + dependency closure
+#   packaging/linux/out/rime-sync-installer_<ver>.<suite>.online.run
+#                                                  online: IME + sync, deps via apt
 #
 # Both variants are the SAME installer (install.sh) and install rime-inputmethod
 # first, then rime-sync. Only the dependency layer differs.
@@ -37,20 +39,22 @@ usage() {
   exit 0
 }
 
-# VARIANTS holds "full" and/or "thin".
+# VARIANTS holds "offline" and/or "online".
 VARIANTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --full) VARIANTS+=("full"); shift ;;
-    --thin | --skip-deps) VARIANTS+=("thin"); shift ;;
-    --both | --all) VARIANTS=("full" "thin"); shift ;;
+    # 兼容旧包/旧写法：--full 是 --offline 的别名
+    --offline | --full) VARIANTS+=("offline"); shift ;;
+    # 兼容旧包/旧写法：--thin / --skip-deps 是 --online 的别名
+    --online | --thin | --skip-deps) VARIANTS+=("online"); shift ;;
+    --both | --all) VARIANTS=("offline" "online"); shift ;;
     -h | --help) usage ;;
-    -*) echo "!! unknown option '$1' (--full|--thin|--skip-deps|--both)" >&2; exit 2 ;;
+    -*) echo "!! unknown option '$1' (--offline|--online|--both)" >&2; exit 2 ;;
     *) break ;;
   esac
 done
 if [ "${#VARIANTS[@]}" -eq 0 ]; then
-  VARIANTS=("full" "thin")
+  VARIANTS=("offline" "online")
 fi
 
 suite_for() {
@@ -99,13 +103,13 @@ for d in "${DISTROS[@]}"; do
 
   for variant in "${VARIANTS[@]}"; do
     dir=$OUT_ROOT/$d
-    runfile=$RUN_DIR/rime-sync-installer_${VERSION}.${suite}.run
-    if [ "$variant" = "thin" ]; then
-      dir=$OUT_ROOT/$d-thin
-      runfile=$RUN_DIR/rime-sync-installer_${VERSION}.${suite}.thin.run
+    runfile=$RUN_DIR/rime-sync-installer_${VERSION}.${suite}.offline.run
+    if [ "$variant" = "online" ]; then
+      dir=$OUT_ROOT/$d-online
+      runfile=$RUN_DIR/rime-sync-installer_${VERSION}.${suite}.online.run
     elif [ ! -d "$vendor" ]; then
-      # The full variant claims to be installable without network: no closure = no product.
-      echo "!! $d: missing vendor deps for the full installer (run scripts/ime/fetch-vendor-deps.sh, or use --thin)" >&2
+      # The offline variant claims to be installable without network: no closure = no product.
+      echo "!! $d: missing vendor deps for the offline installer (run scripts/ime/fetch-vendor-deps.sh, or use --online)" >&2
       FAILED=1
       continue
     fi
@@ -115,7 +119,7 @@ for d in "${DISTROS[@]}"; do
     cp -f "$ime" "$dir/"
     "$HERE/prepare-sync-deb.sh" "$SYNC_DEB" "$dir/$(basename "$SYNC_DEB")"
     vendor_debs=0
-    if [ "$variant" = "full" ]; then
+    if [ "$variant" = "offline" ]; then
       mkdir -p "$dir/vendor"
       cp -f "$vendor"/*.deb "$dir/vendor/"
       cp -f "$vendor/VENDOR-INFO" "$vendor/SHA256SUMS" "$dir/vendor/"

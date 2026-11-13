@@ -23,7 +23,7 @@ use crate::AppState;
 
 /// 换装脚本：只有 rime-sync 的 deb 包安装后才有这个路径。
 ///
-/// AppImage 运行时它不存在 —— 这时界面要改成提示用户手动用完整安装包安装，
+/// AppImage 运行时它不存在 —— 这时界面要改成提示用户手动用安装包安装，
 /// 绝不能直接报错崩掉。
 const INSTALL_SCRIPT: &str = "/usr/lib/rime-sync/install-extra-ime.sh";
 
@@ -81,12 +81,14 @@ pub fn cmd_extra_support(
 pub fn cmd_install_extra_ime(app: AppHandle, package_path: String) -> Result<String, String> {
     if !script_available() {
         return Err(format!(
-            "当前这个程序里没有换装功能（多半是 AppImage 版本，找不到 {INSTALL_SCRIPT}）：请改用完整安装包手动安装 —— 先卸载原来的输入法，再运行完整安装包。"
+            "当前这个程序里没有换装功能（多半是 AppImage 版本，找不到 {INSTALL_SCRIPT}）：请改用安装包手动安装（离线或在线都行）—— 先卸载原来的输入法，再运行安装包。两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。"
         ));
     }
     let path = package_path.trim().to_string();
     if path.is_empty() {
-        return Err("请先选一个安装包（完整包和精简包都行，两个都自带输入法）。".to_string());
+        return Err(
+            "请先选一个安装包（离线安装包或在线安装包都行，两个都自带输入法）。".to_string(),
+        );
     }
     let package = Path::new(&path);
     if !package.exists() {
@@ -123,7 +125,7 @@ pub fn cmd_install_extra_ime(app: AppHandle, package_path: String) -> Result<Str
     Err("Windows 不需要手动换装：点一次「修复输入法」，程序会自动换上我们的输入法。".to_string())
 }
 
-/// 让用户挑一个本地的完整安装包（Rust 侧直接调系统文件选择器，不需要前端插件）。
+/// 让用户挑一个本地的安装包（Rust 侧直接调系统文件选择器，不需要前端插件）。
 #[tauri::command]
 pub async fn cmd_pick_extra_package(app: AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
@@ -133,7 +135,7 @@ pub async fn cmd_pick_extra_package(app: AppHandle) -> Option<String> {
         handle
             .dialog()
             .file()
-            .set_title("选择完整安装包".to_string())
+            .set_title("选择安装包".to_string())
             .add_filter("安装包", &["deb", "run", "AppImage", "gz", "zip"])
             .pick_file(move |path| {
                 let _ = tx.send(path);

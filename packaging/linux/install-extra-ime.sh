@@ -5,7 +5,7 @@
 #       再全新安装 rime-sync 自建的增强输入法（数字小键盘 / 中文标点直出 / v 转数字）。
 #
 # 用法：
-#   pkexec /usr/lib/rime-sync/install-extra-ime.sh /path/to/rime-sync-installer_<版本>.trixie.run
+#   pkexec /usr/lib/rime-sync/install-extra-ime.sh /path/to/rime-sync-installer_<版本>.trixie.offline.run
 #   bash install-extra-ime.sh --dry-run /path/to/已解包目录
 #
 # 约定（与项目其它脚本一致）：
@@ -99,14 +99,14 @@ done
 if [ $# -gt 0 ] && [ -z "$PKG_PATH" ]; then PKG_PATH=$1; fi
 
 if [ -z "$PKG_PATH" ]; then
-  say "缺少参数：没有给出本地完整安装包的路径。"
+  say "缺少参数：没有给出本地安装包的路径。"
   say "用法：install-extra-ime.sh [--dry-run] <安装包路径>"
   say "  <安装包路径> 可以是 .run 自解压包，也可以是已解包目录（里面有 install.sh 与 debian-13/*.deb）。"
   exit 64
 fi
 if [ ! -e "$PKG_PATH" ]; then
   say "找不到安装包：$PKG_PATH"
-  say "请确认路径拼写正确（这个路径必须是本机已经下载好的完整安装包）。"
+  say "请确认路径拼写正确（这个路径必须是本机已经下载好的安装包）。"
   exit 66
 fi
 
@@ -158,11 +158,11 @@ fi
 INSTALL_SH="$BUNDLE/install.sh"
 if [ ! -f "$INSTALL_SH" ]; then
   say "安装包里没有 install.sh：$INSTALL_SH"
-  say "这个目录不是 rime-sync 的完整安装包（应当包含 install.sh 与 debian-13/*.deb）。"
+  say "这个目录不是 rime-sync 的安装包（应当包含 install.sh 与 debian-13/*.deb）。"
   exit 66
 fi
 
-# 找到 debian-13 里的输入法 deb（完整包必须带 rime-inputmethod_*.deb）
+# 找到 debian-13 里的输入法 deb（安装包必须带 rime-inputmethod_*.deb）
 DISTRO_DIR=""
 for d in "$BUNDLE"/debian-13 "$BUNDLE"/*/debian-13; do
   [ -d "$d" ] || continue
@@ -173,7 +173,8 @@ for d in "$BUNDLE"/debian-13 "$BUNDLE"/*/debian-13; do
 done
 if [ -z "$DISTRO_DIR" ]; then
   say "安装包里找不到 rime-inputmethod_*.deb（安装包必须自带输入法本体）。"
-  say "完整包（full）和精简包（thin）都自带输入法，随便哪个都行；请检查是不是选错了文件、或者文件没下完整。"
+  say "离线安装包和在线安装包都自带完整输入法，随便哪个都行；请检查是不是选错了文件、或者文件没下完整。"
+  say "两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。"
   exit 66
 fi
 say "安装集目录：$DISTRO_DIR"

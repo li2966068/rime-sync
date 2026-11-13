@@ -14,19 +14,21 @@
 
 ## 1. 产物形态
 
-0.6.6 起两个平台都是「**一个包 = 输入法本体 + 同步工具**」，各自再分全量 / 非全量；
+0.6.6 起两个平台都是「**一个包 = 输入法本体 + 同步工具**」，各自再分离线安装包 / 在线安装包；
 「输入法本体」不再单独发布（Linux 的 `rime-inputmethod_*.deb` 只作为 .run 的载荷）。
 
 | 平台 | 产物 | 默认文件名 | 来源 |
 |---|---|---|---|
-| Linux x64 | **全量安装器**（IME + 同步，内置依赖闭包） | `rime-sync-installer_<ver>.trixie.run` | `packaging/linux/build-offline-installer.sh --full` |
-| Linux x64 | **非全量安装器**（IME + 同步，依赖走 apt） | `rime-sync-installer_<ver>.trixie.thin.run` | 同上 `--thin` / `--skip-deps` |
+| Linux x64 | **离线安装包**（IME + 同步，内置依赖闭包） | `rime-sync-installer_<ver>.trixie.offline.run` | `packaging/linux/build-offline-installer.sh --offline`（`--full` 为兼容旧写法，仍可用） |
+| Linux x64 | **在线安装包**（IME + 同步，依赖走 apt） | `rime-sync-installer_<ver>.trixie.online.run` | 同上 `--online`（`--thin` / `--skip-deps` 为兼容旧写法，仍可用） |
 | Linux x64 | Debian 包（**不发布**，仅内部传递） | `rime-sync_<ver>_amd64.deb` | `bundle.targets` 含 `deb`；ime/verify job 的输入，转正前由 publish 删除 |
 | Linux x64 | AppImage（更新用） | `rime-sync_<ver>_amd64.AppImage` | `bundle.targets` 含 `appimage` |
 | Linux x64 | 更新包 | `rime-sync_<ver>_amd64.AppImage.tar.gz` + `.sig` | `createUpdaterArtifacts = true` |
-| Windows x64 | NSIS 安装包（**非全量**：缺 WebView2 时弹框，不下载） | `rime-sync_<ver>_x64-setup.exe` + `.sig` | `pnpm tauri build --bundles nsis` |
-| Windows x64 | NSIS 离线包（**全量**：内嵌 WebView2 + Weasel） | `rime-sync_<ver>_x64-offline-setup.exe` + `.sig` | 加 `--config src-tauri/tauri.offline.conf.json` |
+| Windows x64 | NSIS 在线安装包（缺 WebView2 时弹框，不下载） | `rime-sync_<ver>_x64-setup.exe` + `.sig` | `pnpm tauri build --bundles nsis` |
+| Windows x64 | NSIS 离线安装包（内嵌 WebView2 + Weasel） | `rime-sync_<ver>_x64-offline-setup.exe` + `.sig` | 加 `--config src-tauri/tauri.offline.conf.json` |
 | Windows x64 | 便携版 | `rime-sync_<ver>_x64-portable.zip` | `portable-zip.ps1` |
+
+> 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 
 Linux 只编译 **Debian 13（trixie）**：`release.yml` 的 ime matrix 只有 `debian-13`，
 `build-linux.sh` / `fetch-vendor-deps.sh` / `build-offline-installer.sh` 的默认值也是 trixie
@@ -110,8 +112,8 @@ release 的两个构建 job：
 | NSIS 在线包（`webviewInstallMode = skip`） | **约 12–15MB** | 内嵌 Weasel 安装器；WebView2 由钩子检测，缺了只弹框给下载地址（**不联网**） |
 | NSIS 离线包（`*-offline-setup.exe`） | 约 140–160MB | 另内嵌 WebView2 Evergreen Standalone（≈130MB）+ Weasel（≈12MB）；断言下限 100MB |
 | 便携 zip | 与 NSIS 安装后的程序本体相当（约 10–20MB） | 不含 WebView2；**未实测** |
-| Linux 全量安装器（`.trixie.run`） | 约 170–185MB | 内嵌 IME deb + rime-sync deb + 依赖闭包（实测 trixie 176MB）；断言下限 100MB |
-| Linux 非全量安装器（`.trixie.thin.run`） | 约 5.5MB | 实测 5,785,701 B：只有 IME + 同步工具两个 deb，依赖安装时 apt 装；断言区间 5–60MB |
+| Linux 离线安装包（`.trixie.offline.run`） | 约 200MB（近似值） | 内嵌 IME deb + rime-sync deb + 依赖闭包；断言下限 100MB |
+| Linux 在线安装包（`.trixie.online.run`） | 约 35MB（近似值） | 只有 IME + 同步工具两个 deb，依赖安装时 apt 装；断言区间 5–60MB，且需 ≤ 离线安装包的一半 |
 | deb | 约 4–10MB | 不发布，仅工作流内部传递（不含 WebKitGTK，走系统依赖） |
 | AppImage | 约 8–20MB | 估算，未实测；不开 `bundleMediaFramework` 可省 GStreamer |
 | `AppImage.tar.gz` 更新包 | 与 AppImage 相当 + 压缩 | 由 `createUpdaterArtifacts` 生成 |
@@ -245,11 +247,13 @@ pnpm tauri icon packaging/assets/source-icon.png   # 需要自备 1024x1024 源�
 
 | 变体 | 标识 | 依赖层 |
 |---|---|---|
-| 全量 `.trixie.run` | `BUNDLE-INFO` 里 `variant=full` | 内置 `vendor/*.deb` 闭包，断网可装 |
-| 非全量 `.trixie.thin.run` | `variant=thin` | `apt-get update` + `apt-get install ./<deb>`，断网直接失败并给出指引 |
+| 离线安装包 `.trixie.offline.run` | `BUNDLE-INFO` 里 `variant=offline`（老版本发布的包写的是 `variant=full`，安装器同样认） | 内置 `vendor/*.deb` 闭包，断网可装 |
+| 在线安装包 `.trixie.online.run` | `variant=online`（老版本发布的包写的是 `variant=thin`，安装器同样认） | `apt-get update` + `apt-get install ./<deb>`，断网直接失败并给出指引 |
 
-非全量断网时的输出固定包含「非全量包（thin）需要系统仓库或联网」与全量包文件名，
-退出码 3（与全量包依赖失败的退出码一致，日志都在 `/var/log/rime-sync/install.log`）。
+> 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
+
+在线安装包断网时的输出固定包含「需要系统仓库或联网」的提示与离线安装包文件名，
+退出码 3（与离线安装包依赖失败的退出码一致，日志都在 `/var/log/rime-sync/install.log`）。
 
 0.6.0 起安装器只对**自己解包的包**负责：
 

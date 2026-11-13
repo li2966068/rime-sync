@@ -8,12 +8,13 @@
 #
 # 目录约定（.run 自解压后也是这个结构；Linux 只出 trixie）：
 #   install.sh
-#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/*.deb}   全量（full）
-#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb}                非全量（thin）
+#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/*.deb}   离线安装包（offline）
+#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb}                在线安装包（online）
 #
 # 两种安装包都是「输入法本体 + 同步工具」，区别只在依赖层：
-#   full  -> .run 内置 fcitx5/GTK/WebKit 依赖闭包，断网可装（vendor/ 存在）
-#   thin  -> 不带闭包，安装时 apt-get 装缺失依赖（BUNDLE-INFO: variant=thin）
+#   offline -> .run 内置 fcitx5/GTK/WebKit 依赖闭包，断网可装（vendor/ 存在）
+#   online  -> 不带闭包，安装时 apt-get 装缺失依赖（BUNDLE-INFO: variant=online）
+# 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 # 安装顺序两种包完全一致：先 rime-inputmethod，再 rime-sync。
 #
 # 行为约定：
@@ -32,12 +33,12 @@
 #
 # 选项：
 #   --payload DIR     指定安装包根目录
-#   --upgrade-vendor  全量包：允许把系统已装（ii）的依赖升级到内置版本（默认不动系统库）
+#   --upgrade-vendor  离线安装包：允许把系统已装（ii）的依赖升级到内置版本（默认不动系统库）
 #   --with-schema-tweaks
 #                     兼容旧用法：0.6.12 起配置模板始终「缺失才补」，该参数不再改变行为
 #   --uninstall       交给统一卸载脚本（--yes/--keep-ime/--purge-data 见下）
 #
-# 非全量包（thin）离线时的行为：apt 失败即停止，打印手动步骤并提示改用全量包。
+# 在线安装包（online）离线时的行为：apt 失败即停止，打印手动步骤并提示改用离线安装包。
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -195,7 +196,9 @@ verify_installed() {
 if [ ! -d "$PAYLOAD/$DISTRO_KEY" ]; then
   say "没有找到本机（$DISTRO_KEY）对应的安装集：本安装包只支持 Debian 13（trixie）。"
   say "当前安装包支持的发行版：Debian 13（trixie）"
-  for d in "$PAYLOAD"/debian-13 "$PAYLOAD"/debian-13-thin; do
+  # debian-13 = 离线安装包目录，debian-13-online = 在线安装包目录
+  # 兼容旧包：老版本的在线安装包目录叫 debian-13-thin
+  for d in "$PAYLOAD"/debian-13 "$PAYLOAD"/debian-13-online "$PAYLOAD"/debian-13-thin; do
     [ -d "$d" ] && say "  - $(basename "$d")"
   done
   if [ "$ASSUME_YES" -eq 1 ]; then
@@ -236,30 +239,35 @@ say "  IME : $(basename "$IME_DEB")"
 say "  SYNC: $(basename "$SYNC_DEB")"
 
 # ------------------------------------------------------------- package variant
-# full = 内置依赖闭包（vendor/*.deb）；thin = 依赖由 apt 解析。
+# offline = 内置依赖闭包（vendor/*.deb）；online = 依赖由 apt 解析。
 # 以 BUNDLE-INFO 为准，缺失时按 vendor 是否为空退化判断（兼容旧包）。
-VARIANT=full
+VARIANT=offline
 if [ -r "$DIR/BUNDLE-INFO" ]; then
   v=$(sed -n 's/^variant=//p' "$DIR/BUNDLE-INFO" | head -n 1)
   [ -n "$v" ] && VARIANT=$v
 fi
-if [ "$VARIANT" != "thin" ] && ! compgen -G "$DIR/vendor/*.deb" >/dev/null; then
-  VARIANT=thin
+# 兼容旧包：老版本发布的包 BUNDLE-INFO 里写的是 full / thin
+case "$VARIANT" in
+  full) VARIANT=offline ;;
+  thin) VARIANT=online ;;
+esac
+if [ "$VARIANT" != "online" ] && ! compgen -G "$DIR/vendor/*.deb" >/dev/null; then
+  VARIANT=online
 fi
 case "$VARIANT" in
-  full) say "安装包类型: 全量（full）：内置依赖闭包，无需联网" ;;
-  thin) say "安装包类型: 非全量（thin）：依赖由 apt 从系统仓库安装（需要联网或本地仓库）" ;;
+  offline) say "安装包类型: 离线安装包（offline）：内置依赖闭包，无需联网" ;;
+  online) say "安装包类型: 在线安装包（online）：依赖由 apt 从系统仓库安装（需要联网或本地仓库）" ;;
   *)
-    say "!! BUNDLE-INFO 里的 variant=$VARIANT 不是 full/thin"
+    say "!! BUNDLE-INFO 里的 variant=$VARIANT 不是 offline/online"
     fail "无法识别的安装包类型"
     ;;
 esac
 
-# 非全量包装不上依赖时的统一出口：说清原因、给手动步骤、指向全量包。
-thin_dep_advice() {
-  say "---- 非全量包（thin）需要系统仓库或联网 ----"
+# 在线安装包装不上依赖时的统一出口：说清原因、给手动步骤、指向离线安装包。
+online_dep_advice() {
+  say "---- 在线安装包（online）需要系统仓库或联网 ----"
   say "本包不内置依赖闭包，fcitx5 / GTK / WebKit 运行库要由 apt 从发行版仓库补齐。"
-  say "离线机器请改用全量包：rime-sync-installer_<ver>.trixie.run（内置依赖闭包，断网可装）"
+  say "离线机器请改用离线安装包：rime-sync-installer_<ver>.trixie.offline.run（内置依赖闭包，断网可装）"
   say "有网络（或已挂本地仓库）时的手动步骤："
   say "  sudo apt-get update"
   say "  sudo apt-get install -y --no-install-recommends fcitx5 fcitx5-modules"
@@ -497,31 +505,31 @@ if [ -n "$FOREIGN_ARCHS" ]; then
   say "检测到外部架构：$FOREIGN_ARCHS（多架构系统：只补缺失包，不升级系统已有库）"
 fi
 
-if [ "$VARIANT" = "thin" ]; then
-  # ------------------------------------------------------------ thin deps (apt)
-  # 与全量包的区别只有这一层：依赖不打包，交给 apt 解析。
+if [ "$VARIANT" = "online" ]; then
+  # ------------------------------------------------------------ online deps (apt)
+  # 与离线安装包的区别只有这一层：依赖不打包，交给 apt 解析。
   # 单独先装 fcitx5 守护进程：IME deb 只依赖 libfcitx5*，没有守护进程 addon 无处加载。
   command -v apt-get >/dev/null 2>&1 || {
-    thin_dep_advice
-    fail "非全量包需要 apt-get，但本机没有"
+    online_dep_advice
+    fail "在线安装包需要 apt-get，但本机没有"
   }
   export DEBIAN_FRONTEND=noninteractive
-  step "apt-get update (thin)"
-  say "步骤 0/2：更新 apt 索引（非全量包：依赖走系统仓库）"
+  step "apt-get update (online)"
+  say "步骤 0/2：更新 apt 索引（在线安装包：依赖走系统仓库）"
   if ! apt-get update; then
-    thin_dep_advice
-    fail "apt-get update 失败：非全量包需要联网或本地仓库"
+    online_dep_advice
+    fail "apt-get update 失败：在线安装包需要联网或本地仓库"
   fi
-  step "apt install fcitx5 runtime (thin)"
+  step "apt install fcitx5 runtime (online)"
   say "安装 fcitx5 运行库：fcitx5 fcitx5-modules（--no-install-recommends，避免装回发行版 fcitx5-rime）"
   if ! apt-get install -y --no-install-recommends fcitx5 fcitx5-modules; then
-    thin_dep_advice
-    fail "apt 安装 fcitx5 运行库失败：非全量包需要联网或本地仓库"
+    online_dep_advice
+    fail "apt 安装 fcitx5 运行库失败：在线安装包需要联网或本地仓库"
   fi
-  step "thin deps ready"
+  step "online deps ready"
 fi
 
-if [ "$VARIANT" != "thin" ] && [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*.deb" >/dev/null; then
+if [ "$VARIANT" != "online" ] && [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*.deb" >/dev/null; then
   COUNT=$(find "$DIR/vendor" -maxdepth 1 -name '*.deb' | wc -l)
   say "安装离线运行期依赖（$COUNT 个 .deb）"
   if [ -r "$DIR/vendor/SHA256SUMS" ]; then
@@ -645,19 +653,19 @@ if [ "$VARIANT" != "thin" ] && [ -d "$DIR/vendor" ] && compgen -G "$DIR/vendor/*
   fi
   say "离线依赖就绪（本批 ${#OUR_PKGS[@]} 个包，本次解包 ${#unpack_candidates[@]} 个，未配置 0 个）"
   step "vendor deps ready"
-elif [ "$VARIANT" != "thin" ]; then
+elif [ "$VARIANT" != "online" ]; then
   say "警告：$DIR/vendor 为空，跳过依赖安装（要求系统已具备 fcitx5 与 GTK/WebKit 运行库）"
 fi
 
 # --------------------------------------------------------------- strict order
 # 两种安装包都是先 IME 后 sync。差别只在执行器：
-#   full  -> dpkg -i（依赖已由内置闭包解析）
-#   thin  -> apt-get install ./pkg.deb（依赖由仓库解析，顺序不变）
+#   offline -> dpkg -i（依赖已由内置闭包解析）
+#   online  -> apt-get install ./pkg.deb（依赖由仓库解析，顺序不变）
 install_local_deb() { # $1=deb 文件 $2=中文名称
   local deb=$1 label=$2
-  if [ "$VARIANT" = "thin" ]; then
+  if [ "$VARIANT" = "online" ]; then
     if ! apt-get install -y --no-install-recommends "$deb"; then
-      thin_dep_advice
+      online_dep_advice
       fail "$label 安装失败（$(basename "$deb")）"
     fi
     return 0
@@ -671,7 +679,7 @@ install_local_deb() { # $1=deb 文件 $2=中文名称
 }
 
 STEP_INSTALL="dpkg -i"
-[ "$VARIANT" = "thin" ] && STEP_INSTALL="apt install"
+[ "$VARIANT" = "online" ] && STEP_INSTALL="apt install"
 
 step "$STEP_INSTALL $(basename "$IME_DEB")"
 say "步骤 1/2：安装输入法 $(basename "$IME_DEB")（旧版已在 UNINSTALL-OLD 阶段卸载）"

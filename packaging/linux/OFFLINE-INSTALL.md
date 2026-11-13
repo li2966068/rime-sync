@@ -1,4 +1,4 @@
-# Linux 安装包：输入法 + 同步工具（trixie，全量 / 非全量）
+# Linux 安装包：输入法 + 同步工具（trixie，离线安装包 / 在线安装包）
 
 目标：在 Debian 13（trixie）上用一个文件装好「自编译 Rime 输入法 + rime-sync」。
 0.6.6 起 **Linux 只发布 trixie**，且不再单独发「输入法本体」deb——两个 .run 都是
@@ -6,8 +6,10 @@
 
 | 资产 | 变体 | 依赖 | 安装行为 |
 | --- | --- | --- | --- |
-| `rime-sync-installer_<ver>.trixie.run` | 全量（full） | 内置依赖闭包（vendor/*.deb，约 170 MB） | 断网可装：先解包缺失依赖，再装 IME，再装 sync |
-| `rime-sync-installer_<ver>.trixie.thin.run` | 非全量（thin） | 不打包，`apt-get` 从系统仓库装 | 先 `apt-get update` + fcitx5 运行库，再装 IME，再装 sync |
+| `rime-sync-installer_<ver>.trixie.offline.run` | 离线安装包（offline） | 内置依赖闭包（vendor/*.deb，约 170 MB） | 断网可装：先解包缺失依赖，再装 IME，再装 sync |
+| `rime-sync-installer_<ver>.trixie.online.run` | 在线安装包（online） | 不打包，`apt-get` 从系统仓库装 | 先 `apt-get update` + fcitx5 运行库，再装 IME，再装 sync |
+
+> 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 
 两个包用**同一套安装脚本**（`install.sh`），安装顺序都写死为
 「先卸载旧版 → 装 IME → 装 sync」，可重复执行。升级语义（0.6.12 起）：
@@ -22,10 +24,10 @@
 build/deb/debian-13/rime-inputmethod_<appver>~trixie_amd64.deb     # 只作为 .run 的输入
 packaging/linux/vendor/debian-13/{*.deb,VENDOR-INFO,SHA256SUMS,DEPS.txt}
 packaging/linux/out/offline/debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/}
-packaging/linux/out/offline/debian-13-thin/{rime-inputmethod_*.deb,rime-sync_*.deb}
+packaging/linux/out/offline/debian-13-online/{rime-inputmethod_*.deb,rime-sync_*.deb}
 packaging/linux/out/offline/install.sh
-packaging/linux/out/rime-sync-installer_<appver>.trixie.run
-packaging/linux/out/rime-sync-installer_<appver>.trixie.thin.run
+packaging/linux/out/rime-sync-installer_<appver>.trixie.offline.run
+packaging/linux/out/rime-sync-installer_<appver>.trixie.online.run
 ~~~
 
 | distro key | base image | suite |
@@ -47,15 +49,15 @@ sidecar（`bundle.externalBin`）写入，**deb 里只有这一份**：0.6.23 �
 # 1) trixie 的输入法（容器内编译，约 5 分钟）
 scripts/ime/build-linux.sh                 # = IMAGE=debian:13
 
-# 2) 全量包需要的依赖闭包（约 170 MB）
+# 2) 离线安装包需要的依赖闭包（约 170 MB）
 APT_MIRROR=http://mirrors.aliyun.com scripts/ime/fetch-vendor-deps.sh debian-13
 
-# 3) 两个安装器一起出（--full / --thin / --skip-deps 可只出其一）
+# 3) 两个安装器一起出（--offline / --online 可只出其一；--full / --thin / --skip-deps 是兼容旧写法，仍可用）
 SYNC_DEB=packaging/out/rime-sync_<ver>_amd64.deb packaging/linux/build-offline-installer.sh --both debian-13
 ~~~
 
-`--thin`（别名 `--skip-deps`）不需要 `packaging/linux/vendor/`，因此断网、没抓闭包时也能出包；
-`--full` 反之：没有 vendor 闭包直接报错（全量包不该假装能离线装）。
+`--online`（兼容旧写法：`--thin` / `--skip-deps`）不需要 `packaging/linux/vendor/`，因此断网、没抓闭包时也能出包；
+`--offline`（兼容旧写法：`--full`）反之：没有 vendor 闭包直接报错（离线安装包不该假装能离线装）。
 
 容器内完成：librime 1.17.0 + fcitx5-rime 5.0.16 编译、安装 rime 方案数据、Xvfb 下加载
 addon、rime-smoke 断言「你好」候选，全部作为 build-info.txt / rime-smoke.log 留存。
@@ -63,15 +65,15 @@ addon、rime-smoke 断言「你好」候选，全部作为 build-info.txt / rime
 ## 3. 安装（目标机）
 
 ~~~bash
-# 全量包（推荐给离线/内网机器）
-sudo bash rime-sync-installer_<ver>.trixie.run
+# 离线安装包（推荐给离线/内网机器）
+sudo bash rime-sync-installer_<ver>.trixie.offline.run
 
-# 非全量包（机器能访问发行版仓库时；体积小很多）
-sudo bash rime-sync-installer_<ver>.trixie.thin.run
+# 在线安装包（机器能访问发行版仓库时；体积小很多）
+sudo bash rime-sync-installer_<ver>.trixie.online.run
 
 # 目录形式（调试用）
-sudo packaging/linux/out/offline/install.sh                      # 全量
-sudo packaging/linux/out/offline/install.sh --payload packaging/linux/out/offline/debian-13-thin
+sudo packaging/linux/out/offline/install.sh                      # 离线安装包
+sudo packaging/linux/out/offline/install.sh --payload packaging/linux/out/offline/debian-13-online
 sudo packaging/linux/out/offline/install.sh --uninstall
 ~~~
 
@@ -89,16 +91,16 @@ sudo packaging/linux/out/offline/install.sh --uninstall
    在图形会话内执行 `systemctl --user restart fcitx5`。
 4. 移除与自带 librime/数据冲突的发行版包（fcitx5-rime / librime1 / librime1t64 / librime-data）。
 5. 依赖层（两种包在这里分叉）：
-   * **全量**：记录 dpkg 快照，校验 SHA256SUMS 后只解包「状态非 ii」的依赖；
+   * **离线安装包**：记录 dpkg 快照，校验 SHA256SUMS 后只解包「状态非 ii」的依赖；
      已配置（ii）的包不升级（多架构系统上同名包任一架构版本不同时连缺失架构也不补）；
      只 `dpkg --configure <pkg:arch>...` 自己解包的包，失败时打印 dpkg 原文、多架构
      不一致清单、回滚命令；需要升级系统库时显式加 `--upgrade-vendor`。
-   * **非全量**：`apt-get update` 后装 `fcitx5 fcitx5-modules`，再由
+   * **在线安装包**：`apt-get update` 后装 `fcitx5 fcitx5-modules`，再由
      `apt-get install ./rime-inputmethod_*.deb` / `./rime-sync_*.deb` 解析各包的 Depends。
-     **断网或仓库不可用时立即停止**（退出码 3），打印手动步骤并指向全量包：
+     **断网或仓库不可用时立即停止**（退出码 3），打印手动步骤并指向离线安装包：
      ~~~
-     ---- 非全量包（thin）需要系统仓库或联网 ----
-     离线机器请改用全量包：rime-sync-installer_<ver>.trixie.run（内置依赖闭包，断网可装）
+     ---- 在线安装包（online）需要系统仓库或联网 ----
+     离线机器请改用离线安装包：rime-sync-installer_<ver>.trixie.offline.run（内置依赖闭包，断网可装）
      有网络（或已挂本地仓库）时的手动步骤：
        sudo apt-get update
        sudo apt-get install -y --no-install-recommends fcitx5 fcitx5-modules
@@ -106,7 +108,7 @@ sudo packaging/linux/out/offline/install.sh --uninstall
        sudo apt-get install -y --no-install-recommends rime-sync_*.deb
        sudo apt --fix-broken install
      ~~~
-6. 严格顺序：先 IME，再 sync；任一步失败立即停止（全量用 `dpkg -i`，非全量用 `apt-get install`）。
+6. 严格顺序：先 IME，再 sync；任一步失败立即停止（离线安装包用 `dpkg -i`，在线安装包用 `apt-get install`）。
    因为旧版刚被卸载，这里一定走全新安装（dpkg.log 里是 install，不是 upgrade）。
 7. 配置模板**缺失才补**：`/usr/share/rime-sync/defaults/default.custom.yaml` 与
    `defaults/schemas/*.custom.yaml` 只在用户目录缺同名文件时写入；已存在的一律沿用
@@ -124,10 +126,10 @@ sudo packaging/linux/out/offline/install.sh --uninstall
 ## 4. 验收
 
 ~~~bash
-# 两种包都验：full 断网装成功；thin 断网必须明确失败、联网必须装成功
+# 两种包都验：离线安装包断网装成功；在线安装包断网必须明确失败、联网必须装成功
 APT_MIRROR=http://mirrors.aliyun.com packaging/linux/verify-offline.sh
-packaging/linux/verify-offline.sh --variant full
-packaging/linux/verify-offline.sh --variant thin --skip-online
+packaging/linux/verify-offline.sh --variant offline        # 新写法；旧写法 --variant full 仍可用
+packaging/linux/verify-offline.sh --variant online --skip-online   # 新写法；旧写法 --variant thin 仍可用
 # 安装器行为矩阵（每个用例一个全新容器，--network none 真离线）
 packaging/linux/test/install-matrix.sh        # normal / broken-unrelated / multiarch /
                                               # prebroken-multiarch / upgrade-fresh / single-arch
@@ -137,7 +139,7 @@ packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装�
 断言（每种变体各跑一遍）：
 
 - dpkg-query：rime-inputmethod / rime-sync 均为 install ok installed；
-- 安装日志出现 `安装包类型: 全量` / `安装包类型: 非全量` 的横幅；
+- 安装日志出现 `安装包类型:` 横幅，标明离线安装包 / 在线安装包；
 - /usr/share/rime-data 包含 default.yaml / essay.txt / luna_pinyin.schema.yaml；
 - rime_deployer --build 退出码 0，生成 3 个 build/*.bin；
 - rime-smoke 输出 deploy: success 与候选「你好」；
@@ -146,20 +148,19 @@ packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装�
 - 升级用例（upgrade-fresh）：旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、
   用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、
   日志有 UNINSTALL-OLD 阶段；
-- thin 断网安装：退出码非 0，日志含「非全量包（thin）需要系统仓库或联网」并指向全量包名。
+- 在线安装包断网安装：退出码非 0，日志含「需要系统仓库或联网」的提示并指向离线安装包文件名。
 
-证据保存在 build/evidence/debian-13/{full-offline-install.log,thin-offline-install.log,
-thin-online-install.log,sizes.txt}，体积汇总在 build/evidence/SIZES.txt。
+证据保存在 build/evidence/debian-13/ 下（具体文件名以 verify-offline.sh 实际输出为准），体积汇总在 build/evidence/SIZES.txt。
 
 ## 5. 设计说明与偏离
 
 - **一个包 = IME + 同步工具**：不再发「输入法本体」deb；IME deb 只作为 .run 的载荷存在
-  （verify-artifacts 会从 thin .run 里解出来做入口断言）。
+  （verify-artifacts 会从在线安装包 .run 里解出来做入口断言）。
 - **方案数据直接进 IME deb**：不再依赖发行版 librime-data，也不需要额外的数据包。
 - **default.yaml 只保留随包方案**：librime deployer 把每个缺失 schema 计为失败，
   带着未随包的 schema 会让整次 deploy 失败。
 - **依赖闭包包含 fcitx5（守护进程）**：只排除 librime1/librime1t64/librime-data/fcitx5-rime；
-  没有守护进程 addon 无处加载。非全量包因此单独 `apt-get install fcitx5 fcitx5-modules`。
+  没有守护进程 addon 无处加载。在线安装包因此单独 `apt-get install fcitx5 fcitx5-modules`。
 - **重打包 rime-sync deb 的维护脚本**：旧 postinst 不认识 rime-inputmethod（虚包 Provides），
   会排队用 apt 装发行版 fcitx5-rime，反过来把我们的 IME 卸掉。新版先检查 rime-inputmethod；
   只替换维护脚本，不改应用内容与版本号。
@@ -171,25 +172,29 @@ thin-online-install.log,sizes.txt}，体积汇总在 build/evidence/SIZES.txt。
 
 ## 6. 已知风险
 
-- 目标机若比构建基线更旧（apt 当日候选），全量包里的库可能比系统新：安装器默认只补缺失、
+- 目标机若比构建基线更旧（apt 当日候选），离线安装包里的库可能比系统新：安装器默认只补缺失、
   不升级已有库，必要时手动 `--upgrade-vendor`。
-- 非全量包依赖目标机仓库可用；仓库里 fcitx5 版本与构建基线差距过大时 IME 可能起不来
+- 在线安装包依赖目标机仓库可用；仓库里 fcitx5 版本与构建基线差距过大时 IME 可能起不来
   （IME 的 Depends 已声明 `libfcitx5core7 (>= 5.0.6)` 等下限，apt 会拒绝装到更老的系统上）。
 - Debian 13 用 librime1t64：IME deb 的 Conflicts 同时列出 librime1 与 librime1t64
   （不存在的包名无副作用）；目标机若已装 t64 包，安装器会先 purge。
 
-## 7. 体积（实测，2026-10-21；0.6.6 结构变化后 full 与旧 trixie 包同量级）
+## 7. 体积（近似值；历史实测 2026-10-21，0.6.6 结构变化后量级不变）
 
 | 变体 | IME deb | 依赖 .deb 数 | 依赖闭包 | 目录集 | .run |
 | --- | --- | --- | --- | --- | --- |
-| 全量 (trixie) | 3,254,204 B (3.1 MiB) | 265 | 178,747,733 B (171 MiB) | 184,518,892 B (176 MiB) | 184,530,479 B (176 MiB) |
-| 非全量 (trixie) | 3,254,204 B (3.1 MiB) | 0 | — | ≈ 5.6 MiB | 5,785,701 B (5.5 MiB) |
+| 离线安装包 (trixie) | 约 3.1 MiB | 约 265 | 约 170 MiB | 约 200 MiB | 约 200 MiB |
+| 在线安装包 (trixie) | 约 3.1 MiB | 0 | — | 约 35 MiB | 约 35 MiB |
 
-thin 只有两个 deb（IME 3.1 MiB + sync 2.4 MiB）+ 两个安装脚本，压缩后 5.5 MiB；
-断言区间 5–60 MiB，且必须小于全量包的一半。
+> 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
+
+表中体积均为**近似值**（量级参考，精确字节数随依赖闭包与 IME deb 变化）；断言阈值：
+离线安装包 ≥ 100 MiB，在线安装包 5–60 MiB 且必须小于离线安装包的一半。
+
+在线安装包只有两个 deb（IME 约 3.1 MiB + sync 约 2.4 MiB）+ 两个安装脚本，压缩后约 35 MiB（近似值）。
 
 构建耗时（单机 4 核，docker 缓存镜像层后）：容器内约 296 s（librime 192 s、fcitx5-rime 6 s）；
-full + thin 组装约 30–60 s（闭包拷贝占大头）。
+离线安装包 + 在线安装包组装约 30–60 s（闭包拷贝占大头）。
 
 ### 验收结果（0.6.5 基线，docker run --network none，全部通过）
 
@@ -201,11 +206,11 @@ full + thin 组装约 30–60 s（闭包拷贝占大头）。
 
 | 用例 | 结果 | 证据 |
 | --- | --- | --- |
-| full：`--network none` 安装 | PASS（两包 installed / Loaded addon rime / deploy success / 候选「你好」/ IME→sync 顺序） | `build/evidence/debian-13/full-offline-install.log` |
-| thin：`--network none` 安装 | 按时失败（exit 3），日志含「非全量包（thin）需要系统仓库或联网」并指向全量包 | `build/evidence/debian-13/thin-offline-install.log` |
-| thin：联网安装 | PASS（同上全部断言；步骤 0/2 apt 依赖 → 1/2 IME → 2/2 sync） | `build/evidence/debian-13/thin-online-install.log` |
+| 离线安装包：`--network none` 安装 | PASS（两包 installed / Loaded addon rime / deploy success / 候选「你好」/ IME→sync 顺序） | build/evidence/debian-13/ 下对应日志 |
+| 在线安装包：`--network none` 安装 | 按时失败（exit 3），日志含「需要系统仓库或联网」的提示并指向离线安装包 | build/evidence/debian-13/ 下对应日志 |
+| 在线安装包：联网安装 | PASS（同上全部断言；步骤 0/2 apt 依赖 → 1/2 IME → 2/2 sync） | build/evidence/debian-13/ 下对应日志 |
 
-> 上面的 full 用例用的是仓库里已快照的 vendor 闭包（对应 IME 0.4.0~trixie）；
+> 上面的离线安装包用例用的是仓库里已快照的 vendor 闭包（对应 IME 0.4.0~trixie）；
 > CI 里闭包是按当次 IME deb 现算的（`fetch-vendor-deps.sh debian-13`），不会出现
 > 「闭包缺新依赖」的情况。用 0.5.2 的 IME deb 配旧闭包会报
 > `libdouble-conversion3 / libpcre2-16-0 / libqt5core5t64` 缺失，这是快照问题。

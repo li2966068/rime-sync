@@ -1,8 +1,9 @@
 name: offline-verify
 
 # 手动回归：把 trixie 的两个安装器真装一遍（容器内安装 + 断言）。
-#   full -> docker run --network none：断网安装必须成功
-#   thin -> 断网必须失败并提示改用全量包；联网必须安装成功
+#   offline -> docker run --network none：断网安装必须成功
+#   online -> 断网必须失败并提示改用离线安装包；联网必须安装成功
+#   两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 # 不进 tag 触发的发布路径：单次约 60-90 分钟，只用于发版前/改动安装器后的人工验收。
 # 产物证据：build/evidence/<distro>/{test-image.log,*install.log,sizes.txt} + SIZES.txt。
 on:
@@ -18,8 +19,8 @@ on:
         required: false
         default: ""
         type: string
-      skip_thin_online:
-        description: "跳过 thin 包的联网安装（默认 false：断网失败路径 + 联网成功路径都验）"
+      skip_online_install:
+        description: "跳过在线安装包的联网安装（默认 false：断网失败路径 + 联网成功路径都验）"
         required: false
         default: "false"
         type: string
@@ -160,7 +161,7 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: fetch full-installer dependency closure (trixie)
+      - name: fetch offline-installer dependency closure (trixie)
         timeout-minutes: 40
         run: |
           set -euo pipefail
@@ -179,23 +180,24 @@ jobs:
           docker system prune -af --volumes >/dev/null 2>&1 || true
           df -h /
 
-      - name: assemble installers · full + thin (trixie)
+      - name: assemble installers · offline + online (trixie)
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          # --both：全量（内置依赖闭包）+ 非全量（apt 装依赖），两者都是 IME + 同步工具。
+          # --both：离线安装包（内置依赖闭包）+ 在线安装包（apt 装依赖），两者都是 IME + 同步工具。
+          # 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
           bash packaging/linux/build-offline-installer.sh --both debian-13 || {
             echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
             exit 1
           }
 
-      # 真正的验收：trixie 建一个测试镜像，分别验 full（断网安装成功）与
-      # thin（断网必须明确失败 + 联网必须成功）。
-      - name: verify installers (full offline + thin offline/online)
+      # 真正的验收：trixie 建一个测试镜像，分别验 offline（断网安装成功）与
+      # online（断网必须明确失败 + 联网必须成功）。
+      - name: verify installers (offline offline + online offline/online)
         timeout-minutes: 90
         env:
           DISTROS: ${{ inputs.distros }}
-          SKIP_THIN_ONLINE: ${{ inputs.skip_thin_online }}
+          SKIP_ONLINE_INSTALL: ${{ inputs.skip_online_install }}
         run: |
           set -euo pipefail
           read -r -a wanted <<< "$DISTROS"
@@ -204,7 +206,7 @@ jobs:
           fi
           echo "verifying: ${wanted[*]}"
           args=()
-          [ "$SKIP_THIN_ONLINE" = "true" ] && args+=(--skip-online)
+          [ "$SKIP_ONLINE_INSTALL" = "true" ] && args+=(--skip-online)
           bash packaging/linux/verify-offline.sh "${args[@]}" "${wanted[@]}" || {
             echo "::error::packaging/linux/verify-offline.sh 失败：安装断言未通过（证据见 build/evidence）"
             exit 1

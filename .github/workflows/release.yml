@@ -262,7 +262,7 @@ jobs:
 
   # Linux 只出 trixie（Debian 13）。矩阵保留一个条目：job 名/步骤名仍按发行版参数化，
   # 以后要加发行版只需在这里加一行 + build-offline-installer.sh 的 suite_for 加一条。
-  # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，full+thin 组装 2-4 min。
+  # 单套实测：镜像构建 + 编译 270-310 s，闭包 2-4 min，offline+online 组装 2-4 min。
   ime:
     name: ime · ${{ matrix.distro }}
     # linux-app 提供 rime-sync deb；prepare-draft 提供 tag（从草稿 Release 取/放资产都要它）。
@@ -427,7 +427,7 @@ jobs:
             [ -f "$dir/$f" ] || { echo "::error::$DISTRO: 缺少 $f"; exit 1; }
           done
 
-      - name: assemble installers · full + thin (${{ matrix.distro }})
+      - name: assemble installers · offline + online (${{ matrix.distro }})
         timeout-minutes: 20
         env:
           DISTRO: ${{ matrix.distro }}
@@ -435,45 +435,46 @@ jobs:
         run: |
           set -euo pipefail
           # 一次调用出两个包：都是「IME + 同步工具」，区别只在依赖层。
-          #   full -> 内置依赖闭包（断网可装）；thin -> 安装时 apt 装依赖
+          #   offline -> 内置依赖闭包（断网可装）；online -> 安装时 apt 装依赖
           bash packaging/linux/build-offline-installer.sh --both "$DISTRO" || {
             echo "::error file=packaging/linux/build-offline-installer.sh::${DISTRO} 的 .run 组装失败"
             exit 1
           }
           ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-          full=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.run
-          thin=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.thin.run
-          for f in "$full" "$thin"; do
+          offline=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.offline.run
+          online=packaging/linux/out/rime-sync-installer_${ver}.${SUITE}.online.run
+          for f in "$offline" "$online"; do
             if [ ! -f "$f" ]; then
               echo "::error::缺少 $DISTRO 的安装器 $f"
               exit 1
             fi
             [ -x "$f" ] || { echo "::error file=$f::没有可执行位"; exit 1; }
           done
-          full_size=$(stat -c %s "$full")
-          thin_size=$(stat -c %s "$thin")
-          full_mib=$(( full_size / 1024 / 1024 ))
-          thin_mib=$(( thin_size / 1024 / 1024 ))
-          echo "$full: ${full_mib} MiB"
-          echo "$thin: ${thin_mib} MiB"
-          if [ "$full_size" -lt $(( 100 * 1024 * 1024 )) ]; then
-            echo "::error file=$full::${DISTRO} 全量包仅 ${full_mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
+          offline_size=$(stat -c %s "$offline")
+          online_size=$(stat -c %s "$online")
+          offline_mib=$(( offline_size / 1024 / 1024 ))
+          online_mib=$(( online_size / 1024 / 1024 ))
+          echo "$offline: ${offline_mib} MiB"
+          echo "$online: ${online_mib} MiB"
+          if [ "$offline_size" -lt $(( 100 * 1024 * 1024 )) ]; then
+            echo "::error file=$offline::${DISTRO} 离线安装包仅 ${offline_mib} MiB（< 100 MiB）：IME deb 或依赖闭包没打进去"
             exit 1
           fi
-          if [ "$thin_size" -lt $(( 5 * 1024 * 1024 )) ]; then
-            echo "::error file=$thin::${DISTRO} 非全量包仅 ${thin_mib} MiB（< 5 MiB）：IME 或 sync deb 没打进去"
+          if [ "$online_size" -lt $(( 5 * 1024 * 1024 )) ]; then
+            echo "::error file=$online::${DISTRO} 在线安装包仅 ${online_mib} MiB（< 5 MiB）：IME 或 sync deb 没打进去"
             exit 1
           fi
-          if [ "$thin_size" -gt $(( 60 * 1024 * 1024 )) ]; then
-            echo "::error file=$thin::${DISTRO} 非全量包 ${thin_mib} MiB（> 60 MiB）：依赖闭包被打进 thin 包了"
+          if [ "$online_size" -gt $(( 60 * 1024 * 1024 )) ]; then
+            echo "::error file=$online::${DISTRO} 在线安装包 ${online_mib} MiB（> 60 MiB）：依赖闭包被打进在线安装包了"
             exit 1
           fi
-          if [ "$thin_size" -gt $(( full_size / 2 )) ]; then
-            echo "::error file=$thin::${DISTRO} 非全量包不小于全量包一半：thin 应显著更小"
+          if [ "$online_size" -gt $(( offline_size / 2 )) ]; then
+            echo "::error file=$online::${DISTRO} 在线安装包不小于离线安装包一半：在线安装包应显著更小"
             exit 1
           fi
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-            echo "- $DISTRO ($SUITE): $(basename "$full") ${full_mib} MiB（全量）+ $(basename "$thin") ${thin_mib} MiB（非全量）/ vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
+            echo "- $DISTRO ($SUITE): $(basename "$offline") ${offline_mib} MiB（离线安装包）+ $(basename "$online") ${online_mib} MiB（在线安装包）/ vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: cleanup docker images
@@ -484,10 +485,10 @@ jobs:
           df -h /
 
       # 直传草稿 Release。资产名 = basename：
-      #   rime-sync-installer_<ver>.<suite>.run        全量
-      #   rime-sync-installer_<ver>.<suite>.thin.run   非全量
+      #   rime-sync-installer_<ver>.<suite>.offline.run   离线安装包
+      #   rime-sync-installer_<ver>.<suite>.online.run    在线安装包
       # 0.6.6 起 rime-inputmethod deb 不再作为独立资产：它只在两个 .run 里
-      # （verify-artifacts 会从 thin.run 里解出来做入口断言）。
+      # （verify-artifacts 会从 online.run 里解出来做入口断言）。
       # 注意：不要上传 rime-smoke（与发行版同名时 --clobber 会互相覆盖）。
       - name: upload installers to draft release (${{ matrix.distro }})
         env:
@@ -499,13 +500,13 @@ jobs:
           shopt -s nullglob
           runs=(packaging/linux/out/*.run)
           if [ "${#runs[@]}" -ne 2 ]; then
-            echo "::error::$DISTRO: 期望恰好 2 个 .run（全量 + thin），实际 ${#runs[@]} 个"
+            echo "::error::$DISTRO: 期望恰好 2 个 .run（离线 + 在线），实际 ${#runs[@]} 个"
             exit 1
           fi
           printf '  %s\n' "${runs[@]}"
           gh release upload "$TAG" "${runs[@]}" --clobber
 
-  # 汇总 + 验收：只有 trixie 的全量 + 非全量两个 .run 都在、且没有独立的 IME deb 资产，
+  # 汇总 + 验收：只有 trixie 的离线 + 在线两个 .run 都在、且没有独立的 IME deb 资产，
   # publish 才会被触发。
   windows:
     name: windows · nsis + portable zip
@@ -1318,7 +1319,7 @@ jobs:
       # 资产清单的断言逻辑独立成脚本：可以用假清单离线自检（CI 的
       # "guard · release asset inventory" 就是跑它的自检）。
 
-      - name: assert 2 installers (full + thin), no standalone IME deb
+      - name: assert 2 installers (offline + online), no standalone IME deb
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-draft.outputs.tag }}
@@ -1332,7 +1333,7 @@ jobs:
             --suite trixie
 
       # 草稿 Release 是唯一产物来源（不再有 workflow artifact）。
-      # 只下断言要用的：thin .run（几 MiB，里面装着 IME deb）+ rime-sync deb + setup.exe。
+      # 只下断言要用的：online .run（几 MiB，里面装着 IME deb）+ rime-sync deb + setup.exe。
       # 资产名是扁平的，全部落在 dist/ 根下；脚本用 find 递归找，不依赖目录布局。
       - name: download built artifacts from draft release
         env:
@@ -1343,18 +1344,18 @@ jobs:
           rm -rf dist
           mkdir -p dist
           gh release download "$TAG" --dir dist --pattern '*.deb' --pattern '*-setup.exe' \
-            --pattern '*.thin.run'
+            --pattern '*.online.run'
           find dist -maxdepth 2 -type f -printf '%P  %s bytes\n' | sort
 
       # 0.6.6 起 rime-inputmethod deb 不再作为独立资产发布，但"入口必须在 IME 包内"这条
-      # 断言不能丢：从 thin .run 的自解压载荷里把它取出来再交给 verify-artifacts.sh。
-      - name: extract IME deb from thin installer
+      # 断言不能丢：从 online .run 的自解压载荷里把它取出来再交给 verify-artifacts.sh。
+      - name: extract IME deb from online installer
         run: |
           set -euo pipefail
           shopt -s nullglob
-          runs=(dist/*.thin.run)
+          runs=(dist/*.online.run)
           if [ "${#runs[@]}" -ne 1 ]; then
-            echo "::error::期望恰好 1 个 thin .run，实际 ${#runs[@]} 个"
+            echo "::error::期望恰好 1 个 online .run，实际 ${#runs[@]} 个"
             exit 1
           fi
           tmp=$(mktemp -d)
@@ -1364,7 +1365,7 @@ jobs:
           tail -n +"$line" "${runs[0]}" | tar -xzf - -C "$tmp"
           mapfile -t ime < <(find "$tmp" -type f -name 'rime-inputmethod_*.deb' | sort)
           if [ "${#ime[@]}" -ne 1 ]; then
-            echo "::error::thin .run 里应有恰好 1 个 rime-inputmethod deb，实际 ${#ime[@]} 个"
+            echo "::error::online .run 里应有恰好 1 个 rime-inputmethod deb，实际 ${#ime[@]} 个"
             find "$tmp" -type f | sed -n '1,20p'
             exit 1
           fi
@@ -1435,6 +1436,19 @@ jobs:
           VERSION="${TAG#v}"
           # 更新提示直接用 CHANGELOG 的中文段落（用户要求：提示里显示本版更新内容）。
           python3 .github/scripts/changelog-notes.py --version "$VERSION" --out dist/notes.md
+
+      # 下载页说明：两个 Linux 安装包的区别（离线安装包 / 在线安装包）。
+      - name: append linux installer notes
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### Linux 安装包（离线安装包 / 在线安装包）"
+            echo ""
+            echo "- rime-sync-installer_<版本>.trixie.offline.run：离线安装包（内置依赖闭包，断网可装）"
+            echo "- rime-sync-installer_<版本>.trixie.online.run：在线安装包（安装时联网下载依赖）"
+            echo "- 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。"
+          } >> dist/notes.md
 
       # docs/FALLBACK-POLICY.md：任何回退必须在发布说明里可见。
       # WEASEL-SOURCE.json 由 windows job 写出并随 windows-bundles 上传。

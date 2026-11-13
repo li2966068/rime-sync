@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # assert-release-assets.sh -- assert the published asset inventory (0.6.6 layout).
 #
-# 0.6.6 起 Linux 与 Windows 都只发「一个包 = 输入法本体 + 同步工具」，并各自区分全量/非全量：
-#   Linux   rime-sync-installer_<ver>.trixie.run       full  （内置依赖闭包）
-#           rime-sync-installer_<ver>.trixie.thin.run  thin  （apt 装依赖）
+# 0.6.6 起 Linux 与 Windows 都只发「一个包 = 输入法本体 + 同步工具」，并各自区分离线/在线：
+#   Linux   rime-sync-installer_<ver>.trixie.offline.run  offline（内置依赖闭包）
+#           rime-sync-installer_<ver>.trixie.online.run   online （apt 装依赖）
 #           rime-inputmethod_*.deb 不再作为独立资产（它只在两个 .run 内）
-#   Windows rime-sync_<ver>_x64-setup.exe              非全量
-#           rime-sync_<ver>_x64-offline-setup.exe      全量（内嵌 WebView2）
+#   Windows rime-sync_<ver>_x64-setup.exe              在线安装包
+#           rime-sync_<ver>_x64-offline-setup.exe      离线安装包（内嵌 WebView2）
+#
+# 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 #
 # 输入是 gh release view 的两列输出（资产名 + 字节数），所以本脚本可以离线自检：
 #   gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' > assets.txt
@@ -16,10 +18,14 @@
 #   --assets FILE          资产清单（每行 "<名字> <字节数>"）
 #   --version VER          应用版本（tauri.conf.json）
 #   --suite SUITE          发行版 suite，默认 trixie
-#   --full-min-mib N       全量 .run 体积下限，默认 100
-#   --thin-min-mib N       thin .run 体积下限，默认 5
-#   --thin-max-mib N       thin .run 体积上限，默认 60（超了说明依赖闭包被打进去了）
+#   --offline-min-mib N    离线安装包 .run 体积下限，默认 100
+#   --online-min-mib N     在线安装包 .run 体积下限，默认 5
+#   --online-max-mib N     在线安装包 .run 体积上限，默认 60（超了说明依赖闭包被打进去了）
 #   --require-sync-deb 0   允许草稿 Release 里没有 rime-sync deb（转正前会被删掉）
+# 兼容旧包/旧写法（旧参数名仍可用，不报错）：
+#   --full-min-mib  等价于 --offline-min-mib
+#   --thin-min-mib  等价于 --online-min-mib
+#   --thin-max-mib  等价于 --online-max-mib
 #
 # 退出码：0 = 全部通过；1 = 有断言失败；2 = 用法错误。
 set -uo pipefail
@@ -28,9 +34,9 @@ PROG=$(basename "$0")
 ASSETS=""
 VERSION=""
 SUITE=trixie
-FULL_MIN=100
-THIN_MIN=5
-THIN_MAX=60
+OFFLINE_MIN=100
+ONLINE_MIN=5
+ONLINE_MAX=60
 REQUIRE_SYNC_DEB=1
 
 FAILED=0
@@ -51,9 +57,10 @@ while [ $# -gt 0 ]; do
     --assets) [ $# -ge 2 ] || die "--assets 需要文件"; ASSETS=$2; shift 2 ;;
     --version) [ $# -ge 2 ] || die "--version 需要版本号"; VERSION=$2; shift 2 ;;
     --suite) [ $# -ge 2 ] || die "--suite 需要 suite"; SUITE=$2; shift 2 ;;
-    --full-min-mib) [ $# -ge 2 ] || die "--full-min-mib 需要数字"; FULL_MIN=$2; shift 2 ;;
-    --thin-min-mib) [ $# -ge 2 ] || die "--thin-min-mib 需要数字"; THIN_MIN=$2; shift 2 ;;
-    --thin-max-mib) [ $# -ge 2 ] || die "--thin-max-mib 需要数字"; THIN_MAX=$2; shift 2 ;;
+    --offline-min-mib | --full-min-mib) [ $# -ge 2 ] || die "--offline-min-mib 需要数字"; OFFLINE_MIN=$2; shift 2 ;;
+    --online-min-mib | --thin-min-mib) [ $# -ge 2 ] || die "--online-min-mib 需要数字"; ONLINE_MIN=$2; shift 2 ;;
+    --online-max-mib | --thin-max-mib) [ $# -ge 2 ] || die "--online-max-mib 需要数字"; ONLINE_MAX=$2; shift 2 ;;
+    # 兼容旧包/旧写法：--full-min-mib / --thin-min-mib / --thin-max-mib 仍可用（别名）
     --require-sync-deb) [ $# -ge 2 ] || die "--require-sync-deb 需要 0|1"; REQUIRE_SYNC_DEB=$2; shift 2 ;;
     -h | --help)
       sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -66,7 +73,7 @@ done
 [ -n "$ASSETS" ] || die "缺少 --assets"
 [ -f "$ASSETS" ] || die "资产清单不存在：$ASSETS"
 [ -n "$VERSION" ] || die "缺少 --version"
-case "${FULL_MIN}${THIN_MIN}${THIN_MAX}" in *[!0-9]*) die "体积阈值只接受整数（MiB）" ;; esac
+case "${OFFLINE_MIN}${ONLINE_MIN}${ONLINE_MAX}" in *[!0-9]*) die "体积阈值只接受整数（MiB）" ;; esac
 
 size_of() { awk -v n="$1" '$1==n {print $2; exit}' "$ASSETS"; }
 mib() { echo $(( $1 / 1024 / 1024 )); }
@@ -76,44 +83,44 @@ say "资产清单：$ASSETS（version=$VERSION suite=$SUITE）"
 # ---------------------------------------------------- Linux: exactly two .run
 run_count=$(awk '$1 ~ /^rime-sync-installer_/ {c++} END {print c+0}' "$ASSETS")
 if [ "$run_count" -eq 2 ]; then
-  ok "Linux 安装器恰好 2 个 .run（全量 + thin）"
+  ok "Linux 安装器恰好 2 个 .run（离线 + 在线）"
 else
-  bad "Linux 安装器有 $run_count 个 .run（期望 2：全量 + thin）——多出的大概率是旧发行版残留"
+  bad "Linux 安装器有 $run_count 个 .run（期望 2：离线 + 在线）——多出的大概率是旧发行版残留"
 fi
 
-full_name="rime-sync-installer_${VERSION}.${SUITE}.run"
-thin_name="rime-sync-installer_${VERSION}.${SUITE}.thin.run"
-full_size=$(size_of "$full_name")
-thin_size=$(size_of "$thin_name")
+offline_name="rime-sync-installer_${VERSION}.${SUITE}.offline.run"
+online_name="rime-sync-installer_${VERSION}.${SUITE}.online.run"
+offline_size=$(size_of "$offline_name")
+online_size=$(size_of "$online_name")
 
-if [ -z "$full_size" ]; then
-  bad "缺少全量安装器（$full_name）"
+if [ -z "$offline_size" ]; then
+  bad "缺少离线安装包（$offline_name）"
 else
-  m=$(mib "$full_size")
-  say "  $full_name: $m MiB"
-  if [ "$full_size" -lt $(( FULL_MIN * 1024 * 1024 )) ]; then
-    bad "$full_name 仅 $m MiB（< $FULL_MIN MiB）：依赖闭包没打进去"
+  m=$(mib "$offline_size")
+  say "  $offline_name: $m MiB"
+  if [ "$offline_size" -lt $(( OFFLINE_MIN * 1024 * 1024 )) ]; then
+    bad "$offline_name 仅 $m MiB（< $OFFLINE_MIN MiB）：依赖闭包没打进去"
   else
-    ok "$full_name 体积达标（≥ $FULL_MIN MiB）"
+    ok "$offline_name 体积达标（≥ $OFFLINE_MIN MiB）"
   fi
 fi
 
-if [ -z "$thin_size" ]; then
-  bad "缺少非全量安装器（$thin_name）"
+if [ -z "$online_size" ]; then
+  bad "缺少在线安装包（$online_name）"
 else
-  m=$(mib "$thin_size")
-  say "  $thin_name: $m MiB"
-  if [ "$thin_size" -lt $(( THIN_MIN * 1024 * 1024 )) ]; then
-    bad "$thin_name 仅 $m MiB（< $THIN_MIN MiB）：连 IME + sync 都没打进去"
-  elif [ "$thin_size" -gt $(( THIN_MAX * 1024 * 1024 )) ]; then
-    bad "$thin_name 有 $m MiB（> $THIN_MAX MiB）：依赖闭包被打进 thin 包了"
+  m=$(mib "$online_size")
+  say "  $online_name: $m MiB"
+  if [ "$online_size" -lt $(( ONLINE_MIN * 1024 * 1024 )) ]; then
+    bad "$online_name 仅 $m MiB（< $ONLINE_MIN MiB）：连 IME + sync 都没打进去"
+  elif [ "$online_size" -gt $(( ONLINE_MAX * 1024 * 1024 )) ]; then
+    bad "$online_name 有 $m MiB（> $ONLINE_MAX MiB）：依赖闭包被打进在线安装包了"
   else
-    ok "$thin_name 体积达标（$THIN_MIN–$THIN_MAX MiB）"
+    ok "$online_name 体积达标（$ONLINE_MIN–$ONLINE_MAX MiB）"
   fi
-  if [ -n "$full_size" ] && [ "$thin_size" -gt $(( full_size / 2 )) ]; then
-    bad "$thin_name 不小于全量包的一半：thin 去掉依赖后体积应显著更小"
+  if [ -n "$offline_size" ] && [ "$online_size" -gt $(( offline_size / 2 )) ]; then
+    bad "$online_name 不小于离线安装包的一半：在线安装包去掉依赖后体积应显著更小"
   else
-    ok "thin 包体积显著小于全量包"
+    ok "在线安装包体积显著小于离线安装包"
   fi
 fi
 
@@ -143,7 +150,7 @@ for name in "rime-sync_${VERSION}_amd64.AppImage" "rime-sync_${VERSION}_amd64.Ap
   fi
 done
 
-# ------------------------------------------- Windows: non-full + full, + sigs
+# ------------------------------------------- Windows: online + offline, + sigs
 for pair in "rime-sync_${VERSION}_x64-setup.exe:12" "rime-sync_${VERSION}_x64-offline-setup.exe:100"; do
   win_name=${pair%:*}
   min_mib=${pair##*:}

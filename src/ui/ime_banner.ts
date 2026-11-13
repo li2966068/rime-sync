@@ -159,7 +159,7 @@ function renderExtraSupport(): void {
   if (!linux) {
     el.extraHint.textContent = t("extraIme.windowsHint");
   } else if (!state.can_reinstall) {
-    // AppImage 之类没有换装脚本的版本：只能让用户手动用完整安装包装。
+    // AppImage 之类没有换装脚本的版本：只能让用户手动用安装包装。
     el.extraHint.textContent = t("extraIme.noScript");
   } else {
     el.extraHint.textContent = t("extraIme.linuxHint");
@@ -185,7 +185,7 @@ export async function refreshExtraSupport(): Promise<void> {
   renderExtraSupport();
 }
 
-/// 让用户挑一个本地完整安装包（后端直接调系统文件选择器）。
+/// 让用户挑一个本地安装包（后端直接调系统文件选择器）。
 export async function pickExtraPackage(): Promise<void> {
   try {
     const picked = await api.pickExtraPackage();
@@ -198,7 +198,7 @@ export async function pickExtraPackage(): Promise<void> {
   }
 }
 
-/// 「一键换装」：把用户选的完整安装包交给后端，后端用 pkexec 调换装脚本。
+/// 「一键换装」：把用户选的安装包交给后端，后端用 pkexec 调换装脚本。
 /// pkexec 会弹管理员授权窗口，换装要几分钟，所以界面不等它跑完。
 export async function runExtraInstall(): Promise<void> {
   const path = el.extraPackage.value.trim();
