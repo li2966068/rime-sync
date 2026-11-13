@@ -235,15 +235,11 @@ pub fn should_watch(rel: &str) -> bool {
             return false;
         }
     }
-    if name.ends_with(".bin")
+    !(name.ends_with(".bin")
         || name.ends_with(".gram")
         || name.ends_with(".tmp")
         || name.ends_with(".swp")
-        || name.ends_with('~')
-    {
-        return false;
-    }
-    true
+        || name.ends_with('~'))
 }
 
 /// 把 rime_dir 下的相对路径转成「值得触发一次同步」的判断（给 CLI 复用）。

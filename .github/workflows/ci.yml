@@ -821,7 +821,8 @@ jobs:
 
   rimesync-extra-smoke:
     name: rimesync-extra · 运行时冒烟测试
-    runs-on: ubuntu-22.04
+    # 24.04：22.04 的 apt 源里 libgoogle-glog-dev 依赖的 libunwind 装不上。
+    runs-on: ubuntu-24.04
     steps:
       - name: checkout
         uses: actions/checkout@v4
