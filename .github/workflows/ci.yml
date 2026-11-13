@@ -818,3 +818,36 @@ jobs:
       - name: wine smoke（静默安装 + 静默卸载 + 用户数据清理）
         if: env.SKIP_WINE != '1'
         run: bash packaging/windows/test-nsis-hooks-wine.sh --strict
+
+  rimesync-extra-smoke:
+    name: rimesync-extra · 运行时冒烟测试
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # 依赖与 scripts/ime/Dockerfile 里编 librime 的一致（去掉 fcitx5 / Qt 那部分）。
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libboost-dev libboost-regex-dev \
+            libopencc-dev libyaml-cpp-dev libleveldb-dev \
+            libgoogle-glog-dev libmarisa-dev
+
+      # 只编这一个目标（会连带把 librime 编出来），然后直接运行它。
+      # BUILD_TEST=OFF：不注册上游那套 gtest 用例，这里只跑 rimesync-extra 的冒烟测试。
+      # 这个文件此前谁都不跑，所以改键位后断言会悄悄过期；现在每次 push 都会验一遍。
+      - name: build and run the rimesync-extra smoke test
+        run: |
+          set -euo pipefail
+          cmake -S third_party/librime -B /tmp/librime-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_MERGED_PLUGINS=ON \
+            -DBUILD_TEST=OFF
+          cmake --build /tmp/librime-build \
+            --target rimesync_extra_engine_smoke_test -j2
+          cd /tmp
+          LD_LIBRARY_PATH=/tmp/librime-build/lib \
+            /tmp/librime-build/plugins/rimesync-extra/rimesync_extra_engine_smoke_test

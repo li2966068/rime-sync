@@ -43,16 +43,30 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
     test/punct_table_test.cc)
   target_include_directories(rimesync_extra_punct_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # The runtime smoke test drives the components through a real librime
+  # engine, so it links against the library instead of recompiling the
+  # plugin sources.  ${CMAKE_BINARY_DIR}/src carries the generated
+  # rime/build_config.h.
+  add_executable(rimesync_extra_engine_smoke_test
+    test/engine_smoke_test.cc)
+  target_include_directories(rimesync_extra_engine_smoke_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/src
+            ${CMAKE_BINARY_DIR}/src)
+  target_link_libraries(rimesync_extra_engine_smoke_test PRIVATE ${rime_library})
   if(MSVC)
     target_compile_options(rimesync_extra_vnum_test PRIVATE /utf-8)
     target_compile_options(rimesync_extra_numpad_test PRIVATE /utf-8)
     target_compile_options(rimesync_extra_punct_test PRIVATE /utf-8)
+    target_compile_options(rimesync_extra_engine_smoke_test PRIVATE /utf-8)
   endif()
   add_custom_target(check-rimesync-extra
     COMMAND $<TARGET_FILE:rimesync_extra_vnum_test>
     COMMAND $<TARGET_FILE:rimesync_extra_numpad_test>
     COMMAND $<TARGET_FILE:rimesync_extra_punct_test>
+    COMMAND $<TARGET_FILE:rimesync_extra_engine_smoke_test>
     DEPENDS rimesync_extra_vnum_test rimesync_extra_numpad_test rimesync_extra_punct_test
+            rimesync_extra_engine_smoke_test
     COMMENT "Running rimesync-extra unit tests")
   if(BUILD_TEST)
     add_test(NAME rimesync_extra_vnum_test COMMAND rimesync_extra_vnum_test)
@@ -60,6 +74,8 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
       COMMAND rimesync_extra_numpad_test)
     add_test(NAME rimesync_extra_punct_test
       COMMAND rimesync_extra_punct_test)
+    add_test(NAME rimesync_extra_engine_smoke_test
+      COMMAND rimesync_extra_engine_smoke_test)
   endif()
 endif()
 
