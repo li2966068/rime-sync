@@ -7,7 +7,12 @@
 //
 // Part 1 drives the components directly, part 2 applies a small in-memory
 // schema to a real Engine and presses keys through the whole processor chain
-// (that is the part that proves the schema wiring: /fh symbols, v-mode).
+// (that is the part that proves the schema wiring: punctuation, v-mode).
+//
+// Key map as of 2026-11-11: the slash commits 、, the backslash commits
+// ＼, Shift+slash commits ？, Shift+comma opens the 《〈＜ alternatives
+// menu.  The expectations below were checked against a real librime build
+// on 2026-11-13.
 
 #include <cstdio>
 #include <memory>
@@ -121,14 +126,14 @@ void TestProcessor() {
   committed.clear();
   Check(processor->ProcessKeyEvent(KeyEvent(XK_backslash, 0)) == kAccepted,
         "backslash accepted");
-  CheckEq(committed, u8"、", "backslash commits 、 immediately");
+  CheckEq(committed, u8"＼", "backslash commits ＼ immediately");
   Check(!ctx->IsComposing(), "backslash leaves no composition");
 
-  // '/' is handed back to Rime's own punctuator (symbol prefix /fh).
+  // The slash commits the Chinese comma directly (2026-11-11 key remap).
   committed.clear();
-  Check(processor->ProcessKeyEvent(KeyEvent(XK_slash, 0)) == kNoop,
-        "slash is not intercepted any more");
-  Check(committed.empty(), "slash commits nothing here");
+  Check(processor->ProcessKeyEvent(KeyEvent(XK_slash, 0)) == kAccepted,
+        "slash is intercepted");
+  CheckEq(committed, u8"、", "slash commits 、 immediately");
   Check(!ctx->IsComposing(), "slash leaves no composition behind");
 
   committed.clear();
@@ -143,7 +148,8 @@ void TestProcessor() {
         "shift+4 accepted");
   CheckEq(committed, u8"￥", "shift+4 commits ￥");
 
-  // '?' lost its base key ('/') from the table and is committed directly.
+  // The question mark has no alternatives on its base key (the slash), so it
+  // is committed directly.
   committed.clear();
   Check(processor->ProcessKeyEvent(KeyEvent('?', kShiftMask)) == kAccepted,
         "shift+slash accepted");
@@ -266,29 +272,32 @@ void TestSchemaSession() {
     committed += text;
   });
 
-  // 1. '/' keeps Rime's behaviour: a 「、」 candidate from punctuation.yaml.
+  // 1. The slash is committed directly by rimesync_punct (2026-11-11 key
+  //    remap): it no longer enters the input and opens no candidate menu.
   committed.clear();
   Check(engine->ProcessKey(KeyEvent(XK_slash, 0)), "slash accepted by engine");
-  CheckEq(ctx->input(), "/", "slash entered the input");
-  Check(ctx->HasMenu(), "slash opens Rime's punct candidate menu");
-  CheckEq(CandidateText(ctx, 0), u8"、", "Rime's 、 candidate is intact");
-  Check(committed.empty(), "slash does not commit by itself");
+  CheckEq(committed, u8"、", "slash commits 、 immediately");
+  CheckEq(ctx->input(), "", "slash leaves no input behind");
+  Check(!ctx->HasMenu(), "slash opens no candidate menu");
 
-  // 2. '/fh' reaches the symbols table instead of being eaten.
-  Check(engine->ProcessKey(KeyEvent('f', 0)), "f accepted");
-  Check(engine->ProcessKey(KeyEvent('h', 0)), "h accepted");
-  CheckEq(ctx->input(), "/fh", "input became /fh");
-  Check(ctx->HasMenu(), "/fh opens the symbols menu");
-  CheckEq(CandidateText(ctx, 0), u8"©", "/fh first symbol is ©");
+  // 2. Inside a composition the slash is Rime's business again: the
+  //    punctuator opens its candidate menu for the slash.
+  //    (The "/fh" symbol prefix is no longer reachable from Chinese mode,
+  //     because the slash is committed before it can enter the input.  Use
+  //     ascii mode or remap rimesync_punct/keys if the symbols are needed.)
   committed.clear();
-  Check(engine->ProcessKey(KeyEvent('1', 0)), "1 selects a symbol");
-  CheckEq(committed, u8"©", "/fh -> © committed");
-  Check(!ctx->IsComposing(), "symbol composition is finished");
+  engine->ProcessKey(KeyEvent('a', 0));
+  engine->ProcessKey(KeyEvent(XK_slash, 0));
+  Check(ctx->HasMenu(), "punct menu opens inside a composition");
+  CheckEq(CandidateText(ctx, 0), u8"、", "first punct candidate is 、");
+  committed.clear();
+  engine->ProcessKey(KeyEvent(XK_space, 0));
+  engine->ProcessKey(KeyEvent(XK_space, 0));
 
-  // 3. '\' still commits 、 immediately through the whole chain.
+  // 3. Backslash commits the full-width backslash through the whole chain.
   committed.clear();
   Check(engine->ProcessKey(KeyEvent(XK_backslash, 0)), "backslash accepted");
-  CheckEq(committed, u8"、", "backslash still commits 、 immediately");
+  CheckEq(committed, u8"＼", "backslash commits ＼ immediately");
   Check(!ctx->IsComposing(), "backslash leaves no composition");
 
   // 4. Shift+, still opens the 《 alternatives menu.
@@ -390,13 +399,15 @@ void TestSchemaSession() {
           "ascii mode is left alone");
     ctx->set_option("ascii_mode", false);
 
-    // A menu that does not belong to v-mode ('/' punct menu).
+    // A menu that does not belong to v-mode: the punct menu that opens
+    // while a composition is active.
     ctx->Clear();
+    engine->ProcessKey(KeyEvent('a', 0));
     engine->ProcessKey(KeyEvent(XK_slash, 0));
-    Check(ctx->HasMenu(), "slash menu is up");
+    Check(ctx->HasMenu(), "punct menu is up");
     Check(vselect->ProcessKeyEvent(KeyEvent('a', 0)) == kNoop,
           "punct menu does not take letters");
-    CheckEq(ctx->input(), "/", "punct input untouched by vselect");
+    Check(!ctx->input().empty(), "punct input untouched by vselect");
 
     // Plain pinyin input.
     ctx->Clear();
