@@ -85,11 +85,14 @@ pub const DEPLOY_FAILED: &str = "failed";
 pub const DEPLOY_SKIPPED: &str = "skipped";
 /// 启动自举写了新文件但没有主动重载：留给用户点「重新部署」或重启输入法。
 pub const DEPLOY_DEFERRED: &str = "deferred";
-/// 部署命令（Linux）：先让 fcitx5 重载，没有再直接让 rime_deployer 构建。
-#[cfg(not(windows))]
-pub const DEPLOY_RELOAD: &str = "fcitx5-remote";
+/// 部署命令（Linux）：让 rime_deployer 重新编译方案。
 #[cfg(not(windows))]
 pub const DEPLOY_BUILDER: &str = "rime_deployer";
+/// fcitx5 的重载命令。**故意不用它做部署触发**：`-r` 只重载 fcitx 自身配置、
+/// 不触发 librime 重编译，且 fcitx5 未运行时也返回退出码 0（假成功）。
+/// 保留常量是为了让「为什么不用它」有据可查，也便于将来真需要单独重载 fcitx 时引用。
+#[cfg(not(windows))]
+pub const DEPLOY_RELOAD: &str = "fcitx5-remote";
 /// 显式指定 data 目录（多个用系统路径分隔符）；空串或 0 = 关闭补丁。测试靠它隔离。
 pub const ENV_DATA_DIR: &str = "RIMESYNC_WEASEL_DATA";
 /// Linux 的 data 目录。
@@ -566,8 +569,17 @@ fn run_command(program: &str, args: &[&OsStr]) -> RunResult {
     }
 }
 
-/// 写 custom.yaml 后触发一次重新部署：先让 fcitx5 重载，没有再让 rime_deployer
-/// 直接重建。两个命令都不存在 = skipped（调用方提示手动「重新部署」）。
+/// 写 custom.yaml 后触发一次重新部署：直接跑 rime_deployer 重建。
+/// 命令不存在 = skipped（调用方提示手动「重新部署」）。
+///
+/// **不要**在这里先试 `fcitx5-remote -r`（2026-11-15 实测，228）：
+/// ① `-r` 的语义是「reload **fcitx** config」——重载 fcitx 自己的配置，
+///    跟 Rime 的方案无关，**不触发 librime 重编译**；
+/// ② fcitx5 根本没在运行时 `fcitx5-remote -r` 也返回**退出码 0**，
+///    拿它当「成功」判据 = 假成功，于是 `--build` 永远跑不到，
+///    症状是「配置改了、报告说成功，但方案没变」。
+/// 只有 builder 会重编译（实测：reload 后 build 产物 mtime 不变，
+/// `--build` 后 mtime 更新）。同文件的 rebuild_after_config_change 也是这个结论。
 #[cfg(not(windows))]
 fn deploy_outcome(user_dir: &Path, shared_dir: &Path) -> DeployOutcome {
     deploy_outcome_with(&run_command, user_dir, shared_dir)
@@ -580,10 +592,6 @@ fn deploy_outcome_with(
     user_dir: &Path,
     shared_dir: &Path,
 ) -> DeployOutcome {
-    // 顺序固定：先试轻量的 fcitx5 重载，失败 / 不存在再退回 rime_deployer 重建。
-    if run(DEPLOY_RELOAD, &[OsStr::new("-r")]) == RunResult::Ok {
-        return DeployOutcome::Ok;
-    }
     match run(
         DEPLOY_BUILDER,
         &[
@@ -2804,11 +2812,13 @@ patch:
         );
     }
 
-    /// Explicit 下的部署顺序：先 fcitx5-remote -r，失败 / 不存在再退
-    /// rime_deployer --build <用户目录> <共享目录>。
+    /// 部署只跑 rime_deployer --build，**不跑** fcitx5-remote -r。
+    ///
+    /// 2026-11-15 实测（228）：`-r` 不触发 librime 重编译，且 fcitx5 未运行时
+    /// 也返回退出码 0 ⇒ 先 reload 会造成「报告成功但方案没变」的假成功。
     #[cfg(not(windows))]
     #[test]
-    fn deploy_order_tries_reload_then_builder() {
+    fn deploy_order_runs_builder_only() {
         use std::cell::RefCell;
         let user = PathBuf::from("/tmp/rime-user");
         let shared = PathBuf::from("/usr/share/rime-data");
@@ -2820,31 +2830,25 @@ patch:
                     .collect::<Vec<_>>()
                     .join(" "),
             );
-            if program == DEPLOY_RELOAD {
-                RunResult::Failed
-            } else {
-                RunResult::Ok
-            }
+            RunResult::Ok
         };
 
         assert_eq!(deploy_outcome_with(&run, &user, &shared), DeployOutcome::Ok);
         assert_eq!(
             seen.into_inner(),
-            vec![
-                format!("{DEPLOY_RELOAD} -r"),
-                format!(
-                    "{DEPLOY_BUILDER} --build {} {}",
-                    user.display(),
-                    shared.display()
-                ),
-            ]
+            vec![format!(
+                "{DEPLOY_BUILDER} --build {} {}",
+                user.display(),
+                shared.display()
+            )],
+            "部署触发必须直接跑 builder，不能先试 fcitx5-remote -r"
         );
     }
 
-    /// 重载成功就不再多跑重建命令；两个命令都不存在 = skipped。
+    /// builder 成功就返回；命令不存在 = skipped；命令失败 = failed。
     #[cfg(not(windows))]
     #[test]
-    fn deploy_outcome_stops_on_success_and_maps_missing() {
+    fn deploy_outcome_maps_builder_outcome() {
         use std::cell::Cell;
         let calls = Cell::new(0);
         let ok = |_: &str, _: &[&OsStr]| {
@@ -2855,7 +2859,7 @@ patch:
             deploy_outcome_with(&ok, Path::new("/u"), Path::new("/s")),
             DeployOutcome::Ok
         );
-        assert_eq!(calls.get(), 1, "重载成功后不该再跑 rime_deployer");
+        assert_eq!(calls.get(), 1, "builder 成功就返回，不该多跑命令");
 
         let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let missing = |program: &str, _: &[&OsStr]| {
@@ -2866,7 +2870,13 @@ patch:
             deploy_outcome_with(&missing, Path::new("/u"), Path::new("/s")),
             DeployOutcome::Skipped
         );
-        assert_eq!(seen.into_inner().len(), 2);
+        assert_eq!(seen.into_inner(), vec![DEPLOY_BUILDER.to_string()]);
+
+        let failed = |_: &str, _: &[&OsStr]| RunResult::Failed;
+        assert_eq!(
+            deploy_outcome_with(&failed, Path::new("/u"), Path::new("/s")),
+            DeployOutcome::Failed
+        );
     }
 
     #[test]
