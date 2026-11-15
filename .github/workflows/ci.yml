@@ -336,6 +336,25 @@ jobs:
             exit 1
           }
 
+      # postinst 必须把随包保留的输入方案补进用户的 default.custom.yaml：
+      # schema_list 是「装了哪些方案」的清单，librime 只按它生成 build/，
+      # 清单里没有的方案一次全量重新部署就会被清掉（用户方案「凭空消失」）。
+      # Linux 的 postinst 只调 repair-customs（不管 schema_list）与 prune-schemas
+      # （只删不补），走不到 ensure 里的补齐逻辑 ⇒ 必须显式调 repair-schema-list。
+      # 顺序红线：补齐必须在 prune 之后，否则刚补上的方案又被裁掉。
+      - name: postinst repairs the schema list
+        run: |
+          set -euo pipefail
+          bash packaging/linux/test/test-postinst-schema-list.sh
+          grep -q 'repair-schema-list --user-dir' packaging/linux/postinst || {
+            echo "::error::postinst 缺少 repair-schema-list 调用"
+            exit 1
+          }
+          grep -q 'repair-schema-list' crates/cli/src/main.rs || {
+            echo "::error::CLI 缺少 repair-schema-list 子命令"
+            exit 1
+          }
+
       # 改名 / 删步 / 换顺序时这里立刻红：离线安装器静默缺席比构建失败更难查。
       - name: release.yml + offline-verify.yml still wire the offline pipeline
         run: |

@@ -322,6 +322,31 @@ repair_user_customs() { # $1=Rime 用户目录
     done
     say "用户方案配置：已增量补齐缺失的增强组件（你改过的内容原样保留）"
 }
+
+# ---------------------------------------------------- 用户方案列表补齐
+# 用户的 default.custom.yaml 里的 schema_list 就是「装了哪些方案」的清单。
+# librime 只按 schema_list 生成 build/ —— 清单里没有的方案，一次全量重新部署
+# 就会连编译产物一起被清掉，用户正在用的方案会「凭空消失」。
+#
+# 保留清单（packaging/rime/retained-schemas.txt）里的方案必须出现在这个清单里。
+# 补齐逻辑本来在 rime_state::ensure 里（Windows 首启走它，所以 Windows 有这个
+# 补齐），但 Linux 这边只调了 repair-customs（不管 schema_list）与
+# prune-schemas（只删不补），走不到 ensure ⇒ Linux 装/升级后保留方案永远补不进来。
+# 这里补上这一段：只在列表末尾追加缺失的保留方案，用户已有的条目与顺序一律不动，
+# 改前把原文件备份成 default.custom.yaml.rimesync-orig。
+repair_schema_list() { # $1=Rime 用户目录
+    local rime_dir=$1 owner=${TARGET_USER:-root} group
+    group=$(id -gn "$owner" 2>/dev/null || echo "$owner")
+    [ -x "$CLI_HELPER" ] || return 0
+    [ -d "$rime_dir" ] || return 0
+    "$CLI_HELPER" repair-schema-list --user-dir "$rime_dir" >/dev/null 2>&1 || true
+    # CLI 以 root 身份跑，写出来的文件属主会变成 root —— 补回给用户。
+    for f in "$rime_dir"/default.custom.yaml "$rime_dir"/default.custom.yaml.rimesync-orig; do
+        [ -f "$f" ] || continue
+        chown "$owner:$group" "$f" 2>/dev/null || true
+    done
+    say "方案列表：已补齐随包保留的输入方案（你原有的方案与顺序不变）"
+}
 # ---------------------------------------------------- 预编译 build 产物兜底
 # 有些机器上 rime 部署永远不产出 build/（Windows 上实测 WeaselDeployer /deploy 返回 0
 # 但什么都不写；Linux 上也会被用户目录权限 / 插件版本搞坏）。随 IME 包带的
@@ -466,6 +491,10 @@ if [ "${1:-}" = "configure" ] && [ -n "$TARGET_HOME" ]; then
     prune_extra_schemas "$RIME_USER_DIR"
     # 0.6.30：补齐老设备 custom.yaml 里缺失的新增强组件（只补缺，绝不覆盖用户改动）
     repair_user_customs "$RIME_USER_DIR"
+    # 补齐用户方案列表（schema_list）里的随包保留方案。
+    # **顺序在 prune_extra_schemas 之后**：prune 只删不补，先补后裁会把刚补上的
+    # 方案又裁掉；先裁后补才是「最终列表 = 保留清单」。
+    repair_schema_list "$RIME_USER_DIR"
 fi
 # 用户目录不可用时只清 data（root 期；Linux 的 /usr/share/rime-data 属 root）
 if [ "${1:-}" = "configure" ] && [ -z "$TARGET_HOME" ]; then

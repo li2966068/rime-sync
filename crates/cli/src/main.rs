@@ -172,6 +172,21 @@ enum Command {
     /// 不铺 build/、不部署、不碰公共目录 —— 安装或更新后调用它，老设备也能拿到新组件。
     #[command(name = "repair-customs")]
     RepairCustoms,
+    /// 把用户 default.custom.yaml 的 schema_list 补齐到随包保留清单。
+    ///
+    /// 只在列表末尾**追加**缺失的保留方案（用户已有的条目与顺序一律不动，
+    /// 改前把原文件备份成 default.custom.yaml.rimesync-orig）。
+    /// 不铺 build/、不部署、不碰公共目录 —— 安装或更新后调用它，
+    /// 老设备的方案列表就能补上保留方案（否则全量重新部署时它们会消失）。
+    #[command(name = "repair-schema-list")]
+    RepairSchemaList {
+        /// data 目录（可重复；缺省按平台/注册表探测，Linux: /usr/share/rime-data）
+        #[arg(long = "data-dir", value_name = "DIR")]
+        data_dir: Vec<PathBuf>,
+        /// 用户 Rime 目录（缺省自动探测）
+        #[arg(long = "user-dir", value_name = "DIR")]
+        user_dir: Option<PathBuf>,
+    },
     #[command(name = "prune-schemas")]
     PruneSchemas {
         /// 只报告将删除什么，不落盘
@@ -304,6 +319,19 @@ struct ProbeFailed;
 /// fix-ime 铺完仍不可用：报告已经打印过，main 只负责退出码。
 #[derive(Debug)]
 struct FixImeFailed;
+
+/// repair-schema-list 的 JSON 报告。
+#[derive(Serialize)]
+struct RepairSchemaListJson {
+    rime_dir: String,
+    /// 补进去的方案 id（已追加到 schema_list 末尾）。
+    added: Vec<String>,
+    /// 已经在列表里，无需补。
+    present: Vec<String>,
+    /// 没动：文件不存在 / 没有 schema_list / 列表为空 / 该方案在 data 里不存在。
+    skipped: Vec<String>,
+    ok: bool,
+}
 
 /// repair-customs 的 JSON 报告。
 #[derive(Serialize)]
@@ -1436,6 +1464,72 @@ fn run(cli: Cli) -> Result<()> {
             }
             if !report.failed.is_empty() {
                 bail!("有 {} 个 custom.yaml 修补失败", report.failed.len());
+            }
+            Ok(())
+        }
+        Command::RepairSchemaList { data_dir, user_dir } => {
+            // 只做一件事：把用户 default.custom.yaml 的 schema_list 补到保留清单。
+            // 不铺 build/、不部署、不碰公共目录 —— 安装/更新后调用是安全的。
+            //
+            // 为什么需要它（2026-11-15 查证）：补齐逻辑本来在 ime_state::ensure 里，
+            // 但 Linux 的 postinst 只调 repair-customs（不管 schema_list）与
+            // prune-schemas（只删不补），走不到 ensure ⇒ Linux 装/升级后
+            // 保留方案永远补不进用户的方案列表，全量重新部署时它们会消失。
+            let rime_dir = match user_dir {
+                Some(dir) => dir,
+                None => resolve_rime_dir(cli.rime_dir.as_deref(), &config)?,
+            };
+            let data_dirs = if data_dir.is_empty() {
+                data_patch::data_dirs()
+            } else {
+                data_dir.clone()
+            };
+            // 门禁：只补 data 目录里**真实存在**的保留方案 —— 补一个不存在的方案
+            // 会让 librime 的部署把缺失方案计成 failure、整次部署失败
+            // （与 ime_state::ensure 的同一判据）。
+            let allowed: Vec<String> = prune::retained_schemas()
+                .iter()
+                .filter(|id| prebuilt::data_has_schema(&data_dirs, id))
+                .map(|id| id.to_string())
+                .collect();
+            let mut added = Vec::new();
+            let mut present = Vec::new();
+            let mut skipped = Vec::new();
+            match managed_custom::repair_default_schema_list_in(&rime_dir, Some(&allowed)) {
+                Ok(managed_custom::RepairOutcome::Repaired { backup }) => {
+                    added = allowed.clone();
+                    if let Some(backup) = backup {
+                        println!("repair_backup={}", backup.display());
+                    }
+                }
+                Ok(managed_custom::RepairOutcome::Unchanged) => {
+                    present = allowed.clone();
+                }
+                Ok(managed_custom::RepairOutcome::Skipped(reason)) => {
+                    skipped.push(reason);
+                }
+                Err(error) => bail!("补齐 schema_list 失败：{error:#}"),
+            }
+            let report = RepairSchemaListJson {
+                rime_dir: rime_dir.display().to_string(),
+                added,
+                present,
+                skipped,
+                ok: true,
+            };
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("rime_dir={}", report.rime_dir);
+                println!("repair_added={}", report.added.len());
+                println!("repair_present={}", report.present.len());
+                println!("repair_skipped={}", report.skipped.len());
+                for id in &report.added {
+                    println!("repair_added_schema={id}");
+                }
+                for item in &report.skipped {
+                    println!("repair_skipped_reason={item}");
+                }
             }
             Ok(())
         }
