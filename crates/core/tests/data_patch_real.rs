@@ -131,7 +131,20 @@ fn patches_the_three_places_and_the_marker() {
         Some(data_patch::VNUM_PATTERN)
     );
     // 其余配置原样保留
-    assert_eq!(processors.len(), 10);
+    assert_eq!(processors.len(), 11);
+    // rimesync_punct（中文标点直出）必须排在 punctuator 之前。
+    let punctuator = processors
+        .iter()
+        .position(|name| name == "punctuator")
+        .expect("punctuator stays");
+    let punct = processors
+        .iter()
+        .position(|name| name == data_patch::PUNCT_PROCESSOR)
+        .expect("rimesync_punct added");
+    assert!(
+        punct < punctuator,
+        "rimesync_punct 必须排在 punctuator 之前：{processors:?}"
+    );
     assert_eq!(
         strings(&doc, &["engine", "translators"]).len(),
         5,
@@ -375,7 +388,9 @@ recognizer:
         vec![
             "ascii_composer".to_string(),
             data_patch::VSELECT_PROCESSOR.to_string(),
-            data_patch::NUMPAD_PROCESSOR.to_string()
+            data_patch::NUMPAD_PROCESSOR.to_string(),
+            // 这个合成方案没有 punctuator，rimesync_punct 追加到末尾。
+            data_patch::PUNCT_PROCESSOR.to_string()
         ]
     );
     assert_eq!(

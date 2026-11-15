@@ -60,6 +60,11 @@ pub const MARKER_PREFIX: &str = "# patched by rime-sync";
 pub const VNUM_PATTERN: &str = "^[vV][0-9.]*$";
 pub const VNUM_TRANSLATOR: &str = "rimesync_vnum";
 pub const VSELECT_PROCESSOR: &str = "rimesync_vselect";
+/// 中文标点直出处理器（third_party/librime/plugins/rimesync-extra）。
+///
+/// 它必须排在 `punctuator` **之前**：它先处理按键、直接上屏中文标点，
+/// 后面的 punctuator 就不会再把半角标点转成 Rime 自带的那一套。
+pub const PUNCT_PROCESSOR: &str = "rimesync_punct";
 /// 小键盘归一化处理器（third_party/librime/plugins/rimesync-extra）。
 pub const NUMPAD_PROCESSOR: &str = "numpad";
 /// punctuator 深合并（0.6.20）：中文态反斜杠与冒号直出。
@@ -995,6 +1000,10 @@ fn write_user_custom(schema_file: &Path, user_dir: &Path, version: &str) -> Resu
 
 /// 在完整处理器列表上按 schema 模式同样的锚点插入 rimesync_vselect + numpad：
 /// recognizer 之后优先，否则 key_binder / speller 之前，都没有就追加到末尾。
+///
+/// 另外补上 `rimesync_punct`（中文标点直出）：它必须排在 `punctuator` 之前，
+/// 所以插在 punctuator 前面；列表里没有 punctuator 就追加到末尾。
+/// **已经有就不动** —— 用户自己调过的位置一律保留。
 #[cfg(not(windows))]
 fn processor_target(base: &[String]) -> Vec<String> {
     let mut order: Vec<String> = base
@@ -1014,6 +1023,13 @@ fn processor_target(base: &[String]) -> Vec<String> {
         .unwrap_or(order.len());
     order.insert(anchor, VSELECT_PROCESSOR.to_string());
     order.insert(anchor + 1, NUMPAD_PROCESSOR.to_string());
+    // rimesync_punct：缺失才补，位置必须在 punctuator 之前。
+    if !order.iter().any(|name| name == PUNCT_PROCESSOR) {
+        match order.iter().position(|name| name == "punctuator") {
+            Some(index) => order.insert(index, PUNCT_PROCESSOR.to_string()),
+            None => order.push(PUNCT_PROCESSOR.to_string()),
+        }
+    }
     order
 }
 
@@ -1829,7 +1845,20 @@ impl Doc {
             return false;
         }
         // numpad 必须紧跟 vselect。
-        self.insert_item_after("processors", 2, VSELECT_PROCESSOR, NUMPAD_PROCESSOR)
+        if !self.insert_item_after("processors", 2, VSELECT_PROCESSOR, NUMPAD_PROCESSOR) {
+            return false;
+        }
+        // rimesync_punct（中文标点直出）：必须在 punctuator 之前，否则它拿不到
+        // 按键，后面的 punctuator 照样把半角标点转成 Rime 自带的那一套。
+        // **已经有就不动** —— 用户自己调过的位置一律保留。
+        if !self.contains_item("processors", 2, PUNCT_PROCESSOR) {
+            let placed = self.insert_item_before("processors", 2, "punctuator", PUNCT_PROCESSOR)
+                || self.push_item("processors", 2, PUNCT_PROCESSOR);
+            if !placed {
+                return false;
+            }
+        }
+        true
     }
 
     /// recognizer/patterns/vnum。
@@ -2475,14 +2504,16 @@ mod tests {
             .and_then(Value::as_mapping)
             .expect("patch 段");
         let names = |key: &str| list_at(patch, &["engine", key]).expect("engine 列表");
-        // 原有处理器一个都不能丢，顺序也不能变（只在 recognizer 之后插入两项）。
+        // 原有处理器一个都不能丢，顺序也不能变（只在 recognizer 之后插入两项；
+        // punctuator 不在列表里时 rimesync_punct 追加到末尾）。
         assert_eq!(
             names("processors"),
             vec![
                 "recognizer",
                 VSELECT_PROCESSOR,
                 NUMPAD_PROCESSOR,
-                "key_binder"
+                "key_binder",
+                PUNCT_PROCESSOR
             ]
         );
         assert_eq!(
@@ -2569,12 +2600,80 @@ mod tests {
                 NUMPAD_PROCESSOR,
                 "key_binder",
                 "speller",
+                PUNCT_PROCESSOR,
                 "punctuator"
             ]
         );
         assert_eq!(
             list_at(patch, &["engine", "translators"]).expect("translators"),
             vec![VNUM_TRANSLATOR, "table_translator"]
+        );
+    }
+
+    /// rimesync_punct 必须排在 punctuator **之前**，否则它拿不到按键，
+    /// 后面的 punctuator 照样把半角标点转成 Rime 自带的那一套，
+    /// 「中文标点直出」等于没开。
+    ///
+    /// 顺序上还要同时满足 verify 的两条约束：vselect 紧跟 recognizer、
+    /// numpad 紧跟 vselect —— 所以 punct 只能插在 punctuator 前。
+    #[cfg(not(windows))]
+    #[test]
+    fn punct_processor_lands_before_punctuator() {
+        let base = vec![
+            "ascii_composer".to_string(),
+            "recognizer".to_string(),
+            "key_binder".to_string(),
+            "speller".to_string(),
+            "punctuator".to_string(),
+            "selector".to_string(),
+        ];
+        let order = processor_target(&base);
+        let punct = order
+            .iter()
+            .position(|name| name == PUNCT_PROCESSOR)
+            .expect("rimesync_punct 必须被补上");
+        let punctuator = order
+            .iter()
+            .position(|name| name == "punctuator")
+            .expect("punctuator 还在");
+        assert!(punct < punctuator, "顺序不对：{order:?}");
+        // vselect 紧跟 recognizer、numpad 紧跟 vselect（verify 的两条约束）。
+        let recognizer = order.iter().position(|n| n == "recognizer").unwrap();
+        assert_eq!(order[recognizer + 1], VSELECT_PROCESSOR);
+        assert_eq!(order[recognizer + 2], NUMPAD_PROCESSOR);
+    }
+
+    /// 已经有 rimesync_punct 的文件：**不重复添加**，且它仍在 punctuator 之前。
+    ///
+    /// vselect / numpad 按既有规则被重新插到 recognizer 之后（这是老行为），
+    /// 所以 punct 的绝对下标会后移，但它相对 punctuator 的位置不变。
+    #[cfg(not(windows))]
+    #[test]
+    fn punct_processor_is_not_moved_when_present() {
+        let base = vec![
+            "recognizer".to_string(),
+            PUNCT_PROCESSOR.to_string(),
+            "punctuator".to_string(),
+        ];
+        let order = processor_target(&base);
+        assert_eq!(
+            order.iter().filter(|name| *name == PUNCT_PROCESSOR).count(),
+            1,
+            "不能重复添加：{order:?}"
+        );
+        let punct = order.iter().position(|n| n == PUNCT_PROCESSOR).unwrap();
+        let punctuator = order.iter().position(|n| n == "punctuator").unwrap();
+        assert!(punct < punctuator, "顺序不对：{order:?}");
+        assert_eq!(
+            order,
+            vec![
+                "recognizer".to_string(),
+                VSELECT_PROCESSOR.to_string(),
+                NUMPAD_PROCESSOR.to_string(),
+                PUNCT_PROCESSOR.to_string(),
+                "punctuator".to_string(),
+            ],
+            "已有的 punct 不能被挪到 punctuator 之后"
         );
     }
 
@@ -2629,9 +2728,16 @@ patch:
             .expect("patch 段");
         assert_eq!(patch.get("menu/page_size").and_then(Value::as_u64), Some(9));
         // 基准列表来自用户自己的 custom.yaml（不是共享方案的），顺序保留。
+        // rimesync_punct 排在 punctuator 之前（它要先拿到按键）。
         assert_eq!(
             list_at(patch, &["engine", "processors"]).expect("processors"),
-            vec![VSELECT_PROCESSOR, NUMPAD_PROCESSOR, "speller", "punctuator"]
+            vec![
+                VSELECT_PROCESSOR,
+                NUMPAD_PROCESSOR,
+                "speller",
+                PUNCT_PROCESSOR,
+                "punctuator"
+            ]
         );
         let half = get_path(patch, &["punctuator", "half_shape"]).expect("half_shape");
         // 用户写过的键不覆盖，缺的键才补。
