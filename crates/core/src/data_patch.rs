@@ -336,8 +336,18 @@ pub fn resolve_version(explicit: Option<&str>) -> String {
     BUILD_VERSION.to_string()
 }
 
-/// Linux 的用户级 data 目录候选（存在才算）：$XDG_DATA_HOME/fcitx5/rime，
-/// 再是 ~/.local/share/fcitx5/rime。Windows 没有这个降级路径。
+/// Linux 的用户级 data 目录候选（存在才算）。
+///
+/// 第一位是**真正在用**的 Rime 用户目录：`rime_dir::detect(None)` 会读
+/// fcitx5-rime 的 `UserDataDirPath`（也就是 fcitx5 真正读写的那个目录）。
+/// 后面才是历史遗留的默认路径：$XDG_DATA_HOME/fcitx5/rime、
+/// ~/.local/share/fcitx5/rime。Windows 没有这个降级路径。
+///
+/// 为什么要把真正在用的目录排在前面（2026-11-15 在 228 实测）：fcitx5-rime
+/// 一旦配了 `UserDataDirPath`，用户真正在用的就是那个目录（228 上是
+/// /home/ljj/rime），而 ~/.local/share/fcitx5/rime **fcitx5 根本不读**。
+/// 只按默认路径挑候选 ⇒ 降级时把 custom.yaml 写进一个没人读的目录 ⇒
+/// 「修复输入法」报告成功，用户那边毫无变化。
 pub fn user_fallback_candidates() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -346,9 +356,14 @@ pub fn user_fallback_candidates() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         let mut out: Vec<PathBuf> = Vec::new();
+        if let Ok(detection) = crate::rime_dir::detect(None) {
+            if !out.contains(&detection.path) {
+                out.push(detection.path);
+            }
+        }
         if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
             let path = PathBuf::from(xdg).join("fcitx5").join("rime");
-            if path.is_dir() {
+            if path.is_dir() && !out.contains(&path) {
                 out.push(path);
             }
         }
@@ -401,6 +416,45 @@ fn describe_dirs(dirs: &[PathBuf], fallback_text: &str) -> String {
 pub fn patch_auto(version: &str, source: FixSource) -> DataPatchReport {
     let resolution = resolve_data_dirs();
     patch_auto_from(resolution, user_fallback_candidates(), version, source)
+}
+
+/// 同 [`patch_auto`]，但把**已知在用**的 Rime 用户目录排在降级候选最前面。
+///
+/// `ensure` 拿到的 `rime_dir` 是权威值：它认 `--rime-dir` 与配置文件里的
+/// `rime_dir`，比 `user_fallback_candidates()` 里的 `detect(None)` 更准
+/// （后者只认 `RIME_USER_DATA_DIR` 与 fcitx5-rime 的 `UserDataDirPath`）。
+/// 降级写 custom.yaml 时必须写进这个目录，否则写了个 fcitx5 不读的地方。
+///
+/// Windows 没有这条降级路径（data 目录不可写时由 managed_custom 负责修
+/// 用户目录里的 custom.yaml），所以这里在 Windows 上不改变行为。
+pub fn patch_auto_in(rime_dir: &Path, version: &str, source: FixSource) -> DataPatchReport {
+    let resolution = resolve_data_dirs();
+    patch_auto_from(resolution, fallback_dirs(rime_dir), version, source)
+}
+
+/// 降级候选的组装：**已知在用的 Rime 用户目录排第一**，其后才是通用候选。
+///
+/// 第一位必须是用户真正在用的目录：fcitx5-rime 配了 `UserDataDirPath` 时，
+/// 默认候选（~/.local/share/fcitx5/rime）fcitx5 根本不读，写进去等于没写。
+#[cfg(not(windows))]
+fn fallback_dirs(rime_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if rime_dir.is_dir() {
+        out.push(rime_dir.to_path_buf());
+    }
+    for candidate in user_fallback_candidates() {
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Windows 没有这条降级路径（data 目录不可写时由 managed_custom 负责修用户
+/// 目录里的 custom.yaml），行为与改动前完全一致。
+#[cfg(windows)]
+fn fallback_dirs(_rime_dir: &Path) -> Vec<PathBuf> {
+    user_fallback_candidates()
 }
 
 /// 部署触发（可注入：单测用桩替换，避免真的去跑 fcitx5-remote / rime_deployer）。
@@ -2771,6 +2825,73 @@ patch:
             format!("{}|{}", user.display(), data.display()),
             "runner 拿到的必须是用户目录 + 共享目录"
         );
+    }
+
+    /// 降级候选的第一位必须是**用户真正在用**的 Rime 目录。
+    ///
+    /// 2026-11-15 在 228 实测：fcitx5-rime 配了
+    /// `UserDataDirPath=/home/ljj/rime/`，而旧的候选表只有
+    /// ~/.local/share/fcitx5/rime ⇒ 降级时把 custom.yaml 写进了
+    /// fcitx5 根本不读的目录，「修复输入法」报告成功、用户那边毫无变化。
+    #[cfg(not(windows))]
+    #[test]
+    fn fallback_dirs_put_the_in_use_rime_dir_first() {
+        let tmp = TempDir::new("fallback-order");
+        let rime_dir = tmp.path().join("rime");
+        fs::create_dir_all(&rime_dir).expect("mkdir");
+
+        let dirs = fallback_dirs(&rime_dir);
+        assert_eq!(
+            dirs.first(),
+            Some(&rime_dir),
+            "降级候选第一位必须是已知在用的 Rime 用户目录：{dirs:?}"
+        );
+        // 不重复出现同一个目录。
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for dir in &dirs {
+            assert!(!seen.contains(dir), "候选目录重复：{dirs:?}");
+            seen.push(dir.clone());
+        }
+    }
+
+    /// 降级写入的目标必须是已知在用的 Rime 目录（而不是默认候选目录）。
+    #[cfg(not(windows))]
+    #[test]
+    fn fallback_writes_into_the_in_use_rime_dir() {
+        let tmp = TempDir::new("fallback-write");
+        let original = fs::metadata(tmp.path()).expect("meta").permissions();
+        let Some(data) = readonly_dir(&tmp, "data", &original) else {
+            return;
+        };
+        let rime_dir = tmp.path().join("rime");
+        fs::create_dir_all(&rime_dir).expect("mkdir");
+        let resolution = DataDirResolution {
+            dirs: vec![data.clone()],
+            candidates: Vec::new(),
+            error: None,
+        };
+        let deploy = |_: &Path, _: &Path| DeployOutcome::Ok;
+
+        let report = patch_auto_with(
+            resolution,
+            fallback_dirs(&rime_dir),
+            "9.9.9",
+            FixSource::Explicit,
+            &deploy,
+        );
+        fs::set_permissions(&data, original.clone()).expect("restore");
+
+        assert!(
+            !report.custom_written.is_empty(),
+            "降级路径应当往用户目录写 custom.yaml：{report:?}"
+        );
+        for written in &report.custom_written {
+            let path = Path::new(written);
+            assert!(
+                path.starts_with(&rime_dir),
+                "custom.yaml 必须写进用户真正在用的 Rime 目录 {rime_dir:?}，实际写到 {written}"
+            );
+        }
     }
 
     /// 没有用户目录可降级：不写任何文件，报告 skipped + 需 sudo。

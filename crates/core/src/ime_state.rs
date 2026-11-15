@@ -1709,7 +1709,9 @@ pub fn ensure(
             .clone()
             .unwrap_or_else(|| data_patch::resolve_version(None));
         data = if opts.auto_data_patch {
-            data_patch::patch_auto(&version, opts.mode.fix_source())
+            // 传 rime_dir：降级写 custom.yaml 时必须写进用户真正在用的那个目录，
+            // 而不是默认候选（fcitx5 配过 UserDataDirPath 时二者不是同一个）。
+            data_patch::patch_auto_in(rime_dir, &version, opts.mode.fix_source())
         } else {
             data_patch::patch_dirs(&data_dirs, &version)
         };
