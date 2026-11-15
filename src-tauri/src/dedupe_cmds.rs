@@ -28,7 +28,8 @@ const SNAPSHOT_MAX_FILES: usize = 512;
 /// 本机目录名：installation_id 优先（缺 installation.yaml 才回退 device_id）。
 /// 回退时返回 warning，避免 UI 静默按错误标识判定「本机」。
 pub(crate) fn resolve_self_id(config: &Config) -> (String, Option<String>) {
-    let detection = crate::detect_rime(config).ok();
+    // 派生信息（本机身份）：路径失效时退回自动探测，避免本机身份漂到别的远端目录。
+    let detection = crate::detect_rime_lenient(config);
     resolve_self_id_at(
         detection.as_ref().map(|detection| detection.path.as_path()),
         config,

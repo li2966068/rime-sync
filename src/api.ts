@@ -543,6 +543,17 @@ export interface FixImeReport {
   /// ok=没问题；missing=有缺口的方案（形如 "wubi86=artifact-stale"）；
   /// detail=逐方案状态；hint=一句人话的下一步（后端是中文，界面里只当技术细节）。
   numpad?: { ok: boolean; missing: string[]; detail: string[]; hint: string };
+  /// 常驻标点直出判定（Rust: ime_state::PunctStatus）。
+  /// 可选字段：老后端没有它 → 前端不显示标点行（不等于"坏了"）。
+  /// 与小键盘是两件事：配置缺 punct（config-missing）补配置就行；
+  /// 引擎不支持 punct（engine-unsupported）必须换输入法本体。
+  punct?: {
+    ok: boolean;
+    missing: string[];
+    detail: string[];
+    hint: string;
+    engine_support: string;
+  };
 }
 
 /// 启动自举的输入法状态（cmd_ime_status / ime://bootstrap 事件）。

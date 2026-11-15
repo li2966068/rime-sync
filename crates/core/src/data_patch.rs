@@ -36,9 +36,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
+use crate::processor_spec;
 use crate::prune;
 use crate::yaml_text::{
-    indent_of, is_blank, is_comment, is_flow_value, is_key_at, yaml_key, yaml_scalar, Doc,
+    indent_of, is_blank, is_comment, is_flow_value, is_key_at, item_name, yaml_key, yaml_scalar,
+    Doc,
 };
 #[cfg(not(windows))]
 use serde_yaml::Mapping;
@@ -59,14 +61,9 @@ pub const MARKER_PREFIX: &str = "# patched by rime-sync";
 /// recognizer/patterns/vnum 的取值：允许中间态 v、v12.，否则点号会被切成标点。
 pub const VNUM_PATTERN: &str = "^[vV][0-9.]*$";
 pub const VNUM_TRANSLATOR: &str = "rimesync_vnum";
-pub const VSELECT_PROCESSOR: &str = "rimesync_vselect";
-/// 中文标点直出处理器（third_party/librime/plugins/rimesync-extra）。
-///
-/// 它必须排在 `punctuator` **之前**：它先处理按键、直接上屏中文标点，
-/// 后面的 punctuator 就不会再把半角标点转成 Rime 自带的那一套。
-pub const PUNCT_PROCESSOR: &str = "rimesync_punct";
-/// 小键盘归一化处理器（third_party/librime/plugins/rimesync-extra）。
-pub const NUMPAD_PROCESSOR: &str = "numpad";
+// 三个处理器的名字与目标位置规则统一放在 processor_spec（唯一真相源）；
+// 这里原样转出，外部调用方（ime_state、managed_custom、测试）不必改引用。
+pub use crate::processor_spec::{NUMPAD_PROCESSOR, PUNCT_PROCESSOR, VSELECT_PROCESSOR};
 /// punctuator 深合并（0.6.20）：中文态反斜杠与冒号直出。
 pub const PUNCTUATOR_KEY: &str = "punctuator";
 pub const HALF_SHAPE_KEY: &str = "half_shape";
@@ -345,8 +342,8 @@ pub fn resolve_version(explicit: Option<&str>) -> String {
 ///
 /// 第一位是**真正在用**的 Rime 用户目录：`rime_dir::detect(None)` 会读
 /// fcitx5-rime 的 `UserDataDirPath`（也就是 fcitx5 真正读写的那个目录）。
-/// 后面才是历史遗留的默认路径：$XDG_DATA_HOME/fcitx5/rime、
-/// ~/.local/share/fcitx5/rime。Windows 没有这个降级路径。
+/// 后面才是历史遗留的默认路径：`${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime`
+/// （以及历史上写死过的 ~/.local/share/fcitx5/rime）。Windows 没有这个降级路径。
 ///
 /// 为什么要把真正在用的目录排在前面（2026-11-15 在 228 实测）：fcitx5-rime
 /// 一旦配了 `UserDataDirPath`，用户真正在用的就是那个目录（228 上是
@@ -366,8 +363,11 @@ pub fn user_fallback_candidates() -> Vec<PathBuf> {
                 out.push(detection.path);
             }
         }
-        if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
-            let path = PathBuf::from(xdg).join("fcitx5").join("rime");
+        // ${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/rime：
+        // XDG_DATA_HOME 优先，没设就用 ~/.local/share（与 rime_dir::candidates()
+        // 里 ~/.local/share/fcitx5/rime 的口径对齐，只多认 XDG 变量）。
+        if let Some(root) = data_home() {
+            let path = root.join("fcitx5").join("rime");
             if path.is_dir() && !out.contains(&path) {
                 out.push(path);
             }
@@ -384,6 +384,20 @@ pub fn user_fallback_candidates() -> Vec<PathBuf> {
         }
         out
     }
+}
+
+/// 用户级 data 根目录：$XDG_DATA_HOME，缺省 ~/.local/share。
+///
+/// 与 rime_dir::config_home() 同一套写法（空值视为未设置）。
+#[cfg(not(windows))]
+fn data_home() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("XDG_DATA_HOME") {
+        let path = PathBuf::from(raw);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
 }
 
 /// 目录能否新建文件（只读的 /usr/share/rime-data 会被判 false）。
@@ -415,15 +429,25 @@ fn describe_dirs(dirs: &[PathBuf], fallback_text: &str) -> String {
         .join("、")
 }
 
-/// 解析 data 目录并打补丁（CLI / 设置页 / 启动自举统一走这里）。
+/// 把**用户目录候选**按优先级渲染成一句清单。
 ///
-/// source 决定写完 custom.yaml 后要不要触发重载：启动自举绝不能打断用户打字。
-pub fn patch_auto(version: &str, source: FixSource) -> DataPatchReport {
-    let resolution = resolve_data_dirs();
-    patch_auto_from(resolution, user_fallback_candidates(), version, source)
+/// 顺序即优先级，第一位是用户真正在用的 Rime 目录（见
+/// [`user_fallback_candidates`]）。错误信息必须照这个顺序写：否则用户会去改
+/// 一个输入法根本不读的目录（2026-11-15 在 228 实测过这个坑）。
+#[cfg(not(windows))]
+fn describe_candidates(candidates: &[PathBuf]) -> String {
+    if candidates.is_empty() {
+        return "（没有候选目录：既没有已知在用的 Rime 用户目录，也没有可探测到的默认路径）"
+            .to_string();
+    }
+    candidates
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
-/// 同 [`patch_auto`]，但把**已知在用**的 Rime 用户目录排在降级候选最前面。
+/// 同 [`patch_auto_from`]，但把**已知在用**的 Rime 用户目录排在降级候选最前面。
 ///
 /// `ensure` 拿到的 `rime_dir` 是权威值：它认 `--rime-dir` 与配置文件里的
 /// `rime_dir`，比 `user_fallback_candidates()` 里的 `detect(None)` 更准
@@ -504,7 +528,7 @@ impl DeployOutcome {
     }
 }
 
-/// 同 patch_auto，但目录解析结果与降级候选由调用方给出（测试 / 安装器用）。
+/// 目录解析结果与降级候选由调用方给出（测试 / 安装器用）。
 ///
 /// Windows 保持原行为：不可写就报提权提示。Linux 在共享目录不可写时把改动写进
 /// 用户目录的 <schema>.custom.yaml（librime 只从共享目录读方案本体，用户目录只认
@@ -531,9 +555,37 @@ fn patch_auto_with(
     resolution: DataDirResolution,
     fallbacks: Vec<PathBuf>,
     version: &str,
+    source: FixSource,
+    deploy: &DeployFn<'_>,
+) -> DataPatchReport {
+    patch_auto_with_probe(
+        resolution,
+        fallbacks,
+        version,
+        source,
+        deploy,
+        &dir_writable,
+    )
+}
+
+/// [`patch_auto_with`] 的可注入版本：**目录可写性由调用方判定**。
+///
+/// 为什么要留这个口子：不可写这件事没法在所有环境里用权限位复现 —— root 下
+/// `chmod 555` 照样写得进去，于是「共享目录不可写 ⇒ 降级写用户级 custom.yaml」
+/// 这条主路径在 root 环境里根本测不到（历史上就是这么被静默跳过的）。
+/// 判定权交给调用方后，测试可以直接说「这个目录就是不可写」，断言在 root 与
+/// 普通用户下跑的是同一套逻辑。
+fn patch_auto_with_probe(
+    resolution: DataDirResolution,
+    fallbacks: Vec<PathBuf>,
+    version: &str,
     _source: FixSource,
     _deploy: &DeployFn<'_>,
+    writable: &dyn Fn(&Path) -> bool,
 ) -> DataPatchReport {
+    // Windows 分支没有「共享目录不可写 ⇒ 降级」这条路，判定用不上。
+    #[cfg(windows)]
+    let _ = writable;
     let mut candidates = resolution.candidates.clone();
     for path in &fallbacks {
         let text = path.display().to_string();
@@ -558,7 +610,7 @@ fn patch_auto_with(
             // 一个 data 目录都没有（例如没装 rime-data）：没有方案可读，什么都不写。
             report = patch_dirs(&[], version);
             report.data_error = resolution.error.clone();
-        } else if resolution.dirs.iter().any(|dir| dir_writable(dir)) {
+        } else if resolution.dirs.iter().any(|dir| writable(dir)) {
             report = patch_dirs(&resolution.dirs, version);
             report.data_error = resolution.error.clone();
         } else if let Some(user) = fallbacks.first() {
@@ -566,10 +618,14 @@ fn patch_auto_with(
             report.fallback = true;
             report.data_error = Some(if report.custom_written.is_empty() {
                 // 有用户目录但一份都没写出来（方案读不了 / 结构不适用）：如实说，别谎报降级成功。
+                // 候选目录按**真实优先级**列出：第一位就是用户真正在用的 Rime 目录
+                // （fcitx5-rime 的 UserDataDirPath 那个），后面的才是历史默认路径 ——
+                // 照着顺序列，用户才知道该改哪个目录。
                 format!(
-                    "{} 不可写，也没能写出用户目录 {} 下的 custom.yaml（原因见 errors / skipped）；请用 sudo 重试 rime-sync-cli fix-ime",
+                    "{} 不可写，也没能写出用户目录 {} 下的 custom.yaml（候选目录按优先级：{}；原因见 errors / skipped）；请用 sudo 重试 rime-sync-cli fix-ime",
                     describe_dirs(&resolution.dirs, "Rime data 目录"),
-                    user.display()
+                    user.display(),
+                    describe_candidates(&fallbacks)
                 )
             } else {
                 // 只有真写了新文件才谈部署触发；Bootstrap 来源绝不跑外部命令，
@@ -596,8 +652,9 @@ fn patch_auto_with(
         } else {
             report = patch_dirs(&[], version);
             report.data_error = Some(format!(
-                "{} 不可写，且没有可用的用户目录（$XDG_DATA_HOME/fcitx5/rime 或 ~/.local/share/fcitx5/rime）；已跳过 data 补丁，请用 sudo 重试 rime-sync-cli fix-ime",
-                describe_dirs(&resolution.dirs, "Rime data 目录")
+                "{} 不可写，且没有可用的用户目录（候选目录按优先级：{}）；已跳过 data 补丁，请用 sudo 重试 rime-sync-cli fix-ime",
+                describe_dirs(&resolution.dirs, "Rime data 目录"),
+                describe_candidates(&fallbacks)
             ));
             report
                 .schemas_skipped
@@ -998,39 +1055,13 @@ fn write_user_custom(schema_file: &Path, user_dir: &Path, version: &str) -> Resu
     Ok(CustomOutcome::Written(target, backed_up))
 }
 
-/// 在完整处理器列表上按 schema 模式同样的锚点插入 rimesync_vselect + numpad：
-/// recognizer 之后优先，否则 key_binder / speller 之前，都没有就追加到末尾。
+/// 在完整处理器列表上算出目标列表。
 ///
-/// 另外补上 `rimesync_punct`（中文标点直出）：它必须排在 `punctuator` 之前，
-/// 所以插在 punctuator 前面；列表里没有 punctuator 就追加到末尾。
-/// **已经有就不动** —— 用户自己调过的位置一律保留。
+/// 规则全部来自 `processor_spec`（唯一真相源）：recognizer 之后放
+/// rimesync_vselect、紧跟 numpad；rimesync_punct 排在 punctuator 之前。
 #[cfg(not(windows))]
 fn processor_target(base: &[String]) -> Vec<String> {
-    let mut order: Vec<String> = base
-        .iter()
-        .filter(|name| *name != VSELECT_PROCESSOR && *name != NUMPAD_PROCESSOR)
-        .cloned()
-        .collect();
-    let anchor = order
-        .iter()
-        .position(|name| name == "recognizer")
-        .map(|index| index + 1)
-        .or_else(|| {
-            order
-                .iter()
-                .position(|name| name == "key_binder" || name == "speller")
-        })
-        .unwrap_or(order.len());
-    order.insert(anchor, VSELECT_PROCESSOR.to_string());
-    order.insert(anchor + 1, NUMPAD_PROCESSOR.to_string());
-    // rimesync_punct：缺失才补，位置必须在 punctuator 之前。
-    if !order.iter().any(|name| name == PUNCT_PROCESSOR) {
-        match order.iter().position(|name| name == "punctuator") {
-            Some(index) => order.insert(index, PUNCT_PROCESSOR.to_string()),
-            None => order.push(PUNCT_PROCESSOR.to_string()),
-        }
-    }
-    order
+    processor_spec::target_names(base, processor_spec::Policy::Authoritative)
 }
 
 #[cfg(not(windows))]
@@ -1726,17 +1757,11 @@ fn verify(value: &Value) -> Result<()> {
         }
         if let Some(processors) = engine.get("processors").and_then(Value::as_sequence) {
             let names: Vec<&str> = processors.iter().filter_map(Value::as_str).collect();
-            let vselect = names
-                .iter()
-                .position(|name| *name == VSELECT_PROCESSOR)
-                .ok_or_else(|| anyhow!("engine/processors 里没有 {VSELECT_PROCESSOR}"))?;
-            if names.get(vselect + 1) != Some(&NUMPAD_PROCESSOR) {
-                bail!("engine/processors 里 {NUMPAD_PROCESSOR} 没有紧跟 {VSELECT_PROCESSOR}");
-            }
-            if let Some(recognizer) = names.iter().position(|name| *name == "recognizer") {
-                if vselect != recognizer + 1 {
-                    bail!("{VSELECT_PROCESSOR} 没有紧跟 recognizer");
-                }
+            // 目标状态的核对统一走 processor_spec（唯一真相源）：
+            // vselect 在不在、numpad 紧不紧跟它、vselect 是不是紧跟识别器、
+            // punct 在不在、punct 是不是排在 punctuator 之前。
+            if let Err(message) = processor_spec::validate(&names) {
+                bail!("{message}");
             }
         }
     }
@@ -1811,7 +1836,47 @@ impl Doc {
             || self.push_item("translators", 2, VNUM_TRANSLATOR)
     }
 
+    /// engine/processors 列表里的条目名（按文本读，与用户看到的列表一致）。
+    fn processor_names(&self) -> Vec<String> {
+        let Some(block) = self.find_block("processors", 2) else {
+            return Vec::new();
+        };
+        self.item_lines(block)
+            .iter()
+            .map(|&index| item_name(&self.lines[index]))
+            .collect()
+    }
+
+    /// 把一条 processors 编辑动作落到文本行上（保留用户的注释与格式）。
+    fn apply_processor_action(&mut self, action: processor_spec::Action) -> bool {
+        match action {
+            processor_spec::Action::Remove(name) => {
+                // 摘不到也不算失败：计划里可能有「本来就不存在」的项。
+                self.remove_item("processors", 2, name);
+                true
+            }
+            processor_spec::Action::Insert { item, anchor } => {
+                // 幂等保护：目标项已经在列表里就别再插一份。
+                if self.contains_item("processors", 2, item) {
+                    return true;
+                }
+                match anchor {
+                    processor_spec::Anchor::After(name) => {
+                        self.insert_item_after("processors", 2, name, item)
+                    }
+                    processor_spec::Anchor::Before(name) => {
+                        self.insert_item_before("processors", 2, name, item)
+                    }
+                    processor_spec::Anchor::End => self.push_item("processors", 2, item),
+                }
+            }
+        }
+    }
+
     /// engine/processors：recognizer 之后是 rimesync_vselect，再后面是 numpad。
+    ///
+    /// 目标位置的规则全部来自 `processor_spec`（唯一真相源）；这里只负责把
+    /// 「插到哪、删哪个」落到文本行上（保留用户的注释与格式）。
     fn ensure_processors(&mut self, value: &Value) -> bool {
         let Some(engine) = value.get("engine") else {
             return false;
@@ -1819,42 +1884,12 @@ impl Doc {
         if engine.get("processors").is_none() || self.is_flow_list("processors", 2) {
             return false;
         }
-        // 先摘掉同名项，再按目标位置插回去：顺序被用户改过也能纠正。
-        self.remove_item("processors", 2, VSELECT_PROCESSOR);
-        self.remove_item("processors", 2, NUMPAD_PROCESSOR);
-
-        let anchors = ["recognizer", "key_binder", "speller"];
-        let mut placed = false;
-        for anchor in anchors {
-            if !self.contains_item("processors", 2, anchor) {
-                continue;
-            }
-            if anchor == "recognizer" {
-                placed = self.insert_item_after("processors", 2, anchor, VSELECT_PROCESSOR);
-            } else {
-                placed = self.insert_item_before("processors", 2, anchor, VSELECT_PROCESSOR);
-            }
-            if placed {
-                break;
-            }
-        }
-        if !placed {
-            placed = self.push_item("processors", 2, VSELECT_PROCESSOR);
-        }
-        if !placed {
-            return false;
-        }
-        // numpad 必须紧跟 vselect。
-        if !self.insert_item_after("processors", 2, VSELECT_PROCESSOR, NUMPAD_PROCESSOR) {
-            return false;
-        }
-        // rimesync_punct（中文标点直出）：必须在 punctuator 之前，否则它拿不到
-        // 按键，后面的 punctuator 照样把半角标点转成 Rime 自带的那一套。
-        // **已经有就不动** —— 用户自己调过的位置一律保留。
-        if !self.contains_item("processors", 2, PUNCT_PROCESSOR) {
-            let placed = self.insert_item_before("processors", 2, "punctuator", PUNCT_PROCESSOR)
-                || self.push_item("processors", 2, PUNCT_PROCESSOR);
-            if !placed {
+        let actions = processor_spec::plan(
+            &self.processor_names(),
+            processor_spec::Policy::Authoritative,
+        );
+        for action in actions {
+            if !self.apply_processor_action(action) {
                 return false;
             }
         }
@@ -2401,7 +2436,7 @@ mod tests {
         tag: &str,
         files: &[(&str, &str)],
         original: &std::fs::Permissions,
-    ) -> Option<PathBuf> {
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let data = tmp.path().join(tag);
         fs::create_dir_all(&data).expect("mkdir");
@@ -2411,18 +2446,15 @@ mod tests {
         let mut readonly = original.clone();
         readonly.set_mode(0o555);
         fs::set_permissions(&data, readonly).expect("chmod");
-        // root / 特殊文件系统下 chmod 挡不住写：跳过（没有可验证的降级场景）。
-        let probe = data.join(".probe");
-        if fs::write(&probe, b"x").is_ok() {
-            let _ = fs::remove_file(&probe);
-            fs::set_permissions(&data, original.clone()).expect("restore");
-            return None;
-        }
-        Some(data)
+        // 这里**不**再靠「chmod 之后探一下能不能写」来决定要不要跳过：
+        // root 下 chmod 挡不住写，一探就整段测试被静默跳过 —— 那条降级主路径
+        // 于是永远没在 root 环境里跑过。降级与否改由注入的可写性判定决定
+        // （见 patch_auto_with_probe 的 &|_| false），root 与普通用户跑同一套断言。
+        data
     }
 
     #[cfg(not(windows))]
-    fn readonly_dir(tmp: &TempDir, tag: &str, original: &std::fs::Permissions) -> Option<PathBuf> {
+    fn readonly_dir(tmp: &TempDir, tag: &str, original: &std::fs::Permissions) -> PathBuf {
         readonly_files(
             tmp,
             tag,
@@ -2446,9 +2478,7 @@ mod tests {
     fn readonly_data_dir_writes_custom_yaml() {
         let tmp = TempDir::new("custom");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2461,12 +2491,14 @@ mod tests {
             error: None,
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Explicit,
             &|_, _| DeployOutcome::Ok,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -2552,7 +2584,7 @@ mod tests {
             "schema:\n  schema_id: luna_pinyin_simp\n__include: luna_pinyin.schema:/\n";
         let tmp = TempDir::new("custom-include");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_files(
+        let data = readonly_files(
             &tmp,
             "data",
             &[
@@ -2560,9 +2592,7 @@ mod tests {
                 ("luna_pinyin_simp.schema.yaml", CHILD),
             ],
             &original,
-        ) else {
-            return;
-        };
+        );
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2571,12 +2601,14 @@ mod tests {
             error: None,
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Explicit,
             &|_, _| DeployOutcome::Ok,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -2677,6 +2709,55 @@ mod tests {
         );
     }
 
+    /// verify 的新规则：rimesync_punct 排在 punctuator **之后** 时必须报错。
+    ///
+    /// 它排在后面就拿不到按键（ProcessKeyEvent 走不到它），
+    /// 后面的 punctuator 照样把半角标点转成 Rime 自带那一套 ——
+    /// 「中文标点直出」等于没开。这种文件绝不能写盘。
+    #[test]
+    fn verify_rejects_punct_behind_punctuator() {
+        let yaml = "\
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - rimesync_vselect
+    - numpad
+    - punctuator
+    - rimesync_punct
+recognizer:
+  patterns:
+    vnum: '^v[0-9]+$'
+";
+        let value: Value = serde_yaml::from_str(yaml).expect("yaml");
+        let error = verify(&value).expect_err("punct 排在 punctuator 之后必须报错");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rimesync_punct") && message.contains("punctuator"),
+            "错误信息要说清是 punct / punctuator 的顺序问题：{message}"
+        );
+    }
+
+    /// verify 的新规则：rimesync_punct 排在 punctuator **之前**（目标状态）时通过。
+    #[test]
+    fn verify_accepts_punct_before_punctuator() {
+        let yaml = "\
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - rimesync_vselect
+    - numpad
+    - rimesync_punct
+    - punctuator
+recognizer:
+  patterns:
+    vnum: '^v[0-9]+$'
+";
+        let value: Value = serde_yaml::from_str(yaml).expect("yaml");
+        verify(&value).expect("punct 排在 punctuator 之前必须通过");
+    }
+
     /// 已有 custom.yaml：合并而不是覆盖——用户自己的键、已有列表顺序都保留，
     /// 原文件另外留一份 .rimesync-orig。
     #[cfg(not(windows))]
@@ -2684,9 +2765,7 @@ mod tests {
     fn custom_yaml_merges_existing_user_file() {
         let tmp = TempDir::new("custom-merge");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let custom = user.join("luna_pinyin_simp.custom.yaml");
@@ -2706,12 +2785,14 @@ patch:
             error: None,
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Explicit,
             &|_, _| DeployOutcome::Failed,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
 
         assert_eq!(report.mode, MODE_CUSTOM, "{report:?}");
@@ -2760,7 +2841,7 @@ patch:
             .any(|path| path == &custom.display().to_string()));
 
         // 再跑一次：已经是目标状态，不再改写、不再覆盖备份。
-        let again = patch_auto_with(
+        let again = patch_auto_with_probe(
             DataDirResolution {
                 dirs: vec![data.clone()],
                 candidates: Vec::new(),
@@ -2770,6 +2851,8 @@ patch:
             "9.9.9",
             FixSource::Explicit,
             &|_, _| DeployOutcome::Skipped,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
         assert!(again.custom_written.is_empty(), "{again:?}");
@@ -2784,7 +2867,7 @@ patch:
     fn custom_mode_only_writes_retained_schemas() {
         let tmp = TempDir::new("custom-retained");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_files(
+        let data = readonly_files(
             &tmp,
             "data",
             &[
@@ -2795,9 +2878,7 @@ patch:
                 ("cangjie5.schema.yaml", SCHEMA_FIXTURE),
             ],
             &original,
-        ) else {
-            return;
-        };
+        );
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2806,12 +2887,14 @@ patch:
             error: None,
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Explicit,
             &|_, _| DeployOutcome::Ok,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -2850,9 +2933,7 @@ patch:
         use std::cell::Cell;
         let tmp = TempDir::new("deploy-bootstrap");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2866,12 +2947,14 @@ patch:
             DeployOutcome::Ok
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Bootstrap,
             &deploy,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -2897,9 +2980,7 @@ patch:
         use std::cell::RefCell;
         let tmp = TempDir::new("deploy-explicit");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let user = tmp.path().join("xdg").join("fcitx5").join("rime");
         fs::create_dir_all(&user).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2914,12 +2995,14 @@ patch:
             DeployOutcome::Ok
         };
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             vec![user.clone()],
             "9.9.9",
             FixSource::Explicit,
             &deploy,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -2966,9 +3049,7 @@ patch:
     fn fallback_writes_into_the_in_use_rime_dir() {
         let tmp = TempDir::new("fallback-write");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let rime_dir = tmp.path().join("rime");
         fs::create_dir_all(&rime_dir).expect("mkdir");
         let resolution = DataDirResolution {
@@ -2978,12 +3059,14 @@ patch:
         };
         let deploy = |_: &Path, _: &Path| DeployOutcome::Ok;
 
-        let report = patch_auto_with(
+        let report = patch_auto_with_probe(
             resolution,
             fallback_dirs(&rime_dir),
             "9.9.9",
             FixSource::Explicit,
             &deploy,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
         );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
@@ -3006,16 +3089,22 @@ patch:
     fn readonly_without_fallback_reports_skipped() {
         let tmp = TempDir::new("fallback-none");
         let original = fs::metadata(tmp.path()).expect("meta").permissions();
-        let Some(data) = readonly_dir(&tmp, "data", &original) else {
-            return;
-        };
+        let data = readonly_dir(&tmp, "data", &original);
         let resolution = DataDirResolution {
             dirs: vec![data.clone()],
             candidates: Vec::new(),
             error: None,
         };
 
-        let report = patch_auto_from(resolution, Vec::new(), "9.9.9", FixSource::Explicit);
+        let report = patch_auto_with_probe(
+            resolution,
+            Vec::new(),
+            "9.9.9",
+            FixSource::Explicit,
+            &|_, _| DeployOutcome::Skipped,
+            // 共享目录不可写：由判定注入，不靠 chmod（root 下 chmod 挡不住写）。
+            &|_| false,
+        );
         fs::set_permissions(&data, original.clone()).expect("restore");
 
         assert!(!report.fallback);

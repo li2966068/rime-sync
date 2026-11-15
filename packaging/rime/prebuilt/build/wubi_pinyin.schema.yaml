@@ -16,11 +16,11 @@ engine:
   processors:
     - ascii_composer
     - recognizer
-    - rimesync_punct
     - rimesync_vselect
     - numpad
     - key_binder
     - speller
+    - rimesync_punct
     - punctuator
     - selector
     - navigator

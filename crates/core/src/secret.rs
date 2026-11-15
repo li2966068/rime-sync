@@ -154,6 +154,37 @@ impl SecretStore for KeyringStore {
     }
 }
 
+/// 写一个「从创建那一刻起就只有自己能读」的文件。
+///
+/// 为什么不用 `fs::write` + 事后 chmod：`fs::write` 建出来的文件用的是 umask 默认权限
+/// （常见是 0644），在 chmod 之前那段时间里同机其它用户能读到内容 —— 密码文件不能有这种窗口。
+/// Unix 上用 `mode(0o600)` 在 open(2) 时就把权限定死（umask 只会清位，不会把 0600 变松）。
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    // 上一次写失败可能留下临时文件：先删掉，保证这次是**新建**（新建才会应用 mode）。
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    // 兜底 chmod：万一目标文件本来就存在（上面的 remove 失败），权限仍要收紧。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// 0600 文件兜底：headless / 无 Secret Service 时使用。
 #[derive(Debug, Clone)]
 pub struct FileStore {
@@ -190,13 +221,21 @@ impl FileStore {
             }
         }
         let text = serde_json::to_string_pretty(map)?;
-        fs::write(&self.path, format!("{text}\n"))
-            .with_context(|| format!("write {}", self.path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 0600 {}", self.path.display()))?;
+        // 顺序：写临时文件（**从创建那一刻起就是 0600**）→ 改名到最终路径。
+        // 直接写最终路径的话，落盘那一瞬间用的是 umask 默认权限（常常 0644），
+        // 同机其它用户有一个窗口能读到密码；先建私有文件再改名就没有这个窗口。
+        let name = self
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(SECRETS_FILE);
+        let tmp = self.path.with_file_name(format!(".{name}.tmp"));
+        write_private_file(&tmp, &format!("{text}\n"))?;
+        // Windows：std::fs::rename 会替换已存在的目标文件（MoveFileEx + REPLACE_EXISTING），
+        // 与 config.rs 的保存路径同一套语义。
+        if let Err(error) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("rename {}", self.path.display()));
         }
         Ok(())
     }

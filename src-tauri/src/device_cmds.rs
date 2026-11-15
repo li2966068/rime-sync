@@ -15,7 +15,9 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::remote_tree::{self, CopyReport, DeleteReport};
-use crate::{config_path, dav_client, detect_rime, ensure_config, push_log, AppState};
+use crate::{
+    config_path, dav_client, detect_rime, detect_rime_lenient, ensure_config, push_log, AppState,
+};
 
 #[derive(Serialize)]
 pub struct DeviceView {
@@ -132,7 +134,9 @@ pub(crate) fn collect_devices(
     config: &Config,
     client: &DavClient,
 ) -> Result<Vec<DeviceView>, String> {
-    let rime = detect_rime(config).ok().map(|detection| detection.path);
+    // 派生信息（设备身份）：配置路径失效时退回自动探测，
+    // 不能因为路径坏了就把本机身份算成另一个远端目录。
+    let rime = detect_rime_lenient(config).map(|detection| detection.path);
     let local_id = local_remote_id(rime.as_deref(), config);
     collect_devices_for(config, &local_id, client)
 }
@@ -243,7 +247,9 @@ pub(crate) fn revoke_delete_targets(id: &str, self_id: &str) -> Result<Vec<Strin
 }
 
 fn resolve_ids(config: &Config) -> String {
-    let rime = detect_rime(config).ok().map(|detection| detection.path);
+    // 派生信息（设备身份）：配置路径失效时退回自动探测，
+    // 不能因为路径坏了就把本机身份算成另一个远端目录。
+    let rime = detect_rime_lenient(config).map(|detection| detection.path);
     local_remote_id(rime.as_deref(), config)
 }
 
@@ -419,7 +425,8 @@ pub fn cmd_publish_identity(
     state: State<'_, AppState>,
 ) -> Result<PublishIdentityView, String> {
     let (config, client) = dav_client(&app, &state.0)?;
-    let rime = detect_rime(&config).ok().map(|detection| detection.path);
+    // 派生信息（设备身份）：路径失效时退回自动探测，避免本机身份漂到别的远端目录。
+    let rime = detect_rime_lenient(&config).map(|detection| detection.path);
     let view = publish_identity(&config, rime.as_deref(), &client)?;
     push_log(&state.0, format!("已登记远端设备身份 {}", view.remote_path));
     Ok(view)
@@ -472,7 +479,8 @@ pub fn cmd_check_device_id(
         });
     }
     let config = ensure_config(&app, &state.0)?;
-    let rime = detect_rime(&config).ok().map(|detection| detection.path);
+    // 派生信息（设备身份）：路径失效时退回自动探测，避免本机身份漂到别的远端目录。
+    let rime = detect_rime_lenient(&config).map(|detection| detection.path);
     let local_id = local_remote_id(rime.as_deref(), &config);
     if config.webdav.url.trim().is_empty() || local_id == id {
         return Ok(DeviceIdCheck {
@@ -1153,7 +1161,8 @@ impl MigrationIo for DavMigration<'_> {
     fn save_label(&self, new: &str) -> anyhow::Result<()> {
         let mut next = self.config.clone();
         next.device_id = new.to_string();
-        next.save(self.config_path)
+        // 用 crate::save_config：环境变量接管的字段不被固化进配置文件。
+        crate::save_config(self.config_path, &next).map_err(anyhow::Error::msg)
     }
 }
 

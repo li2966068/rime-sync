@@ -132,7 +132,7 @@ pub fn resolve_windows(
     reg: &WeaselRegistryValues,
     program_files: Option<&Path>,
 ) -> DataDirResolution;
-pub fn patch_auto(version: &str) -> DataPatchReport;  // 解析 + 打补丁（CLI/GUI 都用它）
+pub fn patch_auto_in(rime_dir: &Path, version: &str) -> DataPatchReport;  // 解析 + 打补丁（GUI/CLI 都用它）
 pub fn patch_dirs(dirs: &[PathBuf], version: &str) -> DataPatchReport;
 pub fn patch_file(path: &Path, version: &str) -> Result<PatchOutcome>;
 pub fn backup_path(path: &Path) -> PathBuf;

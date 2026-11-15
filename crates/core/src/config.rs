@@ -1,6 +1,6 @@
 //! config.json 的加载、0600 权限写回与环境变量覆盖。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -38,6 +38,43 @@ pub const DEVICE_LOCAL_KEY_MAX_LEN: usize = 128;
 /// 默认设备本地键：输入方案列表因机而异，绝不能被别的设备覆盖或上传。
 pub fn default_device_local_keys() -> Vec<String> {
     vec!["schema_list".to_string()]
+}
+
+/// 解析配置里显式填写的 Rime 用户目录。
+///
+/// 为什么单独一个函数：CLI 与 GUI 必须同口径 —— 用户手填的目录不存在就是填错了，
+/// 绝不能悄悄换成探测到的另一个目录（那会让他以为在同步 A 机器、其实在同步 B 机器）。
+/// 返回 canonicalize 之后的路径：软链目录在两端显示同一个真实路径。
+pub fn resolve_configured_rime_dir(configured: Option<&str>) -> Result<PathBuf> {
+    let raw = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("配置里没有填写 Rime 用户目录"))?;
+    let path = Path::new(raw);
+    if !path.is_dir() {
+        bail!(
+            "配置的 Rime 目录不存在或不是目录：{raw}。请检查该路径（或清空这一项改用自动探测）。"
+        );
+    }
+    let canonical = fs::canonicalize(path).with_context(|| format!("canonicalize {raw}"))?;
+    Ok(canonical)
+}
+
+/// 配置里的 Rime 目录有没有问题（只读体检，**不改配置**）。
+///
+/// GUI 曾经在这里把 rime_dir 清空并写回磁盘 ⇒ 用户手填的路径被静默吃掉，
+/// 用户根本不知道自己填错了。现在只把问题报出来，配置原样保留。
+pub fn rime_dir_problem(configured: Option<&str>) -> Option<String> {
+    let raw = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(raw);
+    if path.is_dir() {
+        return None;
+    }
+    Some(format!(
+        "配置的 Rime 目录不存在或不是目录：{raw}。请检查该路径（或清空这一项改用自动探测）。"
+    ))
 }
 
 /// 校验并规范化设备本地键：去空白、去空项、丢弃含内部空白或过长的键、按首次出现去重。

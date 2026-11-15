@@ -15,10 +15,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
 use rime_sync_core::ime_state::{self, Mode, Options, Outcome, OutcomeResult};
+use rime_sync_core::platform::{FakeTrigger, RimeTrigger};
 
 /// 227 那台机器上的旧模板：带 rime-sync 标记、processors 里有 rimesync_vselect，
 /// 但**没有 numpad**（小键盘就是被它顶掉的）。
@@ -130,6 +132,18 @@ fn options() -> Options {
 
 fn run(fixture: &Fixture) -> Outcome {
     ime_state::ensure(&fixture.rime(), None, &[], &options())
+}
+
+/// 跑一次 ensure，但**注入触发器**：这样「配置变更后重建」这条路径能被断言
+/// （生产路径走平台默认触发器，这里换成 FakeTrigger，不碰真实系统）。
+fn run_with_trigger(fixture: &Fixture, trigger: Arc<dyn RimeTrigger>) -> Outcome {
+    let opts = Options::new(Mode::Fix)
+        .with_auto_data_patch(false)
+        .with_patch_data(false)
+        .with_prune(false)
+        .with_data_resolver(Vec::new)
+        .with_trigger(trigger);
+    ime_state::ensure(&fixture.rime(), None, &[], &opts)
 }
 
 fn action<'a>(outcome: &'a Outcome, kind: &str) -> Option<&'a rime_sync_core::ime_state::Action> {
@@ -373,4 +387,123 @@ fn custom_repair_counts_as_changed_so_deploy_is_not_skipped() {
         "numpad-check 必须报出 wubi86=yes：{}",
         check.detail
     );
+}
+
+/// 缺陷二（两端不一致的那一半）：修好用户 custom.yaml 之后必须真的重编译。
+///
+/// 修好 custom.yaml 只是把配置写进了磁盘；librime 只有**重编译**才会把新内容
+/// 编进 build/ 产物。之前 Linux 这条路径不重建（只有「写了合并词典指针」才重建），
+/// 用户看到的是「报告说修好了、小键盘还是用不了」，而 Windows 进程内部署当场
+/// 重编译 —— 两端表现不一致。
+#[cfg(not(windows))]
+#[test]
+fn custom_repair_triggers_a_rebuild() {
+    let fixture = Fixture::new("repair-rebuild");
+    fixture.write_custom("wubi86", OLD_CUSTOM);
+    fixture.write_build(BUILD_WITHOUT_NUMPAD);
+
+    // Linux：deploy 本身就是 rime_deployer --build（会重编译）。
+    let trigger = FakeTrigger::new();
+    let calls = trigger.calls_shared();
+    let outcome = run_with_trigger(&fixture, Arc::new(trigger));
+
+    let repair = action(&outcome, "custom-repair").expect("custom-repair 动作");
+    assert!(
+        repair.changed,
+        "custom-repair 必须 changed=true：{}",
+        repair.detail
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    assert!(
+        recorded
+            .iter()
+            .any(|step| step == "redeploy_after_config_change"),
+        "修好 custom.yaml 之后必须重建：{:?}",
+        recorded
+    );
+}
+
+/// 平台差异：deploy 不重编译的平台（Windows）必须走 manual_deploy（进程内
+/// librime 部署，当场重编译），走 deploy 的话配置只是躺在磁盘上。
+#[cfg(not(windows))]
+#[test]
+fn rebuild_uses_manual_deploy_when_deploy_does_not_recompile() {
+    let fixture = Fixture::new("repair-rebuild-windows");
+    fixture.write_custom("wubi86", OLD_CUSTOM);
+    fixture.write_build(BUILD_WITHOUT_NUMPAD);
+
+    let trigger = FakeTrigger::new().with_no_recompile();
+    let calls = trigger.calls_shared();
+    let outcome = run_with_trigger(&fixture, Arc::new(trigger));
+
+    let repair = action(&outcome, "custom-repair").expect("custom-repair 动作");
+    assert!(
+        repair.changed,
+        "custom-repair 必须 changed=true：{}",
+        repair.detail
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    assert!(
+        recorded.iter().any(|step| step == "manual_deploy"),
+        "deploy 不重编译的平台必须走 manual_deploy：{:?}",
+        recorded
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|step| step == "redeploy_after_config_change"),
+        "manual_deploy 才是这条平台的路径：{:?}",
+        recorded
+    );
+}
+
+/// 一轮里既有 custom.yaml 修复、又有合并词典指针写入 ⇒ 只重建一次。
+///
+/// 重建是重操作（要停输入法、要编译）：两种变更共用同一条重建路径。
+#[cfg(not(windows))]
+#[test]
+fn several_changes_in_one_round_rebuild_only_once() {
+    let fixture = Fixture::new("repair-rebuild-once");
+    fixture.write_custom("wubi86", OLD_CUSTOM);
+    fixture.write_build(BUILD_WITHOUT_NUMPAD);
+    // 方案本体 + 合并词典 ⇒ 这一轮还会把合并词典指针写进同一份 custom.yaml。
+    fs::write(
+        fixture.rime().join("wubi86.schema.yaml"),
+        b"schema:\n  schema_id: wubi86\ntranslator:\n  dictionary: luna_pinyin\n",
+    )
+    .expect("schema");
+    fs::write(
+        fixture.rime().join("merged.dict.yaml"),
+        b"name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+    )
+    .expect("merged dict");
+
+    let trigger = FakeTrigger::new();
+    let calls = trigger.calls_shared();
+    let outcome = run_with_trigger(&fixture, Arc::new(trigger));
+
+    let repair = action(&outcome, "custom-repair").expect("custom-repair 动作");
+    assert!(
+        repair.changed,
+        "custom-repair 必须 changed=true：{}",
+        repair.detail
+    );
+    let pointer = action(&outcome, "merged-pointer").expect("merged-pointer 动作");
+    assert!(
+        pointer.changed,
+        "这一轮还写了合并词典指针：{}",
+        pointer.detail
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    let rebuilds = recorded
+        .iter()
+        .filter(|step| *step == "redeploy_after_config_change")
+        .count();
+    assert_eq!(rebuilds, 1, "一轮里的多种变更只能重建一次：{:?}", recorded);
 }

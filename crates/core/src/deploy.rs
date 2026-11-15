@@ -693,15 +693,104 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 「我改了配置，请让输入法重新编译」——**全仓库唯一的统一入口**。
+///
+/// 平台差异全部收在这一处，两端对外行为一致：
+/// - Windows：deploy 只结束 WeaselServer（**不**重编译）⇒ 必须走 manual_deploy
+///   （进程内 librime 部署，当场重编译）。走 deploy 的话配置只是躺在磁盘上，
+///   用户看到的却是「同步成功但配置没生效」。
+/// - Linux：deploy 就是 rime_deployer --build（会重编译）⇒ 走平台自带的重建序列
+///   （停 fcitx5 → build → 起 fcitx5）。fcitx5-remote -r 与 DBus ReloadConfig
+///   **都不会**重编译（2026-11-11 在 228 实测），所以不能拿 reload 顶替。
+///
+/// 重建是重操作：调用方必须只在**确实改了配置**时调它（一轮只重建一次）。
+pub fn recompile_after_config_change(
+    trigger: &dyn crate::platform::RimeTrigger,
+    rime_dir: &Path,
+) -> anyhow::Result<()> {
+    if trigger.deploy_recompiles() {
+        // 这个平台的 deploy 本身就是重编译：交给平台自带的重建序列
+        // （Linux：停 fcitx5 → rime_deployer --build → 起 fcitx5）。
+        trigger.redeploy_after_config_change(rime_dir)
+    } else {
+        // deploy 不会重编译（Windows：只结束服务）⇒ 进程内部署，当场重编译。
+        trigger.manual_deploy(rime_dir)
+    }
+}
+
+/// 部署序列里的重建步骤：调用方**已经**停了输入法、之后自己把它拉起来。
+///
+/// 与 [`recompile_after_config_change`] 只差「谁来停/起输入法」，平台判定完全一致：
+/// 配置变了而这个平台的 deploy 不重编译时，一律走 manual_deploy。
+pub fn recompile_in_deploy_sequence(
+    trigger: &dyn crate::platform::RimeTrigger,
+    rime_dir: &Path,
+    config_changed: bool,
+) -> anyhow::Result<()> {
+    if config_changed && !trigger.deploy_recompiles() {
+        trigger.manual_deploy(rime_dir)
+    } else {
+        trigger.deploy(rime_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::FakeTrigger;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     /// 停服务相关测试串行执行：ENV_NO_RESTART 是进程级环境变量，并发会互相干扰。
     static STOP_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// 统一入口按平台分流：
+    /// * deploy 本来就会重编译的平台（Linux）→ 走平台自带的重建序列；
+    /// * deploy 不会重编译的平台（Windows）→ 必须走 manual_deploy（进程内部署，
+    ///   当场重编译），走 deploy 就是「同步成功、配置没生效」。
+    #[test]
+    fn recompile_entry_routes_by_platform() {
+        let linux = FakeTrigger::new();
+        recompile_after_config_change(&linux, Path::new("/tmp/rime")).expect("linux rebuild");
+        assert_eq!(
+            linux.calls(),
+            vec!["redeploy_after_config_change".to_string()],
+            "a platform whose deploy recompiles uses its own rebuild sequence"
+        );
+
+        let windows = FakeTrigger::new().with_no_recompile();
+        recompile_after_config_change(&windows, Path::new("/tmp/rime")).expect("windows rebuild");
+        assert_eq!(
+            windows.calls(),
+            vec!["manual_deploy".to_string()],
+            "a platform whose deploy does not recompile must use manual_deploy"
+        );
+    }
+
+    /// 部署序列里的重建步骤：配置变了且本平台的 deploy 不重编译 → manual_deploy；
+    /// 其余情况 → deploy（保持既有行为）。
+    #[test]
+    fn deploy_sequence_picks_manual_deploy_only_when_needed() {
+        let windows_changed = FakeTrigger::new().with_no_recompile();
+        recompile_in_deploy_sequence(&windows_changed, Path::new("/tmp/rime"), true)
+            .expect("windows deploy sequence");
+        assert_eq!(windows_changed.calls(), vec!["manual_deploy".to_string()]);
+
+        let windows_unchanged = FakeTrigger::new().with_no_recompile();
+        recompile_in_deploy_sequence(&windows_unchanged, Path::new("/tmp/rime"), false)
+            .expect("windows deploy sequence");
+        assert_eq!(windows_unchanged.calls(), vec!["deploy".to_string()]);
+
+        let linux = FakeTrigger::new();
+        recompile_in_deploy_sequence(&linux, Path::new("/tmp/rime"), true)
+            .expect("linux deploy sequence");
+        assert_eq!(
+            linux.calls(),
+            vec!["deploy".to_string()],
+            "Linux deploy is rime_deployer --build, it already recompiles"
+        );
+    }
 
     struct TempDir {
         path: PathBuf,

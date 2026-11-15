@@ -338,6 +338,26 @@ fn patch_dirs_reports_what_it_did() {
     assert_eq!(again.backup_dir, "", "没有新备份就没有 backup_dir");
 }
 
+/// 当前进程的 uid（读不到就当非 root）。
+///
+/// 用途：把「root 下只读权限挡不住写」这件事**说出来**，而不是让用例静悄悄
+/// 少跑一半断言。
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
 #[test]
 fn permission_denied_is_a_readable_error() {
     let tmp = TempDir::new();
@@ -347,9 +367,16 @@ fn permission_denied_is_a_readable_error() {
     permissions.set_readonly(true);
     fs::set_permissions(&schema, permissions).expect("chmod");
 
-    // root 下只读文件照样可写：这种环境跳过（不是被测行为）。
+    // root 下只读文件照样可写：这属于「权限位在本机不生效」，不是被测行为 ——
+    // **显式**说明并跳过，不许静默 return（静默跳过会让这条断言在 root 环境里
+    // 从来没跑过）。
     let probe = fs::OpenOptions::new().write(true).open(&schema);
     if probe.is_ok() {
+        eprintln!(
+            "skip: 只读权限在当前环境不生效（uid={:?}，多半是 root）——权限拒绝分支由 \
+             unwritable_target_reports_readable_error 用「写不进去的路径」覆盖",
+            current_uid()
+        );
         return;
     }
 
@@ -357,6 +384,47 @@ fn permission_denied_is_a_readable_error() {
     let message = format!("{error:#}");
     assert!(message.contains("管理员"), "错误要提示提权：{message}");
     assert_eq!(read(&schema), STOCK, "失败时原文件不动");
+}
+
+/// 「写不进去」这件事不靠权限位模拟：目标是**目录**（读写它必然失败，root 也
+/// 一样），或者父目录根本不存在。
+///
+/// 这样这条断言在 root 与普通用户下跑的是同一套逻辑，不会因为权限位对 root
+/// 无效而被悄悄跳过。
+#[test]
+fn unwritable_target_reports_readable_error() {
+    let tmp = TempDir::new();
+    // 目标是个目录：当成方案文件去读必然失败。
+    let dir_target = tmp.path().join("luna_pinyin.schema.yaml");
+    fs::create_dir_all(&dir_target).expect("create dir target");
+
+    let error = data_patch::patch_file(&dir_target, "0.6.18").expect_err("must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&dir_target.display().to_string()),
+        "错误信息要指出是哪个路径：{message}"
+    );
+    assert!(
+        !message.is_empty(),
+        "错误信息不许是空的（uid={:?}）",
+        current_uid()
+    );
+    // 目录本身没被动过。
+    assert!(dir_target.is_dir(), "失败时不该改动目标");
+
+    // 父目录不存在：同样写不进去。
+    let missing = tmp.path().join("no-such-dir/luna_pinyin.schema.yaml");
+    let error = data_patch::patch_file(&missing, "0.6.18").expect_err("must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "错误信息要指出是哪个路径：{message}"
+    );
+
+    eprintln!(
+        "unwritable_target_reports_readable_error 已执行（uid={:?}）",
+        current_uid()
+    );
 }
 
 #[test]

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rime_sync_core::data_patch::{self, DataPatchReport};
 use rime_sync_core::ime::{self, ImeReport};
 use rime_sync_core::ime_state;
+use rime_sync_core::platform;
 use rime_sync_core::prebuilt::{self, PrebuiltReport};
 use rime_sync_core::prune;
 use serde::Serialize;
@@ -352,7 +353,12 @@ fn fix_ime_blocking(
             .with_force(force.unwrap_or(false))
             .with_version(Some(app_version(app)))
             .with_exe_dir(exe_dir())
-            .with_source(location.source.clone()),
+            .with_source(location.source.clone())
+            // 重建触发器必须显式注入：core 的默认路径读的是 CLI 的配置
+            // （~/.config/rime-sync/config.json），而 GUI 的配置在
+            // ~/.config/com.rimesync.app/config.json —— 不注入就等于让 GUI
+            // 按「读不到配置」的默认值行事，用户在设置页关掉的开关不生效。
+            .with_trigger(platform::default_trigger(config.stop_fcitx5_during_apply)),
     );
     let data = &outcome.data;
     let report = &outcome.report;
@@ -1253,7 +1259,10 @@ fn bootstrap_body(handle: &AppHandle) {
                     &ime_state::Options::bootstrap()
                         .with_force(force)
                         .with_version(Some(app_version(&handle)))
-                        .with_exe_dir(exe.clone()),
+                        .with_exe_dir(exe.clone())
+                        // 同 fix_ime_blocking：显式注入 GUI 自己的触发器，
+                        // 否则 core 会去读 CLI 的配置路径，读不到就按默认值行事。
+                        .with_trigger(platform::default_trigger(config.stop_fcitx5_during_apply)),
                 );
                 log(format!(
                     "ensure result={} build_ok={} copied={} kept={} overwritten={} config_copied={} config_kept={} failed={} build_schemas={} repaired={} missing={} data_patched={} deploy_method={} deploy_result={} deploy_ms={} detail={} core_log={}",

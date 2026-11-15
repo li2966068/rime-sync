@@ -528,6 +528,10 @@ export const zh = {
   "fixIme.numpadBad": "小键盘未生效：{list}",
   "fixIme.numpadNext": "重启输入法后再点一次「修复输入法」",
   "fixIme.numpadDetail": "小键盘技术细节：{text}",
+  "fixIme.punctOk": "标点直出已就绪",
+  "fixIme.punctBad": "标点直出未生效：{list}",
+  "fixIme.punctNext": "点一次「修复输入法」补上；若提示引擎不支持，请换装 rime-sync 自建的输入法本体",
+  "fixIme.punctDetail": "标点直出技术细节：{text}",
 
   // 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）：
   // 只有 rime-sync 自建的输入法才有；装的是发行版 Rime 就没有。

@@ -351,6 +351,8 @@ patch:
             "    - rimesync_vselect",
             "    - numpad",
             "    - key_binder",
+            // 列表里没有 punctuator，rimesync_punct 只能追加到末尾。
+            "    - rimesync_punct",
         ],
         "numpad 必须挪到 rimesync_vselect 后面，并且只留一份"
     );
@@ -409,6 +411,8 @@ patch:
             "      - rimesync_vselect",
             "      - numpad",
             "      - key_binder",
+            // 列表里没有 punctuator，rimesync_punct 只能追加到末尾。
+            "      - rimesync_punct",
         ]
     );
 }

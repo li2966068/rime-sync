@@ -743,6 +743,12 @@ seed_schema_customs() { # $1=Rime 用户目录
 # 开关：RIMESYNC_PREBUILT=0 关闭；RIMESYNC_PREBUILT=force 覆盖已存在的文件。
 PREBUILT_DIR=/usr/share/rime-sync/prebuilt
 PREBUILT_LOG=$LOGDIR/prebuilt.log
+# 随包产物的清单（每个文件的 sha256 + size）。口径与 Rust 侧
+# crates/core/src/prebuilt.rs 的 verify_manifest 一致：**只校验 files[] 里的条目**，
+# generated_at / docker_image 这类元数据不一致不报错。
+PREBUILT_MANIFEST=${RIMESYNC_PREBUILT_MANIFEST:-$PREBUILT_DIR/MANIFEST.json}
+# 清单解析结果缓存（TSV：path<TAB>bytes<TAB>sha256），由 prebuilt_manifest_load 生成。
+PREBUILT_MANIFEST_CACHE=""
 
 prebuilt_usable() { # $1=Rime 用户目录
   local f=$1/build/luna_pinyin_simp.schema.yaml
@@ -751,28 +757,141 @@ prebuilt_usable() { # $1=Rime 用户目录
   grep -q rimesync_punct "$f" 2>/dev/null || return 1
 }
 
-# 逐个文件复制：存在即跳过；mode=force 才覆盖。输出 "copied kept failed"
-prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组
-  local src=$1 dst=$2 mode=$3 owner=$4 f copied=0 kept=0 failed=0
-  if ! mkdir -p "$dst" 2>/dev/null; then printf '0 0 1\n'; return 0; fi
-  for f in "$src"/*; do
-    [ -f "$f" ] || continue
-    if [ -e "$dst/${f##*/}" ] && [ "$mode" != force ]; then
-      kept=$((kept + 1)); continue
+# 解析 MANIFEST.json 的 files[] → TSV 缓存。
+# 返回：0 = 清单可用；1 = 清单不存在（旧版 payload，Rust 侧同样不校验）；
+#       2 = 清单存在但解析不出条目（当损坏处理，见 prebuilt_copy_dir）。
+#
+# 解析方式：MANIFEST.json 由 scripts/ime/gen-prebuilt-build.py 生成，条目形如
+#   { "path": "build/x.bin", "bytes": 123, "sha256": "…" }
+# 这里按 JSON 对象的 "}" 边界聚合，与键的先后顺序无关。
+prebuilt_manifest_load() {
+    local manifest=$1 out=$2 path="" bytes="" sha="" line in_files=0
+    PREBUILT_MANIFEST_CACHE=""
+    [ -f "$manifest" ] || return 1
+    [ -r "$manifest" ] || return 2
+    : >"$out" 2>/dev/null || return 2
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 只解析 "files" 数组段（顶层的 schemas / markers 等段落里也可能出现
+        # 大括号，不能让它们干扰条目边界）。
+        if [ "$in_files" = 0 ]; then
+            case "$line" in
+                *'"files"'*) in_files=1 ;;
+            esac
+            continue
+        fi
+        case "$line" in
+            ']'*) break ;;
+        esac
+        case "$line" in
+            *'"path"'*)
+                path=$(printf '%s' "$line" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                ;;
+        esac
+        case "$line" in
+            *'"bytes"'*)
+                bytes=$(printf '%s' "$line" | sed -n 's/.*"bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+                ;;
+        esac
+        case "$line" in
+            *'"sha256"'*)
+                sha=$(printf '%s' "$line" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                ;;
+        esac
+        # 一个 JSON 对象结束（"}" 独占一行或行尾带 ","）：三个字段齐了才落一条。
+        case "$line" in
+            *'}'*)
+                if [ -n "$path" ] && [ -n "$sha" ]; then
+                    printf '%s\t%s\t%s\n' "$path" "${bytes:-0}" "$sha" >>"$out"
+                fi
+                path=""; bytes=""; sha=""
+                ;;
+        esac
+    done <"$manifest"
+    [ -s "$out" ] || return 2
+    return 0
+}
+
+# 校验单个源文件；返回 0 = 通过，1 = 不匹配/读不出，2 = 清单里没有这个文件。
+# 比对两个字段：size（清单 bytes > 0 时）与 sha256（大小写不敏感，同 Rust 侧）。
+prebuilt_verify_file() { # $1=清单相对路径 $2=源文件 $3=清单缓存
+    local rel=$1 src=$2 cache=$3 entry="" want_bytes="" want_sha="" got_bytes="" got_sha=""
+    entry=$(awk -F'\t' -v k="$rel" '$1 == k { print $2 "\t" $3; exit }' "$cache" 2>/dev/null)
+    [ -n "$entry" ] || return 2
+    want_bytes=${entry%%	*}
+    want_sha=${entry#*	}
+    got_bytes=$(stat -c%s "$src" 2>/dev/null) || return 1
+    got_sha=$(sha256sum "$src" 2>/dev/null | cut -d' ' -f1) || return 1
+    [ -n "$got_sha" ] || return 1
+    if [ "${want_bytes:-0}" -gt 0 ] 2>/dev/null && [ "$want_bytes" != "$got_bytes" ]; then
+        # 格式与 Rust 侧 verify_manifest 的 "<path>:size:expected=.. actual=.." 对齐
+        printf '%s:size:expected=%s actual=%s' "$rel" "$want_bytes" "$got_bytes" >&2
+        return 1
     fi
-    if install -D -m 644 "$f" "$dst/${f##*/}" 2>/dev/null; then
-      chown "$owner" "$dst/${f##*/}" 2>/dev/null || true
-      copied=$((copied + 1))
-    else
-      failed=$((failed + 1))
+    # sha256 大小写不敏感（与 Rust 侧的 eq_ignore_ascii_case 一致）。
+    want_sha=$(printf '%s' "$want_sha" | tr 'A-Z' 'a-z')
+    got_sha=$(printf '%s' "$got_sha" | tr 'A-Z' 'a-z')
+    if [ "$want_sha" != "$got_sha" ]; then
+        # 格式与 Rust 侧 verify_manifest 的 "<path>:sha256:expected=.. actual=.." 对齐
+        printf '%s:sha256:expected=%s actual=%s' "$rel" "$want_sha" "$got_sha" >&2
+        return 1
     fi
-  done
-  printf '%s %s %s\n' "$copied" "$kept" "$failed"
+    return 0
+}
+
+# 列出清单里有、但 payload 目录里没有的条目（与 Rust 侧 "<path>:missing:" 对齐）。
+prebuilt_manifest_missing() { # $1=清单缓存 $2=payload 根目录
+    local cache=$1 root=$2 rel
+    awk -F'\t' '{ print $1 }' "$cache" 2>/dev/null | while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        [ -f "$root/$rel" ] || printf '%s:missing:not-found\n' "$rel"
+    done
+}
+
+# 逐个文件复制：存在即跳过；mode=force 才覆盖。
+# **复制前按 MANIFEST 校验 sha256（与 size）**：不匹配 / 清单里没有的文件一律不拷。
+# 输出 "copied kept failed corrupt"（corrupt = 校验没通过、没装上的文件数）。
+prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组 $5=清单缓存 $6=清单里的目录名
+    local src=$1 dst=$2 mode=$3 owner=$4 cache=$5 prefix=$6
+    local f rel rc copied=0 kept=0 failed=0 corrupt=0 reason=""
+    if ! mkdir -p "$dst" 2>/dev/null; then printf '0 0 1 0\n'; return 0; fi
+    for f in "$src"/*; do
+        [ -f "$f" ] || continue
+        rel="$prefix/${f##*/}"
+        # 既有策略：用户目录里已有同名文件就沿用、不覆盖（2026-11-02 定案）。
+        # 沿用的文件根本不复制，所以不必校验它。
+        if [ -e "$dst/${f##*/}" ] && [ "$mode" != force ]; then
+            kept=$((kept + 1)); continue
+        fi
+        # 要复制了 ⇒ 先按 MANIFEST 校验 sha256（与 size）。校验不过就不拷。
+        if [ -n "$cache" ] && [ -f "$cache" ]; then
+            reason=$(prebuilt_verify_file "$rel" "$f" "$cache" 2>&1)
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                # rc=2：清单里没有这个文件（无法校验）—— 同样不拷。
+                [ "$rc" = 2 ] && reason="not-in-manifest"
+                corrupt=$((corrupt + 1))
+                # 注意：say 走 stdout，而本函数的 stdout 会被 read 捕获成计数，
+                # 所以这里的告警必须写到 stderr，否则会污染计数解析。
+                say "!! 预编译产物校验不通过，未复制：$rel（${reason:-unknown}）" >&2
+                printf '%s corrupt file=%s reason=%s\n' "$(date '+%F %T')" "$rel" "${reason:-unknown}" \
+                    >>"$PREBUILT_LOG" 2>/dev/null || true
+                continue
+            fi
+        fi
+        if install -D -m 644 "$f" "$dst/${f##*/}" 2>/dev/null; then
+            chown "$owner" "$dst/${f##*/}" 2>/dev/null || true
+            copied=$((copied + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+    printf '%s %s %s %s\n' "$copied" "$kept" "$failed" "$corrupt"
 }
 
 seed_prebuilt_build() { # $1=Rime 用户目录
   local rime_dir=$1 mode=${RIMESYNC_PREBUILT:-auto} owner=${TARGET_USER:-root}
-  local ogroup copied=0 kept=0 failed=0 c k f escalated=0
+  local ogroup copied=0 kept=0 failed=0 corrupt=0 c k f b escalated=0
+  local manifest_cache="" manifest_rc=0 missing_list="" rel
   ogroup=$(id -gn "$owner" 2>/dev/null || echo "$owner")
 
   case "$mode" in
@@ -794,27 +913,81 @@ seed_prebuilt_build() { # $1=Rime 用户目录
   fi
   chown "$owner:$ogroup" "$rime_dir/build" 2>/dev/null || true
 
+  # 解析清单（复制前校验用）。清单缺失 = 旧版 payload（没有清单就没法校验），
+  # 与 Rust 侧 verify_manifest 的口径一致：**不校验，也不算失败**。
+  # 清单存在但解析不出条目 = 清单本身坏了：此时**不复制任何文件**（宁可不装，
+  # 也不能装一份无法验证的产物），并把失败记进日志。
+  manifest_cache=$(mktemp "${TMPDIR:-/tmp}/rime-sync-manifest.XXXXXX" 2>/dev/null || printf '')
+  if [ -n "$manifest_cache" ]; then
+    prebuilt_manifest_load "$PREBUILT_MANIFEST" "$manifest_cache"
+    manifest_rc=$?
+  else
+    manifest_rc=2
+  fi
+  case "$manifest_rc" in
+    0)
+      say "预编译产物：已按 MANIFEST 校验 sha256 后复制"
+      printf '%s manifest=ok path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+        >>"$PREBUILT_LOG" 2>/dev/null || true
+      ;;
+    1)
+      say "预编译产物：没有 $PREBUILT_MANIFEST（旧版产物，无清单可校验），按原样复制"
+      printf '%s manifest=missing path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+        >>"$PREBUILT_LOG" 2>/dev/null || true
+      [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
+      manifest_cache=""
+      ;;
+    *)
+      say "!! 预编译产物的 MANIFEST 解析失败（$PREBUILT_MANIFEST），本次不复制任何产物"
+      printf '%s manifest=broken path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+        >>"$PREBUILT_LOG" 2>/dev/null || true
+      [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
+      return 0
+      ;;
+  esac
+
   # 第一遍：build/* -> <rime_dir>/build/，config/*.yaml -> <rime_dir>/（都是存在即跳过）
-  read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" "${mode}" "$owner:$ogroup")"
-  copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
-  read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/config" "$rime_dir" "${mode}" "$owner:$ogroup")"
-  copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+  read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" "${mode}" "$owner:$ogroup" "$manifest_cache" build)"
+  copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
+  read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/config" "$rime_dir" "${mode}" "$owner:$ogroup" "$manifest_cache" config)"
+  copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
 
   # 第二遍（只在第一遍没解决问题时）：旧 build 产物（没有插件标记）被「存在即跳过」放过了。
   # build/ 是部署器随时重写的派生数据、不是用户数据，只对它覆盖重铺；config 绝不动。
   if ! prebuilt_usable "$rime_dir" && [ "$mode" != "force" ]; then
     escalated=1
     say "预编译产物：用户目录里的旧 build 产物不可用，只对 build/ 覆盖重铺一遍（配置不动）"
-    read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" force "$owner:$ogroup")"
-    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+    read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" force "$owner:$ogroup" "$manifest_cache" build)"
+    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
   fi
+
+  # 清单里有、payload 里没有的条目（Rust 侧记作 "<path>:missing:"）也算问题：
+  # 装上去的产物是不完整的。
+  # 注意：这里不能用管道（管道里的 while 是子 shell，计数传不回来）。
+  missing_list=$(prebuilt_manifest_missing "$manifest_cache" "$PREBUILT_DIR" 2>/dev/null)
+  if [ -n "$missing_list" ]; then
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      corrupt=$((corrupt + 1))
+      say "!! 预编译产物缺失，未复制：$rel"
+      printf '%s corrupt file=%s reason=missing\n' "$(date '+%F %T')" "$rel" \
+        >>"$PREBUILT_LOG" 2>/dev/null || true
+    done <<EOF_MISSING
+$missing_list
+EOF_MISSING
+  fi
+
+  [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
 
   if prebuilt_usable "$rime_dir"; then
     say "预编译产物：已铺入 $copied 个，沿用 $kept 个（build 判定通过）"
-    printf '%s ok source=prebuilt copied=%d kept=%d failed=%d escalated=%d dir=%s\n' \
-      "$(date '+%F %T')" "$copied" "$kept" "$failed" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+    printf '%s ok source=prebuilt copied=%d kept=%d failed=%d corrupt=%d escalated=%d dir=%s\n' \
+      "$(date '+%F %T')" "$copied" "$kept" "$failed" "$corrupt" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
   else
-    say "!! 预编译产物铺完仍不满足判据（copied=$copied kept=$kept failed=$failed），只告警不中止"
+    say "!! 预编译产物铺完仍不满足判据（copied=$copied kept=$kept failed=$failed corrupt=$corrupt），只告警不中止"
+  fi
+  if [ "$corrupt" -gt 0 ]; then
+    say "!! 有 $corrupt 个随包产物没装上（校验不通过或缺失），详情见 $PREBUILT_LOG"
   fi
   return 0
 }

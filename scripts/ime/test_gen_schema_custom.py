@@ -3,9 +3,12 @@
 """gen-schema-custom.py 的自检。
 
 默认跑「不依赖 librime」的静态检查：
-  * 16 个方案都生成了 custom 文件，且能被 yaml.safe_load 解析
-  * translators 首位是 rimesync_vnum；rimesync_punct 在 key_binder/punctuator/selector
-    中最先出现的那个之前（selector 会先吃掉数字选词）
+  * 保留清单里的每个方案都生成了 custom 文件，且能被 yaml.safe_load 解析
+  * translators 首位是 rimesync_vnum
+  * engine/processors 顺序满足 rime-sync 的三条硬规则（与 Rust 侧
+    crates/core/src/processor_spec.rs 的 validate() 同一口径）：
+    rimesync_vselect 紧跟 recognizer、numpad 紧跟 rimesync_vselect、
+    rimesync_punct 排在 punctuator 之前（否则它拿不到按键，中文标点直出等于没开）
   * 其余引擎条目顺序与 vendored 方案完全一致（含 __include 继承来的方案）
   * 有 recognizer/patterns/vnum（vnum 依赖 segmentor 把 v1234 当一个片段）
   * 不再有 import_preset；half_shape 目标键是 {commit: X}，非目标键与 preset 原值一致
@@ -33,6 +36,8 @@ from pathlib import Path
 import yaml
 
 sys.dont_write_bytecode = True  # 不要在 scripts/ime 里留 __pycache__
+
+import rime_common  # 与生成器共用同一份规则（scripts/ime 在 sys.path 里）
 
 REPO = Path(__file__).resolve().parents[2]
 GEN = REPO / "scripts" / "ime" / "gen-schema-custom.py"
@@ -66,7 +71,11 @@ def source_cfg(sid, gen):
 
 def static_checks(gen):
     ids = gen.schema_ids(RIME_DATA, USER_DEFAULT)
-    check(len(ids) == 16, "schema_list 是 16 个方案", "got %d" % len(ids))
+    # 保留清单是单一真相源（packaging/rime/retained-schemas.txt）：模板数必须与它一致。
+    # 早先这里写死 16（0.6.21 之前的方案数），保留清单收敛到 3 个后一直误报。
+    retained = rime_common.retained_schemas()
+    check(ids == retained, "schema_list 与 retained-schemas.txt 一致",
+          "%s vs %s" % (ids, retained))
     files = sorted(OUT.glob("*.custom.yaml"))
     check(len(files) == len(ids), "custom 文件数 = 方案数", "%d vs %d" % (len(files), len(ids)))
 
@@ -94,34 +103,13 @@ def static_checks(gen):
             "%s translators 其余顺序与源方案一致" % sid,
         )
 
-        anchors = [i for i, name in enumerate(src_p) if name in gen.PUNCT_ANCHORS]
-        want_idx = min(anchors) if anchors else None
-        if gen.PUNCT in processors:
-            idx = processors.index(gen.PUNCT)
-            check(
-                idx == want_idx
-                and (processors[idx + 1] == src_p[want_idx]
-                     or (processors[idx + 1] == gen.VSEL
-                         and processors[idx + 2] == gen.NUMPAD
-                         and processors[idx + 3] == src_p[want_idx])),
-                "%s rimesync_punct 在最先出现的 key_binder/punctuator/selector 之前" % sid,
-                "idx=%s want=%s" % (idx, want_idx),
-            )
-        else:
-            check(False, "%s 有 rimesync_punct" % sid)
+        # 位置口径：vselect 紧跟 recognizer、numpad 紧跟 vselect、
+        # punct 排在 punctuator 之前（与 crates/core/src/processor_spec.rs 一致）。
+        violations = rime_common.processor_order_violations(processors)
+        check(not violations, "%s processors 顺序满足三条硬规则" % sid, "；".join(violations))
         check(
             [x for x in processors if x not in (gen.PUNCT, gen.VSEL, gen.NUMPAD)] == src_p,
             "%s processors 其余顺序与源方案一致" % sid,
-        )
-        check(
-            gen.VSEL in processors
-            and processors.index(gen.VSEL) == processors.index(gen.PUNCT) + 1,
-            "%s rimesync_vselect 紧跟 rimesync_punct" % sid,
-        )
-        check(
-            gen.NUMPAD in processors
-            and processors.index(gen.NUMPAD) == processors.index(gen.VSEL) + 1,
-            "%s numpad 紧跟 rimesync_vselect" % sid,
         )
         check(
             patch.get("recognizer/patterns/vnum") == gen.VNUM_PATTERN,
@@ -239,20 +227,13 @@ def deploy_checks(gen, keep=False):
         src = source_cfg(sid, gen)
         src_proc = src["engine"]["processors"]
         src_t = src["engine"]["translators"]
-        want_idx = min(i for i, n in enumerate(src_proc) if n in gen.PUNCT_ANCHORS)
-        if gen.PUNCT in processors:
-            idx = processors.index(gen.PUNCT)
-            check(
-                idx == want_idx
-                and [x for x in processors if x not in (gen.PUNCT, gen.VSEL, gen.NUMPAD)] == src_proc
-                and gen.VSEL in processors
-                and processors.index(gen.VSEL) == idx + 1
-                and gen.NUMPAD in processors
-                and processors.index(gen.NUMPAD) == idx + 2,
-                "[生效] %s rimesync_punct 位置正确且引擎其余顺序不变" % sid,
-            )
-        else:
-            check(False, "[生效] %s 有 rimesync_punct" % sid)
+        violations = rime_common.processor_order_violations(processors)
+        check(not violations, "[生效] %s processors 顺序满足三条硬规则" % sid,
+              "；".join(violations))
+        check(
+            [x for x in processors if x not in (gen.PUNCT, gen.VSEL, gen.NUMPAD)] == src_proc,
+            "[生效] %s 引擎其余顺序不变" % sid,
+        )
         check(
             [x for x in translators if x != gen.VNUM] == src_t,
             "[生效] %s translators 其余顺序不变" % sid,

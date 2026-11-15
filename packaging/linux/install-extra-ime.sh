@@ -266,36 +266,129 @@ if [ -n "$TARGET_USER" ]; then
 fi
 say "目标桌面用户：${TARGET_USER:-（未确定）}"
 
-# Rime 用户目录：规则与 packaging/linux/postinst 的 resolve_rime_user_dir 一致
-# （key=value 或 key: value、引号、~ 展开、空值视为未设置、末尾斜杠归一）。
-resolve_rime_user_dir() { # <home>
-  local home=$1 conf raw="" out=""
+# Rime 用户目录：规则与 packaging/linux/postinst 的 resolve_rime_user_dir
+# 以及 crates/core/src/rime_dir.rs 的 parse_fcitx5_user_data_dir **逐条一致**：
+#   1. 分隔符 = 与 : 都支持，值是分隔符之后的全部内容（允许含 =）；
+#   2. 键名去空白后必须正好是 UserDataDirPath；
+#   3. 值去两端空白，再剥掉**成对**的双引号或单引号；
+#   4. 空值视为未设置；
+#   5. ~ 展开为 HOME，~/xxx 展开为 $HOME/xxx；
+#   6. 必须是绝对路径：相对路径按未设置处理（fcitx5 引擎也拒绝相对路径，
+#      见 third_party/fcitx5-rime/src/rimeengine.cpp 的 resolveRimeUserDir）；
+#   7. 去掉末尾斜杠（根目录除外）。
+#
+# 注意：bash 的 case pattern 与 ${var#pattern} 会先做 tilde 展开，
+# 判断 "~/xxx" 前缀必须用字符串切片 ${value:0:2}。
+#
+# ---------------------------------------------------------------- 配置根目录（XDG）
+# 与 packaging/linux/postinst、packaging/linux/uninstall.sh 的 resolve_config_home
+# **逐条一致**，规则与 Rust 侧 crates/core/src/rime_dir.rs 的 config_home() 对齐：
+# 「XDG_CONFIG_HOME 优先，缺省 ~/.config」。
+# 本脚本以 root 跑（pkexec），进程里的 XDG_CONFIG_HOME 是 root 的，
+# 所以要找目标用户的：
+#   1. RIMESYNC_TARGET_CONFIG_HOME：显式指定（安装器 / 测试注入）。
+#   2. 目标用户环境文件里导出的 XDG_CONFIG_HOME：~/.pam_environment、
+#      ~/.config/environment、~/.profile、~/.bashrc。
+#   3. 当前进程环境里的 XDG_CONFIG_HOME —— 只在 home 就是当前 $HOME 时才认。
+#   4. $home/.config（XDG 缺省值）。
+resolve_config_home() { # <home>
+  local home=$1 value="" file=""
   [ -n "$home" ] || { printf ''; return 0; }
-  conf="$home/.config/fcitx5/conf/rime.conf"
-  if [ -r "$conf" ]; then
-    raw=$(sed -n -E 's/^[[:space:]]*UserDataDirPath[[:space:]]*([=:][[:space:]]*)?(.*)$/\2/p' "$conf" 2>/dev/null | head -n 1)
-    raw=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  if [ -n "${RIMESYNC_TARGET_CONFIG_HOME:-}" ]; then
+    printf '%s' "$RIMESYNC_TARGET_CONFIG_HOME"
+    return 0
   fi
-  if [ -n "$raw" ]; then
-    if [ "$raw" = "~" ]; then
-      out=$home
-    elif [ "${raw:0:2}" = "~/" ]; then
-      out=$home/${raw:2}
-    else
-      out=$raw
+  for file in "$home/.pam_environment" "$home/.config/environment" \
+    "$home/.profile" "$home/.bashrc"; do
+    [ -r "$file" ] || continue
+    value=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?XDG_CONFIG_HOME=' \
+      "$file" 2>/dev/null || true)
+    [ -n "$value" ] || continue
+    value=${value#*=}
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    value=${value#\"}
+    value=${value%\"}
+    value=${value#\'}
+    value=${value%\'}
+    if [ "${value:0:6}" = '$HOME/' ]; then
+      value=$home/${value:6}
+    elif [ "${value:0:2}" = '~/' ]; then
+      value=$home/${value:2}
     fi
-  else
-    out=$home/.local/share/fcitx5/rime
+    case "$value" in
+      /*) printf '%s' "$value"; return 0 ;;
+    esac
+  done
+  if [ "$home" = "${HOME:-}" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s' "$XDG_CONFIG_HOME"
+    return 0
   fi
-  while [ "${out%/}" != "$out" ] && [ "$out" != "/" ]; do out=${out%/}; done
-  printf '%s' "$out"
+  printf '%s' "$home/.config"
 }
 
-# 先看 rime-sync 自己的解析（权威值：crates/core/src/rime_dir.rs），拿不到再退回 shell 规则
+resolve_rime_user_dir() { # <home>
+  local home=$1 conf="" line="" key="" value=""
+  [ -n "$home" ] || { printf ''; return 0; }
+  conf="$(resolve_config_home "$home")/fcitx5/conf/rime.conf"
+  if [ -r "$conf" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      case "$line" in
+        ""|\#*|\[* ) continue ;;
+      esac
+      key=""
+      value=""
+      case "$line" in
+        *=*) key=${line%%=*}; value=${line#*=} ;;
+      esac
+      key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [ "$key" != "UserDataDirPath" ]; then
+        key=""
+        value=""
+        case "$line" in
+          *:*) key=${line%%:*}; value=${line#*:} ;;
+        esac
+        key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ "$key" = "UserDataDirPath" ] || continue
+      fi
+      break
+    done <"$conf"
+  fi
+  value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$value" in
+    \"*\") value=${value#\"}; value=${value%\"} ;;
+    \'*\') value=${value#\'}; value=${value%\'} ;;
+  esac
+  value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$value" ] || { printf '%s' "$home/.local/share/fcitx5/rime"; return 0; }
+  if [ "$value" = "~" ]; then
+    value=$home
+  elif [ "${value:0:2}" = "~/" ]; then
+    value=$home/${value:2}
+  fi
+  case "$value" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*) : ;;
+    *) printf '%s' "$home/.local/share/fcitx5/rime"; return 0 ;;
+  esac
+  while [ "${value%/}" != "$value" ] && [ "$value" != "/" ]; do value=${value%/}; done
+  if [ ${#value} -eq 2 ] && [ "${value:1:1}" = ":" ]; then value="$value/"; fi
+  printf '%s' "$value"
+}
+
+# 先看 rime-sync 自己的解析（权威值：crates/core/src/rime_dir.rs），拿不到再退回 shell 规则。
+# detect --json 是权威接口（postinst / uninstall.sh 也用它）；HOME 指向目标桌面用户，
+# 否则脚本以 root 跑时 CLI 探到的是 root 的 Rime 目录。
 rime_user_dir=""
 if command -v rime-sync-cli >/dev/null 2>&1; then
-  json=$(rime-sync-cli check-ime --json 2>/dev/null || true)
-  rime_user_dir=$(printf '%s' "$json" | sed -n 's/.*"rime_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  json=$(HOME="$TARGET_HOME" XDG_CONFIG_HOME="$(resolve_config_home "$TARGET_HOME")" RIME_USER_DATA_DIR= \
+    rime-sync-cli detect --json 2>/dev/null || true)
+  rime_user_dir=$(printf '%s' "$json" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  if [ -z "$rime_user_dir" ]; then
+    # 兼容旧版本 CLI：detect 子命令可能还不存在，退回 check-ime 的 rime_dir 字段。
+    json=$(HOME="$TARGET_HOME" XDG_CONFIG_HOME="$(resolve_config_home "$TARGET_HOME")" RIME_USER_DATA_DIR= \
+      rime-sync-cli check-ime --json 2>/dev/null || true)
+    rime_user_dir=$(printf '%s' "$json" | sed -n 's/.*"rime_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  fi
 fi
 if [ -z "$rime_user_dir" ] && [ -n "$TARGET_HOME" ]; then
   rime_user_dir=$(resolve_rime_user_dir "$TARGET_HOME")
@@ -307,8 +400,8 @@ say "---- 第 1 步：卸载旧输入法（用户数据全部保留）----"
 say "保留不动的用户数据："
 if [ -n "$TARGET_HOME" ]; then
   say "  ${rime_user_dir:-$TARGET_HOME/.local/share/fcitx5/rime}   Rime 词库与方案自定义"
-  say "  $TARGET_HOME/.config/com.rimesync.app   同步配置与备份"
-  say "  $TARGET_HOME/.config/rime-sync          旧版配置目录"
+  say "  $(resolve_config_home "$TARGET_HOME")/com.rimesync.app   同步配置与备份"
+  say "  $(resolve_config_home "$TARGET_HOME")/rime-sync          旧版配置目录"
 fi
 
 # 1a) 发行版输入法 fcitx5-rime：必须卸掉（它带的发行版 librime 没有增强组件，

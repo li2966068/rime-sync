@@ -289,6 +289,7 @@ fn matrix_invariants_hold_for_every_combination() {
     let mut seen_partial = 0;
     let mut seen_failed = 0;
     let mut readonly_effective = 0;
+    let mut readonly_skip_reported = false;
 
     for (state, state_label) in labels() {
         for full in [true, false] {
@@ -349,7 +350,19 @@ fn matrix_invariants_hold_for_every_combination() {
                     }
 
                     if readonly && is_writable(&fixture.rime()) {
-                        // root 下 chmod 555 不生效：只记录，不因此判失败。
+                        // root 下 chmod 555 挡不住写 ⇒ 这条依赖「真实不可写」的
+                        // 断言在本机**没有**被执行。必须显式说出来（不许静默跳过），
+                        // 否则「只读目录 ⇒ 补不齐产物」这条结论在 root 环境里
+                        // 从来没被验证过。等价场景由 unwritable_rime_dir_fails_without
+                        // _permission_tricks 用「不靠权限位」的写法覆盖。
+                        if !readonly_skip_reported {
+                            readonly_skip_reported = true;
+                            eprintln!(
+                                "[skip] 只读权限在当前环境不生效（uid={:?}，多半是 root）：\
+                                 依赖真实不可写的断言未执行",
+                                current_uid()
+                            );
+                        }
                         continue;
                     }
                     if readonly
@@ -611,4 +624,72 @@ fn ensure_seeds_templates_and_reports_ok() {
         "报 Ok 但没有任何 changed 的 action：{:?}",
         outcome.actions
     );
+}
+
+/// 当前进程的 uid（读不到就当非 root）。
+///
+/// 用途：把「root 下权限位挡不住写」这件事说出来，而不是静悄悄少跑断言。
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+/// 「写不进去」不靠权限位模拟：Rime 用户目录的**父路径是一个文件** ⇒ 目录根本
+/// 建不出来 ⇒ ensure 必须如实报失败，而不是假装成功。
+///
+/// 这条断言在 root 与普通用户下跑的是同一套逻辑（root 也不能在一个文件下面
+/// 建目录），所以「不可写 ⇒ 失败」这条结论不再依赖 chmod 是否生效。
+#[test]
+fn unwritable_rime_dir_fails_without_permission_tricks() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ime-state-unwritable-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create root");
+    // 父路径是文件 ⇒ rime 目录建不出来。
+    let blocker = root.join("blocker");
+    fs::write(&blocker, b"not a directory").expect("write blocker");
+    let rime = blocker.join("rime");
+
+    let outcome = ime_state::ensure(&rime, None, &[], &options(Mode::Fix));
+
+    let rime_dir_action = outcome
+        .actions
+        .iter()
+        .find(|action| action.kind == "rime-dir")
+        .expect("必须有 rime-dir 动作");
+    assert!(
+        !rime_dir_action.changed,
+        "目录建不出来时 rime-dir 不该报 changed：{:?}",
+        rime_dir_action
+    );
+    assert!(
+        rime_dir_action.detail.contains("create failed"),
+        "rime-dir 要如实报创建失败：{}",
+        rime_dir_action.detail
+    );
+    assert!(
+        !matches!(outcome.result, OutcomeResult::Ok),
+        "目录建不出来时不许报 Ok：{:?} detail={}",
+        outcome.result,
+        outcome.detail
+    );
+    assert!(!outcome.detail.trim().is_empty(), "失败必须有可读原因");
+    assert!(!blocker.is_dir(), "占位文件不能被目录替换掉");
+
+    eprintln!(
+        "unwritable_rime_dir_fails_without_permission_tricks 已执行（uid={:?}）",
+        current_uid()
+    );
+    let _ = fs::remove_dir_all(&root);
 }

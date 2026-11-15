@@ -12,6 +12,7 @@
 //!   不覆盖已有备份（同一秒重跑会追加 .1/.2）；
 //! * RIMESYNC_PRUNE_SCHEMAS=0 关闭；重复执行是幂等的。
 
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::env;
@@ -170,6 +171,14 @@ impl PruneReport {
         if let Some(first) = self.failures.first() {
             text.push_str(&format!("；首个错误：{first}"));
         }
+        // 告警要出现在结论里：探测不到用户目录时用户目录整段没被裁剪，
+        // 只看「删除 0 个文件」会以为清理已经做完了。
+        if let Some(first) = self.warnings.first() {
+            text.push_str(&format!(
+                "；告警 {} 条（首个：{first}）",
+                self.warnings.len()
+            ));
+        }
         text
     }
 }
@@ -184,6 +193,20 @@ pub fn prune_auto_with(
     data_dirs: Option<&[PathBuf]>,
     user_dir: Option<&Path>,
     options: PruneOptions,
+) -> PruneReport {
+    prune_auto_with_detector(data_dirs, user_dir, options, || rime_dir::detect(None))
+}
+
+/// 同 prune_auto_with，但用户目录的探测可以被替换。
+///
+/// 为什么留这个口子：探测失败必须**如实报告**（"用户目录没被裁剪"），
+/// 而"探测失败"这件事在真实机器上不好复现（取决于本机有没有 Rime 目录），
+/// 单测需要一个可控的探测入口才能把这条分支钉死。
+fn prune_auto_with_detector(
+    data_dirs: Option<&[PathBuf]>,
+    user_dir: Option<&Path>,
+    options: PruneOptions,
+    detect: impl FnOnce() -> Result<rime_dir::Detection>,
 ) -> PruneReport {
     let (env_keep, mut warnings) = env_keep();
     let retained = retained_schemas();
@@ -202,11 +225,24 @@ pub fn prune_auto_with(
         Some(dirs) if !dirs.is_empty() => dirs.to_vec(),
         _ => data_patch::resolve_data_dirs().dirs,
     };
-    let user = match user_dir {
-        Some(dir) => Some(dir.to_path_buf()),
-        None => rime_dir::detect(None).ok().map(|detection| detection.path),
+    // 探测不到用户目录时不能静默跳过：用户目录里的 build 产物、用户 *.custom.yaml
+    // 与 default.custom.yaml 的 schema_list 这次**没有**被裁剪，报告里必须看得出来。
+    let (user, user_warning) = match user_dir {
+        Some(dir) => (Some(dir.to_path_buf()), None),
+        None => match detect() {
+            Ok(detection) => (Some(detection.path), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "未能探测 Rime 用户目录：{error:#}；用户目录（build 产物、用户 *.custom.yaml、default.custom.yaml 的 schema_list）本次未裁剪。"
+                )),
+            ),
+        },
     };
     let mut report = prune_paths_with_keep(&dirs, user.as_deref(), &timestamp, options, &env_keep);
+    if let Some(warning) = user_warning {
+        report.warnings.push(warning);
+    }
     report.warnings.append(&mut warnings);
     report
 }
@@ -900,6 +936,61 @@ mod tests {
         assert!(!data
             .join("terra_pinyin.schema.yaml.rimesync-removed-T0")
             .exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_dir_detection_failure_is_reported_not_silently_skipped() {
+        // 探测不到用户目录时，用户目录整段没被裁剪 —— 报告里必须看得出来
+        // （缺陷 D2：以前 .ok() 把「找不到」变成 None，报告仍是「删除 0 个文件」）。
+        let root = scratch("detect-fail");
+        let data = root.join("data");
+        fake_schema(&data, "terra_pinyin");
+        let report = prune_auto_with_detector(
+            Some(std::slice::from_ref(&data)),
+            None,
+            PruneOptions { dry_run: true },
+            || Err(anyhow::anyhow!("no Rime user directory found")),
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("未能探测 Rime 用户目录")
+                    && warning.contains("未裁剪")),
+            "探测失败必须出现在 warnings 里：{:?}",
+            report.warnings
+        );
+        assert!(
+            report.summary().contains("告警"),
+            "结论里也要看得见：{}",
+            report.summary()
+        );
+        assert!(report.user_dir.is_empty(), "探测不到时不该编一个用户目录");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn explicit_user_dir_needs_no_detection() {
+        let root = scratch("detect-explicit");
+        let data = root.join("data");
+        let user = root.join("user");
+        fake_schema(&data, "terra_pinyin");
+        let report = prune_auto_with_detector(
+            Some(std::slice::from_ref(&data)),
+            Some(&user),
+            PruneOptions { dry_run: true },
+            || panic!("显式给了用户目录就不该再探测"),
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("未能探测 Rime 用户目录")),
+            "不该有探测失败的告警：{:?}",
+            report.warnings
+        );
+        assert_eq!(report.user_dir, user.display().to_string());
         fs::remove_dir_all(&root).ok();
     }
 

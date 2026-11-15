@@ -56,7 +56,11 @@ pub struct BackupInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreReport {
     pub backup_id: String,
-    pub pre_restore_id: Option<String>,
+    /// 还原前留下的「还原点」备份 id。
+    ///
+    /// 必存在：留不下还原点时 restore 直接失败（宁可不还原），
+    /// 所以这里不会是 None。
+    pub pre_restore_id: String,
     pub restored: usize,
 }
 
@@ -98,6 +102,35 @@ impl BackupManager {
             tracing::error!("backup failed: {error:#}");
         }
         result
+    }
+
+    /// 开一份增量备份会话：只快照调用方点名要存的文件。
+    ///
+    /// 用于「覆盖本地文件前先留底」这类按需备份：全量快照太重，而 transport
+    /// 真正会被覆盖的文件通常只有个别几个。
+    pub fn start_session(&self, reason: &str) -> Result<BackupSession> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("create backup root {}", self.root.display()))?;
+        let now = now_secs();
+        let id = self.unique_id(now);
+        let dir = self.root.join(&id);
+        let files_dir = dir.join("files");
+        fs::create_dir_all(&files_dir)
+            .with_context(|| format!("create {}", files_dir.display()))?;
+        let manifest = BackupManifest {
+            id: id.clone(),
+            created_at: now,
+            created_at_text: format_timestamp(now),
+            reason: reason.to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            files: Vec::new(),
+        };
+        Ok(BackupSession {
+            rime_dir: self.rime_dir.clone(),
+            dir,
+            files_dir,
+            manifest,
+        })
     }
 
     fn populate(&self, files_dir: &Path, id: &str, now: u64, reason: &str) -> Result<String> {
@@ -276,7 +309,12 @@ impl BackupManager {
             verified.push((file.rel.clone(), bytes));
         }
 
-        let pre_restore_id = self.create("pre-restore").ok();
+        // 还原会覆盖当前状态 ⇒ 必须先留一份「还原点」，否则用户回不去。
+        // 留不下还原点就不还原（与 apply 路径「备份失败即中止」同一口径）：
+        // 宁可用户手动再点一次，也不做一次没有退路的覆盖。
+        let pre_restore_id = self
+            .create("pre-restore")
+            .with_context(|| "create pre-restore snapshot before restoring")?;
         let mut restored = 0usize;
         for (rel, bytes) in &verified {
             let target = self
@@ -329,6 +367,76 @@ impl BackupManager {
             }
         }
         Ok(removed)
+    }
+}
+
+/// 一轮同步的增量备份会话：只收「本轮真正会被覆盖」的那些文件。
+///
+/// 与 `BackupManager::create` 的全量快照不同，会话是按需的：transport 每覆盖
+/// 一个本地文件之前，先把那个文件的旧内容存进来。manifest 格式与全量备份
+/// 完全一致 ⇒ 既有的 list / restore / rollback 都能直接用，用户可以把这轮
+/// transport 覆盖掉的文件原样恢复回去。
+pub struct BackupSession {
+    rime_dir: PathBuf,
+    dir: PathBuf,
+    files_dir: PathBuf,
+    manifest: BackupManifest,
+}
+
+impl BackupSession {
+    pub fn id(&self) -> &str {
+        &self.manifest.id
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.manifest.files.is_empty()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.manifest.files.len()
+    }
+
+    /// 快照一个即将被覆盖的文件；失败即视为不可继续（宁可不覆盖）。
+    ///
+    /// 顺序：先落文件内容，再更新 manifest —— manifest 里没有的文件，
+    /// restore 不会去动它，备份天然是「要么完整要么缺一整个文件」。
+    pub fn snapshot(&mut self, rel: &str) -> Result<()> {
+        plan::validate_rel_path(rel).with_context(|| format!("unsafe path to backup: {rel}"))?;
+        plan::assert_no_userdb_dir(rel)?;
+        let source = self.rime_dir.join(rel);
+        let bytes = fs::read(&source).with_context(|| format!("read {}", source.display()))?;
+        let target = self
+            .files_dir
+            .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        fs::write(&target, &bytes).with_context(|| format!("write {}", target.display()))?;
+        self.manifest.files.push(BackupFile {
+            rel: rel.to_string(),
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        });
+        self.write_manifest()
+    }
+
+    /// 收尾：确保 manifest 落盘（幂等）。
+    pub fn finalize(&self) -> Result<()> {
+        self.write_manifest()
+    }
+
+    fn write_manifest(&self) -> Result<()> {
+        let text = serde_json::to_string_pretty(&self.manifest)?;
+        // 先写临时文件再改名：manifest 写坏会让整份备份被 restore 拒绝。
+        let tmp = self.dir.join(format!("{MANIFEST_NAME}.tmp"));
+        fs::write(&tmp, format!("{text}\n")).with_context(|| format!("write {}", tmp.display()))?;
+        fs::rename(&tmp, self.dir.join(MANIFEST_NAME))
+            .with_context(|| format!("rename {}", tmp.display()))?;
+        Ok(())
     }
 }
 
@@ -470,7 +578,7 @@ mod tests {
         fs::write(rime.join("default.custom.yaml"), b"patch:\n  a: 2\n").expect("mutate");
         let report = manager.restore(&id).expect("restore");
         assert_eq!(report.restored, 6);
-        assert!(report.pre_restore_id.is_some());
+        assert!(!report.pre_restore_id.is_empty());
         let text = fs::read_to_string(rime.join("default.custom.yaml")).expect("read");
         assert_eq!(text, "patch:\n  a: 1\n");
         let _ = fs::remove_dir_all(&root);
@@ -656,6 +764,48 @@ mod tests {
         let manager = BackupManager::new(&root, &root.join("backups"));
         assert!(manager.restore("../escape").is_err());
         assert!(manager.restore("").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_snapshots_only_named_files_and_restores_them() {
+        let root = temp_root("session");
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        fs::write(rime.join("a.custom.yaml"), b"old a").expect("a");
+        fs::write(rime.join("b.txt"), b"old b").expect("b");
+        let manager = BackupManager::new(&rime, &root.join("backups"));
+        let mut session = manager.start_session("pre-transport").expect("session");
+        session.snapshot("a.custom.yaml").expect("snapshot");
+        assert_eq!(session.file_count(), 1);
+        assert!(!session.is_empty());
+        let id = session.id().to_string();
+        session.finalize().expect("finalize");
+
+        fs::write(rime.join("a.custom.yaml"), b"new a").expect("mutate");
+        let report = manager.restore(&id).expect("restore");
+        assert_eq!(report.restored, 1);
+        assert_eq!(
+            fs::read_to_string(rime.join("a.custom.yaml")).expect("read"),
+            "old a"
+        );
+        // 没被点名快照的文件不受影响。
+        assert_eq!(
+            fs::read_to_string(rime.join("b.txt")).expect("read"),
+            "old b"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_rejects_unsafe_paths() {
+        let root = temp_root("session-unsafe");
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        let manager = BackupManager::new(&rime, &root.join("backups"));
+        let mut session = manager.start_session("pre-transport").expect("session");
+        assert!(session.snapshot("../escape").is_err());
+        assert!(session.snapshot("main.userdb/CURRENT").is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

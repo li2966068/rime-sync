@@ -33,6 +33,7 @@ use crate::deploy;
 use crate::ime::{self, ImeReport};
 use crate::managed_custom;
 use crate::prebuilt::{self, InstallOptions, PrebuiltReport, SchemaBuild};
+use crate::processor_spec::PUNCT_PROCESSOR;
 use crate::prune;
 
 /// 判据用的插件标记（主方案 schema.yaml 必须含它；官方部署产物不含）。
@@ -372,7 +373,15 @@ const EXTRA_ENGINE_MARKER: &[u8] = b"rimesync";
 
 /// 二进制文件里有没有这个标记（流式读，不把整库读进内存）。
 fn file_has_marker(path: &Path) -> bool {
+    file_has_marker_with(path, EXTRA_ENGINE_MARKER)
+}
+
+/// 二进制文件里有没有指定标记（流式读，不把整库读进内存）。
+fn file_has_marker_with(path: &Path, marker: &[u8]) -> bool {
     use std::io::Read;
+    if marker.is_empty() {
+        return false;
+    }
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
@@ -387,17 +396,11 @@ fn file_has_marker(path: &Path) -> bool {
         }
         let mut window = tail.clone();
         window.extend_from_slice(&buf[..read]);
-        if window
-            .windows(EXTRA_ENGINE_MARKER.len())
-            .any(|part| part == EXTRA_ENGINE_MARKER)
-        {
+        if window.windows(marker.len()).any(|part| part == marker) {
             return true;
         }
         // 保留尾巴，避免标记横跨两块时被漏掉。
-        let keep = EXTRA_ENGINE_MARKER
-            .len()
-            .saturating_sub(1)
-            .min(window.len());
+        let keep = marker.len().saturating_sub(1).min(window.len());
         tail = window[window.len() - keep..].to_vec();
     }
 }
@@ -553,6 +556,14 @@ fn system_engine_libs() -> Vec<PathBuf> {
 /// 1. 系统里正在用的 librime 库里有我们的标记 → 确定支持（发行版没有）；
 /// 2. 已编译产物 / 用户配置里有我们的标记 → 确定支持；
 /// 3. 都查不到 → 判断不了（可能是没编译过，也可能是发行版引擎）。
+///
+/// **这里用「任一标记有就行」（|| 语义），而 `ime::PLUGIN_MARKERS` 的 Weasel
+/// 健康判据要求「全部标记齐备」（&& 语义）—— 两处问的不是同一件事，
+/// 不要互相「统一」：** 本处问的是**能力**（「这个引擎带不带增强功能」），
+/// 任一 rimesync_* 组件在，就说明它是增强版而不是发行版原版；判据松一点的后果
+/// 只是不提示用户换输入法，判据过严反而会把功能正常的自建引擎误判成不支持。
+/// `ime.rs` 那边问的是**身份**（「这个输入法本体是不是我们自建的那一份」），
+/// 少一个标记就说明它是别的构建 ⇒ 必须换装，所以那边必须严格。
 pub fn assess_extra_support(rime_dir: &Path) -> ExtraSupport {
     let system_libs = system_engine_libs();
     for lib in &system_libs {
@@ -757,6 +768,227 @@ fn numpad_hint(missing: &[String]) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 标点直出（rimesync_punct）判定
+// ---------------------------------------------------------------------------
+
+/// 逐方案状态：来源侧的 custom.yaml 自己定义了 processors 列表却少了 rimesync_punct。
+const PUNCT_SOURCE_MISSING: &str = "config-missing";
+/// 逐方案状态：来源侧有 punct，但编译产物里没有（还没重编译）。
+const PUNCT_ARTIFACT_STALE: &str = "artifact-stale";
+/// 逐方案状态：压根没有编译产物（还没编译过，不算缺口）。
+const PUNCT_NO_ARTIFACT: &str = "no-artifact";
+/// 逐方案状态：没有 rime-sync 的引擎定制 → 不判定、不报缺口。
+const PUNCT_SKIPPED: &str = "skipped";
+/// 逐方案状态：一切正常。
+const PUNCT_OK: &str = "ok";
+/// 逐方案状态：本机引擎本体不认识 rimesync_punct（补配置也没用，得换输入法本体）。
+const PUNCT_ENGINE_UNSUPPORTED: &str = "engine-unsupported";
+
+/// 标点直出（rimesync_punct）判定结果（只读；序列化给 CLI/GUI 用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PunctStatus {
+    /// 是否一切正常（没有缺口）。
+    pub ok: bool,
+    /// 有缺口的方案：形如 "wubi86=config-missing"。
+    pub missing: Vec<String>,
+    /// 逐方案状态：形如 "wubi86=ok" / "wubi86=config-missing" /
+    /// "wubi86=artifact-stale" / "wubi86=engine-unsupported" / "wubi86=skipped"。
+    pub detail: Vec<String>,
+    /// 人话结论（可执行的下一步）。
+    pub hint: String,
+    /// 本机引擎本体是否认识 rimesync_punct：supported / unsupported / unknown。
+    pub engine_support: String,
+}
+
+/// 常驻标点直出判定：检查保留主方案的配置与编译产物里有没有 rimesync_punct。
+///
+/// 与小键盘判定是两件不同的事，必须分开：
+/// * **配置缺 punct**（config-missing）：用户 custom.yaml 自己定义了 processors 列表
+///   却少了 rimesync_punct —— 补配置就能解决（补丁路径会补上）。
+/// * **引擎不支持 punct**（engine-unsupported）：本机引擎本体里没有这个组件 ——
+///   补配置只会让方案整个不可用（error creating processor: 'rimesync_punct'），
+///   必须换输入法本体。判据只看**引擎库**（以及产物里有没有编译出过它）。
+pub fn assess_punct(rime_dir: &Path, data_dirs: &[PathBuf]) -> PunctStatus {
+    let engine_support = punct_engine_support();
+    let mut detail = Vec::new();
+    let mut missing = Vec::new();
+    for id in prune::retained_schemas() {
+        let state = punct_state(rime_dir, data_dirs, id, engine_support);
+        detail.push(format!("{id}={state}"));
+        if matches!(
+            state,
+            PUNCT_SOURCE_MISSING | PUNCT_ARTIFACT_STALE | PUNCT_ENGINE_UNSUPPORTED
+        ) {
+            missing.push(format!("{id}={state}"));
+        }
+    }
+    let ok = missing.is_empty();
+    let hint = if ok {
+        String::new()
+    } else {
+        punct_hint(&missing, engine_support)
+    };
+    PunctStatus {
+        ok,
+        missing,
+        detail,
+        hint,
+        engine_support: engine_support.as_str().to_string(),
+    }
+}
+
+/// 单个方案的逐档判定（只读）。
+fn punct_state(
+    rime_dir: &Path,
+    data_dirs: &[PathBuf],
+    id: &str,
+    engine_support: ExtraSupport,
+) -> &'static str {
+    let custom_text = fs::read(rime_dir.join(format!("{id}.custom.yaml")))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let source_active = custom_text
+        .as_deref()
+        .map(|text| managed_custom::is_managed(text) && managed_custom::customization_active(text))
+        == Some(true);
+    if custom_text.is_some() && !source_active {
+        // 用户自己写的 / 用户主动关掉了定制：既不改，也不报缺口。
+        return PUNCT_SKIPPED;
+    }
+    let artifact_text = fs::read(rime_dir.join("build").join(format!("{id}.schema.yaml")))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let artifact_has_punct = artifact_text.as_deref().map(artifact_text_has_punct) == Some(true);
+    if !source_active && !artifact_has_punct {
+        // 既没有受管的配置、产物里也没有 punct → 不预期 → 一律不报。
+        return PUNCT_SKIPPED;
+    }
+    if source_active {
+        // 只有「这份文件自己定义了 processors 列表」才归 config-missing；
+        // 没定义的话处理器列表来自共享方案，不在这里下结论。
+        if let Some(list) = custom_text
+            .as_deref()
+            .and_then(managed_custom::source_processors)
+        {
+            if !list.iter().any(|name| name == PUNCT_PROCESSOR) {
+                return PUNCT_SOURCE_MISSING;
+            }
+        }
+    }
+    match artifact_text.as_deref() {
+        None => {
+            // 产物压根没有 = 还没编译过，不算缺口（build 不可用由 assess 判）。
+            if data_dirs
+                .iter()
+                .any(|dir| dir.join(format!("{id}.schema.yaml")).is_file())
+            {
+                PUNCT_NO_ARTIFACT
+            } else {
+                PUNCT_SKIPPED
+            }
+        }
+        Some(text) => {
+            if artifact_text_has_punct(text) {
+                PUNCT_OK
+            } else if engine_support == ExtraSupport::Unsupported {
+                // 来源侧要 punct、产物里却没有、而本机引擎根本不认识这个组件：
+                // 这不是「还没重编译」，是引擎本体的问题 ⇒ 补配置只会弄坏方案。
+                PUNCT_ENGINE_UNSUPPORTED
+            } else {
+                PUNCT_ARTIFACT_STALE
+            }
+        }
+    }
+}
+
+/// 引擎本体（不是配置）认不认识 rimesync_punct。
+///
+/// 判据：系统引擎库里有没有这个组件。找到引擎库却都没有 ⇒ 确定不支持
+/// （多半是发行版 librime）；一个都没找到 ⇒ 判断不了。
+/// 编译产物**不**作为判据：产物可能来自随包预编译拷贝，不能证明本机引擎支持。
+fn punct_engine_support() -> ExtraSupport {
+    let libs = system_engine_libs();
+    if libs.is_empty() {
+        return ExtraSupport::Unknown;
+    }
+    let mut found = false;
+    for lib in &libs {
+        found = true;
+        if file_has_marker_with(lib, PUNCT_PROCESSOR.as_bytes()) {
+            return ExtraSupport::Supported;
+        }
+    }
+    if found {
+        ExtraSupport::Unsupported
+    } else {
+        ExtraSupport::Unknown
+    }
+}
+
+/// 产物里是不是有 rimesync_punct 处理器（只读）。
+///
+/// managed_custom 只提供 numpad 的同类判定，punct 的判定放在这里，
+/// 免得「一个组件一份口径」。
+fn artifact_text_has_punct(text: &str) -> bool {
+    if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) {
+        if let Some(list) = value
+            .get("engine")
+            .and_then(|engine| engine.get("processors"))
+            .and_then(serde_yaml::Value::as_sequence)
+        {
+            return list
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .any(|name| name == PUNCT_PROCESSOR);
+        }
+    }
+    // 产物结构不是预期时退回文本判断（宁可宽判，也不要漏判）。
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == PUNCT_PROCESSOR || trimmed == format!("- {PUNCT_PROCESSOR}")
+    })
+}
+
+/// 缺口的人话下一步（用户照着就能做）。
+fn punct_hint(missing: &[String], engine_support: ExtraSupport) -> String {
+    let engine: Vec<&str> = missing
+        .iter()
+        .filter(|item| item.ends_with(PUNCT_ENGINE_UNSUPPORTED))
+        .map(String::as_str)
+        .collect();
+    if !engine.is_empty() || engine_support == ExtraSupport::Unsupported {
+        // 引擎本体不支持时，补配置是有害的（方案会整个不可用）：必须换输入法本体。
+        return "本机输入法引擎不认识 rimesync_punct（中文标点直出）：需要换装 rime-sync 自建的输入法本体（补配置只会让方案整个不可用）。".to_string();
+    }
+    let source: Vec<&str> = missing
+        .iter()
+        .filter(|item| item.ends_with(PUNCT_SOURCE_MISSING))
+        .map(String::as_str)
+        .collect();
+    if !source.is_empty() {
+        return format!(
+            "用户 custom.yaml（{}）里还缺 rimesync_punct 处理器：再点一次「修复输入法」把它补上（补上后还需要重编译一次）。",
+            source.join(" ")
+        );
+    }
+    let artifact: Vec<&str> = missing
+        .iter()
+        .filter(|item| item.ends_with(PUNCT_ARTIFACT_STALE))
+        .map(String::as_str)
+        .collect();
+    let ids = artifact.join(" ");
+    if cfg!(windows) {
+        format!(
+            "标点直出处理器（rimesync_punct）还没编译进产物（{ids}）：请再点一次「修复输入法」，它会触发进程内部署重编译。"
+        )
+    } else {
+        format!(
+            "标点直出处理器（rimesync_punct）还没编译进产物（{ids}）：请重启一次输入法，引擎启动/维护时会自动重编译。"
+        )
+    }
+}
+
 /// 一次 config 模板播种的结果（安装版首次启动用）。
 ///
 /// 语义与旧 NSIS 钩子的 RimeSyncSeedRimeConfig 一致：
@@ -950,6 +1182,12 @@ pub struct Options {
     /// true = 每次 ensure 都保证 default.custom.yaml 在位（幂等：缺才写）。
     /// Install/Fix 模式：true。Bootstrap：false（启动期不做多余写入）。
     pub always_config: bool,
+    /// 注入的输入法触发器（配置变更后重建用）。
+    ///
+    /// 缺省 = 按平台默认触发器（platform::default_trigger，读配置里的
+    /// stop_fcitx5_during_apply）。注入是为了让「配置变更后重建」这条路径
+    /// 在测试里可断言（FakeTrigger），生产调用方不需要改动。
+    pub trigger: Option<Arc<dyn crate::platform::RimeTrigger>>,
 }
 
 /// 手写 Debug：data_resolver 是闭包（没有 Debug）。
@@ -973,6 +1211,7 @@ impl std::fmt::Debug for Options {
             )
             .field("prune", &self.prune)
             .field("always_config", &self.always_config)
+            .field("trigger", &self.trigger.as_ref().map(|_| "injected"))
             .finish()
     }
 }
@@ -993,6 +1232,7 @@ impl Default for Options {
             data_resolver: None,
             prune: false,
             always_config: false,
+            trigger: None,
         }
     }
 }
@@ -1117,6 +1357,21 @@ impl Options {
         self.always_config = always;
         self
     }
+
+    /// 注入输入法触发器（配置变更后重建用）。
+    ///
+    /// 生产调用方一般不注入（走平台默认触发器）；测试注入 FakeTrigger 就能断言
+    /// 「重建真的发生了、走的哪条路径」。
+    /// 注入重建触发器。接受 `Arc<dyn RimeTrigger>` 与 `Box<dyn RimeTrigger>`
+    /// 两种：平台默认触发器给的是 Box（`platform::default_trigger`），测试里
+    /// 习惯用 Arc，两边都不该被迫改写。
+    pub fn with_trigger(
+        mut self,
+        trigger: impl Into<Arc<dyn crate::platform::RimeTrigger>>,
+    ) -> Self {
+        self.trigger = Some(trigger.into());
+        self
+    }
 }
 
 /// 一次 ensure 的结论。**只能**由最终 assess 与本次实际动作推出。
@@ -1194,6 +1449,8 @@ pub struct Outcome {
     pub prune: prune::PruneReport,
     /// 常驻小键盘判定（部署之后判的；CLI/GUI 都读这一份，不许自己再算一遍）。
     pub numpad: NumpadStatus,
+    /// 常驻标点直出判定（部署之后判的；与 numpad 同一份口径）。
+    pub punct: PunctStatus,
 }
 
 impl Outcome {
@@ -1280,6 +1537,7 @@ fn failed_outcome(
         config_skipped: Vec::new(),
         prune: prune::PruneReport::default(),
         numpad: assess_numpad(rime_dir, data_dirs),
+        punct: assess_punct(rime_dir, data_dirs),
     }
 }
 
@@ -1337,6 +1595,25 @@ fn repair_user_customs(rime_dir: &Path) -> (bool, Vec<String>, Vec<String>, Vec<
         }
     }
     (changed, repaired, details, errors)
+}
+
+/// 重建用的触发器：优先用注入的（测试可断言），否则按平台默认。
+///
+/// 平台默认触发器要读配置里的 stop_fcitx5_during_apply —— Linux 上为了
+/// rime_deployer --build 需不需要停 fcitx5，取决于用户的设置。
+fn rebuild_trigger(opts: &Options) -> Box<dyn crate::platform::RimeTrigger> {
+    if let Some(trigger) = &opts.trigger {
+        // Arc<dyn> 克隆出来还是 Arc，要转回 Box 才能和平台默认触发器同类型。
+        return Box::new(trigger.clone());
+    }
+    crate::platform::default_trigger(stop_fcitx5_during_apply())
+}
+
+/// 配置里的「apply 期间停 fcitx5」开关；读不到配置就按默认（true）。
+fn stop_fcitx5_during_apply() -> bool {
+    crate::config::Config::load(&crate::config::default_config_path())
+        .map(|config| config.stop_fcitx5_during_apply)
+        .unwrap_or(true)
 }
 
 /// **唯一入口**：assess → （不满足才）铺 prebuilt → （需要才）patch data →
@@ -1773,25 +2050,44 @@ pub fn ensure(
         actions.push(Action::new("merged-pointer", true, detail));
     }
 
-    // 指针写进 custom.yaml 之后必须重编译 build/ 才算真的生效。
+    // ---- 配置变更后的重建（统一入口）--------------------------------------
     //
-    // Windows 不用在这里管：部署闸门把 pointer_changed 算进 changed，走进程内
-    // 部署（crate::librime::deploy）时会顺带重编译。
-    // Linux 的部署闸门是 no-op（platform:linux-keeps-existing-deploy），所以
-    // 这里显式跑一次 rime_deployer --build。
+    // 自定义 custom.yaml 被修好（numpad 等增强组件补上）、或者合并词典指针写
+    // 进去了 —— 这两种都改的是用户目录里的 <id>.custom.yaml。librime 只有
+    // **重编译**才会把新内容编进 build/ 产物，否则配置只是躺在磁盘上，用户看到
+    // 的就是「报告说 ok、配置没生效」：Linux 上修完 custom.yaml 不重编译（要等
+    // 重启输入法才生效），Windows 进程内部署当场重编译 —— 两端表现不一致。
     //
-    // 2026-11-11 在 228 上实测：fcitx5-remote -r 与 DBus 的 ReloadConfig 都
-    // 不会让 librime 重编译（build/ 产物 mtime 不变、引擎日志零新增），只有
-    // rime_deployer --build 会。所以这里不用 reload。
-    #[cfg(not(windows))]
-    if pointer_changed && opts.deploy && opts.mode != Mode::Bootstrap {
-        if let Some(shared) = data_dirs.first() {
-            let outcome = crate::data_patch::rebuild_after_config_change(rime_dir, shared);
-            actions.push(Action::new(
-                "merged-pointer-rebuild",
-                outcome == crate::data_patch::DeployOutcome::Ok,
-                format!("result={}", outcome.as_str()),
-            ));
+    // 平台差异收在 deploy::recompile_after_config_change 里：
+    //   Windows → manual_deploy（进程内 librime 部署，当场重编译）
+    //   Linux   → redeploy_after_config_change（停 fcitx5 → rime_deployer --build
+    //             → 起 fcitx5）。2026-11-11 在 228 实测：fcitx5-remote -r 与
+    //             DBus 的 ReloadConfig 都不会重编译，只有 rime_deployer --build 会。
+    //
+    // 一轮只重建一次：custom.yaml 修好了、指针也写了 ⇒ 仍然只重建一次。
+    let config_changed = custom_repair_changed || pointer_changed;
+    let need_rebuild = config_changed && opts.deploy && opts.mode != Mode::Bootstrap;
+    // Windows 的部署闸门（下面的 prebuilt::finish_deploy）里那一次进程内 librime
+    // 部署**就是**重建（当场重编译）⇒ 那里不再单独重建，否则一轮编译两次；
+    // 别的平台闸门是 no-op，必须在这里显式重建。
+    let rebuild_by_deploy_gate = cfg!(windows);
+    let mut rebuild_error: Option<String> = None;
+    if need_rebuild && !rebuild_by_deploy_gate {
+        let trigger = rebuild_trigger(opts);
+        match deploy::recompile_after_config_change(trigger.as_ref(), rime_dir) {
+            Ok(()) => {
+                actions.push(Action::new("config-rebuild", true, "result=ok"));
+            }
+            Err(error) => {
+                // 重建失败不能吞：配置已经落盘却没编译进产物，如实降级。
+                tracing::error!("recompile after config change failed: {error:#}");
+                rebuild_error = Some(format!("{error:#}"));
+                actions.push(Action::new(
+                    "config-rebuild",
+                    false,
+                    format!("result=failed {error:#}"),
+                ));
+            }
         }
     }
     actions.push(Action::new(
@@ -1869,11 +2165,34 @@ pub fn ensure(
         ));
     }
 
+    // Windows：重建由上面的部署闸门（进程内 librime 部署）完成，这里如实反映
+    // 它的结局 —— inproc 没成功就等于「配置落盘了但没编译进产物」，不能报成功。
+    if need_rebuild && rebuild_by_deploy_gate {
+        // deploy_method=inproc 只在「进程内 librime 部署成功」时才会出现
+        // （见 deploy::decide：inproc_ok ⇒ method=inproc）。
+        let compiled = report.deploy_method == "inproc" && report.deploy_ok;
+        actions.push(Action::new(
+            "config-rebuild",
+            compiled,
+            format!(
+                "method=deploy-gate deploy_result={} inproc={}",
+                report.deploy_result, report.deploy_inproc
+            ),
+        ));
+        if !compiled {
+            rebuild_error = Some(format!(
+                "部署闸门没有完成进程内部署（{}）",
+                report.deploy_inproc
+            ));
+        }
+    }
+
     // ---- 常驻小键盘判定（缺陷三）--------------------------------------------
     // 每轮都重新判，不看「本轮修过谁」：修完用户 custom.yaml 之后引擎一直没
     // 重编译的话，后续轮次必须继续报 —— 否则又回到「报告说 ok、小键盘其实用不了」
     // 的静默失败（缺陷三当初就是这么悄悄发布出去的）。
     let numpad = assess_numpad(rime_dir, &data_dirs);
+    let punct = assess_punct(rime_dir, &data_dirs);
     actions.push(Action::new("numpad", false, numpad.detail.join(" ")));
     // 兼容旧动作名：本轮修过的方案，产物里有没有 numpad。
     // 取值来自同一份判定结果，不另做一套判据。
@@ -1954,6 +2273,11 @@ pub fn ensure(
                 "custom_repair_failed={}",
                 custom_repair_errors.join(" | ")
             ));
+        }
+        // 重建失败：配置写进磁盘了却没编译进 build/ 产物 —— 用户看到的就是
+        // 「报告说修好了、输入法还是老样子」。必须降级，不许报 ok。
+        if let Some(error) = &rebuild_error {
+            problems.push(format!("config_rebuild_failed={error}"));
         }
         // 小键盘没生效：产物里没有 numpad 处理器 = 用户按小键盘还是打不出数字。
         // 不降级就会报 ok —— 那正是缺陷三当初的静默失败。
@@ -2045,6 +2369,7 @@ pub fn ensure(
         config_skipped,
         prune: prune_report,
         numpad,
+        punct,
     }
 }
 
@@ -2087,6 +2412,142 @@ mod tests {
         fs::write(&path, vec![0u8; 200 * 1024]).expect("write");
         assert!(!super::file_has_marker(&path));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 受管的用户 custom.yaml：processors 里**没有** rimesync_punct。
+    const PUNCT_CUSTOM_WITHOUT_PUNCT: &str = "\
+# 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
+# schema: wubi86
+patch:
+  engine/processors:
+    - ascii_composer
+    - rimesync_vselect
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+  engine/translators:
+    - rimesync_vnum
+    - punct_translator
+";
+
+    /// 受管的用户 custom.yaml：processors 里有 rimesync_punct。
+    const PUNCT_CUSTOM_WITH_PUNCT: &str = "\
+# 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
+# schema: wubi86
+patch:
+  engine/processors:
+    - ascii_composer
+    - rimesync_punct
+    - rimesync_vselect
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+  engine/translators:
+    - rimesync_vnum
+    - punct_translator
+";
+
+    /// 编译产物：有 punct。
+    const PUNCT_ARTIFACT_WITH: &str = "\
+engine:
+  processors:
+    - ascii_composer
+    - rimesync_punct
+    - selector
+";
+
+    /// 编译产物：没有 punct。
+    const PUNCT_ARTIFACT_WITHOUT: &str = "\
+engine:
+  processors:
+    - ascii_composer
+    - selector
+";
+
+    fn punct_fixture(tag: &str, custom: &str, artifact: Option<&str>) -> PathBuf {
+        let dir = tmp_file(tag);
+        fs::write(dir.join("wubi86.custom.yaml"), custom).expect("write custom");
+        if let Some(artifact) = artifact {
+            fs::create_dir_all(dir.join("build")).expect("mkdir build");
+            fs::write(dir.join("build").join("wubi86.schema.yaml"), artifact)
+                .expect("write artifact");
+        }
+        dir
+    }
+
+    #[test]
+    fn punct_config_missing_is_distinct_from_engine_unsupported() {
+        // 配置缺 punct：补配置就行（补丁路径会补）。
+        let dir = punct_fixture(
+            "punct-config-missing",
+            PUNCT_CUSTOM_WITHOUT_PUNCT,
+            Some(PUNCT_ARTIFACT_WITH),
+        );
+        assert_eq!(
+            super::punct_state(&dir, &[], "wubi86", super::ExtraSupport::Supported),
+            "config-missing"
+        );
+        // 引擎不支持 punct：补配置是有害的（方案会整个不可用），必须换输入法本体。
+        let dir = punct_fixture(
+            "punct-engine-unsupported",
+            PUNCT_CUSTOM_WITH_PUNCT,
+            Some(PUNCT_ARTIFACT_WITHOUT),
+        );
+        assert_eq!(
+            super::punct_state(&dir, &[], "wubi86", super::ExtraSupport::Unsupported),
+            "engine-unsupported"
+        );
+        // 同一个产物，引擎支持 → 只是还没重编译。
+        assert_eq!(
+            super::punct_state(&dir, &[], "wubi86", super::ExtraSupport::Supported),
+            "artifact-stale"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn punct_ok_when_both_source_and_artifact_have_it() {
+        let dir = punct_fixture(
+            "punct-ok",
+            PUNCT_CUSTOM_WITH_PUNCT,
+            Some(PUNCT_ARTIFACT_WITH),
+        );
+        assert_eq!(
+            super::punct_state(&dir, &[], "wubi86", super::ExtraSupport::Supported),
+            "ok"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn punct_skipped_for_user_owned_custom() {
+        // 用户自己写的 custom.yaml：既不改也不报缺口。
+        let dir = punct_fixture(
+            "punct-user-owned",
+            "patch:\n  engine/processors:\n    - selector\n",
+            Some(PUNCT_ARTIFACT_WITHOUT),
+        );
+        assert_eq!(
+            super::punct_state(&dir, &[], "wubi86", super::ExtraSupport::Supported),
+            "skipped"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn punct_hint_distinguishes_the_two_problems() {
+        let engine = super::punct_hint(
+            &["wubi86=engine-unsupported".to_string()],
+            super::ExtraSupport::Unsupported,
+        );
+        assert!(engine.contains("换装"), "{engine}");
+        let config = super::punct_hint(
+            &["wubi86=config-missing".to_string()],
+            super::ExtraSupport::Supported,
+        );
+        assert!(config.contains("修复输入法"), "{config}");
     }
 
     #[test]

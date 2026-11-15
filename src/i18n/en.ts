@@ -531,6 +531,10 @@ export const en: Record<keyof Dict, string> = {
   "fixIme.numpadBad": "Numeric keypad is not in effect: {list}",
   "fixIme.numpadNext": "Restart the input method, then click Repair input method again",
   "fixIme.numpadDetail": "Numeric keypad technical details: {text}",
+  "fixIme.punctOk": "Direct punctuation output is ready",
+  "fixIme.punctBad": "Direct punctuation output is not in effect: {list}",
+  "fixIme.punctNext": "Click Repair input method once to add it; if the engine is reported unsupported, install rime-sync's own input method build",
+  "fixIme.punctDetail": "Direct punctuation technical details: {text}",
 
   // Input method extras (numeric keypad / direct Chinese punctuation / v-to-number):
   // only the rime-sync build has them; a distro Rime does not.

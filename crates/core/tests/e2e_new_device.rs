@@ -20,6 +20,9 @@ use support::{manifest_for, temp_dir, MockDav};
 const MERGED: &str = "merged.dict.yaml";
 const CUSTOM: &str = "luna_pinyin_simp.custom.yaml";
 
+/// 远端那份配置类文件：拉到本地就是一次「配置变了」。
+const REMOTE_CUSTOM: &str = "patch:\n  \"menu/page_size\": 12\n";
+
 const MERGED_YAML: &str =
     "name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n  - local_extra\n...\n";
 const EXTRA_YAML: &str = "name: local_extra\nversion: \"1\"\n...\n";
@@ -188,6 +191,174 @@ fn a_users_own_pointer_is_never_overwritten() {
     assert!(
         !recorded.iter().any(|s| s == "redeploy_after_config_change"),
         "no pointer written -> no redeploy, got {:?}",
+        recorded
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 缺陷一（Windows）：配置类文件拉到本地后必须**真的重编译**。
+///
+/// Windows 的 deploy 只结束 WeaselServer（**不**重编译），所以这一轮必须看到
+/// manual_deploy（进程内 librime 部署，当场重编译），而不是 deploy ——
+/// 走 deploy 的话配置只是躺在磁盘上，用户看到的是「同步成功、配置没生效」。
+#[test]
+fn windows_transport_recompiles_through_manual_deploy() {
+    let (root, rime, state) = workspace("e2e-windows-recompile");
+    let device = "windows-device";
+    let dav = MockDav::start(vec![
+        (
+            "sync/windows-device/config/manifest.json",
+            manifest_for(&[("default.custom.yaml", REMOTE_CUSTOM.as_bytes())]),
+        ),
+        (
+            "sync/windows-device/config/files/default.custom.yaml",
+            REMOTE_CUSTOM.as_bytes().to_vec(),
+        ),
+    ]);
+
+    // 本机没有这份配置 → 这轮会把它拉下来（config_changed=true）。
+    // 模拟 Windows：deploy 不重编译。
+    let trigger = FakeTrigger::new().with_no_recompile();
+    let calls = trigger.calls_shared();
+    let mut config = Config::default();
+    config.webdav.url = dav.url();
+    config.webdav.username = "u".to_string();
+    config.device_id = device.to_string();
+    config.first_sync_policy = FirstSyncPolicy::Normal;
+    let mut engine =
+        Engine::new(config, rime.clone(), state.clone(), Box::new(trigger)).expect("engine");
+
+    let report = engine.transport();
+    assert!(report.ok, "transport must succeed: {:?}", report.error);
+    assert!(
+        report.config_changed,
+        "the pulled custom.yaml is a config change"
+    );
+    assert!(
+        !report.merged_pointer_written,
+        "this round writes no pointer (the rebuild must come from the config change)"
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    assert!(
+        recorded.iter().any(|s| s == "manual_deploy"),
+        "a platform whose deploy does not recompile must use manual_deploy, got {:?}",
+        recorded
+    );
+    assert!(
+        !recorded.iter().any(|s| s == "deploy"),
+        "plain deploy does not recompile on that platform, got {:?}",
+        recorded
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 同一个场景在 Linux 上：配置变了也要重建，而且走平台自带的重建序列
+/// （停 fcitx5 → rime_deployer --build → 起 fcitx5）。
+#[test]
+fn linux_transport_recompiles_through_the_platform_rebuild() {
+    let (root, rime, state) = workspace("e2e-linux-recompile");
+    let dav = MockDav::start(vec![
+        (
+            "sync/linux-device/config/manifest.json",
+            manifest_for(&[("default.custom.yaml", REMOTE_CUSTOM.as_bytes())]),
+        ),
+        (
+            "sync/linux-device/config/files/default.custom.yaml",
+            REMOTE_CUSTOM.as_bytes().to_vec(),
+        ),
+    ]);
+
+    let trigger = FakeTrigger::new();
+    let calls = trigger.calls_shared();
+    let mut config = Config::default();
+    config.webdav.url = dav.url();
+    config.webdav.username = "u".to_string();
+    config.device_id = "linux-device".to_string();
+    config.first_sync_policy = FirstSyncPolicy::Normal;
+    let mut engine =
+        Engine::new(config, rime.clone(), state.clone(), Box::new(trigger)).expect("engine");
+
+    let report = engine.transport();
+    assert!(report.ok, "transport must succeed: {:?}", report.error);
+    assert!(
+        report.config_changed,
+        "the pulled custom.yaml is a config change"
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    assert!(
+        recorded.iter().any(|s| s == "redeploy_after_config_change"),
+        "Linux must rebuild after a config change, got {:?}",
+        recorded
+    );
+    assert!(
+        !recorded.iter().any(|s| s == "manual_deploy"),
+        "manual_deploy is the Windows path, got {:?}",
+        recorded
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 一轮里既有配置变更、又有合并词典指针写入 ⇒ 只重建一次。
+///
+/// 重建是重操作（要停输入法、要编译）：两种变更共用同一条重建路径，
+/// 不能编译两次。
+#[test]
+fn one_round_with_several_changes_rebuilds_only_once() {
+    let (root, rime, state) = workspace("e2e-one-rebuild");
+    let dav = MockDav::start(vec![
+        (
+            "sync/multi-device/config/manifest.json",
+            manifest_for(&[("default.custom.yaml", REMOTE_CUSTOM.as_bytes())]),
+        ),
+        (
+            "sync/multi-device/config/files/default.custom.yaml",
+            REMOTE_CUSTOM.as_bytes().to_vec(),
+        ),
+    ]);
+
+    // 方案本体 + 合并词典都在用户目录里 ⇒ 这一轮会补写合并词典指针。
+    write_schema(&rime);
+    write(
+        &rime.join(MERGED),
+        "name: merged\nversion: \"2026.11.11\"\nimport_tables:\n  - luna_pinyin\n...\n",
+    );
+    // 用户自己写的 custom.yaml：还没有指针 ⇒ 指针会被补写（配置变更之一）。
+    write(&rime.join(CUSTOM), "patch:\n  \"menu/page_size\": 8\n");
+
+    let trigger = FakeTrigger::new();
+    let calls = trigger.calls_shared();
+    let mut config = Config::default();
+    config.webdav.url = dav.url();
+    config.webdav.username = "u".to_string();
+    config.device_id = "multi-device".to_string();
+    config.first_sync_policy = FirstSyncPolicy::Normal;
+    let mut engine =
+        Engine::new(config, rime.clone(), state.clone(), Box::new(trigger)).expect("engine");
+
+    let report = engine.transport();
+    assert!(report.ok, "transport must succeed: {:?}", report.error);
+    assert!(report.config_changed, "config changed");
+    assert!(
+        report.merged_pointer_written,
+        "the pointer must be written in this round"
+    );
+
+    let recorded = calls.lock().expect("lock").clone();
+    println!("trigger calls: {:?}", recorded);
+    let rebuilds = recorded
+        .iter()
+        .filter(|step| *step == "redeploy_after_config_change")
+        .count();
+    assert_eq!(
+        rebuilds, 1,
+        "several changes in one round must rebuild exactly once, got {:?}",
         recorded
     );
 

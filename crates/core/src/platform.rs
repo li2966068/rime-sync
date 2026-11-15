@@ -61,6 +61,49 @@ pub trait RimeTrigger: Send + Sync {
     }
 }
 
+/// Arc<dyn RimeTrigger> 本身也能当触发器用。
+///
+/// 为什么需要：上层（ime_state 的 Options）要能**注入**触发器，Options 得 Clone
+/// ⇒ 只能存 Arc；而各处调用点统一按 &dyn RimeTrigger 传 ⇒ 这里补一层转发，
+/// 注入的和平台默认的触发器走完全相同的代码路径。
+impl RimeTrigger for Arc<dyn RimeTrigger> {
+    fn sync_userdb(&self, rime_dir: &Path) -> Result<()> {
+        (**self).sync_userdb(rime_dir)
+    }
+
+    fn deploy(&self, rime_dir: &Path) -> Result<()> {
+        (**self).deploy(rime_dir)
+    }
+
+    fn manual_deploy(&self, rime_dir: &Path) -> Result<()> {
+        (**self).manual_deploy(rime_dir)
+    }
+
+    fn deploy_recompiles(&self) -> bool {
+        (**self).deploy_recompiles()
+    }
+
+    fn redeploy_after_config_change(&self, rime_dir: &Path) -> Result<()> {
+        (**self).redeploy_after_config_change(rime_dir)
+    }
+
+    fn stop_ime(&self) -> Result<()> {
+        (**self).stop_ime()
+    }
+
+    fn start_ime(&self) -> Result<()> {
+        (**self).start_ime()
+    }
+
+    fn export_userdb(&self, rime_dir: &Path, schema: &str, dest: &Path) -> Result<()> {
+        (**self).export_userdb(rime_dir, schema, dest)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
 pub fn command_exists(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;

@@ -168,20 +168,163 @@ cleanup_files() {
 
 # ------------------------------------------------- 用户数据路径（白名单解析）
 # Rime 用户目录：fcitx5 的 rime addon 把自定义目录记在 rime.conf 的 UserDataDirPath。
-rime_user_dir() {
-  local home=$1 conf raw=""
-  conf="$home/.config/fcitx5/conf/rime.conf"
-  if [ -r "$conf" ]; then
-    raw=$(sed -n 's/^[[:space:]]*UserDataDirPath[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null | head -n 1)
-    raw=$(printf '%s' "$raw" | sed 's/[[:space:]]*$//; s/^"//; s/"$//')
+#
+# 这里必须和安装器（packaging/linux/postinst 的 resolve_rime_user_dir）、
+# 以及 Rust 侧（crates/core/src/rime_dir.rs 的 parse_fcitx5_user_data_dir）
+# 用**同一套规则**：否则卸载器算出来的目录和安装器不是同一个，
+# 卸载 --purge-data 就会删错目录（用户真正在用的词库留着，别的目录被删）。
+#
+# 规则（逐条对应 Rust 侧）：
+#   1. 分隔符 = 与 : 都支持，值是分隔符之后的全部内容（允许含 =）；
+#   2. 键名去空白后必须正好是 UserDataDirPath；
+#   3. 值去两端空白，再剥掉**成对**的双引号或单引号；
+#   4. 空值视为未设置；
+#   5. ~ 展开为 HOME，~/xxx 展开为 $HOME/xxx；
+#   6. 必须是绝对路径：相对路径按未设置处理（fcitx5 引擎也拒绝相对路径，
+#      见 third_party/fcitx5-rime/src/rimeengine.cpp 的 resolveRimeUserDir）；
+#   7. 去掉末尾斜杠（根目录除外）。
+#
+# 优先用 rime-sync-cli detect --json 取权威值；CLI 没装时用下面这份
+# 与 Rust 等价的本地解析兜底。
+#
+# 注意：bash 的 case pattern 与 ${var#pattern} 会先做 tilde 展开，
+# 判断 "~/xxx" 前缀必须用字符串切片 ${value:0:2}。
+
+# ---------------------------------------------------------------- 配置根目录（XDG）
+# 三个脚本（postinst / uninstall.sh / install-extra-ime.sh）取「配置目录」的地方
+# 统一走这里，规则与 Rust 侧 crates/core/src/rime_dir.rs 的 config_home() 一致：
+# 「XDG_CONFIG_HOME 优先，缺省 ~/.config」。
+#
+# 为什么不能直接写 ${XDG_CONFIG_HOME:-$HOME/.config}：这三个脚本以 root 跑
+# （pkexec 调卸载器），进程里的 XDG_CONFIG_HOME 是 **root 的**，
+# 而我们要找的是**桌面用户**的。优先级（**三个脚本必须逐条一致**）：
+#   1. RIMESYNC_TARGET_CONFIG_HOME：显式指定（安装器 / 测试注入）。
+#   2. 目标用户环境文件里导出的 XDG_CONFIG_HOME：~/.pam_environment、
+#      ~/.config/environment、~/.profile、~/.bashrc
+#      （只认行首的 `XDG_CONFIG_HOME=` 或 `export XDG_CONFIG_HOME=`）。
+#   3. 当前进程环境里的 XDG_CONFIG_HOME —— 只在 home 就是当前 $HOME 时才认。
+#   4. $home/.config（XDG 缺省值）。
+resolve_config_home() { # $1=目标用户 HOME
+  local home=$1 value="" file=""
+  [ -n "$home" ] || { printf ''; return 0; }
+  if [ -n "${RIMESYNC_TARGET_CONFIG_HOME:-}" ]; then
+    printf '%s' "$RIMESYNC_TARGET_CONFIG_HOME"
+    return 0
   fi
-  case "$raw" in
-    ""|"~"|"~/") printf '%s\n' "$home/.local/share/fcitx5/rime"; return 0 ;;
-    "~/"*) raw=$home/${raw#\~/} ;;
+  for file in "$home/.pam_environment" "$home/.config/environment" \
+    "$home/.profile" "$home/.bashrc"; do
+    [ -r "$file" ] || continue
+    value=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?XDG_CONFIG_HOME=' \
+      "$file" 2>/dev/null || true)
+    [ -n "$value" ] || continue
+    value=${value#*=}
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    value=${value#\"}
+    value=${value%\"}
+    value=${value#\'}
+    value=${value%\'}
+    # $HOME / ~ 展开成目标用户的 home（用字符串切片，不用 glob）。
+    if [ "${value:0:6}" = '$HOME/' ]; then
+      value=$home/${value:6}
+    elif [ "${value:0:2}" = '~/' ]; then
+      value=$home/${value:2}
+    fi
+    case "$value" in
+      /*) printf '%s' "$value"; return 0 ;;
+    esac
+  done
+  if [ "$home" = "${HOME:-}" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s' "$XDG_CONFIG_HOME"
+    return 0
+  fi
+  printf '%s' "$home/.config"
+}
+
+# 本地解析 rime.conf 的 UserDataDirPath；未设置时输出空串。
+parse_rime_user_data_dir() { # $1=目标用户的 HOME
+  local home=$1 conf="" line="" key="" value=""
+  [ -n "$home" ] || { printf ''; return 0; }
+  conf="$(resolve_config_home "$home")/fcitx5/conf/rime.conf"
+  if [ -r "$conf" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      case "$line" in
+        ""|\#*|\[* ) continue ;;
+      esac
+      key=""
+      value=""
+      case "$line" in
+        *=*) key=${line%%=*}; value=${line#*=} ;;
+      esac
+      key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [ "$key" != "UserDataDirPath" ]; then
+        key=""
+        value=""
+        case "$line" in
+          *:*) key=${line%%:*}; value=${line#*:} ;;
+        esac
+        key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [ "$key" = "UserDataDirPath" ] || continue
+      fi
+      break
+    done <"$conf"
+  fi
+  value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$value" in
+    \"*\") value=${value#\"}; value=${value%\"} ;;
+    \'*\') value=${value#\'}; value=${value%\'} ;;
   esac
-  # 去尾斜杠（"/" 除外）
-  while [ "${raw%/}" != "$raw" ] && [ "$raw" != "/" ]; do raw=${raw%/}; done
-  printf '%s\n' "$raw"
+  value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$value" ] || { printf ''; return 0; }
+  if [ "$value" = "~" ]; then
+    value=$home
+  elif [ "${value:0:2}" = "~/" ]; then
+    value=$home/${value:2}
+  fi
+  case "$value" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*) : ;;
+    *) printf ''; return 0 ;;
+  esac
+  while [ "${value%/}" != "$value" ] && [ "$value" != "/" ]; do value=${value%/}; done
+  if [ ${#value} -eq 2 ] && [ "${value:1:1}" = ":" ]; then value="$value/"; fi
+  printf '%s' "$value"
+}
+
+# 用 CLI 取权威值：输出 "路径|来源"；CLI 不可用时输出空串。
+rime_user_dir_from_cli() { # $1=目标用户的 HOME
+  local home=$1 json="" path="" source=""
+  [ -n "$home" ] || return 0
+  command -v rime-sync-cli >/dev/null 2>&1 || return 0
+  json=$(HOME="$home" XDG_CONFIG_HOME="$(resolve_config_home "$home")" RIME_USER_DATA_DIR= \
+    rime-sync-cli detect --json 2>/dev/null || true)
+  path=$(printf '%s' "$json" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  source=$(printf '%s' "$json" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  [ -n "$path" ] || return 0
+  printf '%s|%s' "$path" "$source"
+}
+
+# Rime 用户目录（权威值优先，本地同规则解析兜底）。
+rime_user_dir() {
+  local home=$1 local_value="" cli_value="" cli_source=""
+  [ -n "$home" ] || { printf '\n'; return 0; }
+  local_value=$(parse_rime_user_data_dir "$home")
+  cli_value=$(rime_user_dir_from_cli "$home")
+  cli_source=${cli_value#*|}
+  cli_value=${cli_value%%|*}
+  # known:xxx 表示 CLI 因为该目录当时不存在而回退到了候选目录列表；
+  # 这种情况下 fcitx5 引擎用的仍是 rime.conf 里的目录，以本地解析为准。
+  if [ -n "$cli_value" ] && [ "${cli_source#known:}" != "$cli_source" ]; then
+    cli_value=""
+  fi
+  if [ -n "$cli_value" ]; then
+    printf '%s\n' "$cli_value"
+    return 0
+  fi
+  if [ -n "$local_value" ]; then
+    printf '%s\n' "$local_value"
+    return 0
+  fi
+  printf '%s\n' "$home/.local/share/fcitx5/rime"
 }
 
 # 绝对路径、严格位于 home 之下、不等于 home 本身、不是根目录
@@ -220,8 +363,10 @@ add_purge_candidate() {
 
 if [ -n "$INVOKER_HOME" ]; then
   add_purge_candidate "$(rime_user_dir "$INVOKER_HOME")"
-  add_purge_candidate "$INVOKER_HOME/.config/com.rimesync.app"
-  add_purge_candidate "$INVOKER_HOME/.config/rime-sync"
+  # 配置目录（XDG_CONFIG_HOME 优先，缺省 ~/.config）。
+  INVOKER_CONFIG_HOME=$(resolve_config_home "$INVOKER_HOME")
+  add_purge_candidate "$INVOKER_CONFIG_HOME/com.rimesync.app"
+  add_purge_candidate "$INVOKER_CONFIG_HOME/rime-sync"
 fi
 
 # -------------------------------------------------------------------- plan
@@ -287,10 +432,11 @@ cleanup_files \
 # 开机自启由应用自身以用户身份写入（tauri-plugin-autostart），root 脚本只能按
 # 已知文件名清理调用者的那一份，绝不遍历其他用户的目录。
 if [ -n "$INVOKER_HOME" ]; then
+  # autostart 目录也在配置根下（XDG_CONFIG_HOME 优先，缺省 ~/.config）。
   cleanup_files \
-    "$INVOKER_HOME/.config/autostart/rime-sync.desktop" \
-    "$INVOKER_HOME/.config/autostart/rime-sync-app.desktop" \
-    "$INVOKER_HOME/.config/autostart/com.rimesync.app.desktop"
+    "$(resolve_config_home "$INVOKER_HOME")/autostart/rime-sync.desktop" \
+    "$(resolve_config_home "$INVOKER_HOME")/autostart/rime-sync-app.desktop" \
+    "$(resolve_config_home "$INVOKER_HOME")/autostart/com.rimesync.app.desktop"
 fi
 
 # 刷新菜单缓存（工具不存在就跳过）
@@ -354,8 +500,8 @@ else
   say "---- 保留的用户数据（未删除）----"
   if [ -n "$INVOKER_HOME" ]; then
     say "  $(rime_user_dir "$INVOKER_HOME")   Rime 用户词库与方案自定义"
-    say "  $INVOKER_HOME/.config/com.rimesync.app   同步配置与备份"
-    say "  $INVOKER_HOME/.config/rime-sync          旧版配置目录（若存在）"
+    say "  $(resolve_config_home "$INVOKER_HOME")/com.rimesync.app   同步配置与备份"
+    say "  $(resolve_config_home "$INVOKER_HOME")/rime-sync          旧版配置目录（若存在）"
   else
     say "  ~/.local/share/fcitx5/rime               Rime 用户词库与方案自定义"
     say "  ~/.config/com.rimesync.app               同步配置与备份"

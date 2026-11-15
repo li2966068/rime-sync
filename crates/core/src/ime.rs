@@ -7,7 +7,8 @@
 //!
 //! 判定（与 NSIS 钩子的 RimeSyncWeaselReady 同一判据）：
 //! 注册表 WeaselRoot/InstallDir 有值 → 目录里真有 WeaselServer.exe（直接在根目录，
-//! 或在 weasel-* 版本目录里）→ 同目录的 rime.dll 里能搜到 rimesync_vnum。
+//! 或在 weasel-* 版本目录里）→ 同目录的 rime.dll 里能搜到全部插件标记
+//! （rimesync_vnum + rimesync_punct，少一个都不算我们的构建）。
 //! 任一条不满足都算「输入法缺失 / 不是我们的构建」，触发静默安装。
 //!
 //! 纪律：安装器参数固定 /S /NOREBOOT（绝不重启机器），最多等 300 秒（与 NSIS 钩子
@@ -44,7 +45,27 @@ pub const RIME_DLL: &str = "rime.dll";
 /// NSIS 安装版写在 exe 同级的卸载器（便携判据用）。
 pub const UNINSTALL_FILE: &str = "uninstall.exe";
 /// 我们自己的 librime 插件标记（插件合进 rime.dll 后是 ASCII 明文）。
-pub const PLUGIN_MARKER: &str = "rimesync_vnum";
+///
+/// 判据与 prebuilt::MARKERS 一致（两个标记都得在）：只带 rimesync_vnum 的引擎是
+/// 旧构建 —— 它不认识 rimesync_punct，中文标点直出根本用不了，却被判成「健康」，
+/// 于是永远不触发换装（缺陷 D6）。这里直接复用 prebuilt 的清单，两端不会再漂。
+///
+/// **为什么这里是「全部齐备」（&& 语义），而 `ime_state::assess_extra_support`
+/// 是「任一有就行」（|| 语义）—— 两处问的不是同一件事，不要互相「统一」：**
+///
+/// * 本处（Weasel 健康判据）问的是「**这个输入法本体是不是我们自建的那一份**」。
+///   自建版把 rimesync_vnum / rimesync_punct / rimesync_vselect 一起编进 rime.dll，
+///   少一个就说明它是**别的构建**（旧版或官方 Weasel）⇒ 缺任一标记即判定
+///   plugin-missing、触发换装。判据必须严格，取「任一有就行」会把旧构建放过去。
+/// * `ime_state::assess_extra_support` 问的是「**本机引擎带不带增强功能**」
+///   （一个能力问题，不是身份问题）。只要引擎里有**任意一个** rimesync_* 组件，
+///   就说明它是增强版而不是发行版原版 ⇒ 支持。这里的 || 是有意的宽松判定：
+///   判据松一点的后果只是「不提示用户换输入法」，而判据过严会让一个功能正常的
+///   自建引擎被误判成不支持，反而更糟。
+///
+/// 换句话说：&& 用于**认身份**（是不是我们的构建），|| 用于**认能力**
+/// （有没有增强功能）。把任一处的口径改成另一处都会改错。
+pub const PLUGIN_MARKERS: [&str; 2] = crate::prebuilt::MARKERS;
 
 /// 安装器退出码：拒绝访问 / 需要重启 / UAC 被拒。只在 Windows 与单测里用。
 #[cfg(any(windows, test))]
@@ -67,8 +88,10 @@ pub struct WeaselHealth {
     pub server_exe: String,
     /// 同目录的 rime.dll。
     pub rime_dll: String,
-    /// rime.dll 里是否有 rimesync_vnum。
+    /// rime.dll 里是否含全部插件标记（rimesync_vnum + rimesync_punct）。
     pub plugin: bool,
+    /// rime.dll 里缺了哪些标记（判 unhealthy 时给出可执行的下一步）。
+    pub missing_markers: Vec<String>,
     /// exe-present / registry-missing / root-missing / server-missing /
     /// rime-dll-missing / plugin-missing / rime-dll-unreadable。
     pub reason: String,
@@ -125,14 +148,25 @@ pub fn check_root(root: &Path) -> WeaselHealth {
         return health;
     }
     health.rime_dll = dll.display().to_string();
-    match file_contains(&dll, PLUGIN_MARKER.as_bytes()) {
-        Ok(true) => {
-            health.plugin = true;
-            health.present = true;
-            health.reason = "exe-present".to_string();
+    // 判据：所有标记都必须出现（少一个就不是我们的构建 ⇒ 判 unhealthy，触发换装）。
+    let mut missing = Vec::new();
+    for marker in PLUGIN_MARKERS {
+        match file_contains(&dll, marker.as_bytes()) {
+            Ok(true) => {}
+            Ok(false) => missing.push(marker.to_string()),
+            Err(_) => {
+                health.reason = "rime-dll-unreadable".to_string();
+                return health;
+            }
         }
-        Ok(false) => health.reason = "plugin-missing".to_string(),
-        Err(_) => health.reason = "rime-dll-unreadable".to_string(),
+    }
+    if missing.is_empty() {
+        health.plugin = true;
+        health.present = true;
+        health.reason = "exe-present".to_string();
+    } else {
+        health.missing_markers = missing;
+        health.reason = "plugin-missing".to_string();
     }
     health
 }
@@ -774,13 +808,51 @@ mod tests {
     fn health_detects_root_level_install() {
         let tmp = TempDir::new("root-level");
         fs::write(tmp.path().join(SERVER_EXE), b"MZ server").expect("write server");
-        fs::write(tmp.path().join(RIME_DLL), b"MZ rimesync_vnum").expect("write dll");
+        // 判据是两个标记都要在（缺陷 D6）：只写 rimesync_vnum 的旧构建不再算健康。
+        fs::write(
+            tmp.path().join(RIME_DLL),
+            b"MZ rimesync_vnum / rimesync_punct",
+        )
+        .expect("write dll");
 
         let health = check_root(tmp.path());
 
         assert!(health.present, "{health:?}");
         assert_eq!(health.version, "", "根目录直接命中时没有版本号");
         assert_eq!(health.reason, "exe-present");
+    }
+
+    #[test]
+    fn engine_with_only_vnum_is_not_healthy() {
+        // 缺陷 D6：只带 rimesync_vnum 的旧构建不认识 rimesync_punct，
+        // 中文标点直出用不了 —— 判成「健康」就永远不触发换装。
+        let tmp = TempDir::new("only-vnum");
+        let dir = tmp.path().join("weasel-9.9.9");
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::write(dir.join(SERVER_EXE), b"MZ fake server").expect("write server");
+        fs::write(dir.join(RIME_DLL), b"MZ rimesync_vnum only").expect("write dll");
+
+        let health = check_root(tmp.path());
+
+        assert!(
+            !health.present,
+            "只带 vnum 的引擎不算我们的构建：{health:?}"
+        );
+        assert_eq!(health.reason, "plugin-missing");
+        assert!(!health.plugin);
+        assert_eq!(
+            health.missing_markers,
+            vec!["rimesync_punct".to_string()],
+            "要指出缺的是哪个标记：{health:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_markers_match_the_prebuilt_criterion() {
+        // 判据只有一份：prebuilt::MARKERS。漂移就会出现「一边说健康、一边说缺 punct」。
+        assert_eq!(PLUGIN_MARKERS, crate::prebuilt::MARKERS);
+        assert!(PLUGIN_MARKERS.contains(&"rimesync_vnum"));
+        assert!(PLUGIN_MARKERS.contains(&"rimesync_punct"));
     }
 
     #[test]

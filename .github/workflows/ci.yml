@@ -89,8 +89,14 @@ jobs:
   # gnu 目标的 target_os 同样是 windows，而 cargo check 不链接，所以对「Windows 专属
   # 代码能否编过」等价；mingw 的 gcc 只用来编 ring 的 C。结论见
   # docs/PREBUILT-BOOTSTRAP.md §13.7。
+  #
+  # --all-targets：测试目标也一起编。cfg(windows) 的分支在 Linux CI 上被编译掉，
+  # 不带 --all-targets 时 **Windows 专属的测试代码从来没人编过**（2026-11-15 之前）。
+  # 注意：这不会碰到「Windows 上 librime 是 DLL、不导出内部 C++ 符号」那个坑 ——
+  # Rust 侧根本不链接 librime（crates/core/src/librime.rs 是运行时 LoadLibrary +
+  # GetProcAddress 取 C API 符号），cargo check 也不做链接。
   windows-typecheck:
-    name: windows · cargo check（core + cli）
+    name: windows · cargo check（core + cli，含测试目标）
     runs-on: ubuntu-22.04
     steps:
       - name: checkout
@@ -111,11 +117,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64
 
-      - name: cargo check · rime-sync-core
-        run: cargo check -p rime-sync-core --target x86_64-pc-windows-gnu
+      - name: cargo check · rime-sync-core（含测试目标）
+        run: cargo check -p rime-sync-core --target x86_64-pc-windows-gnu --all-targets
 
-      - name: cargo check · rime-sync-cli
-        run: cargo check -p rime-sync-cli --target x86_64-pc-windows-gnu
+      - name: cargo check · rime-sync-cli（含测试目标）
+        run: cargo check -p rime-sync-cli --target x86_64-pc-windows-gnu --all-targets
 
   # 0.6.23：判据 / 修补 / 报告一致性在真实 Windows 上验一遍（不装输入法、不需要 librime）。
   # 断言全部从 JSON 报告里取字段（PowerShell ConvertFrom-Json），不解析 stdout 文本。
@@ -187,6 +193,50 @@ jobs:
 
       - name: type check
         run: pnpm exec tsc --noEmit
+
+  # 桌面端（src-tauri）的单元测试护栏。
+  #
+  # 为什么单独一个 job：src-tauri 是**独立 workspace**（src-tauri/Cargo.toml 里自己有
+  # [workspace]），根 Cargo.toml 的 exclude 里也排除了它 ⇒ 根 cargo test --workspace
+  # 只覆盖 crates/core 与 crates/cli，桌面端的测试在 CI 里一个都没跑过（2026-11-15 之前）。
+  #
+  # 这些测试是纯逻辑测试：不建 Tauri app、不开窗口、不起 WebView（代码里没有用
+  # tauri::test::mock_app），所以无头 runner（没有 DISPLAY）也能跑；系统依赖只是为了
+  # 把 tauri / webkit2gtk 编出来。
+  desktop-tests:
+    name: desktop · src-tauri 单元测试
+    # 24.04：22.04 的 apt 源里没有 webkit2gtk-4.1（Tauri v2 要求 4.1），装不了就编不过。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: desktop-tests
+
+      # Tauri v2 的 Linux 系统依赖（官方清单：https://v2.tauri.app/start/prerequisites/#linux
+      # ；同款见 tauri-docs 的 src/content/docs/start/prerequisites.mdx）。
+      # pkg-config / libdbus-1-dev：core 的 keyring 依赖（与 rust job 一致）。
+      - name: install tauri linux dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libdbus-1-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev libssl-dev \
+            curl wget file
+
+      - name: cargo test · src-tauri
+        working-directory: src-tauri
+        run: cargo test
 
   # 断言脚本自检：用合成产物证明"少一个功能入口就会红"。
   # 真实产物验收在 release.yml 的 verify-artifacts job（那里才有 deb / setup.exe）；
@@ -318,6 +368,18 @@ jobs:
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           echo "bash -n OK: ${#files[@]} 个脚本"
+
+
+      # 随包预编译产物复制前必须按 MANIFEST.json 校验 sha256：
+      # 包在下载/打包环节损坏一个 .bin 时，用户装完就是「切不出五笔」，
+      # 而安装器压根没检查过，查不出原因。
+      # 两条安装路径（deb 的 postinst、离线安装器 install.sh）口径必须一致，
+      # 否则走 deb 会拦下坏文件、走离线包照装。
+      - name: prebuilt payload is verified before copy
+        run: |
+          set -euo pipefail
+          bash packaging/linux/test/test-postinst-prebuilt-sha256.sh
+          bash packaging/linux/test/test-offline-install-prebuilt-sha256.sh
 
 
       # postinst 必须按 fcitx5-rime 的 UserDataDirPath 解析 Rime 用户目录：

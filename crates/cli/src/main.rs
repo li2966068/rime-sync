@@ -308,7 +308,8 @@ struct BackupReport {
 struct RollbackReport {
     ok: bool,
     backup_id: String,
-    pre_restore_id: Option<String>,
+    /// 还原点备份 id：必存在（留不下还原点时 rollback 直接失败）。
+    pre_restore_id: String,
     restored: usize,
 }
 
@@ -380,6 +381,8 @@ struct FixImeJson<'a> {
     weasel_log: String,
     /// 常驻小键盘判定（CLI/GUI 都读这一份，不许自己再算）。
     numpad: &'a ime_state::NumpadStatus,
+    /// 常驻标点直出判定（rimesync_punct；与 check-ime 同一份判据）。
+    punct: &'a ime_state::PunctStatus,
     /// 本机引擎是否带 rime-sync 自研的增强组件（数字小键盘 / 中文标点直出 / v 转数字）：
     /// supported（确定可用）/ unsupported（确定没有，多半装的是发行版输入法）/ unknown（判断不了）。
     extra_support: &'a str,
@@ -406,6 +409,8 @@ struct CheckImeJson<'a> {
     missing: Vec<String>,
     /// 常驻小键盘判定（与 ensure-ime 同一份判据）。
     numpad: &'a ime_state::NumpadStatus,
+    /// 常驻标点直出判定（rimesync_punct；与 ensure-ime 同一份判据）。
+    punct: &'a ime_state::PunctStatus,
     /// 本机引擎是否带 rime-sync 自研的增强组件（数字小键盘 / 中文标点直出 / v 转数字）：
     /// supported（确定可用）/ unsupported（确定没有，多半装的是发行版输入法）/ unknown（判断不了）。
     extra_support: &'a str,
@@ -444,6 +449,8 @@ struct EnsureImeJson<'a> {
     config_seeded: &'a ime_state::SeedReport,
     /// 常驻小键盘判定（与 fix-ime / check-ime 同一份判据）。
     numpad: &'a ime_state::NumpadStatus,
+    /// 常驻标点直出判定（rimesync_punct；与 fix-ime / check-ime 同一份判据）。
+    punct: &'a ime_state::PunctStatus,
 }
 
 /// 解析 --payload / 自动定位；找不到不是错误（只读探测要照常出报告）。
@@ -481,6 +488,14 @@ fn numpad_line(numpad: &ime_state::NumpadStatus) -> String {
         return "ok".to_string();
     }
     format!("问题 {}（{}）", numpad.missing.join(" "), numpad.hint)
+}
+
+/// 标点直出的一行人话（与 numpad_line 同一形状）。
+fn punct_line(punct: &ime_state::PunctStatus) -> String {
+    if punct.ok {
+        return "ok".to_string();
+    }
+    format!("问题 {}（{}）", punct.missing.join(" "), punct.hint)
 }
 
 impl std::fmt::Display for FixImeFailed {
@@ -838,9 +853,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 println!(
                     "rollback={} restored={} pre_restore={}",
-                    report.backup_id,
-                    report.restored,
-                    report.pre_restore_id.as_deref().unwrap_or("-")
+                    report.backup_id, report.restored, report.pre_restore_id
                 );
                 Ok(())
             }
@@ -931,6 +944,7 @@ fn run(cli: Cli) -> Result<()> {
                 weasel_needs_elevation: weasel.needs_elevation,
                 weasel_log: weasel.log.clone(),
                 numpad: &outcome.numpad,
+                punct: &outcome.punct,
                 extra_support: extra_support.as_str(),
             };
             if cli.json {
@@ -986,6 +1000,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("build_repaired={}", outcome.report.build_repaired.join(","));
                 println!("build_missing={}", outcome.report.build_missing.join(","));
                 println!("numpad={}", numpad_line(&outcome.numpad));
+                println!("punct={}", punct_line(&outcome.punct));
                 for line in extra_support_lines(&extra_support) {
                     println!("{line}");
                 }
@@ -1145,13 +1160,25 @@ fn run(cli: Cli) -> Result<()> {
             // 常驻小键盘判定：与 ensure-ime 用的是**同一个**函数（只读判据 =
             // 写路径的结论），不允许这里自己再判一套。
             let numpad = ime_state::assess_numpad(&rime_dir, &data_dirs);
+            // 常驻标点直出判定：与 ensure-ime 用的是**同一个**函数（只读判据 =
+            // 写路径的结论），不允许这里自己再判一套。
+            let punct = ime_state::assess_punct(&rime_dir, &data_dirs);
             // 本机引擎是否带 rime-sync 自研的增强组件（core 判定；CLI 不自己再算一遍）。
             let extra_support = ime_state::assess_extra_support(&rime_dir);
             // 结论口径与 ensure-ime 一致：产物不可用 = failed；有缺口 = partial；
             // 其余 = ok。partial 与 failed 都必须非零退出。
+            //
+            // 标点直出也算缺口：退出码 0 的含义是「输入法现在就绪」，
+            // 而标点直出关着/没重编译/引擎根本不支持时，方案并不是用户想要的状态，
+            // 报 ok 就是「假 ok」（审计原文：check-ime 必须不报假 ok）。
+            //
+            // 判据用 punct.ok（= missing 为空）：用户自己写的 / 用户主动关掉定制的
+            // custom.yaml 判为 skipped，**不进 missing**，因此不会把退出码变成非零；
+            // 而 config-missing / artifact-stale / engine-unsupported 都进 missing，
+            // 一律算缺口（artifact-stale = 配置已补但产物还没重编译，确实还没就绪）。
             let result = if !assessment.build_ok {
                 "failed"
-            } else if !numpad.ok {
+            } else if !numpad.ok || !punct.ok {
                 "partial"
             } else {
                 "ok"
@@ -1162,6 +1189,13 @@ fn run(cli: Cli) -> Result<()> {
                     "{detail} numpad_missing={}（{}）",
                     numpad.missing.join(","),
                     numpad.hint
+                );
+            }
+            if !punct.ok {
+                detail = format!(
+                    "{detail} punct_missing={}（{}）",
+                    punct.missing.join(","),
+                    punct.hint
                 );
             }
             let check = CheckImeJson {
@@ -1183,6 +1217,7 @@ fn run(cli: Cli) -> Result<()> {
                 schemas: &assessment.schemas,
                 missing: assessment.missing_ids(),
                 numpad: &numpad,
+                punct: &punct,
                 extra_support: extra_support.as_str(),
             };
             if cli.json {
@@ -1197,6 +1232,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("schemas={}", assessment.line());
                 println!("missing={}", check.missing.join(","));
                 println!("numpad={}", numpad_line(&numpad));
+                println!("punct={}", punct_line(&punct));
                 for line in extra_support_lines(&extra_support) {
                     println!("{line}");
                 }
@@ -1207,8 +1243,9 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(path) = report.as_deref() {
                 write_json_file(path, &check)?;
             }
-            // partial 与 failed 一样必须非零退出："小键盘不能用"不是成功。
-            if assessment.build_ok && numpad.ok {
+            // partial 与 failed 一样必须非零退出："小键盘不能用"不是成功，
+            // "标点直出没生效"同样不是成功（punct.ok=false 表示有缺口）。
+            if assessment.build_ok && numpad.ok && punct.ok {
                 Ok(())
             } else {
                 Err(anyhow::Error::new(FixImeFailed))
@@ -1299,6 +1336,7 @@ fn run(cli: Cli) -> Result<()> {
                 weasel_log: outcome.ime.log.clone(),
                 config_seeded: &outcome.seeded,
                 numpad: &outcome.numpad,
+                punct: &outcome.punct,
             };
             if cli.json {
                 print_json(&json)?;
@@ -1316,6 +1354,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("config_seeded={}", outcome.seeded.summary());
                 println!("schemas={}", outcome.assessment.line());
                 println!("numpad={}", numpad_line(&outcome.numpad));
+                println!("punct={}", punct_line(&outcome.punct));
                 println!("build_repaired={}", json.repaired.join(","));
                 println!(
                     "copied={} kept={} overwritten={} config_copied={} failed={}",
@@ -1748,8 +1787,22 @@ fn exe_dir() -> Option<PathBuf> {
 }
 
 fn resolve_rime_dir(explicit: Option<&Path>, config: &Config) -> Result<PathBuf> {
-    let configured = config.rime_dir.clone().map(PathBuf::from);
-    let detection = rime_dir::detect(explicit.or(configured.as_deref()))?;
+    if let Some(path) = explicit {
+        let detection = rime_dir::detect(Some(path))?;
+        return fs::canonicalize(&detection.path)
+            .with_context(|| format!("canonicalize {}", detection.path.display()));
+    }
+    // 配置里显式填的目录：不存在就是填错了 —— 明确报错，绝不静默换成探测到的另一个目录。
+    // 与 GUI 同一份判据（core::config::resolve_configured_rime_dir），报错文案也一致。
+    if let Some(dir) = config
+        .rime_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return config::resolve_configured_rime_dir(Some(dir));
+    }
+    let detection = rime_dir::detect(None)?;
     fs::canonicalize(&detection.path)
         .with_context(|| format!("canonicalize {}", detection.path.display()))
 }

@@ -1,16 +1,16 @@
 # 由 rime-sync 生成：启用 v 数值转换与中文标点直出（缺失才写入）
 # schema: wubi86
-# 引擎顺序抄自 third_party/rime-data/rime-wubi/wubi86.schema.yaml（translators 首位加 rimesync_vnum；rimesync_punct 插在 key_binder/punctuator/selector 之前）
+# 引擎顺序抄自 third_party/rime-data/rime-wubi/wubi86.schema.yaml（translators 首位加 rimesync_vnum；rimesync_punct 插在 punctuator 之前，rimesync_vselect 紧跟 recognizer）
 # 关闭：删掉本文件后重新部署；或删掉下面 patch 里的 rimesync_vnum / rimesync_punct。
 patch:
   engine/processors:
     - ascii_composer
     - recognizer
-    - rimesync_punct
     - rimesync_vselect
     - numpad
     - key_binder
     - speller
+    - rimesync_punct
     - punctuator
     - selector
     - navigator

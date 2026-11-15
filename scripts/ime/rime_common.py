@@ -215,6 +215,78 @@ def data_files(
 
 SCHEME_FILE_SUFFIXES = (".schema.yaml", ".custom.yaml")
 
+# rime-sync 自研的三个处理器（与 crates/core/src/processor_spec.rs 同名）。
+VSELECT = "rimesync_vselect"
+NUMPAD = "numpad"
+PUNCT = "rimesync_punct"
+# 引擎里的锚点处理器。
+RECOGNIZER = "recognizer"
+PUNCTUATOR = "punctuator"
+
+# engine/processors 列表项：`- 名字`。
+_PROCESSOR_ITEM_RE = re.compile(r"^\s*-\s*([A-Za-z0-9_]+)\s*$")
+# 列表键：custom.yaml 里是 `engine/processors:`，编译产物里是 `engine:` 下的 `processors:`。
+_PROCESSOR_KEY_RE = re.compile(r"^\s*(?:engine/)?processors:\s*$")
+
+
+def extract_processors(text: str) -> list[str]:
+    """从一份 YAML 文本里取出 engine/processors 列表项（按出现顺序）。
+
+    刻意不 import yaml：deb 构建镜像里没有 PyYAML（见本文件开头的说明），
+    而 processors 只是一个平铺的字符串列表，缩进扫描足够。
+    """
+    names: list[str] = []
+    collecting = False
+    for line in text.splitlines():
+        if not collecting:
+            if _PROCESSOR_KEY_RE.match(line):
+                collecting = True
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = _PROCESSOR_ITEM_RE.match(line)
+        if match:
+            names.append(match.group(1))
+            continue
+        # 缩进回退或换成了别的键 ⇒ 列表结束。
+        if not line.startswith((" ", "\t")) or ":" in line:
+            break
+    return names
+
+
+def processor_order_violations(names: list[str]) -> list[str]:
+    """processors 列表是否满足 rime-sync 的三条硬规则。
+
+    规则（与 crates/core/src/processor_spec.rs 的 validate() 一致）：
+      * rimesync_vselect 存在；
+      * numpad 紧跟 rimesync_vselect（且只有一份）；
+      * 有 recognizer 时 rimesync_vselect 紧跟它；
+      * rimesync_punct 存在；
+      * rimesync_punct 排在 punctuator 之前（否则它拿不到按键，中文标点直出等于没开）。
+
+    列表里一个 rimesync 处理器都没有 ⇒ 不是 rime-sync 管的列表，直接放行。
+    """
+    if not any(name in names for name in (VSELECT, NUMPAD, PUNCT)):
+        return []
+    fail: list[str] = []
+    if VSELECT not in names:
+        fail.append("engine/processors 里没有 %s" % VSELECT)
+        return fail
+    vselect = names.index(VSELECT)
+    if names[vselect + 1: vselect + 2] != [NUMPAD]:
+        fail.append("engine/processors 里 %s 没有紧跟 %s" % (NUMPAD, VSELECT))
+    if names.count(NUMPAD) != 1:
+        fail.append("engine/processors 里 %s 有 %d 份（必须只有一份）"
+                    % (NUMPAD, names.count(NUMPAD)))
+    if RECOGNIZER in names and vselect != names.index(RECOGNIZER) + 1:
+        fail.append("engine/processors 里 %s 没有紧跟 %s" % (VSELECT, RECOGNIZER))
+    if PUNCT not in names:
+        fail.append("engine/processors 里没有 %s" % PUNCT)
+    elif PUNCTUATOR in names and names.index(PUNCT) > names.index(PUNCTUATOR):
+        fail.append("engine/processors 里 %s 必须排在 %s 之前，否则拿不到按键"
+                    % (PUNCT, PUNCTUATOR))
+    return fail
+
 
 def expected_data(rime_data: Path = RIME_DATA) -> dict[str, str]:
     """闭包内应该出现在 data 目录里的文件（名字 -> 期望内容）。

@@ -243,6 +243,19 @@ impl TreeKind {
     }
 }
 
+/// 本地文件的读取结果：必须区分「不存在」与「存在但读不出来」。
+///
+/// 读不出来（权限、IO 错误）绝不能被当成「本地已删除」——那会让三向合并
+/// 得出 LocalDeleted，进而把远端文件删掉，而本地文件其实还在。
+enum LocalRead {
+    /// 文件存在，内容可读。
+    Present(Vec<u8>),
+    /// 文件确实不存在（NotFound）。
+    Missing,
+    /// 文件在，但读不出来。
+    Unreadable(std::io::Error),
+}
+
 /// 一棵三向合并树的远端路径 + 本地基线位置。
 struct TreeScope {
     kind: TreeKind,
@@ -308,6 +321,10 @@ pub struct Engine {
     history_path: PathBuf,
     retry: RetryState,
     retry_path: PathBuf,
+    /// retry.json 读取失败的原因（文件不存在不算错，由 RetryState::load 归一）。
+    retry_load_error: Option<String>,
+    /// 本轮 transport 的增量备份会话：第一次真正要覆盖本地文件时才创建。
+    backup_session: Option<crate::backup::BackupSession>,
     trigger: Box<dyn RimeTrigger>,
     progress: Option<ProgressSink>,
     cancel: Option<CancelToken>,
@@ -339,7 +356,23 @@ impl Engine {
         let index_existed = index_path.is_file();
         let index = FileIndex::load(&index_path)?;
         let retry_path = state_dir.join("retry.json");
-        let retry = RetryState::load(&retry_path).unwrap_or_default();
+        // 退避状态读不出来（文件损坏 / 读不动）不能静默当成「从没失败过」：
+        // 用户看到的必须是「状态丢了」，而不是一份假的干净状态。
+        // 注意 RetryState::load 把「文件不存在」归为首次运行（Ok），
+        // 走到 Err 分支的一定是真错，不会把首次运行误报成错误。
+        let (retry, retry_load_error) = match RetryState::load(&retry_path) {
+            Ok(state) => (state, None),
+            Err(error) => {
+                tracing::error!("retry state load failed: {error:#}");
+                (
+                    RetryState::default(),
+                    Some(format!(
+                        "退避状态读取失败（retry.json 损坏或不可读），本轮按无退避继续：{error:#}"
+                    )),
+                )
+            }
+        };
+
         let sync_dir = rime_dir::sync_dir(&rime_dir);
         Ok(Self {
             config,
@@ -356,6 +389,8 @@ impl Engine {
             history_path: state_dir.join("history.jsonl"),
             retry,
             retry_path,
+            retry_load_error,
+            backup_session: None,
             trigger,
             progress: None,
             cancel: None,
@@ -450,22 +485,21 @@ impl Engine {
                 }
             }
         }
-        // Windows：配置类文件（*.custom.yaml）落到本地后必须让 Weasel 重新部署，
-        // 否则用户要手动「重新部署」才生效。Linux/macOS 不触发（会打断输入法）。
-        if report.ok && report.config_changed && cfg!(windows) && !report.merged_pointer_written {
-            self.emit("deploy", 0, 0, "deploying weasel configuration");
-            match self.trigger.deploy(&self.rime_dir) {
-                Ok(()) => tracing::info!("weasel deploy triggered after custom yaml update"),
-                Err(error) => tracing::warn!(
-                    "weasel deploy after config sync failed (config files are still on disk): {error:#}"
-                ),
-            }
-        }
-        // 写了合并词典指针 → 立刻重新部署（Linux/Windows 两端一致）。
-        // Windows：结束 WeaselServer + 进程内 librime 部署（立刻重编译）；
-        // Linux：停 fcitx5 → rime_deployer --build → 重启 fcitx5。
+        // 配置变了 → 让输入法真的重新编译（唯一入口，两端一致）。
+        //
+        // * Windows：deploy 只结束 WeaselServer（**不**重编译）⇒ 必须走 manual_deploy
+        //   （进程内 librime 部署，当场重编译）。以前这里只调 deploy，配置只是躺在
+        //   磁盘上，用户看到的是「同步成功、配置没生效」。
+        // * Linux：deploy 就是 rime_deployer --build（会重编译）⇒ 走平台自带的重建
+        //   序列（停 fcitx5 → build → 起 fcitx5）。
+        //
+        // 一轮只重建一次：合并词典指针也是配置变更（写进 <id>.custom.yaml），
+        // 两种变更共用这一条重建，不重复编译。
+        //
+        // 只有 transport 走这一步：apply 有自己完整的部署序列（停输入法 → 合并词库
+        // → 部署 → 起输入法），重建由那条序列负责，两边都做就是编译两次。
         if report.ok && redeploy_pointer {
-            self.redeploy_after_pointer_if_needed(&report);
+            self.recompile_if_config_changed(&mut report);
         }
         dedupe(&mut report.conflicts);
         dedupe(&mut report.skipped);
@@ -530,28 +564,31 @@ impl Engine {
         }
     }
 
-    /// 只有这轮真的写了指针才重新部署（没写就别白折腾一次编译）。
-    fn redeploy_after_pointer_if_needed(&mut self, report: &Report) {
-        if report.merged_pointer_written {
-            self.redeploy_after_pointer();
+    /// 这轮真的改了配置才重建（没改就别白折腾一次编译）。
+    ///
+    /// 「我改了配置，请让输入法重新编译」只有一个入口
+    /// （deploy::recompile_after_config_change），平台差异收在那里面：
+    /// Windows 走 manual_deploy（进程内 librime 部署，当场重编译），
+    /// Linux 走 redeploy_after_config_change（停 fcitx5 → rime_deployer --build
+    /// → 起 fcitx5）。
+    fn recompile_if_config_changed(&mut self, report: &mut Report) {
+        if !report.config_changed {
+            return;
         }
-    }
-
-    /// 写完合并词典指针后的立刻重新部署（两端一致）。
-    fn redeploy_after_pointer(&mut self) {
-        self.emit(
-            "deploy",
-            0,
-            0,
-            "redeploying after merged dictionary pointer",
-        );
-        // 平台差异收在 RimeTrigger 里：Windows 走进程内 librime 部署（结束
-        // WeaselServer + 立刻重编译），Linux 走 fcitx5 重载 / rime_deployer 重建。
-        match self.trigger.redeploy_after_config_change(&self.rime_dir) {
-            Ok(()) => tracing::info!("redeploy after merged dictionary pointer ok"),
-            Err(error) => tracing::warn!(
-                "redeploy after merged dictionary pointer failed (config is still on disk): {error:#}"
-            ),
+        self.emit("deploy", 0, 0, "recompiling after config change");
+        match crate::deploy::recompile_after_config_change(&*self.trigger, &self.rime_dir) {
+            Ok(()) => tracing::info!("recompile after config change ok"),
+            Err(error) => {
+                // 重建失败必须如实上报：配置已经落盘却没编译进 build/ 产物，
+                // 对用户就是「报告说成功、配置没生效」——那正是要消灭的假成功。
+                report.ok = false;
+                let message = format!("配置已写入但重新编译失败：{error:#}");
+                report.error = Some(match report.error.take() {
+                    Some(previous) => format!("{previous}; {message}"),
+                    None => message,
+                });
+                tracing::error!("recompile after config change failed: {error:#}");
+            }
         }
     }
 
@@ -658,12 +695,81 @@ impl Engine {
     }
 
     /// 本地写入闸门：远端 -> 本地，以及合并结果落盘。
-    fn write_pulled(&mut self, rel: &str, bytes: &[u8], detail: &str) -> Result<()> {
+    ///
+    /// 覆盖已存在且内容不同的文件前，先把旧内容存进本轮备份会话；
+    /// 备份失败就一个字都不写（与 apply 路径同一口径：宁可不覆盖，
+    /// 也不能无备份覆盖）。返回是否真的写了盘。
+    fn write_pulled(&mut self, rel: &str, bytes: &[u8], detail: &str) -> Result<bool> {
         if self.dry_run {
             self.record(PlanKind::Pull, rel, detail);
-            return Ok(());
+            return Ok(true);
         }
-        write_file(&self.rime_dir, rel, bytes)
+        self.write_local_guarded(rel, bytes)
+    }
+
+    /// 覆盖本地文件前的统一闸门。
+    ///
+    /// 口径（读本地旧内容必须分三态，不能把「读不出来」当成「不存在」）：
+    /// * 读到内容且与要写的完全相同 ⇒ 不碰文件、不备份（幂等性必须保持，
+    ///   否则每轮同步都会改 mtime，把 librime 的重编译判断搅乱）。
+    /// * 读到内容且不同 ⇒ 先备份旧内容，备份失败即中止本轮写入。
+    /// * 文件不存在（NotFound）⇒ 没有旧内容要留，直接写。
+    /// * 文件存在但读不出来（权限、IO 异常等）⇒ **中止本轮写入**。
+    ///   这种文件既备份不了也读不懂，写下去等于无备份毁掉一份已经异常的
+    ///   配置 —— 宁可不写，让用户先处理权限问题。
+    fn write_local_guarded(&mut self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        let path = safe_join(&self.rime_dir, rel)?;
+        match fs::read(&path) {
+            Ok(current) => {
+                if current == bytes {
+                    return Ok(false);
+                }
+                self.backup_before_overwrite(rel)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read {rel} before overwrite; refusing to write without a backup")
+                });
+            }
+        }
+        write_bytes(&path, bytes)?;
+        Ok(true)
+    }
+
+    /// 删除本地文件前的闸门：删除同样不可逆，先把旧内容存进本轮备份。
+    ///
+    /// 存在性判定不能用 `exists()`：目录权限受限时它会返回 false，看起来像
+    /// 「本地没这文件」，其实只是读不出来 —— 那种情况必须报错，不能静默
+    /// 跳过（否则用户以为删了，文件其实还在，远端索引却已经把它删了）。
+    fn remove_local_guarded(&mut self, rel: &str) -> Result<()> {
+        let path = safe_join(&self.rime_dir, rel)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {rel} before delete"));
+            }
+        }
+        self.backup_before_overwrite(rel)?;
+        fs::remove_file(&path).with_context(|| format!("remove {rel}"))
+    }
+
+    /// 覆盖前把旧内容存进本轮备份会话；备份失败即中止（宁可不覆盖）。
+    fn backup_before_overwrite(&mut self, rel: &str) -> Result<()> {
+        if self.backup_session.is_none() {
+            let manager = BackupManager::new(&self.rime_dir, &self.backup_root);
+            let session = manager
+                .start_session("pre-transport")
+                .context("create transport backup session")?;
+            self.backup_session = Some(session);
+        }
+        match self.backup_session.as_mut() {
+            Some(session) => session
+                .snapshot(rel)
+                .with_context(|| format!("backup {rel} before transport overwrite")),
+            None => bail!("transport backup session is missing"),
+        }
     }
 
     /// 合并 + 部署 + 再 push（librime 会产出新快照）。
@@ -747,17 +853,21 @@ impl Engine {
         }
         if deploy_error.is_none() {
             self.emit("deploy", 2, 4, "rime_deployer --build");
-            // 这一轮写了合并词典指针的话，配置必须真的重编译才生效。
-            // Linux 的 deploy 就是 rime_deployer --build（会重编译）；
-            // Windows 的 deploy 只结束 WeaselServer（不重编译），
-            // 所以那边改走 manual_deploy（进程内 librime 部署）。
-            let needs_recompile =
-                report.merged_pointer_written && !self.trigger.deploy_recompiles();
-            let outcome = if needs_recompile {
-                self.trigger.manual_deploy(&self.rime_dir)
-            } else {
-                self.trigger.deploy(&self.rime_dir)
-            };
+            // 这一轮改了配置的话，配置必须真的重编译才生效。
+            //
+            // 平台差异收在 deploy::recompile_in_deploy_sequence 里：
+            // Linux 的 deploy 就是 rime_deployer --build（会重编译）⇒ 走 deploy；
+            // Windows 的 deploy 只结束 WeaselServer（**不**重编译）⇒ 改走
+            // manual_deploy（进程内 librime 部署，当场重编译）。
+            //
+            // 判据用 config_changed 而不是 merged_pointer_written：两者都是
+            // 「用户 custom.yaml 变了」，指针只是其中一种（另一种是拉下来的
+            // *.custom.yaml）。只看指针的话，光拉了配置文件的轮次同样不重编译。
+            let outcome = crate::deploy::recompile_in_deploy_sequence(
+                &*self.trigger,
+                &self.rime_dir,
+                report.config_changed,
+            );
             if let Err(error) = outcome {
                 deploy_error = Some(error);
             }
@@ -801,16 +911,51 @@ impl Engine {
 
     /// 连续失败退避：1→2→4→8→16→30 分钟，成功即复位（SPEC-3 §B8）。
     fn record_retry(&mut self, report: &mut Report) {
+        self.record_retry_with(report, |state, path| state.save(path));
+    }
+
+    /// 退避状态的落盘与对外表达。
+    ///
+    /// save 抽成参数：落盘失败这条路径必须能被测试覆盖，而真实的
+    /// 「写不进 retry.json」很难在测试里稳定造出来。
+    fn record_retry_with<F>(&mut self, report: &mut Report, save: F)
+    where
+        F: FnOnce(&RetryState, &Path) -> Result<()>,
+    {
+        // 退避状态读不出来这件事必须让用户看见（不能当成"从没失败过"）。
+        if let Some(note) = self.retry_load_error.clone() {
+            if !report.notes.contains(&note) {
+                report.notes.push(note);
+            }
+        }
         if report.ok {
             if self.retry.failures > 0 {
                 self.retry.record_success();
-                let _ = self.retry.save(&self.retry_path);
+                if let Err(error) = save(&self.retry, &self.retry_path) {
+                    let note = format!("退避状态复位未落盘：{error:#}");
+                    tracing::warn!("{note}");
+                    if !report.notes.contains(&note) {
+                        report.notes.push(note);
+                    }
+                }
             }
             report.next_retry_at = None;
             return;
         }
-        report.next_retry_at = Some(self.retry.record_failure(now_secs()));
-        let _ = self.retry.save(&self.retry_path);
+        let next = self.retry.record_failure(now_secs());
+        match save(&self.retry, &self.retry_path) {
+            Ok(()) => report.next_retry_at = Some(next),
+            Err(error) => {
+                // 状态没落盘 ⇒ 不能对外报告一个根本不存在的「下次重试时间」，
+                // 否则用户会以为退避生效了，下一轮却照旧立刻重试。
+                report.next_retry_at = None;
+                let note = format!("退避状态保存失败，本轮不报告下次重试时间：{error:#}");
+                tracing::warn!("{note}");
+                if !report.notes.contains(&note) {
+                    report.notes.push(note);
+                }
+            }
+        }
     }
 
     pub fn retry_state(&self) -> &RetryState {
@@ -866,7 +1011,40 @@ impl Engine {
         count
     }
 
+    /// 一轮 transport 的外层：负责本轮增量备份会话的生命周期。
+    ///
+    /// 每轮 transport 一份会话（只收本轮真正被覆盖的文件），收尾时按
+    /// backup_keep 清理旧备份 —— 备份不能无界堆积。
     fn do_transport(&mut self, report: &mut Report) -> Result<()> {
+        self.backup_session = None;
+        let result = self.do_transport_round(report);
+        self.finish_transport_backup(report);
+        result
+    }
+
+    /// transport 收尾：封口本轮备份会话 + 按 backup_keep 清理旧备份。
+    fn finish_transport_backup(&mut self, report: &mut Report) {
+        if let Some(session) = self.backup_session.take() {
+            if session.is_empty() {
+                // 没覆盖任何文件 ⇒ 不留空备份目录污染备份列表。
+                let _ = fs::remove_dir_all(session.dir());
+            } else {
+                if let Err(error) = session.finalize() {
+                    tracing::warn!("finalize transport backup: {error:#}");
+                }
+                // apply 已经有一份 pre-apply 全量备份，backup_id 留给它。
+                if report.backup_id.is_none() {
+                    report.backup_id = Some(session.id().to_string());
+                }
+            }
+        }
+        let manager = BackupManager::new(&self.rime_dir, &self.backup_root);
+        if let Err(error) = manager.prune(self.config.backup_keep as usize) {
+            tracing::warn!("prune backups: {error:#}");
+        }
+    }
+
+    fn do_transport_round(&mut self, report: &mut Report) -> Result<()> {
         let device = self.config.device_id.clone();
         plan::validate_rel_path(&device).context("invalid device_id")?;
         if device.contains('/') {
@@ -1254,12 +1432,16 @@ impl Engine {
                         self.note_userdb_conflict(&entry.path, &current, &bytes, report);
                     }
                 }
-                if self.dry_run {
+                let written = if self.dry_run {
                     self.record(PlanKind::Pull, &entry.path, "snapshot download");
+                    true
                 } else {
-                    write_bytes(&local, &bytes)?;
+                    // 覆盖本地快照前先备份旧内容：备份失败就一个字都不写。
+                    self.write_local_guarded(&entry.path, &bytes)?
+                };
+                if written {
+                    report.pulled += 1;
                 }
-                report.pulled += 1;
                 if is_userdb {
                     // 新/变化的 *.userdb.txt 只是落盘，还需 apply 才会导入 LevelDB。
                     report.pending_merge = true;
@@ -1440,7 +1622,29 @@ impl Engine {
             scope.assert_allowed(rel)?;
 
             let local_path = safe_join(&self.rime_dir, rel)?;
-            let local_bytes = fs::read(&local_path).ok();
+            // 本地读取必须区分三种状态，不能用 .ok() 把它们压成一个 None：
+            //   存在      → 有内容可比；
+            //   不存在    → 真的被本地删了（只有这种情况才能推远端删除）；
+            //   读不出来  → 权限/IO 异常，**绝不能**当成「本地已删除」，
+            //                 否则三向合并会得出 LocalDeleted 并把远端文件删掉，
+            //                 而本地文件其实还在，下一轮又被推回去。
+            // 读不出来一律当冲突处理：既不动远端，也不覆盖本地。
+            let local_read = match fs::read(&local_path) {
+                Ok(bytes) => LocalRead::Present(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocalRead::Missing,
+                Err(error) => LocalRead::Unreadable(error),
+            };
+            let local_bytes: Option<Vec<u8>> = match local_read {
+                LocalRead::Present(bytes) => Some(bytes),
+                LocalRead::Missing => None,
+                LocalRead::Unreadable(error) => {
+                    // 读不出来 ≠ 本地已删除。当成冲突：既不删远端，也不覆盖本地。
+                    let detail = format!("{rel}: local file present but unreadable: {error}");
+                    report.conflicts.push(detail.clone());
+                    tracing::error!("{detail}; treating as conflict, remote left untouched");
+                    continue;
+                }
+            };
             let local_hash = local_bytes.as_ref().map(|bytes| sha256_hex(bytes));
             let base = base_index.files.get(rel).cloned();
             let remote_meta = manifest.files.get(rel).cloned();
@@ -1714,7 +1918,10 @@ impl Engine {
                             }
                         }
                     }
-                    self.write_pulled(rel, &local_write, "tree merge: take remote")?;
+                    // 拉取会覆盖本地文件：闸门负责「先备份再覆盖」，
+                    // 内容完全相同时不碰文件（不计数）。
+                    let written =
+                        self.write_pulled(rel, &local_write, "tree merge: take remote")?;
                     // base 缓存按内容寻址，不能把共享视图存到旧远端摘要下面。
                     let base = if sha256_hex(&shared) == meta.sha256 {
                         &shared
@@ -1723,7 +1930,9 @@ impl Engine {
                     };
                     self.remember_base(Some(&meta.sha256), Some(base));
                     base_index.files.insert(rel.clone(), meta);
-                    report.pulled += 1;
+                    if written {
+                        report.pulled += 1;
+                    }
                     report.merged += 1;
                 }
                 MergeResult::Conflict => {
@@ -1749,7 +1958,8 @@ impl Engine {
                         if let Some(bytes) = &local_bytes {
                             if !self.has_conflict_copy(rel)? {
                                 let conflict_rel = conflict_path(rel, &self.config.device_id)?;
-                                write_file(&self.rime_dir, &conflict_rel, bytes)?;
+                                // 冲突副本走同一道闸门：万一目标已存在，不允许无备份覆盖。
+                                self.write_local_guarded(&conflict_rel, bytes)?;
                             }
                         }
                     } else {
@@ -1758,16 +1968,25 @@ impl Engine {
                     report.conflicts.push(rel.clone());
                 }
                 MergeResult::DeleteLocal => {
-                    if local_path.exists() {
-                        if self.dry_run {
-                            self.record(
-                                PlanKind::DeleteLocal,
-                                rel,
-                                "deleted remotely, local unchanged",
-                            );
-                        } else {
-                            fs::remove_file(&local_path)
-                                .with_context(|| format!("remove {rel}"))?;
+                    // 存在性判定不能靠 exists()：目录权限受限时它返回 false，
+                    // 看起来像「本地没这文件」，其实只是读不出来 —— 那种情况
+                    // 必须报错，不能静默跳过（远端索引会把它删掉，本地却还在）。
+                    match fs::symlink_metadata(&local_path) {
+                        Ok(_) => {
+                            if self.dry_run {
+                                self.record(
+                                    PlanKind::DeleteLocal,
+                                    rel,
+                                    "deleted remotely, local unchanged",
+                                );
+                            } else {
+                                // 删除本地文件同样不可逆 ⇒ 先把旧内容存进本轮备份。
+                                self.remove_local_guarded(rel)?;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| format!("stat {rel} before delete"));
                         }
                     }
                     base_index.files.remove(rel);
@@ -1874,9 +2093,17 @@ impl Engine {
             self.cancelled()?;
             plan::assert_profile_allowed(&rel)?;
             let local = safe_join(&self.rime_dir, &rel)?;
-            if local.exists() {
-                // 不覆盖本地已有配置：老用户升级时本地就是初值。
-                continue;
+            // 存在性判定不能靠 exists()：目录权限受限时它返回 false，
+            // 会把「读不出来」当成「本地没有」⇒ 后面按新文件写，风险很大。
+            match fs::symlink_metadata(&local) {
+                Ok(_) => {
+                    // 不覆盖本地已有配置：老用户升级时本地就是初值。
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("stat {rel} before seeding"));
+                }
             }
             let remote_path = format!("{}/{rel}", profile::SHARED_FILES_DIR);
             let Some(bytes) = self.dav.get(&remote_path)? else {
@@ -1905,7 +2132,9 @@ impl Engine {
                     );
                 }
             } else {
-                write_file(&self.rime_dir, &rel, &bytes)?;
+                // 种子落盘：本机还没有同名文件（上面已跳过已存在的），
+                // 仍走统一闸门，保证「有则备份、无则直写」的口径一致。
+                self.write_local_guarded(&rel, &bytes)?;
             }
             pulled += 1;
             report.pulled += 1;
@@ -2050,7 +2279,8 @@ impl Engine {
                 .push(format!("{rel}: {}", conflicts.join(", ")));
             if !self.dry_run && !self.has_conflict_copy(rel)? {
                 let conflict_rel = conflict_path(rel, &self.config.device_id)?;
-                write_file(&self.rime_dir, &conflict_rel, local_bytes)?;
+                // 冲突副本走同一道闸门：万一目标已存在，不允许无备份覆盖。
+                self.write_local_guarded(&conflict_rel, local_bytes)?;
             }
         }
         Ok(true)
@@ -2214,11 +2444,6 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(root.join(rel))
 }
 
-fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
-    let path = safe_join(root, rel)?;
-    write_bytes(&path, bytes)
-}
-
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -2281,10 +2506,222 @@ mod tests {
     }
 
     #[test]
+    fn guarded_write_backs_up_before_overwrite() {
+        let (mut engine, root) = engine_for_retry("guarded-write");
+        let rime = engine.rime_dir.clone();
+        fs::write(rime.join("a.custom.yaml"), b"old").expect("seed");
+        assert!(engine
+            .write_local_guarded("a.custom.yaml", b"new")
+            .expect("write"));
+        assert_eq!(fs::read(rime.join("a.custom.yaml")).expect("read"), b"new");
+
+        // 旧内容进了备份，且能被既有的 restore 机制找回来。
+        let manager = BackupManager::new(&rime, &engine.backup_root);
+        let list = manager.list().expect("list");
+        assert_eq!(list.len(), 1, "{list:?}");
+        manager.restore(&list[0].id).expect("restore");
+        assert_eq!(fs::read(rime.join("a.custom.yaml")).expect("read"), b"old");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_write_skips_identical_content() {
+        let (mut engine, root) = engine_for_retry("guarded-write-same");
+        let rime = engine.rime_dir.clone();
+        let target = rime.join("a.custom.yaml");
+        fs::write(&target, b"same").expect("seed");
+        let before = fs::metadata(&target)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert!(!engine
+            .write_local_guarded("a.custom.yaml", b"same")
+            .expect("write"));
+        let after = fs::metadata(&target)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after, "identical content must not be rewritten");
+        let manager = BackupManager::new(&rime, &engine.backup_root);
+        assert!(manager.list().expect("list").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_remove_backs_up_before_delete() {
+        let (mut engine, root) = engine_for_retry("guarded-remove");
+        let rime = engine.rime_dir.clone();
+        let target = rime.join("a.custom.yaml");
+        fs::write(&target, b"old").expect("seed");
+        engine
+            .remove_local_guarded("a.custom.yaml")
+            .expect("remove");
+        assert!(!target.exists(), "file must be removed");
+        // 删除前留了底 ⇒ 能找回来。
+        let manager = BackupManager::new(&rime, &engine.backup_root);
+        let list = manager.list().expect("list");
+        assert_eq!(list.len(), 1, "{list:?}");
+        manager.restore(&list[0].id).expect("restore");
+        assert_eq!(fs::read(&target).expect("read"), b"old");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_write_aborts_when_local_file_cannot_be_read() {
+        let (mut engine, root) = engine_for_retry("guarded-write-unreadable");
+        let rime = engine.rime_dir.clone();
+        // 「读不出来」的稳定构造：路径指向一个目录 ⇒ fs::read 返回
+        // IsADirectory（root 下也稳定复现，不依赖 chmod）。
+        let dir = rime.join("unreadable");
+        fs::create_dir_all(&dir).expect("dir");
+        let error = engine
+            .write_local_guarded("unreadable", b"new")
+            .expect_err("must refuse to write over an unreadable path");
+        assert!(
+            format!("{error:#}").contains("refusing to write"),
+            "{error:#}"
+        );
+        // 没有被覆盖，也没有产生备份。
+        assert!(dir.is_dir(), "the directory must be untouched");
+        let manager = BackupManager::new(&rime, &engine.backup_root);
+        assert!(manager.list().expect("list").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_remove_aborts_when_local_file_cannot_be_read() {
+        let (mut engine, root) = engine_for_retry("guarded-remove-unreadable");
+        let rime = engine.rime_dir.clone();
+        let dir = rime.join("unreadable");
+        fs::create_dir_all(&dir).expect("dir");
+        // 删不掉就报错，不能静默跳过（用户以为删了，其实还在）。
+        assert!(engine.remove_local_guarded("unreadable").is_err());
+        assert!(dir.is_dir(), "the directory must still be there");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_write_creates_new_file_without_backup() {
+        let (mut engine, root) = engine_for_retry("guarded-write-new");
+        let rime = engine.rime_dir.clone();
+        // 本地没有这个文件 ⇒ 没有旧内容要留，直接写，也不产生备份。
+        assert!(engine
+            .write_local_guarded("brand-new.custom.yaml", b"hello")
+            .expect("write"));
+        assert_eq!(
+            fs::read(rime.join("brand-new.custom.yaml")).expect("read"),
+            b"hello"
+        );
+        let manager = BackupManager::new(&rime, &engine.backup_root);
+        assert!(manager.list().expect("list").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guarded_write_aborts_when_backup_fails() {
+        let (mut engine, root) = engine_for_retry("guarded-write-fail");
+        let rime = engine.rime_dir.clone();
+        let target = rime.join("a.custom.yaml");
+        fs::write(&target, b"old").expect("seed");
+        // 备份根指向一个普通文件 ⇒ 建目录必失败。
+        let blocked = root.join("blocked");
+        fs::write(&blocked, b"not a directory").expect("blocked");
+        engine.backup_root = blocked;
+        assert!(engine.write_local_guarded("a.custom.yaml", b"new").is_err());
+        assert_eq!(fs::read(&target).expect("read"), b"old");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn conflict_name_lands_next_to_original() {
         let path = conflict_path("sub/default.custom.yaml", "devA").expect("conflict");
         assert!(path.starts_with("sub/default.custom.yaml.conflict-devA-"));
         assert!(plan::validate_rel_path(&path).is_ok());
+    }
+
+    /// 造一个不联网也能用的 Engine（只为测退避状态的对外表达）。
+    fn engine_for_retry(tag: &str) -> (Engine, PathBuf) {
+        let root = temp_test_dir(tag);
+        let rime = root.join("rime");
+        fs::create_dir_all(&rime).expect("rime");
+        let state = root.join("state");
+        fs::create_dir_all(&state).expect("state");
+        let mut config = Config::default();
+        config.webdav.url = "http://127.0.0.1:1/dav".into();
+        config.device_id = "devA".into();
+        let engine =
+            Engine::new(config, rime, state, Box::new(FakeTrigger::new())).expect("engine");
+        (engine, root)
+    }
+
+    #[test]
+    fn retry_save_failure_does_not_report_unpersisted_next_retry() {
+        let (mut engine, root) = engine_for_retry("retry-save-fail");
+        let mut report = Report {
+            ok: false,
+            ..Report::default()
+        };
+        engine.record_retry_with(&mut report, |_, _| Err(anyhow!("disk is full")));
+        assert!(
+            report.next_retry_at.is_none(),
+            "must not report a retry time that was never persisted"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("退避状态保存失败")),
+            "{:?}",
+            report.notes
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retry_save_success_reports_next_retry() {
+        let (mut engine, root) = engine_for_retry("retry-save-ok");
+        let mut report = Report {
+            ok: false,
+            ..Report::default()
+        };
+        engine.record_retry_with(&mut report, |_, _| Ok(()));
+        assert!(report.next_retry_at.is_some());
+        assert!(
+            !report
+                .notes
+                .iter()
+                .any(|note| note.contains("退避状态保存失败")),
+            "{:?}",
+            report.notes
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retry_load_failure_is_carried_into_the_report() {
+        let (engine, root) = engine_for_retry("retry-load-fail");
+        fs::write(engine.state_dir.join("retry.json"), b"{ broken").expect("corrupt");
+        let mut fresh = Engine::new(
+            engine.config.clone(),
+            engine.rime_dir.clone(),
+            engine.state_dir.clone(),
+            Box::new(FakeTrigger::new()),
+        )
+        .expect("engine");
+        let mut report = Report {
+            ok: true,
+            ..Report::default()
+        };
+        fresh.record_retry_with(&mut report, |_, _| Ok(()));
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("退避状态读取失败")),
+            "{:?}",
+            report.notes
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2382,7 +2819,7 @@ mod tests {
         );
 
         // 指针写完必须重新部署，否则不会编译进 build/ 产物。
-        engine.redeploy_after_pointer_if_needed(&report);
+        engine.recompile_if_config_changed(&mut report);
         let recorded = calls.lock().expect("calls lock").clone();
         assert!(
             recorded
@@ -2559,7 +2996,7 @@ mod tests {
             Some("luna_pinyin_extra"),
             "user's own pointer must survive"
         );
-        engine.redeploy_after_pointer_if_needed(&report);
+        engine.recompile_if_config_changed(&mut report);
         let recorded = calls.lock().expect("calls lock").clone();
         assert!(
             !recorded

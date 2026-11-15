@@ -33,7 +33,9 @@ export async function runFixIme(force = false): Promise<void> {
     const configMessage = configSkippedLine(report);
     // 小键盘的结论也要进 toast：用户往往只看到这条气泡。
     const numpadMessage = numpadConclusion(report);
-    const message = [buildMessage, weaselMessage, configMessage, numpadMessage]
+    // 标点直出同理：它是用户能直接感知的输入体验，不该只藏在详情里。
+    const punctMessage = punctConclusion(report);
+    const message = [buildMessage, weaselMessage, configMessage, numpadMessage, punctMessage]
       .filter(Boolean)
       .join("；");
     toast(message);
@@ -129,6 +131,20 @@ function describe(report: FixImeReport): string {
       }
     }
   }
+  // 标点直出：与小键盘同样的口径——后端给了常驻判定就如实呈现。
+  // 这一项比小键盘更需要说清"下一步做什么"：配置缺 punct 可以点修复解决，
+  // 但引擎本体不认识 punct 就得换输入法本体（补配置反而会让方案整个不可用）。
+  const punct = report.punct;
+  if (punct) {
+    parts.push(punct.ok ? t("fixIme.punctOk") : t("fixIme.punctBad", { list: punctSchemaIds(punct.missing ?? []).join(", ") }));
+    if (!punct.ok) {
+      parts.push(t("fixIme.punctNext"));
+      const technical = punctTechnicalText(punct);
+      if (technical) {
+        parts.push(t("fixIme.punctDetail", { text: technical }));
+      }
+    }
+  }
   if (report.result === "partial" || report.result === "failed") {
     // 后端 detail 是中文技术描述：标成"技术细节"，英文界面下不当正文。
     parts.push(
@@ -218,6 +234,46 @@ function numpadTechnicalText(numpad: NonNullable<FixImeReport["numpad"]>): strin
     parts.push(numpad.hint);
   }
   const raw = numpad.missing?.length ? numpad.missing : numpad.detail ?? [];
+  if (raw.length > 0) {
+    parts.push(raw.join(", "));
+  }
+  return parts.join(" · ");
+}
+
+/// 标点的方案名：后端给的是 "wubi86=config-missing"，取前半截。
+function punctSchemaIds(missing: string[]): string[] {
+  return missing.map((entry) => entry.split("=")[0] || entry);
+}
+
+/// 标点的 toast 结论：与小键盘同一口径。
+///
+/// 只在"确实有缺口"时说话；好的时候不刷屏（toast 已经很长了）。
+function punctConclusion(report: FixImeReport): string {
+  const punct = report.punct;
+  if (!punct || punct.ok) {
+    return "";
+  }
+  // 坏了就把下一步一起给出去：toast 是用户唯一会看的地方，不能只说"坏了"。
+  return [
+    t("fixIme.punctBad", { list: punctSchemaIds(punct.missing ?? []).join(", ") }),
+    t("fixIme.punctNext"),
+  ].join(" · ");
+}
+
+/// 标点的技术细节：后端 hint 与逐方案状态。
+///
+/// 后端是中文，只能当"技术细节"出现，英文界面下不当正文。
+/// 带上 engine_support：它是"缺配置"与"引擎本体不支持"的分界，
+/// 用户照 hint 才知道该点修复还是该换输入法本体。
+function punctTechnicalText(punct: NonNullable<FixImeReport["punct"]>): string {
+  const parts: string[] = [];
+  if (punct.engine_support) {
+    parts.push(`engine=${punct.engine_support}`);
+  }
+  if (punct.hint) {
+    parts.push(punct.hint);
+  }
+  const raw = punct.missing?.length ? punct.missing : punct.detail ?? [];
   if (raw.length > 0) {
     parts.push(raw.join(", "));
   }

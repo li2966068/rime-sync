@@ -28,6 +28,7 @@ pub mod platform;
 pub mod prebuilt;
 pub mod presets;
 pub mod process;
+pub mod processor_spec;
 pub mod profile;
 pub mod proxy;
 pub mod prune;

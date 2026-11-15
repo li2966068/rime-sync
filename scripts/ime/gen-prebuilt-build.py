@@ -627,6 +627,36 @@ def verify_manifest(out_dir: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- 校验
+def check_processors_order(out_dir: Path) -> list[str]:
+    """断言随包产物里的 engine/processors 顺序满足 rime-sync 的三条硬规则。
+
+    三条规则（与 crates/core/src/processor_spec.rs 的 validate() 同一口径）：
+      * rimesync_vselect 紧跟 recognizer；
+      * numpad 紧跟 rimesync_vselect；
+      * rimesync_punct 排在 punctuator 之前（否则它拿不到按键，中文标点直出等于没开）。
+
+    为什么在这里断言：随包产物是**我们自己生成**的（Authoritative 策略），
+    顺序由我们说了算；一旦漂了，用户装到的就是一套顺序错乱的引擎。
+    config/*.custom.yaml（手写源的拷贝）与 build/*.schema.yaml（编译后的生效配置）
+    两边都要查 —— 前者是模板，后者才是引擎真正读的那份。
+    """
+    fail: list[str] = []
+    targets: list[Path] = []
+    for sub in ("build", "config"):
+        base = out_dir / sub
+        if base.is_dir():
+            targets.extend(sorted(base.glob("*.schema.yaml")))
+            targets.extend(sorted(base.glob("*.custom.yaml")))
+    for path in targets:
+        names = rime_common.extract_processors(path.read_text(encoding="utf-8", errors="replace"))
+        if not names:
+            continue
+        problems = rime_common.processor_order_violations(names)
+        for item in problems:
+            fail.append(f"{path.relative_to(out_dir)}：{item}")
+    return fail
+
+
 def check_payload(out_dir: Path, budget: int) -> list[str]:
     fail: list[str] = []
     manifest_path = out_dir / "MANIFEST.json"
@@ -936,7 +966,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.check:
         fails = (check_payload(out_dir, budget) + check_git_ignore(out_dir)
-                 + check_wiring() + check_rime_payload_eol() + check_windows_checkout())
+                 + check_wiring() + check_rime_payload_eol() + check_windows_checkout()
+                 + check_processors_order(out_dir))
         if fails:
             for item in fails:
                 print(f"FAIL {item}", file=sys.stderr)

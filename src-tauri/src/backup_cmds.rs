@@ -26,7 +26,8 @@ pub struct CreatedView {
 #[derive(Serialize)]
 pub struct RestoreView {
     pub backup_id: String,
-    pub pre_restore_id: Option<String>,
+    /// 还原点备份 id：必存在（留不下还原点时回滚直接失败）。
+    pub pre_restore_id: String,
     pub restored: usize,
 }
 
@@ -90,9 +91,7 @@ pub fn cmd_restore_backup(
         &state.0,
         format!(
             "已回滚到备份 {}（写回 {} 个文件，pre-restore={}）",
-            report.backup_id,
-            report.restored,
-            report.pre_restore_id.as_deref().unwrap_or("none")
+            report.backup_id, report.restored, report.pre_restore_id
         ),
     );
     Ok(RestoreView {

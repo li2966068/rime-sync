@@ -121,6 +121,8 @@ fn same_level_list_is_recognized_and_repaired() {
             "  - rimesync_vselect",
             "  - numpad",
             "  - key_binder",
+            // 列表里没有 punctuator，rimesync_punct 只能追加到末尾。
+            "  - rimesync_punct",
         ],
         "numpad 必须插在 rimesync_vselect 紧后，且沿用同级缩进"
     );
@@ -153,26 +155,32 @@ fn nested_level_list_still_works() {
             "    - rimesync_vselect",
             "    - numpad",
             "    - key_binder",
+            // 列表里没有 punctuator，rimesync_punct 只能追加到末尾。
+            "    - rimesync_punct",
         ],
     );
 }
 
 /// 已经是目标状态：同级写法也必须一个字节都不动（幂等）。
+///
+/// 目标状态 = vselect 后面紧跟 numpad，且 rimesync_punct 已在列表里。
 #[test]
 fn same_level_already_repaired_is_unchanged() {
     let tmp = TempDir::new("idem");
     let path = tmp.path().join("luna_pinyin_simp.custom.yaml");
-    let already = SAME_LEVEL.replace(
-        "  - rimesync_vselect\n",
-        "  - rimesync_vselect\n  - numpad\n",
-    );
+    let already = SAME_LEVEL
+        .replace(
+            "  - rimesync_vselect\n",
+            "  - rimesync_vselect\n  - numpad\n",
+        )
+        .replace("  - key_binder\n", "  - key_binder\n  - rimesync_punct\n");
     write(&path, &already);
 
     let outcome = repair_file(&path).expect("repair");
     assert_eq!(
         outcome,
         RepairOutcome::Unchanged,
-        "已含 numpad 的同级写法文件必须判定为 Unchanged"
+        "已含 numpad 与 rimesync_punct 的同级写法文件必须判定为 Unchanged"
     );
     assert_eq!(read(&path), already, "Unchanged 时不得写盘");
 }

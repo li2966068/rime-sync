@@ -34,6 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::data_patch::{backup_path, NUMPAD_PROCESSOR, VSELECT_PROCESSOR};
+use crate::processor_spec;
 use crate::yaml_text::{
     block_end, indent_of, is_blank, is_comment, is_flow_value, is_key_at, is_seq_item, item_name,
     Doc, RawLines,
@@ -225,6 +226,54 @@ fn numpad_lines(lines: &[String], items: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// 把一条 processors 编辑动作落到文本行上（保留用户的注释与格式）。
+///
+/// 动作来自 `processor_spec::plan`（唯一真相源）；这里只负责「插到哪一行、
+/// 删哪几行」，不自己判断规则。
+fn apply_action(doc: &mut Doc, action: processor_spec::Action) -> bool {
+    let Some(list) = find_processors(doc) else {
+        return false;
+    };
+    match action {
+        processor_spec::Action::Remove(name) => {
+            let victims: Vec<usize> = list
+                .items
+                .iter()
+                .copied()
+                .filter(|&index| item_name(&doc.lines[index]) == name)
+                .collect();
+            // 摘不到也不算失败：计划里可能有「本来就不存在」的项。
+            if victims.is_empty() {
+                return true;
+            }
+            for index in victims.into_iter().rev() {
+                doc.lines.remove(index);
+            }
+            doc.changed = true;
+            true
+        }
+        processor_spec::Action::Insert { item, anchor } => {
+            let names = names_of(&doc.lines, &list.items);
+            let at = match anchor {
+                processor_spec::Anchor::After(anchor) => names
+                    .iter()
+                    .position(|name| name == anchor)
+                    .map(|index| list.items[index] + 1),
+                processor_spec::Anchor::Before(anchor) => names
+                    .iter()
+                    .position(|name| name == anchor)
+                    .map(|index| list.items[index]),
+                processor_spec::Anchor::End => list.items.last().map(|&index| index + 1),
+            };
+            let Some(at) = at else {
+                return false;
+            };
+            insert_item(doc, at, list.item_indent, item);
+            true
+        }
+    }
+}
+
 /// 这份 processors 列表要不要改。
 enum ListPlan {
     /// 已经是目标状态（rimesync_vselect 后面紧跟 numpad，且只有一份 numpad）。
@@ -236,41 +285,31 @@ enum ListPlan {
 }
 
 /// 按目标状态修这份 processors 列表。
+///
+/// 规则来自 `processor_spec`（唯一真相源），这里用的是**保守策略**：
+/// * 用户摆好的 `rimesync_vselect` 绝不挪（用户可能自己插了别的处理器）；
+/// * `numpad` 必须紧跟 vselect 且只有一份；
+/// * `rimesync_punct` 缺了就补（排在 punctuator 之前），已有的位置原样保留。
 fn repair_processors(doc: &mut Doc) -> ListPlan {
     let Some(list) = find_processors(doc) else {
         return ListPlan::Unchanged;
     };
     let names = names_of(&doc.lines, &list.items);
-    let Some(index) = names.iter().position(|name| name == VSELECT_PROCESSOR) else {
+    if !processor_spec::contains(&names, VSELECT_PROCESSOR) {
         // rimesync_vselect 不在：这份文件被用户大改过（rime-sync 历来发布的每一版
         // 管理型 custom.yaml 都带它），保守跳过比替用户加回处理器安全。
         return ListPlan::NoVSelect;
-    };
-    let numpads = numpad_lines(&doc.lines, &list.items);
-    let adjacent = names
-        .get(index + 1)
-        .map(|name| name == NUMPAD_PROCESSOR)
-        .unwrap_or(false);
-    if adjacent && numpads.len() == 1 {
+    }
+    let actions = processor_spec::plan(&names, processor_spec::Policy::Conservative);
+    if actions.is_empty() {
         // 已经就位：一个字节都不动。
         return ListPlan::Unchanged;
     }
-    let item_indent = list.item_indent;
-    // 摘掉列表里已有的 numpad：目标状态要求它紧跟 vselect，而且只能有一份。
-    for index in numpads.into_iter().rev() {
-        doc.lines.remove(index);
+    for action in actions {
+        if !apply_action(doc, action) {
+            return ListPlan::Unchanged;
+        }
     }
-    // 摘完之后重新取一次列表（行号变了）。
-    let Some(list) = find_processors(doc) else {
-        return ListPlan::Unchanged;
-    };
-    let names = names_of(&doc.lines, &list.items);
-    let Some(index) = names.iter().position(|name| name == VSELECT_PROCESSOR) else {
-        return ListPlan::NoVSelect;
-    };
-    // numpad 紧跟 rimesync_vselect。
-    let at = list.items[index] + 1;
-    insert_item(doc, at, item_indent, NUMPAD_PROCESSOR);
     ListPlan::Repair
 }
 
@@ -298,20 +337,12 @@ fn verify_repaired(text: &str, path: &Path) -> Result<()> {
             )
         })?;
     let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
-    let index = names
-        .iter()
-        .position(|name| *name == VSELECT_PROCESSOR)
-        .ok_or_else(|| {
-            anyhow!(
-                "修复后的 {} 里没有 {VSELECT_PROCESSOR}，已取消写入",
-                path.display()
-            )
-        })?;
-    if names.get(index + 1) != Some(&NUMPAD_PROCESSOR) {
-        bail!(
-            "修复后的 {} 里 {NUMPAD_PROCESSOR} 没有紧跟 {VSELECT_PROCESSOR}，已取消写入",
-            path.display()
-        );
+    // 目标状态的核对统一走 processor_spec（唯一真相源）：vselect 在不在、
+    // numpad 紧不紧跟它、punct 在不在。
+    // 注意：这里用的是保守校验 —— 不查 vselect 是不是紧跟 recognizer，
+    // 也不查 punct 的位置（保守策略承诺保留用户摆的位置）。
+    if let Err(message) = processor_spec::validate_conservative(&names) {
+        bail!("修复后的 {} {message}，已取消写入", path.display());
     }
     Ok(())
 }

@@ -111,6 +111,98 @@ pub(crate) fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(state_dir(app)?.join("config.json"))
 }
 
+/// 读配置文件（磁盘原值，**不含**环境变量覆盖）。
+fn read_stored_config(path: &Path) -> Result<Config, String> {
+    Config::load(path).map_err(|error| format!("读取配置失败：{error:#}"))
+}
+
+/// 读配置文件并套用 `RIME_SYNC_*` 环境变量覆盖。
+///
+/// 与 CLI（crates/cli/src/main.rs）同口径：环境变量覆盖配置文件里的对应字段，
+/// 且只在内存里生效（CLI 里就是 stored/config 两份，磁盘那份始终是用户自己填的值）。
+/// 桌面端所有读配置的地方都必须走这里，否则会出现「有的界面认环境变量、有的不认」。
+fn read_effective_config(path: &Path) -> Result<Config, String> {
+    let mut config = read_stored_config(path)?;
+    config.apply_env();
+    Ok(config)
+}
+
+/// 哪些字段正被环境变量接管。
+struct EnvOverrides {
+    url: bool,
+    username: bool,
+    remote_dir: bool,
+    rime_dir: bool,
+    first_sync_policy: bool,
+}
+
+impl EnvOverrides {
+    /// 用「原值 vs 套过 apply_env 的值」做对比，而不是另抄一份变量清单：
+    /// core::apply_env 增删变量时这里自动跟着变，不会两处漂移。
+    fn detect(stored: &Config) -> Self {
+        let mut probe = stored.clone();
+        probe.apply_env();
+        Self {
+            url: probe.webdav.url != stored.webdav.url,
+            username: probe.webdav.username != stored.webdav.username,
+            remote_dir: probe.webdav.remote_dir != stored.webdav.remote_dir,
+            rime_dir: probe.rime_dir != stored.rime_dir,
+            first_sync_policy: probe.first_sync_policy != stored.first_sync_policy,
+        }
+    }
+
+    /// 给人看的名字（只用于日志提示，永远不含密码）。
+    fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.url {
+            names.push("WebDAV 地址");
+        }
+        if self.username {
+            names.push("WebDAV 用户名");
+        }
+        if self.remote_dir {
+            names.push("远端目录");
+        }
+        if self.rime_dir {
+            names.push("Rime 目录");
+        }
+        if self.first_sync_policy {
+            names.push("首次同步策略");
+        }
+        names
+    }
+}
+
+/// 落盘配置：被环境变量接管的字段保持磁盘上的原值。
+///
+/// 为什么：环境变量是**运行时**覆盖（与 CLI 的 stored/config 两份同口径）——
+/// 它决定「这次用哪个地址」，但不该改写用户自己的配置文件；否则用户撤掉环境变量后，
+/// 配置文件里还留着被固化的那份值，就再也回不去了。
+/// 密码本来就不会落盘（webdav.password 不序列化），环境变量里的密码同样只在内存里。
+pub(crate) fn save_config(path: &Path, config: &Config) -> Result<(), String> {
+    let stored = read_stored_config(path)?;
+    let overrides = EnvOverrides::detect(&stored);
+    let mut to_save = config.clone();
+    if overrides.url {
+        to_save.webdav.url = stored.webdav.url.clone();
+    }
+    if overrides.username {
+        to_save.webdav.username = stored.webdav.username.clone();
+    }
+    if overrides.remote_dir {
+        to_save.webdav.remote_dir = stored.webdav.remote_dir.clone();
+    }
+    if overrides.rime_dir {
+        to_save.rime_dir = stored.rime_dir.clone();
+    }
+    if overrides.first_sync_policy {
+        to_save.first_sync_policy = stored.first_sync_policy;
+    }
+    to_save
+        .save(path)
+        .map_err(|error| format!("写入配置失败：{error:#}"))
+}
+
 /// 密码后端：探测一次后缓存（钥匙串探测会写测试条目，不能每个命令都做）。
 fn secret_selection(app: &AppHandle, inner: &Inner) -> Result<Arc<SecretSelection>, String> {
     if let Ok(guard) = inner.secret.lock() {
@@ -130,7 +222,7 @@ fn secret_selection(app: &AppHandle, inner: &Inner) -> Result<Arc<SecretSelectio
 pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
     let path = config_path(app)?;
     let selection = secret_selection(app, inner)?;
-    let mut config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    let mut config = read_stored_config(&path)?;
     if config.legacy_password {
         match config.migrate_legacy_password(selection.store.as_ref(), &path) {
             Ok(true) => push_log(inner, "已把旧配置里的明文密码迁移到密码后端"),
@@ -138,6 +230,9 @@ pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, Stri
             Err(error) => push_log(inner, format!("迁移旧密码失败：{error:#}")),
         }
     }
+    // 环境变量覆盖放在解析密码**之前**：内存里的密码优先于密码后端，
+    // 这样 RIME_SYNC_DAV_PASS 的优先级与 CLI 完全一致（CLI 也是先 apply_env 再 load_password）。
+    config.apply_env();
     if let Err(error) = config.load_password(selection.store.as_ref()) {
         push_log(inner, format!("读取密码失败：{error:#}"));
     }
@@ -147,14 +242,54 @@ pub(crate) fn load_config(app: &AppHandle, inner: &Inner) -> Result<Config, Stri
     Ok(config)
 }
 
+/// 配置里显式填的 Rime 目录（空 = 没填，走自动探测）。
+fn configured_rime_dir(config: &Config) -> Option<&str> {
+    config
+        .rime_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// 解析 Rime 用户目录。
+///
+/// 用户手填的目录不存在时**明确报错**，不再悄悄换成探测到的另一个目录：
+/// 悄悄换目录 = 用户以为在同步 A 机器、其实在同步 B 机器，而他完全不知情。
+/// 口径与 CLI（crates/cli/src/main.rs::resolve_rime_dir）一致，同样做 canonicalize，
+/// 软链目录在两端显示同一个真实路径。
 pub(crate) fn detect_rime(config: &Config) -> Result<rime_dir::Detection, String> {
-    rime_dir::detect(config.rime_dir.as_deref().map(Path::new))
-        .or_else(|_| rime_dir::detect(None))
-        .map_err(|error| {
-            format!(
-                "未能定位 Rime 用户目录：{error:#}。请在「同步」页点击自动探测或手动填写目录路径。"
-            )
-        })
+    match configured_rime_dir(config) {
+        Some(dir) => {
+            let path = config::resolve_configured_rime_dir(Some(dir))
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(rime_dir::Detection {
+                path,
+                source: "config".to_string(),
+            })
+        }
+        None => detect_rime_fresh(),
+    }
+}
+
+/// 自动探测 Rime 用户目录（忽略配置里那个可能已经失效的路径）。
+///
+/// 「自动探测」按钮必须走这里：用户点它就是为了救回一个填错的路径，
+/// 拿配置里的坏路径去探测只会再报一次同样的错。
+pub(crate) fn detect_rime_fresh() -> Result<rime_dir::Detection, String> {
+    let detection = rime_dir::detect(None).map_err(|error| {
+        format!("未能定位 Rime 用户目录：{error:#}。请在「同步」页点击自动探测或手动填写目录路径。")
+    })?;
+    // 与 CLI 同口径：canonicalize 之后软链目录两边显示同一个路径。
+    let path = std::fs::canonicalize(&detection.path).map_err(|error| {
+        format!(
+            "无法解析 Rime 用户目录的真实路径：{}（{error}）",
+            detection.path.display()
+        )
+    })?;
+    Ok(rime_dir::Detection {
+        path,
+        source: detection.source,
+    })
 }
 
 /// 读取配置；device_id 为空时按 PLAN §6 生成并写回。
@@ -169,21 +304,30 @@ pub(crate) fn ensure_config(app: &AppHandle, inner: &Inner) -> Result<Config, St
 /// 读设置/探测目录这类操作没必要为此等待。
 pub(crate) fn ensure_config_meta(app: &AppHandle, inner: &Inner) -> Result<Config, String> {
     let path = config_path(app)?;
-    let config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    let config = read_effective_config(&path)?;
     ensure_device_id(app, inner, config)
+}
+
+/// 「尽力而为」地拿 Rime 目录：配置里的目录失效时退回自动探测。
+///
+/// 只用于**派生信息**（设备 ID 这类「拿不到也无害」的场合）：设备 ID 要跟
+/// installation.yaml 对齐，配置路径填错时不能因此把设备 ID 换成随机值
+/// （那会让同步落到另一个远端目录）。真正要读写用户目录的操作一律走 detect_rime。
+pub(crate) fn detect_rime_lenient(config: &Config) -> Option<rime_dir::Detection> {
+    detect_rime(config)
+        .ok()
+        .or_else(|| detect_rime_fresh().ok())
 }
 
 fn ensure_device_id(app: &AppHandle, inner: &Inner, mut config: Config) -> Result<Config, String> {
     let path = config_path(app)?;
     if config.device_id.trim().is_empty() {
-        let detected = detect_rime(&config).ok();
+        let detected = detect_rime_lenient(&config);
         config.device_id = match detected {
             Some(detection) => config.resolve_device_id(&detection.path),
             None => config::generate_device_id(),
         };
-        config
-            .save(&path)
-            .map_err(|error| format!("写入配置失败：{error:#}"))?;
+        save_config(&path, &config)?;
         push_log(inner, format!("已生成设备 ID：{}", config.device_id));
     }
     Ok(config)
@@ -255,19 +399,12 @@ fn server_kind(server: Option<&str>, dav: &[String]) -> String {
 #[tauri::command]
 fn cmd_get_config(app: AppHandle, state: State<'_, AppState>) -> Result<Config, String> {
     // 设置页要的是配置本身（密码字段序列化时已跳过），不必解析密码。
-    let mut config = ensure_config_meta(&app, &state.0)?;
-    // 配置里的 Rime 目录可能已被删除（或来自旧机器/旧测试），启动时校验一次。
-    if let Some(dir) = config.rime_dir.clone() {
-        if !Path::new(&dir).is_dir() {
-            push_log(
-                &state.0,
-                format!("配置的 Rime 目录不存在，已重置以便重新探测：{dir}"),
-            );
-            config.rime_dir = None;
-            config
-                .save(&config_path(&app)?)
-                .map_err(|error| format!("写入配置失败：{error:#}"))?;
-        }
+    let config = ensure_config_meta(&app, &state.0)?;
+    // 配置里的 Rime 目录可能已被删除（或来自旧机器/旧测试）。
+    // 这里**只提示、不改配置**：把用户手填的路径清空并写回磁盘 = 静默吃掉用户的输入，
+    // 用户根本不知道自己填错了（缺陷 D1）。要修就在设置页改，或点「自动探测」。
+    if let Some(problem) = config::rime_dir_problem(config.rime_dir.as_deref()) {
+        push_log(&state.0, problem);
     }
     Ok(config)
 }
@@ -378,11 +515,28 @@ fn cmd_set_config(
         .validate()
         .map_err(|error| format!("代理配置无效：{error:#}"))?;
 
-    config
-        .save(&path)
-        .map_err(|error| format!("写入配置失败：{error:#}"))?;
+    // 落盘：被环境变量接管的字段保持磁盘上的原值（环境变量是运行时覆盖，不改写用户配置）。
+    // 顺手告诉用户「这几项改不动」，免得他以为是自己没保存成功。
+    if let Ok(path) = config_path(&app) {
+        if let Ok(stored) = read_stored_config(&path) {
+            let names = EnvOverrides::detect(&stored).names();
+            if !names.is_empty() {
+                push_log(
+                    &state.0,
+                    format!(
+                        "以下配置项由环境变量接管，配置文件里的值保持不变：{}",
+                        names.join("、")
+                    ),
+                );
+            }
+        }
+    }
+    save_config(&path, &config)?;
     push_log(&state.0, "配置已保存");
-    Ok(config)
+    // 返回给界面的是**生效值**（含环境变量覆盖）：界面显示的必须等于真正会用上的。
+    let mut effective = config;
+    effective.apply_env();
+    Ok(effective)
 }
 
 #[derive(Serialize)]
@@ -398,7 +552,12 @@ fn cmd_detect_rime_dir(
     state: State<'_, AppState>,
 ) -> Result<DetectionView, String> {
     let config = ensure_config(&app, &state.0)?;
-    let detection = detect_rime(&config)?;
+    // 配置里的目录还能用就照旧用它；已经失效（用户填错 / 机器换了）时退回真正的
+    // 自动探测 —— 这个按钮就是用来把坏路径救回来的，不能因为它坏就什么都做不了。
+    let detection = match configured_rime_dir(&config) {
+        Some(dir) if Path::new(dir).is_dir() => detect_rime(&config)?,
+        _ => detect_rime_fresh()?,
+    };
     Ok(DetectionView {
         exists: detection.path.is_dir(),
         path: detection.path.display().to_string(),
@@ -611,17 +770,23 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
 
     let detected = detect_rime(&config)?;
     let rime_path = detected.path;
-    let rime_text = rime_path.display().to_string();
-    if config.rime_dir.as_deref() != Some(rime_text.as_str()) {
-        config.rime_dir = Some(rime_text);
+    // 只在「本来就没填」时补写：用户手填的路径原样保留（canonicalize 只是
+    // 解析口径，不该反过来改写用户的输入）。
+    if config
+        .rime_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        config.rime_dir = Some(rime_path.display().to_string());
     }
     if config.device_id.trim().is_empty() {
         config.device_id = config.resolve_device_id(&rime_path);
     }
     config.device_id = config.device_id.trim().to_string();
-    config
-        .save(&path)
-        .map_err(|error| format!("保存配置失败：{error:#}"))?;
+    // 落盘用 save_config：环境变量接管的字段不被固化进配置文件（与 CLI 同口径）。
+    save_config(&path, &config)?;
     if let Err(error) = config.validate() {
         return Err(format!("配置不完整：{error:#}"));
     }
@@ -787,11 +952,9 @@ fn cmd_get_log(state: State<'_, AppState>, limit: Option<usize>) -> Result<Vec<S
 #[tauri::command]
 fn cmd_needs_setup(app: AppHandle, _state: State<'_, AppState>) -> Result<bool, String> {
     let path = config_path(&app)?;
-    if !path.exists() {
-        return Ok(true);
-    }
     // 启动路径：只看 URL 是否为空，绝不探测钥匙串。
-    let config = Config::load(&path).map_err(|error| format!("读取配置失败：{error:#}"))?;
+    // 环境变量也算「已经配置过」：RIME_SYNC_DAV_URL 给出了地址就不必再进向导。
+    let config = read_effective_config(&path)?;
     Ok(config.webdav.url.trim().is_empty())
 }
 
@@ -971,6 +1134,16 @@ pub fn run() {
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
             push_log(&state.0, "Rime 同步已启动");
+            // 环境变量覆盖：启动时先说一声，免得用户以为设置没生效
+            //（只报被接管的字段名，绝不打印密码）。
+            if let Ok(path) = config_path(&handle) {
+                if let Ok(stored) = read_stored_config(&path) {
+                    let names = EnvOverrides::detect(&stored).names();
+                    if !names.is_empty() {
+                        push_log(&state.0, format!("环境变量覆盖生效：{}", names.join("、")));
+                    }
+                }
+            }
             let setup_requested = setup_requested(std::env::args());
             state
                 .0
@@ -1094,5 +1267,188 @@ pub fn run() {
     if let Err(error) = builder.run(tauri::generate_context!()) {
         eprintln!("rime-sync 启动失败：{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 环境变量测试的全局锁：std::env 是进程级的，测试并行跑时会互相踩。
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
+    /// 环境变量测试涉及的变量（测完必须清干净，免得影响别的测试）。
+    const ENV_KEYS: [&str; 6] = [
+        "RIME_SYNC_DAV_URL",
+        "RIME_SYNC_DAV_USER",
+        "RIME_SYNC_DAV_PASS",
+        "RIME_SYNC_DAV_DIR",
+        "RIME_SYNC_RIME_DIR",
+        "RIME_SYNC_FIRST_SYNC_POLICY",
+    ];
+
+    fn clear_env() {
+        for key in ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// 建一个临时配置文件，返回它的路径（内容由调用方写）。
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rime-sync-tauri-env-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        dir.join("config.json")
+    }
+
+    /// 造一份「文件里已经填好值」的配置。
+    fn stored_config() -> Config {
+        let mut stored = Config::default();
+        stored.webdav.url = "https://file.example/dav".to_string();
+        stored.webdav.username = "file-user".to_string();
+        stored.webdav.remote_dir = "from-file".to_string();
+        stored.rime_dir = Some("/from/file".to_string());
+        stored.first_sync_policy = config::FirstSyncPolicy::Preview;
+        stored
+    }
+
+    /// B4：桌面端读配置时，环境变量必须覆盖配置文件里的对应字段。
+    ///
+    /// 与 CLI（crates/cli/src/main.rs 的 apply_env）同口径：环境变量赢，
+    /// 且只在内存里生效——磁盘上的 config.json 仍保留用户自己填的值。
+    #[test]
+    fn env_overrides_stored_config_fields() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        clear_env();
+        let path = temp_config_path("override");
+        stored_config().save(&path).expect("写入配置文件");
+
+        std::env::set_var("RIME_SYNC_DAV_URL", "https://env.example/dav");
+        std::env::set_var("RIME_SYNC_DAV_USER", "env-user");
+        std::env::set_var("RIME_SYNC_DAV_DIR", "from-env");
+        std::env::set_var("RIME_SYNC_RIME_DIR", "/from/env");
+        std::env::set_var("RIME_SYNC_FIRST_SYNC_POLICY", "normal");
+
+        let effective = read_effective_config(&path).expect("读取生效配置");
+        assert_eq!(effective.webdav.url, "https://env.example/dav");
+        assert_eq!(effective.webdav.username, "env-user");
+        assert_eq!(effective.webdav.remote_dir, "from-env");
+        assert_eq!(effective.rime_dir.as_deref(), Some("/from/env"));
+        assert_eq!(effective.first_sync_policy, config::FirstSyncPolicy::Normal);
+
+        // 磁盘上的原值不受影响：环境变量是运行时覆盖，不是配置改写。
+        let on_disk = read_stored_config(&path).expect("读取磁盘配置");
+        assert_eq!(on_disk.webdav.url, "https://file.example/dav");
+        assert_eq!(on_disk.webdav.username, "file-user");
+        assert_eq!(on_disk.webdav.remote_dir, "from-file");
+        assert_eq!(on_disk.rime_dir.as_deref(), Some("/from/file"));
+        assert_eq!(on_disk.first_sync_policy, config::FirstSyncPolicy::Preview);
+
+        clear_env();
+        let _ = std::fs::remove_dir_all(path.parent().expect("取临时目录"));
+    }
+
+    /// 没有环境变量时，配置文件里的值照旧生效（别把原来的行为改坏）。
+    #[test]
+    fn without_env_the_stored_config_wins() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        clear_env();
+        let path = temp_config_path("no-env");
+        stored_config().save(&path).expect("写入配置文件");
+
+        let effective = read_effective_config(&path).expect("读取生效配置");
+        assert_eq!(effective.webdav.url, "https://file.example/dav");
+        assert_eq!(effective.webdav.username, "file-user");
+        assert_eq!(effective.webdav.remote_dir, "from-file");
+        assert_eq!(effective.rime_dir.as_deref(), Some("/from/file"));
+        assert_eq!(
+            effective.first_sync_policy,
+            config::FirstSyncPolicy::Preview
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("取临时目录"));
+    }
+
+    /// 落盘时不能把环境变量的值固化进配置文件。
+    ///
+    /// 否则用户撤掉环境变量后，配置文件里还留着被固化的那份值，就再也回不去了。
+    #[test]
+    fn saving_config_keeps_env_overridden_fields_untouched() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        clear_env();
+        let path = temp_config_path("save");
+        stored_config().save(&path).expect("写入配置文件");
+
+        std::env::set_var("RIME_SYNC_DAV_URL", "https://env.example/dav");
+        std::env::set_var("RIME_SYNC_RIME_DIR", "/from/env");
+
+        let mut effective = read_effective_config(&path).expect("读取生效配置");
+        effective.device_id = "device-under-test".to_string();
+        save_config(&path, &effective).expect("保存配置");
+
+        let on_disk = read_stored_config(&path).expect("读取磁盘配置");
+        // 被环境变量接管的字段：仍是用户自己填的值。
+        assert_eq!(on_disk.webdav.url, "https://file.example/dav");
+        assert_eq!(on_disk.rime_dir.as_deref(), Some("/from/file"));
+        // 其它改动照常落盘。
+        assert_eq!(on_disk.device_id, "device-under-test");
+
+        clear_env();
+        let _ = std::fs::remove_dir_all(path.parent().expect("取临时目录"));
+    }
+
+    /// 环境变量里的密码只在内存里用：既不落盘，也不进日志。
+    #[test]
+    fn env_password_never_reaches_the_config_file() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        clear_env();
+        let path = temp_config_path("password");
+        stored_config().save(&path).expect("写入配置文件");
+
+        std::env::set_var("RIME_SYNC_DAV_PASS", "s3cret-from-env");
+        let effective = read_effective_config(&path).expect("读取生效配置");
+        assert_eq!(effective.webdav.password, "s3cret-from-env");
+
+        save_config(&path, &effective).expect("保存配置");
+        let text = std::fs::read_to_string(&path).expect("读取配置文件");
+        assert!(
+            !text.contains("s3cret-from-env"),
+            "环境变量里的密码绝不能写进配置文件：{text}"
+        );
+
+        clear_env();
+        let _ = std::fs::remove_dir_all(path.parent().expect("取临时目录"));
+    }
+
+    /// D1：GUI 不许再静默改掉用户手填的 Rime 目录。
+    ///
+    /// 改前 `detect_rime` 在配置目录不存在时会 `.or_else(|_| rime_dir::detect(None))`
+    /// 悄悄换一个目录，用户完全不知道自己填错了；改后必须明确报错。
+    #[test]
+    fn detect_rime_refuses_a_missing_configured_directory() {
+        let config = Config {
+            rime_dir: Some("/definitely/not/a/rime/dir".to_string()),
+            ..Config::default()
+        };
+
+        let error = detect_rime(&config).expect_err("目录不存在时必须报错，不能悄悄换目录");
+        assert!(
+            error.contains("/definitely/not/a/rime/dir"),
+            "报错必须点名用户填的目录：{error}"
+        );
+    }
+
+    /// 没填目录时才能走自动探测（探测失败也只在这里发生）。
+    #[test]
+    fn detect_rime_without_configuration_falls_back_to_detection() {
+        let config = Config {
+            rime_dir: None,
+            ..Config::default()
+        };
+        // 本机有没有 Rime 目录不确定：两种结果都合法，但都不许 panic。
+        let _ = detect_rime(&config);
     }
 }

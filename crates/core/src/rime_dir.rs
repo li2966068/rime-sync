@@ -107,39 +107,117 @@ fn config_home() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".config"))
 }
 
-/// 纯函数：rime.conf 文本 → UserDataDirPath（支持 `key=value` / `key: value`、引号、~）。
+/// 纯函数：rime.conf 文本 → UserDataDirPath。
+///
+/// 规则（与 packaging/linux/postinst、packaging/linux/uninstall.sh 的 shell 版
+/// **逐条一致**，两端必须同步改，否则安装器与卸载器会算到不同的 Rime 目录）：
+/// 1. 分隔符 `=` 与 `:` 都支持；值是分隔符之后的**全部**内容（允许含 `=`）。
+/// 2. 键名（trim 后）必须等于 `UserDataDirPath`，否则跳过该行。
+/// 3. 值先 trim 空白，再剥掉**成对**的双引号或单引号。
+/// 4. 空值 = 未设置（None）。
+/// 5. `~` 展开为 HOME，`~/xxx` 展开为 `$HOME/xxx`；HOME 缺失时视为未设置。
+/// 6. **必须是绝对路径**：相对路径按未设置处理（fcitx5 引擎自己也拒绝相对路径，
+///    见 third_party/fcitx5-rime/src/rimeengine.cpp 的 resolveRimeUserDir）。
+/// 7. 去掉末尾斜杠（根目录除外）。
 pub fn parse_fcitx5_user_data_dir(text: &str, home: Option<&Path>) -> Option<PathBuf> {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
             continue;
         }
-        let split = line.split_once('=').or_else(|| line.split_once(':'));
-        let Some((key, value)) = split else {
+        let Some((key, value)) = split_conf_entry(line) else {
             continue;
         };
-        if key.trim() != "UserDataDirPath" {
+        if key != "UserDataDirPath" {
             continue;
         }
-        let value = value.trim().trim_matches('"').trim_matches('\u{27}').trim();
-        if value.is_empty() {
-            return None;
-        }
-        return Some(expand_tilde(value, home));
+        // 只认第一处匹配：后面的同名键不覆盖（与 fcitx5 的「首个生效」一致）。
+        return normalize_user_data_dir(value, home);
     }
     None
 }
 
-fn expand_tilde(value: &str, home: Option<&Path>) -> PathBuf {
-    if let Some(home) = home {
-        if value == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = value.strip_prefix("~/") {
-            return home.join(rest);
+/// 从一行配置里切出 (键, 值)。
+///
+/// 先按 `=` 切：这样 `UserDataDirPath=C:\foo` 不会被冒号切坏（Windows 盘符）。
+/// 但值里含 `=` 时（如 `UserDataDirPath: /x=y`）按 `=` 切出来的键是
+/// `UserDataDirPath: /x`，不匹配 ⇒ 再按 `:` 切一次（只切第一个冒号）拿到真键。
+fn split_conf_entry(line: &str) -> Option<(&str, &str)> {
+    if let Some((key, value)) = line.split_once('=') {
+        let key = key.trim();
+        if key == "UserDataDirPath" {
+            return Some((key, value));
         }
     }
-    PathBuf::from(value)
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    if key == "UserDataDirPath" {
+        Some((key, value))
+    } else {
+        None
+    }
+}
+
+/// 值规范化：引号 → 空值 → `~` 展开 → 绝对路径校验 → 去尾斜杠。
+/// 返回 None 表示「未设置」，调用方应回退到默认目录。
+fn normalize_user_data_dir(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let value = raw.trim();
+    // 只剥**成对**的引号：不成对的引号属于路径本身的一部分，不能吞掉。
+    let value = match value.as_bytes() {
+        [first, .., last]
+            if value.len() >= 2 && (*first == b'"' || *first == b'\'') && *first == *last =>
+        {
+            value[1..value.len() - 1].trim()
+        }
+        _ => value,
+    };
+    if value.is_empty() {
+        return None;
+    }
+    let expanded = expand_tilde(value, home)?;
+    if !is_absolute_path(&expanded) {
+        // 相对路径：fcitx5 引擎会用默认目录，这里同样按未设置处理，
+        // 否则 rime-sync 与引擎会各自读写两个不同的目录。
+        return None;
+    }
+    Some(strip_trailing_slash(PathBuf::from(expanded)))
+}
+
+/// `~` → HOME，`~/xxx` → `$HOME/xxx`；HOME 缺失时返回 None（视为未设置）。
+fn expand_tilde(value: &str, home: Option<&Path>) -> Option<String> {
+    if value == "~" {
+        return home.map(|home| home.to_string_lossy().to_string());
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home.map(|home| home.join(rest).to_string_lossy().to_string());
+    }
+    Some(value.to_string())
+}
+
+/// 绝对路径判定（跨平台一致，Rust 与 shell 版必须同规则）。
+/// Unix 以 `/` 开头；Windows 额外接受盘符形式 `C:\...` / `C:/...`。
+fn is_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+/// 去掉末尾斜杠；根目录保留，盘符根 `C:/` 也保留（去掉会变成 `C:`，语义变了）。
+fn strip_trailing_slash(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().to_string();
+    let trimmed = text.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return PathBuf::from("/");
+    }
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        return PathBuf::from(format!("{trimmed}/"));
+    }
+    PathBuf::from(trimmed)
 }
 
 /// 读 fcitx5 的 rime.conf 并解析 UserDataDirPath（读不到/为空都返回 None）。
@@ -617,6 +695,161 @@ mod tests {
         assert_eq!(
             parse_fcitx5_user_data_dir("OtherKey=/tmp/x\n", Some(&home)),
             None
+        );
+    }
+
+    /// 分隔符形态全覆盖：`=` / `:` / 带空格 / 值里含 `=`。
+    /// 这些形态在 shell 版（postinst、uninstall.sh）必须得到同样的结果。
+    #[test]
+    fn parses_fcitx5_conf_separator_variants() {
+        let home = PathBuf::from("/home/tester");
+        for text in [
+            "UserDataDirPath=/tmp/rime-a\n",
+            "UserDataDirPath: /tmp/rime-a\n",
+            "UserDataDirPath:/tmp/rime-a\n",
+            "UserDataDirPath = /tmp/rime-a\n",
+            "UserDataDirPath : /tmp/rime-a\n",
+            "UserDataDirPath:  /tmp/rime-a\n",
+        ] {
+            assert_eq!(
+                parse_fcitx5_user_data_dir(text, Some(&home)),
+                Some(PathBuf::from("/tmp/rime-a")),
+                "分隔符形态解析失败: {text:?}"
+            );
+        }
+    }
+
+    /// 路径里含 `=` 时不能被腰斩：`UserDataDirPath: /x=y` 必须得到 `/x=y`。
+    #[test]
+    fn parses_fcitx5_conf_value_containing_equals() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath: /x=y\n", Some(&home)),
+            Some(PathBuf::from("/x=y"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=/x=y\n", Some(&home)),
+            Some(PathBuf::from("/x=y"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath: /a=b/c=d\n", Some(&home)),
+            Some(PathBuf::from("/a=b/c=d"))
+        );
+    }
+
+    /// 引号：成对的双引号/单引号都剥；不成对的引号属于路径本身。
+    #[test]
+    fn parses_fcitx5_conf_quotes() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath='/tmp/rime-single'\n", Some(&home)),
+            Some(PathBuf::from("/tmp/rime-single"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=\"/tmp/rime-double\"\n", Some(&home)),
+            Some(PathBuf::from("/tmp/rime-double"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=  ~/spaced  \n", Some(&home)),
+            Some(home.join("spaced"))
+        );
+    }
+
+    /// `~` 展开：裸 `~` = HOME，`~/x` = `$HOME/x`。
+    #[test]
+    fn parses_fcitx5_conf_tilde() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=~\n", Some(&home)),
+            Some(home.clone())
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath: ~\n", Some(&home)),
+            Some(home.clone())
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath='~'\n", Some(&home)),
+            Some(home.clone())
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=~/single\n", Some(&home)),
+            Some(home.join("single"))
+        );
+    }
+
+    /// 相对路径按未设置处理（与 fcitx5 引擎一致：拒绝相对路径，用默认目录）。
+    #[test]
+    fn rejects_relative_fcitx5_user_data_dir() {
+        let home = PathBuf::from("/home/tester");
+        for text in [
+            "UserDataDirPath=relrime\n",
+            "UserDataDirPath: relrime\n",
+            "UserDataDirPath=./relrime\n",
+            "UserDataDirPath=../relrime\n",
+            "UserDataDirPath=sub/dir\n",
+        ] {
+            assert_eq!(
+                parse_fcitx5_user_data_dir(text, Some(&home)),
+                None,
+                "相对路径必须按未设置处理: {text:?}"
+            );
+        }
+    }
+
+    /// 末尾斜杠归一：去掉（根目录除外）。
+    #[test]
+    fn strips_trailing_slash_of_fcitx5_user_data_dir() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=/tmp/rime/\n", Some(&home)),
+            Some(PathBuf::from("/tmp/rime"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=/tmp/rime///\n", Some(&home)),
+            Some(PathBuf::from("/tmp/rime"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=/\n", Some(&home)),
+            Some(PathBuf::from("/"))
+        );
+    }
+
+    /// Windows 盘符路径：按 `=` 分隔时不能被冒号切坏；按 `:` 分隔时值里
+    /// 的盘符冒号也要保留（只切第一个冒号）。
+    #[test]
+    fn parses_windows_style_fcitx5_user_data_dir() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=C:\\rime\n", Some(&home)),
+            Some(PathBuf::from("C:\\rime"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath: C:\\rime\n", Some(&home)),
+            Some(PathBuf::from("C:\\rime"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir("UserDataDirPath=C:/rime\n", Some(&home)),
+            Some(PathBuf::from("C:/rime"))
+        );
+    }
+
+    /// 注释行 / 段头 / 首个匹配生效。
+    #[test]
+    fn parses_fcitx5_conf_skips_comments_and_sections() {
+        let home = PathBuf::from("/home/tester");
+        assert_eq!(
+            parse_fcitx5_user_data_dir(
+                "# UserDataDirPath=/commented\n[Profile]\nUserDataDirPath=/real\n",
+                Some(&home)
+            ),
+            Some(PathBuf::from("/real"))
+        );
+        assert_eq!(
+            parse_fcitx5_user_data_dir(
+                "UserDataDirPath=/first\nUserDataDirPath=/second\n",
+                Some(&home)
+            ),
+            Some(PathBuf::from("/first"))
         );
     }
 

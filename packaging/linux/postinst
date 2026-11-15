@@ -80,44 +80,199 @@ target_home() {
     printf ''
 }
 
+# ---------------------------------------------------------------- 配置根目录（XDG）
+# 三个脚本（postinst / uninstall.sh / install-extra-ime.sh）取「配置目录」的地方
+# 统一走这里，规则与 Rust 侧 crates/core/src/rime_dir.rs 的 config_home() 一致：
+# 「XDG_CONFIG_HOME 优先，缺省 ~/.config」。
+#
+# 为什么不能直接写 ${XDG_CONFIG_HOME:-$HOME/.config}：这三个脚本都以 root 跑
+# （dpkg 调 postinst / pkexec 调卸载器），进程里的 XDG_CONFIG_HOME 是 **root 的**，
+# 而我们要找的是**桌面用户**的（~/.config/fcitx5/conf/rime.conf 在谁 home 下）。
+# 所以按下面的优先级解析（**三个脚本必须逐条一致**，改一处要同步另两处）：
+#   1. RIMESYNC_TARGET_CONFIG_HOME：显式指定（安装器 / 测试注入）。
+#   2. 目标用户环境文件里导出的 XDG_CONFIG_HOME：~/.pam_environment、
+#      ~/.config/environment（systemd 用户级）、~/.profile、~/.bashrc
+#      （只认行首的 `XDG_CONFIG_HOME=` 或 `export XDG_CONFIG_HOME=`）。
+#   3. 当前进程环境里的 XDG_CONFIG_HOME —— 只在 home 就是当前 $HOME 时才认
+#      （脚本以该用户身份直接跑的情形）。
+#   4. $home/.config（XDG 缺省值）。
+# 与 Rust 侧的唯一差别：Rust 读的是**自己进程**的环境变量（应用跑在用户会话里，
+# 本来就是对的），shell 需要替目标用户去找。
+resolve_config_home() { # $1=目标用户 HOME
+    local home=$1 value="" file=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    if [ -n "${RIMESYNC_TARGET_CONFIG_HOME:-}" ]; then
+        printf '%s' "$RIMESYNC_TARGET_CONFIG_HOME"
+        return 0
+    fi
+    for file in "$home/.pam_environment" "$home/.config/environment" \
+        "$home/.profile" "$home/.bashrc"; do
+        [ -r "$file" ] || continue
+        value=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?XDG_CONFIG_HOME=' \
+            "$file" 2>/dev/null || true)
+        [ -n "$value" ] || continue
+        value=${value#*=}
+        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        value=${value#\"}
+        value=${value%\"}
+        value=${value#\'}
+        value=${value%\'}
+        # $HOME / ~ 展开成目标用户的 home（用字符串切片，不用 glob）。
+        if [ "${value:0:6}" = '$HOME/' ]; then
+            value=$home/${value:6}
+        elif [ "${value:0:2}" = '~/' ]; then
+            value=$home/${value:2}
+        fi
+        # 只认绝对路径（相对路径按未设置处理）。
+        case "$value" in
+            /*) printf '%s' "$value"; return 0 ;;
+        esac
+    done
+    if [ "$home" = "${HOME:-}" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s' "$XDG_CONFIG_HOME"
+        return 0
+    fi
+    printf '%s' "$home/.config"
+}
+
 # ---------------------------------------------------------------- Rime 用户目录
 # fcitx5-rime 可以在 ~/.config/fcitx5/conf/rime.conf 里用 UserDataDirPath 指定
 # 用户数据目录（自建 fcitx5-rime 新增的选项）。fcitx5 真正读写的正是那个目录，
 # 不是默认的 ~/.local/share/fcitx5/rime。
-# 解析规则与 crates/core/src/rime_dir.rs 的 parse_fcitx5_user_data_dir 保持一致
-#（key=value / key: value、引号、~ 展开、空值视为未设置）。
 # 以前这里硬编码默认目录，于是受管 custom.yaml 与预编译产物都 seed 到了没人读的
 # 目录，用户真正在用的目录反而缺文件（表现为「切不到五笔 / check-ime 恒 failed」）。
-resolve_rime_user_dir() { # $1=目标用户的 HOME
-    local home=$1 conf value=""
-    [ -n "$home" ] || { printf '' ""; return 0; }
-    conf=$home/.config/fcitx5/conf/rime.conf
-    if [ -f "$conf" ]; then
-        value=$(sed -n -E 's/^[[:space:]]*UserDataDirPath[[:space:]]*[=:][[:space:]]*(.*)$/\1/p' "$conf" 2>/dev/null | head -1)
-        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+#
+# 权威实现在 crates/core/src/rime_dir.rs（parse_fcitx5_user_data_dir + detect）。
+# 这里优先调用 rime-sync-cli detect --json 取同一个答案，免得 shell 与 Rust 各写
+# 一套规则而算到不同目录（安装器算一套、卸载器算另一套 ⇒ 卸载删错目录）。
+# CLI 还没装好时（dpkg 维护脚本运行时二进制可能缺席）退回本地解析，
+# 且本地解析的规则与 Rust 侧**逐条相同**。
+#
+# 本地解析规则（= crates/core/src/rime_dir.rs 的 parse_fcitx5_user_data_dir）：
+#   1. 分隔符 = 与 : 都支持；值是分隔符之后的全部内容（允许含 =）；
+#   2. 键名（去空白后）必须正好是 UserDataDirPath，否则跳过该行；
+#   3. 值先去掉两端空白，再剥掉**成对**的双引号或单引号；
+#   4. 空值视为未设置；
+#   5. ~ 展开为 HOME，~/xxx 展开为 $HOME/xxx；
+#   6. **必须是绝对路径**：相对路径按未设置处理（fcitx5 引擎自己也拒绝相对路径，
+#      见 third_party/fcitx5-rime/src/rimeengine.cpp 的 resolveRimeUserDir；
+#      不统一的话 rime-sync 与引擎会各读各的目录）；
+#   7. 去掉末尾斜杠（根目录除外）。
+# 改规则时必须同步四处：crates/core/src/rime_dir.rs、packaging/linux/postinst、
+# packaging/linux/uninstall.sh、packaging/linux/install-extra-ime.sh。
+#
+# 注意：bash 的 case pattern 与 ${var#pattern} 都会先做 tilde 展开，
+# 连双引号包住的 ~ 也也不例外（pattern 里的 ~ 会被换成 HOME），所以
+# 这里一律不用 glob，改用字符串切片判断前缀。
+
+# 纯本地解析：读 <配置根>/fcitx5/conf/rime.conf 里的 UserDataDirPath。
+# 配置根由 resolve_config_home 决定（XDG_CONFIG_HOME 优先，缺省 ~/.config）。
+# 输出规范化后的绝对路径；未设置（没有该键 / 值为空 / 相对路径）时输出空串。
+parse_rime_user_data_dir() { # $1=目标用户的 HOME
+    local home=$1 conf="" line="" key="" value=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    conf=$(resolve_config_home "$home")/fcitx5/conf/rime.conf
+    if [ -r "$conf" ]; then
+        # 逐行找**第一处**匹配 UserDataDirPath 的行（后面的同名键不覆盖）。
+        # 切分规则与 Rust 的 split_conf_entry 一致：先按 = 切（这样 Windows 盘符
+        # C:\foo 不会被冒号切坏），键名对不上再按第一个 : 切。
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            case "$line" in
+                ""|\#*|\[* ) continue ;;
+            esac
+            key=""
+            value=""
+            case "$line" in
+                *=*) key=${line%%=*}; value=${line#*=} ;;
+            esac
+            key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ "$key" != "UserDataDirPath" ]; then
+                key=""
+                value=""
+                case "$line" in
+                    *:*) key=${line%%:*}; value=${line#*:} ;;
+                esac
+                key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                [ "$key" = "UserDataDirPath" ] || continue
+            fi
+            break
+        done <"$conf"
     fi
-    local out=""
-    if [ -n "$value" ]; then
-        # 注意：bash 的 case pattern 与 ${var#pattern} 都会先做 tilde 展开，
-        # 连双引号包住的 ~ 也不例外（pattern 里的 ~ 会被换成 HOME），所以
-        # 这里一律不用 glob，改用字符串切片判断前缀。
-        if [ "$value" = "~" ]; then
-            out=$home
-        elif [ "${value:0:2}" = "~/" ]; then
-            out=$home/${value:2}
-        else
-            out=$value
-        fi
-    else
-        out=$home/.local/share/fcitx5/rime
-    fi
-    # 去掉末尾多余的 /（根目录除外），免得拼路径时出现双斜杠。
-    # Rust 侧是 PathBuf，尾斜杠在语义上等价；这里只是让打印与拼接更干净。
-    case "$out" in
-        /) : ;;
-        */) out=${out%/} ;;
+    # 值规范化：去空白 → 剥成对引号 → 剥完再去一次空白。
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
     esac
-    printf '%s' "$out"
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$value" ] || { printf ''; return 0; }
+    if [ "$value" = "~" ]; then
+        value=$home
+    elif [ "${value:0:2}" = "~/" ]; then
+        value=$home/${value:2}
+    fi
+    # 必须是绝对路径：相对路径按未设置处理（与 fcitx5 引擎一致）。
+    case "$value" in
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*) : ;;
+        *) printf ''; return 0 ;;
+    esac
+    # 去掉末尾斜杠（根目录除外）。
+    while [ "${value%/}" != "$value" ] && [ "$value" != "/" ]; do value=${value%/}; done
+    # 盘符根 C:/ 去掉斜杠会变成 C:（语义变了），补回来。
+    if [ ${#value} -eq 2 ] && [ "${value:1:1}" = ":" ]; then value="$value/"; fi
+    printf '%s' "$value"
+}
+
+# 用 CLI 取权威值：rime-sync-cli detect --json 的 "path" 字段。
+# 输出 "路径|来源"；CLI 不存在、执行失败或没给路径时输出空串。
+rime_user_dir_from_cli() { # $1=目标用户的 HOME
+    local home=$1 json="" path="" source=""
+    [ -n "$home" ] || return 0
+    command -v rime-sync-cli >/dev/null 2>&1 || return 0
+    # HOME / XDG_CONFIG_HOME 指向目标用户（Rust 侧 config_home 优先用后者），
+    # 并清掉 RIME_USER_DATA_DIR：那是 root 的环境，不是目标用户的。
+    json=$(HOME="$home" XDG_CONFIG_HOME="$(resolve_config_home "$home")" RIME_USER_DATA_DIR= \
+        rime-sync-cli detect --json 2>/dev/null || true)
+    path=$(printf '%s' "$json" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    source=$(printf '%s' "$json" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$path" ] || return 0
+    printf '%s|%s' "$path" "$source"
+}
+
+# 最终目录：
+#   * rime.conf 里显式配了 UserDataDirPath ⇒ 用它（那才是 fcitx5 引擎真正读写的
+#     目录，即使它还不存在也不能换成别的目录）；
+#   * 没配 ⇒ 用 CLI 的权威值（它还知道应用配置与历史候选目录）；
+#   * CLI 也没装 ⇒ 用默认目录。
+# 唯一的例外：CLI 的来源是 known:xxx（说明 CLI 因为配置目录当时不存在而回退到了
+# 候选目录列表）。这时引擎用的仍是配置目录（引擎自己会把它创建出来），所以以
+# 本地解析结果为准，否则受管 custom.yaml 会被 seed 到引擎根本不读的目录。
+resolve_rime_user_dir() { # $1=目标用户的 HOME
+    local home=$1 local_value="" cli_value="" cli_source=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    local_value=$(parse_rime_user_data_dir "$home")
+    cli_value=$(rime_user_dir_from_cli "$home")
+    cli_source=${cli_value#*|}
+    cli_value=${cli_value%%|*}
+    # CLI 的来源决定优先级，与 Rust 的 detect 优先级一一对应：
+    #   argument / env:... ⇒ 用户显式指定，权威值就是它；
+    #   fcitx5-rime:... ⇒ 与本地解析结果相同（都用 rime.conf 的值）；
+    #   known:...        ⇒ CLI 因为该目录当时不存在而回退到了候选目录列表。
+    #     这种情况下 fcitx5 引擎用的仍是 rime.conf 里的目录（引擎自己会创建它），
+    #     所以以本地解析结果为准，否则受管 custom.yaml 会被 seed 到没人读的目录。
+    if [ -n "$cli_value" ] && [ "${cli_source#known:}" != "$cli_source" ]; then
+        cli_value=""
+    fi
+    if [ -n "$cli_value" ]; then
+        printf '%s' "$cli_value"
+        return 0
+    fi
+    if [ -n "$local_value" ]; then
+        printf '%s' "$local_value"
+        return 0
+    fi
+    printf '%s' "$home/.local/share/fcitx5/rime"
 }
 
 TARGET_USER=$(pick_target_user)
@@ -127,7 +282,9 @@ RIME_USER_DIR=$(resolve_rime_user_dir "$TARGET_HOME")
 WARN_DIR=""
 WARN_FILE=""
 if [ -n "$TARGET_HOME" ]; then
-    WARN_DIR=$TARGET_HOME/.config/com.rimesync.app
+    # 告警文件放在目标用户的**配置目录**下（Rust 侧按 XDG_CONFIG_HOME 找）：
+    # 用户改过 XDG_CONFIG_HOME 时，应用的配置目录也跟着变，这里必须一致。
+    WARN_DIR=$(resolve_config_home "$TARGET_HOME")/com.rimesync.app
     WARN_FILE=$WARN_DIR/install-warning.json
 fi
 
@@ -354,8 +511,14 @@ repair_schema_list() { # $1=Rime 用户目录
 # 判据与 Windows 安装器一致：build/luna_pinyin_simp.schema.yaml 存在，且里面有
 # rimesync_vnum / rimesync_punct 插件标记（官方部署出来的没有）。
 # 开关：RIMESYNC_PREBUILT=0 关闭；RIMESYNC_PREBUILT=force 覆盖已存在的文件。
-PREBUILT_DIR=/usr/share/rime-sync/prebuilt
+PREBUILT_DIR=${RIMESYNC_PREBUILT_DIR:-/usr/share/rime-sync/prebuilt}
 PREBUILT_LOG=$LOGDIR/prebuilt.log
+# 随包产物的清单（每个文件的 sha256 + size）。口径与 Rust 侧
+# crates/core/src/prebuilt.rs 的 verify_manifest 一致：**只校验 files[] 里的条目**，
+# generated_at / docker_image 这类元数据不一致不报错。
+PREBUILT_MANIFEST=${RIMESYNC_PREBUILT_MANIFEST:-$PREBUILT_DIR/MANIFEST.json}
+# 清单解析结果缓存（TSV：path<TAB>bytes<TAB>sha256），由 prebuilt_manifest_load 生成。
+PREBUILT_MANIFEST_CACHE=""
 
 prebuilt_usable() { # $1=Rime 用户目录
     local f=$1/build/luna_pinyin_simp.schema.yaml
@@ -364,14 +527,126 @@ prebuilt_usable() { # $1=Rime 用户目录
     grep -q rimesync_punct "$f" 2>/dev/null || return 1
 }
 
-# 逐个文件复制：存在即跳过；mode=force 才覆盖。输出 "copied kept failed"
-prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组
-    local src=$1 dst=$2 mode=$3 owner=$4 f copied=0 kept=0 failed=0
-    if ! mkdir -p "$dst" 2>/dev/null; then printf '0 0 1\n'; return 0; fi
+# 解析 MANIFEST.json 的 files[] → TSV 缓存。
+# 返回：0 = 清单可用；1 = 清单不存在（旧版 payload，Rust 侧同样不校验）；
+#       2 = 清单存在但解析不出条目（当损坏处理，见 prebuilt_copy_dir）。
+#
+# 解析方式：MANIFEST.json 由 scripts/ime/gen-prebuilt-build.py 生成，条目形如
+#   { "path": "build/x.bin", "bytes": 123, "sha256": "…" }
+# 这里按 JSON 对象的 "}" 边界聚合，与键的先后顺序无关。
+prebuilt_manifest_load() {
+    local manifest=$1 out=$2 path="" bytes="" sha="" line in_files=0
+    PREBUILT_MANIFEST_CACHE=""
+    [ -f "$manifest" ] || return 1
+    [ -r "$manifest" ] || return 2
+    : >"$out" 2>/dev/null || return 2
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 只解析 "files" 数组段（顶层的 schemas / markers 等段落里也可能出现
+        # 大括号，不能让它们干扰条目边界）。
+        if [ "$in_files" = 0 ]; then
+            case "$line" in
+                *'"files"'*) in_files=1 ;;
+            esac
+            continue
+        fi
+        case "$line" in
+            ']'*) break ;;
+        esac
+        case "$line" in
+            *'"path"'*)
+                path=$(printf '%s' "$line" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                ;;
+        esac
+        case "$line" in
+            *'"bytes"'*)
+                bytes=$(printf '%s' "$line" | sed -n 's/.*"bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+                ;;
+        esac
+        case "$line" in
+            *'"sha256"'*)
+                sha=$(printf '%s' "$line" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                ;;
+        esac
+        # 一个 JSON 对象结束（"}" 独占一行或行尾带 ","）：三个字段齐了才落一条。
+        case "$line" in
+            *'}'*)
+                if [ -n "$path" ] && [ -n "$sha" ]; then
+                    printf '%s\t%s\t%s\n' "$path" "${bytes:-0}" "$sha" >>"$out"
+                fi
+                path=""; bytes=""; sha=""
+                ;;
+        esac
+    done <"$manifest"
+    [ -s "$out" ] || return 2
+    return 0
+}
+
+# 校验单个源文件；返回 0 = 通过，1 = 不匹配/读不出，2 = 清单里没有这个文件。
+# 比对两个字段：size（清单 bytes > 0 时）与 sha256（大小写不敏感，同 Rust 侧）。
+prebuilt_verify_file() { # $1=清单相对路径 $2=源文件 $3=清单缓存
+    local rel=$1 src=$2 cache=$3 entry="" want_bytes="" want_sha="" got_bytes="" got_sha=""
+    entry=$(awk -F'\t' -v k="$rel" '$1 == k { print $2 "\t" $3; exit }' "$cache" 2>/dev/null)
+    [ -n "$entry" ] || return 2
+    want_bytes=${entry%%	*}
+    want_sha=${entry#*	}
+    got_bytes=$(stat -c%s "$src" 2>/dev/null) || return 1
+    got_sha=$(sha256sum "$src" 2>/dev/null | cut -d' ' -f1) || return 1
+    [ -n "$got_sha" ] || return 1
+    if [ "${want_bytes:-0}" -gt 0 ] 2>/dev/null && [ "$want_bytes" != "$got_bytes" ]; then
+        # 格式与 Rust 侧 verify_manifest 的 "<path>:size:expected=.. actual=.." 对齐
+        printf '%s:size:expected=%s actual=%s' "$rel" "$want_bytes" "$got_bytes" >&2
+        return 1
+    fi
+    # sha256 大小写不敏感（与 Rust 侧的 eq_ignore_ascii_case 一致）。
+    want_sha=$(printf '%s' "$want_sha" | tr 'A-Z' 'a-z')
+    got_sha=$(printf '%s' "$got_sha" | tr 'A-Z' 'a-z')
+    if [ "$want_sha" != "$got_sha" ]; then
+        # 格式与 Rust 侧 verify_manifest 的 "<path>:sha256:expected=.. actual=.." 对齐
+        printf '%s:sha256:expected=%s actual=%s' "$rel" "$want_sha" "$got_sha" >&2
+        return 1
+    fi
+    return 0
+}
+
+# 列出清单里有、但 payload 目录里没有的条目（与 Rust 侧 "<path>:missing:" 对齐）。
+prebuilt_manifest_missing() { # $1=清单缓存 $2=payload 根目录
+    local cache=$1 root=$2 rel
+    awk -F'\t' '{ print $1 }' "$cache" 2>/dev/null | while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        [ -f "$root/$rel" ] || printf '%s:missing:not-found\n' "$rel"
+    done
+}
+
+# 逐个文件复制：存在即跳过；mode=force 才覆盖。
+# **复制前按 MANIFEST 校验 sha256（与 size）**：不匹配 / 清单里没有的文件一律不拷。
+# 输出 "copied kept failed corrupt"（corrupt = 校验没通过、没装上的文件数）。
+prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组 $5=清单缓存 $6=清单里的目录名
+    local src=$1 dst=$2 mode=$3 owner=$4 cache=$5 prefix=$6
+    local f rel rc copied=0 kept=0 failed=0 corrupt=0 reason=""
+    if ! mkdir -p "$dst" 2>/dev/null; then printf '0 0 1 0\n'; return 0; fi
     for f in "$src"/*; do
         [ -f "$f" ] || continue
+        rel="$prefix/${f##*/}"
+        # 既有策略：用户目录里已有同名文件就沿用、不覆盖（2026-11-02 定案）。
+        # 沿用的文件根本不复制，所以不必校验它。
         if [ -e "$dst/${f##*/}" ] && [ "$mode" != force ]; then
             kept=$((kept + 1)); continue
+        fi
+        # 要复制了 ⇒ 先按 MANIFEST 校验 sha256（与 size）。校验不过就不拷。
+        if [ -n "$cache" ] && [ -f "$cache" ]; then
+            reason=$(prebuilt_verify_file "$rel" "$f" "$cache" 2>&1)
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                # rc=2：清单里没有这个文件（无法校验）—— 同样不拷。
+                [ "$rc" = 2 ] && reason="not-in-manifest"
+                corrupt=$((corrupt + 1))
+                # 注意：say 走 stdout，而本函数的 stdout 会被 read 捕获成计数，
+                # 所以这里的告警必须写到 stderr，否则会污染计数解析。
+                say "!! 预编译产物校验不通过，未复制：$rel（${reason:-unknown}）" >&2
+                printf '%s corrupt file=%s reason=%s\n' "$(date '+%F %T')" "$rel" "${reason:-unknown}" \
+                    >>"$PREBUILT_LOG" 2>/dev/null || true
+                continue
+            fi
         fi
         if install -D -m 644 "$f" "$dst/${f##*/}" 2>/dev/null; then
             chown "$owner" "$dst/${f##*/}" 2>/dev/null || true
@@ -380,12 +655,13 @@ prebuilt_copy_dir() { # $1=源目录 $2=目标目录 $3=mode $4=属主:属组
             failed=$((failed + 1))
         fi
     done
-    printf '%s %s %s\n' "$copied" "$kept" "$failed"
+    printf '%s %s %s %s\n' "$copied" "$kept" "$failed" "$corrupt"
 }
 
 seed_prebuilt_build() { # $1=Rime 用户目录
     local rime_dir=$1 mode=${RIMESYNC_PREBUILT:-auto} owner=${TARGET_USER:-root}
-    local ogroup copied=0 kept=0 failed=0 c k f escalated=0
+    local ogroup copied=0 kept=0 failed=0 c k f b corrupt=0 escalated=0 rel
+    local manifest_cache="" manifest_rc=0
     ogroup=$(id -gn "$owner" 2>/dev/null || echo "$owner")
 
     case "$mode" in
@@ -411,11 +687,46 @@ seed_prebuilt_build() { # $1=Rime 用户目录
     fi
     chown "$owner:$ogroup" "$rime_dir/build" 2>/dev/null || true
 
+    # 解析清单（复制前校验用）。清单缺失 = 旧版 payload（没有清单就没法校验），
+    # 与 Rust 侧 verify_manifest 的口径一致：**不校验，也不算失败**。
+    # 清单存在但解析不出条目 = 清单本身坏了：此时**不复制任何文件**（宁可不装，
+    # 也不能装一份无法验证的产物），并把失败记进日志 + 写 install-warning.json。
+    manifest_cache=$(mktemp "${TMPDIR:-/tmp}/rime-sync-manifest.XXXXXX" 2>/dev/null || printf '')
+    if [ -n "$manifest_cache" ]; then
+        prebuilt_manifest_load "$PREBUILT_MANIFEST" "$manifest_cache"
+        manifest_rc=$?
+    else
+        manifest_rc=2
+    fi
+    case "$manifest_rc" in
+        0)
+            say "预编译产物：已按 MANIFEST 校验 sha256 后复制"
+            printf '%s manifest=ok path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+                >>"$PREBUILT_LOG" 2>/dev/null || true
+            ;;
+        1)
+            say "预编译产物：没有 $PREBUILT_MANIFEST（旧版产物，无清单可校验），按原样复制"
+            printf '%s manifest=missing path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+                >>"$PREBUILT_LOG" 2>/dev/null || true
+            [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
+            manifest_cache=""
+            ;;
+        *)
+            say "!! 预编译产物的 MANIFEST 解析失败（$PREBUILT_MANIFEST），本次不复制任何产物"
+            printf '%s manifest=broken path=%s\n' "$(date '+%F %T')" "$PREBUILT_MANIFEST" \
+                >>"$PREBUILT_LOG" 2>/dev/null || true
+            write_install_warning "rime-inputmethod" \
+                "随包预编译产物校验失败：$PREBUILT_MANIFEST 解析不出来，已跳过全部预编译产物（输入法可能缺方案）"
+            [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
+            return 0
+            ;;
+    esac
+
     # 第一遍：build/* -> <rime_dir>/build/，config/*.yaml -> <rime_dir>/（都是存在即跳过）
-    read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" "${mode}" "$owner:$ogroup")"
-    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
-    read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/config" "$rime_dir" "${mode}" "$owner:$ogroup")"
-    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+    read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" "${mode}" "$owner:$ogroup" "$manifest_cache" build)"
+    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
+    read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/config" "$rime_dir" "${mode}" "$owner:$ogroup" "$manifest_cache" config)"
+    copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
 
     # 第二遍（只在第一遍没解决问题时）：用户目录里本来就有旧的 build 产物（没有插件标记，
     # 例如上次部署留下的），「存在即跳过」把它们跳过去了。build/ 是部署器随时重写的派生
@@ -424,18 +735,47 @@ seed_prebuilt_build() { # $1=Rime 用户目录
     if ! prebuilt_usable "$rime_dir" && [ "$mode" != "force" ]; then
         escalated=1
         say "预编译产物：用户目录里的旧 build 产物不可用，只对 build/ 覆盖重铺一遍（配置不动）"
-        read -r c k f <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" force "$owner:$ogroup")"
-        copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f))
+        read -r c k f b <<<"$(prebuilt_copy_dir "$PREBUILT_DIR/build" "$rime_dir/build" force "$owner:$ogroup" "$manifest_cache" build)"
+        copied=$((copied + c)); kept=$((kept + k)); failed=$((failed + f)); corrupt=$((corrupt + b))
+    fi
+
+    # 清单里有、payload 里没有的条目（Rust 侧记作 "<path>:missing:"）也算问题：
+    # 装上去的产物是不完整的。
+    # 注意：这里不能用管道（管道里的 while 是子 shell，计数传不回来）。
+    missing_list=$(prebuilt_manifest_missing "$manifest_cache" "$PREBUILT_DIR" 2>/dev/null)
+    if [ -n "$missing_list" ]; then
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            corrupt=$((corrupt + 1))
+            say "!! 预编译产物缺失，未复制：$rel"
+            printf '%s corrupt file=%s reason=missing\n' "$(date '+%F %T')" "$rel" \
+                >>"$PREBUILT_LOG" 2>/dev/null || true
+        done <<EOF_MISSING
+$missing_list
+EOF_MISSING
+    fi
+
+    [ -n "$manifest_cache" ] && rm -f "$manifest_cache" 2>/dev/null
+
+    if [ "$corrupt" -gt 0 ]; then
+        # 有文件没装上：写进日志 + 让应用能看见（install-warning.json），但**不让 dpkg 失败**
+        # —— 一个坏文件不该把整包安装搞挂。输入法缺文件时由用户自己重装或等下一次安装。
+        say "!! 预编译产物有 $corrupt 个文件校验不通过、没有装上（详见 $PREBUILT_LOG）"
+        printf '%s partial source=prebuilt copied=%d kept=%d failed=%d corrupt=%d escalated=%d dir=%s\n' \
+            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$corrupt" "$escalated" "$rime_dir" \
+            >>"$PREBUILT_LOG" 2>/dev/null || true
+        write_install_warning "rime-inputmethod" \
+            "随包预编译产物有 $corrupt 个文件 sha256/大小校验不通过、没有安装（详见 $PREBUILT_LOG）"
     fi
 
     if prebuilt_usable "$rime_dir"; then
         say "预编译产物：已铺入 $copied 个，沿用 $kept 个（build 判定通过）"
-        printf '%s ok source=prebuilt copied=%d kept=%d failed=%d escalated=%d dir=%s\n' \
-            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+        printf '%s ok source=prebuilt copied=%d kept=%d failed=%d corrupt=%d escalated=%d dir=%s\n' \
+            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$corrupt" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
     else
-        say "!! 预编译产物铺完仍不满足判据（copied=$copied kept=$kept failed=$failed），只告警不中止"
-        printf '%s failed source=prebuilt copied=%d kept=%d failed=%d escalated=%d dir=%s\n' \
-            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
+        say "!! 预编译产物铺完仍不满足判据（copied=$copied kept=$kept failed=$failed corrupt=$corrupt），只告警不中止"
+        printf '%s failed source=prebuilt copied=%d kept=%d failed=%d corrupt=%d escalated=%d dir=%s\n' \
+            "$(date '+%F %T')" "$copied" "$kept" "$failed" "$corrupt" "$escalated" "$rime_dir" >>"$PREBUILT_LOG" 2>/dev/null || true
     fi
     return 0
 }

@@ -892,7 +892,9 @@ mod tests {
             &dir,
             &[],
             &["b".into(), "a".into()],
-            &FakeTrigger::failing("deploy"),
+            // 0.6.23 起「保存并重新部署」走的是 manual_deploy（不是 deploy），
+            // 失败点必须写对，否则这个测试永远测不到失败分支。
+            &FakeTrigger::failing("manual_deploy"),
         )
         .expect("apply returns a result");
         assert!(!result.deployed);

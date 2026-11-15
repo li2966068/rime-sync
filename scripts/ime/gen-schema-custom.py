@@ -4,7 +4,8 @@
 
 每个文件做三件事：
   1. engine/translators 首位加 rimesync_vnum（v123 / v12.5 -> 中文数字候选）
-  2. engine/processors 里 punctuator 之前插入 rimesync_punct（中文标点直出 + Shift 备选）
+  2. engine/processors 按 rime-sync 自己的「唯一真相源」口径排好
+     （crates/core/src/processor_spec.rs 的 Authoritative 策略，见下方 target_processors）
   3. 内联 punctuator：half_shape 的主字符改成单值 commit（没装插件时的兜底）
 
 为什么 punctuator 要整段内联，而不是只写 punctuator/half_shape/<键>：
@@ -52,9 +53,13 @@ PUNCT = "rimesync_punct"
 VSEL = "rimesync_vselect"
 # 小键盘归一化（KP_0..KP_9 / KP_Decimal -> 0..9 / .），对所有输入都生效。
 NUMPAD = "numpad"
-# rimesync_punct 要插在 key_binder / punctuator / selector 里最先出现的那个之前：
-# 只插在 punctuator 前的话，数字选词会先被 selector（或 key_binder 的页码键）吃掉。
-PUNCT_ANCHORS = ("key_binder", "punctuator", "selector")
+# vselect 的首选锚点：识别器之后（它要在识别器切出片段之后才接手选词）。
+RECOGNIZER = "recognizer"
+# 没有识别器时，vselect 退到「输入处理环节」（按键绑定 / 拼写）里更靠前的那个之前。
+INPUT_STAGES = ("key_binder", "speller")
+# 标点处理器：punct 必须排在它前面（命中按键就 CommitText 返回 kAccepted，
+# 后面的 punctuator 就没机会把半角标点转成 Rime 自带的那一套了）。
+PUNCTUATOR = "punctuator"
 # vnum translator 依赖 recognizer 把 v1234 当一个片段；朙月拼音的拼写代数会把 v 当
 # 无效音节切开，所以每个方案都要给一条 vnum 模式（允许中间态 v、v12.）。
 VNUM_PATTERN = r"^[vV][0-9.]*$"
@@ -245,6 +250,42 @@ def effective_punctuator(cfg, rime_data=RIME_DATA):
     return _deep_merge(base, {k: v for k, v in own.items() if k != "import_preset"})
 
 
+def target_processors(sid, base):
+    """按 rime-sync 的「唯一真相源」口径算出 engine/processors 的目标顺序。
+
+    口径来自 crates/core/src/processor_spec.rs（Authoritative 策略）：
+      * rimesync_vselect 紧跟 recognizer（识别器切出片段之后才接手选词）；
+        没有识别器时退到「输入处理环节」（key_binder / speller）里更靠前的那个之前；
+        都没有就追加到末尾。
+      * numpad 紧跟 rimesync_vselect（依赖 vselect 建好的上下文）。
+      * rimesync_punct 必须排在 punctuator 之前 —— 它命中按键就直接 CommitText
+        并返回 kAccepted，后面的 punctuator 就没机会把半角标点转成 Rime 自带的那套。
+
+    为什么这里要抄一份而不用 Rust 的实现：Rust 那份是运行时给**用户已有文件**
+    打补丁用的（还要保留用户的注释与格式），而这里是生成器写**全新文件**，
+    两边的落点机制不同；规则本身必须一致，所以三条规则逐条对应上面的注释。
+    """
+    out = [name for name in base if name not in (VSEL, NUMPAD)]
+    # vselect：recognizer 之后优先；没有就退到 key_binder / speller 里更靠前的之前。
+    if RECOGNIZER in out:
+        at = out.index(RECOGNIZER) + 1
+    else:
+        stages = [out.index(stage) for stage in INPUT_STAGES if stage in out]
+        at = min(stages) if stages else len(out)
+    out.insert(at, VSEL)
+    # numpad：紧随 vselect（小键盘要先归一化成 ASCII，再交给 recognizer/speller）。
+    out.insert(out.index(VSEL) + 1, NUMPAD)
+    # punct：缺了就插到 punctuator 之前；已经在 punctuator 之后的（位置不对，
+    # 中文标点直出等于没开）挪回来；已经在正确位置上的原样保留。
+    if PUNCT in out:
+        if PUNCTUATOR in out and out.index(PUNCT) > out.index(PUNCTUATOR):
+            out.remove(PUNCT)
+            out.insert(out.index(PUNCTUATOR), PUNCT)
+    else:
+        out.insert(out.index(PUNCTUATOR) if PUNCTUATOR in out else len(out), PUNCT)
+    return out
+
+
 def build_schema(sid, index, rime_data=RIME_DATA):
     path = index[sid]
     cfg = resolve_schema(path, index)
@@ -255,20 +296,12 @@ def build_schema(sid, index, rime_data=RIME_DATA):
         raise SystemExit("%s: 解析后没有 engine/processors" % sid)
     if not translators:
         raise SystemExit("%s: 解析后没有 engine/translators" % sid)
-    if PUNCT not in processors:
-        anchors = [processors.index(name) for name in PUNCT_ANCHORS if name in processors]
-        if not anchors:
-            raise SystemExit(
-                "%s: processors 里没有 %s 中的任何一个，无处插入 %s"
-                % (sid, "/".join(PUNCT_ANCHORS), PUNCT)
-            )
-        processors.insert(min(anchors), PUNCT)
-    if VSEL not in processors:
-        # 紧随 rimesync_punct：两者都必须在 speller 之前（vselect 要能拦字母、punct 要能拦标点）。
-        processors.insert(processors.index(PUNCT) + 1, VSEL)
-    if NUMPAD not in processors:
-        # 紧随 vselect：小键盘要先归一化成 ASCII，再交给 recognizer/speller。
-        processors.insert(processors.index(VSEL) + 1, NUMPAD)
+    processors = target_processors(sid, processors)
+    # 自检：生成出来的顺序必须满足 rime-sync 的三条硬规则（口径与 Rust 侧
+    # crates/core/src/processor_spec.rs 的 validate() 一致，见 rime_common）。
+    problems = rime_common.processor_order_violations(processors)
+    if problems:
+        raise SystemExit("%s: engine/processors 顺序不合法：%s" % (sid, "；".join(problems)))
     if VNUM not in translators:
         translators.insert(0, VNUM)
 
@@ -301,8 +334,8 @@ def render(sid, built):
     lines = list(HEADER)
     lines.append("# schema: %s" % sid)
     lines.append(
-        "# 引擎顺序抄自 %s（translators 首位加 %s；%s 插在 key_binder/punctuator/selector 之前）"
-        % (rel, VNUM, PUNCT)
+        "# 引擎顺序抄自 %s（translators 首位加 %s；%s 插在 %s 之前，%s 紧跟 %s）"
+        % (rel, VNUM, PUNCT, PUNCTUATOR, VSEL, RECOGNIZER)
     )
     lines.append("# 关闭：删掉本文件后重新部署；或删掉下面 patch 里的 %s / %s。" % (VNUM, PUNCT))
     lines.append("patch:")
@@ -370,6 +403,15 @@ def main(argv=None):
             for path in sorted(out_dir.glob("*.custom.yaml")):
                 if path.name[: -len(".custom.yaml")] not in files:
                     problems.append("多余 %s（schema_list 里没有这个方案）" % path)
+        # 防回归：直接读**磁盘上的**文件断言 processors 顺序满足三条硬规则。
+        # 上面那句「与生成结果一致」已经能覆盖顺序，但它是间接的（内容相同 ⇒ 顺序相同）；
+        # 这里显式查一遍，改坏顺序时报错能直接指出是哪条规则破了。
+        for path in sorted(out_dir.glob("*.custom.yaml")):
+            names = rime_common.extract_processors(path.read_text(encoding="utf-8"))
+            if not names:
+                continue
+            for item in rime_common.processor_order_violations(names):
+                problems.append("%s：%s" % (path.name, item))
         if problems:
             for item in problems:
                 print("!! %s" % item, file=sys.stderr)
