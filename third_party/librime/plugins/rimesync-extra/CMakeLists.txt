@@ -47,7 +47,18 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
   # engine, so it links against the library instead of recompiling the
   # plugin sources.  ${CMAKE_BINARY_DIR}/src carries the generated
   # rime/build_config.h.
+  #
+  # EXCLUDE_FROM_ALL is required, not cosmetic: the test uses librime's
+  # internal C++ API (rime::Config::LoadFromStream, rime::kDefaultModules,
+  # rime::Segment::GetCandidateAt).  On Windows librime is a DLL and those
+  # symbols are not exported, so building this target as part of the default
+  # build breaks the link of the DLL itself (LNK2019/LNK2001).  The upstream
+  # Windows build (build.bat librime) builds every target, so without this
+  # flag the release pipeline fails.  The test still builds on request:
+  #   cmake --build <dir> --target rimesync_extra_engine_smoke_test
+  # which is what the CI job (ubuntu-24.04, static librime) does.
   add_executable(rimesync_extra_engine_smoke_test
+    EXCLUDE_FROM_ALL
     test/engine_smoke_test.cc)
   target_include_directories(rimesync_extra_engine_smoke_test
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
@@ -60,7 +71,12 @@ if(RIMESYNC_EXTRA_BUILD_TEST)
     target_compile_options(rimesync_extra_punct_test PRIVATE /utf-8)
     target_compile_options(rimesync_extra_engine_smoke_test PRIVATE /utf-8)
   endif()
+  # EXCLUDE_FROM_ALL for the same reason as the smoke test above: this
+  # custom target pulls in the smoke test, which cannot link against the
+  # Windows DLL build.  It stays available on demand:
+  #   cmake --build <dir> --target check-rimesync-extra
   add_custom_target(check-rimesync-extra
+    EXCLUDE_FROM_ALL
     COMMAND $<TARGET_FILE:rimesync_extra_vnum_test>
     COMMAND $<TARGET_FILE:rimesync_extra_numpad_test>
     COMMAND $<TARGET_FILE:rimesync_extra_punct_test>
