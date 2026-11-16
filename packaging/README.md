@@ -16,6 +16,9 @@
 
 0.6.6 起两个平台都是「**一个包 = 输入法本体 + 同步工具**」，各自再分离线安装包 / 在线安装包；
 「输入法本体」不再单独发布（Linux 的 `rime-inputmethod_*.deb` 只作为 .run 的载荷）。
+0.6.33 起更进一步：Linux 侧输入法 deb 与同步 deb 在打包阶段合成**一个** deb
+（包名 `rime-sync`，见 `packaging/linux/merge-debs.sh`），装一次就有两样东西，
+**卸载也是一个整体**（卸 `rime-sync` 会连输入法一起卸）。
 
 | 平台 | 产物 | 默认文件名 | 来源 |
 |---|---|---|---|
@@ -243,7 +246,7 @@ pnpm tauri icon packaging/assets/source-icon.png   # 需要自备 1024x1024 源�
 ## 12. Linux 离线安装器：判定逻辑与故障排查
 
 `packaging/linux/install.sh` 负责 `.run` 自解压包里的
-「依赖层 → rime-inputmethod → rime-sync」三段安装，两个变体只差依赖层：
+「依赖层 → 合并后的 rime-sync」两段安装，两个变体只差依赖层：
 
 | 变体 | 标识 | 依赖层 |
 |---|---|---|
@@ -296,11 +299,11 @@ packaging/linux/test/install-matrix.sh upgrade-fresh  # 只跑升级用例（upg
 
 | 用例 | 场景 | 断言 |
 |---|---|---|
-| `normal` | debian-13 干净系统 | 两个包都装上、rime_deployer 能构建、dpkg.log 0 次 upgrade |
+| `normal` | debian-13 干净系统 | 合并后的 rime-sync 装上（输入法组件随之落地）、rime_deployer 能构建、dpkg.log 0 次 upgrade |
 | `broken-unrelated` | 预置一个无关的半配置包（postinst 返回 1） | 安装仍成功；那个包保持原状且不出现在 install.log |
 | `multiarch` | 启用 i386 + libbrotli1 两架构同版本，离线库里该包更高 | 不升级 `libbrotli1:amd64`、安装成功、0 次 upgrade |
 | `prebroken-multiarch` | 已处于"上次安装把 amd64 解包成新版、i386 仍是旧版"的坏状态 | 退出码 3 但措辞明确，输出 dpkg 原文 + 多架构说明 + 修复命令 + 责任归属 |
-| `upgrade-fresh` | 先装旧版（0.4.0 IME + 0.3.0 sync），再装当前产物 | 旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、新版装好、用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、日志有 UNINSTALL-OLD |
+| `upgrade-fresh` | 先装旧版（0.4.0 IME + 0.3.0 sync 两个包），再装当前产物（合并包） | 旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、新版装好、用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、日志有 UNINSTALL-OLD |
 | `single-arch` | debian-12（无任何外部架构） | 安装成功且不触发多架构分支 |
 
 产物默认取本地已有的 `.deb`（`build/deb/debian-*/`、`packaging/out/`），可用

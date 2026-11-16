@@ -10,6 +10,8 @@
 #   IME_DEB_NEW / IME_DEB_OLD     当前/上一版 rime-inputmethod deb（debian-13）
 #   IME_DEB_NEW_12                debian-12 的 IME deb（single-arch 用例）
 #   SYNC_DEB_NEW / SYNC_DEB_OLD   当前/上一版 rime-sync deb
+# 注意：0.6.33 起这两个 deb 会在 stage_bundle 里被 merge-debs.sh 合成**一个**
+# rime-sync deb 放进离线包，容器里安装的是合并后的包。
 #   EXTRA_DEBS                    额外补进离线库的 .deb 目录（默认
 #                                 packaging/linux/out/test-extra-debs，见下）
 #
@@ -105,12 +107,16 @@ stage_bundle() { # $1=dest $2=distro $3=ime deb $4=sync deb $5=vendor dir
   mkdir -p "$dest/$d"
   cp -f "$REPO/packaging/linux/install.sh" "$REPO/packaging/linux/uninstall.sh" "$dest/"
   chmod 0755 "$dest/install.sh" "$dest/uninstall.sh"
-  cp -f "$3" "$dest/$d/"
+  # 0.6.33 起：输入法 deb 与同步 deb 先合成一个 rime-sync deb，离线包里只有它。
   bash "$REPO/packaging/linux/prepare-sync-deb.sh" "$4" "$dest/$d/$(basename "$4")" >/dev/null
+  mkdir -p "$WORK/merged"
+  bash "$REPO/packaging/linux/merge-debs.sh" "$3" "$dest/$d/$(basename "$4")" \
+      "$WORK/merged/$(basename "$4")" >/dev/null || die "合并 $(basename "$3") 与 $(basename "$4") 失败"
+  mv -f "$WORK/merged/$(basename "$4")" "$dest/$d/$(basename "$4")"
   link_vendor "$5" "$dest/$d/vendor"
   add_extra_debs "$dest/$d/vendor" "$d"
   [ -r "$dest/$d/vendor/SHA256SUMS" ] || die "$dest/$d/vendor 缺少 SHA256SUMS"
-  printf 'test bundle: %s %s\n' "$d" "$(basename "$3")" >"$dest/$d/BUNDLE-INFO"
+  printf 'test bundle: %s %s\n' "$d" "$(basename "$4")" >"$dest/$d/BUNDLE-INFO"
 }
 
 BROTLI_VER=$(dpkg-deb -f "$VENDOR13"/libbrotli1_*_amd64.deb Version) || die "读不到离线库里 libbrotli1 的版本"
@@ -183,7 +189,8 @@ with_schema_templates() { # $1=in.deb $2=out.deb
   rm -rf "$tmp"
   say "  重打包 $(basename "$2")：加入 $(ls "$REPO"/packaging/rime/schemas/*.custom.yaml | wc -l) 个 schema 模板"
 }
-# 文件名必须保持 rime-inputmethod_*.deb（install.sh 按这个 glob 找包）
+# 这里重打包的是**输入法** deb；它随后会与同步 deb 合并成一个 rime-sync deb，
+# 所以 IME deb 的文件名不必匹配 install.sh 的 glob（合并产物才需要）。
 install -d "$WORK/repack"
 with_schema_templates "$IME_DEB_NEW" "$WORK/repack/$(basename "$IME_DEB_NEW")"
 with_schema_templates "$IME_DEB_OLD" "$WORK/repack/$(basename "$IME_DEB_OLD")"

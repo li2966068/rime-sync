@@ -27,7 +27,10 @@ check_one_cli() { # <deb>：检查不通过返回 1（不退出脚本）
     dpkg-deb -c "$1" 2>&1 | grep rime-sync-cli >&2 || true
     return 1
   fi
-  mode=$(dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli") { print $1; exit } }') || return 1
+  # 不要在 awk 里 exit：awk 提前退出会关掉管道，dpkg-deb 背后的 tar 写 stdout 时收到
+  # SIGPIPE 报「tar 子进程返回错误状态 2」，而 set -o pipefail 会把整条管道判成失败
+  # （小包时是竞态，所以时好时坏）。改成读完再打印。
+  mode=$(dpkg-deb -c "$1" | awk '{ p = $6; sub(/^\.\//, "", p); if (p == "usr/bin/rime-sync-cli" && m == "") { m = $1 } } END { print m }') || return 1
   if [ "$mode" != "-rwxr-xr-x" ]; then
     echo "!! $1: /usr/bin/rime-sync-cli 权限是 $mode（期望 -rwxr-xr-x）" >&2
     return 1

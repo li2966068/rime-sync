@@ -1,18 +1,22 @@
 # Linux 安装包：输入法 + 同步工具（trixie，离线安装包 / 在线安装包）
 
 目标：在 Debian 13（trixie）上用一个文件装好「自编译 Rime 输入法 + rime-sync」。
-0.6.6 起 **Linux 只发布 trixie**，且不再单独发「输入法本体」deb——两个 .run 都是
-「输入法本体 + 同步工具」，区别只在**依赖层**：
+0.6.6 起 **Linux 只发布 trixie**；0.6.33 起「输入法本体」和「同步工具」在打包阶段
+合成**一个 deb**（包名 `rime-sync`），两个 .run 里都只带这一个包，区别只在**依赖层**：
 
 | 资产 | 变体 | 依赖 | 安装行为 |
 | --- | --- | --- | --- |
-| `rime-sync-installer_<ver>.trixie.offline.run` | 离线安装包（offline） | 内置依赖闭包（vendor/*.deb，约 170 MB） | 断网可装：先解包缺失依赖，再装 IME，再装 sync |
-| `rime-sync-installer_<ver>.trixie.online.run` | 在线安装包（online） | 不打包，`apt-get` 从系统仓库装 | 先 `apt-get update` + fcitx5 运行库，再装 IME，再装 sync |
+| `rime-sync-installer_<ver>.trixie.offline.run` | 离线安装包（offline） | 内置依赖闭包（vendor/*.deb，约 170 MB） | 断网可装：先解包缺失依赖，再装合并后的 rime-sync |
+| `rime-sync-installer_<ver>.trixie.online.run` | 在线安装包（online） | 不打包，`apt-get` 从系统仓库装 | 先 `apt-get update` + fcitx5 运行库，再装合并后的 rime-sync |
 
 > 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 
+**合并包的直接后果（0.6.33 起）**：装一次即同时得到输入法与同步程序；
+反过来，**卸载也是一个整体**——`apt remove rime-sync` 会把输入法组件一起卸掉，
+不能只卸其一。
+
 两个包用**同一套安装脚本**（`install.sh`），安装顺序都写死为
-「先卸载旧版 → 装 IME → 装 sync」，可重复执行。升级语义（0.6.12 起）：
+「先卸载旧版 → 装合并后的 rime-sync」，可重复执行。升级语义（0.6.12 起）：
 **先卸载旧版，再全新安装**——旧版 rime-inputmethod / rime-sync 被 `purge`，
 用户配置与数据（~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、
 ~/.config/com.rimesync.app）一律保留；新版安装时配置模板只补缺失，已存在的一律沿用
@@ -23,8 +27,8 @@
 ~~~
 build/deb/debian-13/rime-inputmethod_<appver>~trixie_amd64.deb     # 只作为 .run 的输入
 packaging/linux/vendor/debian-13/{*.deb,VENDOR-INFO,SHA256SUMS,DEPS.txt}
-packaging/linux/out/offline/debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/}
-packaging/linux/out/offline/debian-13-online/{rime-inputmethod_*.deb,rime-sync_*.deb}
+packaging/linux/out/offline/debian-13/{rime-sync_*.deb,vendor/}       # 合并后的 deb（唯一）
+packaging/linux/out/offline/debian-13-online/{rime-sync_*.deb}         # 合并后的 deb（唯一）
 packaging/linux/out/offline/install.sh
 packaging/linux/out/rime-sync-installer_<appver>.trixie.offline.run
 packaging/linux/out/rime-sync-installer_<appver>.trixie.online.run
@@ -96,7 +100,7 @@ sudo packaging/linux/out/offline/install.sh --uninstall
      只 `dpkg --configure <pkg:arch>...` 自己解包的包，失败时打印 dpkg 原文、多架构
      不一致清单、回滚命令；需要升级系统库时显式加 `--upgrade-vendor`。
    * **在线安装包**：`apt-get update` 后装 `fcitx5 fcitx5-modules`，再由
-     `apt-get install ./rime-inputmethod_*.deb` / `./rime-sync_*.deb` 解析各包的 Depends。
+     `apt-get install ./rime-sync_*.deb`（合并包）解析 Depends。
      **断网或仓库不可用时立即停止**（退出码 3），打印手动步骤并指向离线安装包：
      ~~~
      ---- 在线安装包（online）需要系统仓库或联网 ----
@@ -104,11 +108,11 @@ sudo packaging/linux/out/offline/install.sh --uninstall
      有网络（或已挂本地仓库）时的手动步骤：
        sudo apt-get update
        sudo apt-get install -y --no-install-recommends fcitx5 fcitx5-modules
-       sudo apt-get install -y --no-install-recommends rime-inputmethod_*.deb
-       sudo apt-get install -y --no-install-recommends rime-sync_*.deb
+       sudo apt-get install -y --no-install-recommends ./rime-sync_*.deb
        sudo apt --fix-broken install
      ~~~
-6. 严格顺序：先 IME，再 sync；任一步失败立即停止（离线安装包用 `dpkg -i`，在线安装包用 `apt-get install`）。
+6. 严格顺序：先卸旧版，再装合并后的 rime-sync（一个 deb 一步到位）；任一步失败立即停止
+   （离线安装包用 `dpkg -i`，在线安装包用 `apt-get install`）。
    因为旧版刚被卸载，这里一定走全新安装（dpkg.log 里是 install，不是 upgrade）。
 7. 配置模板**缺失才补**：`/usr/share/rime-sync/defaults/default.custom.yaml` 与
    `defaults/schemas/*.custom.yaml` 只在用户目录缺同名文件时写入；已存在的一律沿用
@@ -119,7 +123,8 @@ sudo packaging/linux/out/offline/install.sh --uninstall
    步骤名在两种包下分别是 `dpkg -i <deb>` / `apt install <deb>`；升级时还应有
    `UNINSTALL-OLD rime-inputmethod rime-sync`，且排在安装步骤之前。
 
-卸载（--uninstall）先卸 rime-sync、再卸 rime-inputmethod，默认保留全部用户数据
+卸载（--uninstall）卸掉合并后的 rime-sync（输入法与同步程序**一起卸**，因为它们已是同一个包），
+并顺手清理历史遗留的旧包名 rime-inputmethod，默认保留全部用户数据
 （~/rime、~/.config/fcitx5/rime、~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
 ~/.config/rime-sync）；只有显式 `--purge-data` 才删除，且删除前会列出全部绝对路径。
 
@@ -138,13 +143,13 @@ packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装�
 
 断言（每种变体各跑一遍）：
 
-- dpkg-query：rime-inputmethod / rime-sync 均为 install ok installed；
+- dpkg-query：rime-sync 为 install ok installed（0.6.33 起输入法与同步程序合并为一个包）；
 - 安装日志出现 `安装包类型:` 横幅，标明离线安装包 / 在线安装包；
 - /usr/share/rime-data 包含 default.yaml / essay.txt / luna_pinyin.schema.yaml；
 - rime_deployer --build 退出码 0，生成 3 个 build/*.bin；
 - rime-smoke 输出 deploy: success 与候选「你好」；
 - Xvfb + fcitx5 日志出现 Loaded addon rime，无 deploy failure，并生成 build/*.bin；
-- /var/log/rime-sync/install-steps.log 证明先 IME 后 sync；
+- /var/log/rime-sync/install-steps.log 证明「先卸旧版、再装合并后的 rime-sync」；
 - 升级用例（upgrade-fresh）：旧版被 purge（dpkg.log 是 remove/install，不是 upgrade）、
   用户文件 sha256 未变、缺失模板补回（result=new）、已有模板沿用（result=reuse）、
   日志有 UNINSTALL-OLD 阶段；
@@ -156,7 +161,7 @@ packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装�
 
 - **一个包 = IME + 同步工具**：不再发「输入法本体」deb；IME deb 只作为 .run 的载荷存在
   （verify-artifacts 会从在线安装包 .run 里解出来做入口断言）。
-- **方案数据直接进 IME deb**：不再依赖发行版 librime-data，也不需要额外的数据包。
+- **方案数据直接进合并后的 deb**：不再依赖发行版 librime-data，也不需要额外的数据包。
 - **default.yaml 只保留随包方案**：librime deployer 把每个缺失 schema 计为失败，
   带着未随包的 schema 会让整次 deploy 失败。
 - **依赖闭包包含 fcitx5（守护进程）**：只排除 librime1/librime1t64/librime-data/fcitx5-rime；
@@ -164,6 +169,24 @@ packaging/linux/test/install-matrix.sh upgrade-fresh   # 先装旧版，再装�
 - **重打包 rime-sync deb 的维护脚本**：旧 postinst 不认识 rime-inputmethod（虚包 Provides），
   会排队用 apt 装发行版 fcitx5-rime，反过来把我们的 IME 卸掉。新版先检查 rime-inputmethod；
   只替换维护脚本，不改应用内容与版本号。
+- **0.6.33 起合并成一个 deb**：打包阶段用 `packaging/linux/merge-debs.sh` 把
+  rime-inputmethod 与 rime-sync 合成一个包（包名 rime-sync）。控制字段规则：
+  Depends 取并集去重、Provides 保留 `fcitx5-rime`、Conflicts/Replaces 取并集并额外
+  覆盖旧包名 `rime-inputmethod` 与 `rime-sync`、Installed-Size 按合并后的文件树重算；
+  两个包的 postinst/prerm/postrm **都**会执行（postinst：IME 的 localepurge 提示在前、
+  同步包在后；prerm/postrm：同步包在前、IME 在后），其中一个失败不阻塞另一个；
+  两包文件路径冲突时合并直接报错、不做静默覆盖。
+- **合并包的输入法探测兼容层**：合并之后包名变成 `rime-sync`，旧的 `rime-inputmethod`
+  不再是 dpkg 里的包名；而 `fcitx5-rime` 是虚包，`dpkg-query` 查虚包只会得到
+  `unknown ok not-installed`。于是 `postinst` 里的 `rime_im_installed()` 会误判「输入法没装」，
+  去排队用 apt 装发行版 `fcitx5-rime` —— 而合并包 `Conflicts: fcitx5-rime`，
+  apt 为了装它会顺手把合并包自己卸掉。合并脚本因此生成一份「输入法探测兼容层」
+  （`/usr/lib/rime-sync/ime-detect-shim.sh`）：它给 `dpkg-query` 包一层，
+  在**我们自带的输入法文件确实在位**时，把 `rime-inputmethod` / `fcitx5-rime`
+  回答成「已安装」，其余包名一律转交真正的 `dpkg-query`。
+  合并后的 `postinst` 内联同一份内容（覆盖安装时 postinst 自己与它拉起的后台 worker）；
+  诊断页「重试」走 `pkexec`，环境被清空、拿不到函数，因此生成的
+  `/var/lib/rime-sync/install-vendor-deps-wrapper.sh` 会被补一行 `source` 该文件。
 - **不修改版本号**：IME 用 tauri.conf.json 的版本，只加 ~<suite> 后缀区分发行版。
 - **升级 = 卸载旧版 + 全新安装**（0.6.12 起）：每个新版本都先 purge 旧版
   rime-inputmethod / rime-sync，再全新安装；用户配置与数据不在包的文件清单里，
@@ -277,7 +300,7 @@ librime 版本、插件缺失搞成「部署静默失败」。这种机器上用
 
 | 目的 | 做法 |
 |---|---|
-| 关闭兜底 | `sudo RIMESYNC_PREBUILT=0 bash install.sh …` 或 `sudo RIMESYNC_PREBUILT=0 dpkg -i rime-inputmethod_*.deb rime-sync_*.deb` |
+| 关闭兜底 | `sudo RIMESYNC_PREBUILT=0 bash install.sh …` 或 `sudo RIMESYNC_PREBUILT=0 dpkg -i rime-sync_*.deb`（合并包） |
 | 强制覆盖已有产物 | `sudo RIMESYNC_PREBUILT=force bash install.sh …` |
 | 手工铺一次（不重装） | 用桌面账号：`mkdir -p ~/.local/share/fcitx5/rime/build && cp -a /usr/share/rime-sync/prebuilt/build/. ~/.local/share/fcitx5/rime/build/`，需要配置再 `cp -n /usr/share/rime-sync/prebuilt/config/*.yaml ~/.local/share/fcitx5/rime/`，然后 `fcitx5-remote -r` |
 | 不要这份产物 | `rm -rf ~/.local/share/fcitx5/rime/build/luna_pinyin.* ~/.local/share/fcitx5/rime/build/wubi86.*` 后重新部署 |

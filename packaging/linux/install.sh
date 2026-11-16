@@ -8,23 +8,24 @@
 #
 # 目录约定（.run 自解压后也是这个结构；Linux 只出 trixie）：
 #   install.sh
-#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb,vendor/*.deb}   离线安装包（offline）
-#   debian-13/{rime-inputmethod_*.deb,rime-sync_*.deb}                在线安装包（online）
+#   debian-13/{rime-sync_*.deb,vendor/*.deb}   离线安装包（offline）
+#   debian-13/{rime-sync_*.deb}                在线安装包（online）
 #
 # 两种安装包都是「输入法本体 + 同步工具」，区别只在依赖层：
 #   offline -> .run 内置 fcitx5/GTK/WebKit 依赖闭包，断网可装（vendor/ 存在）
 #   online  -> 不带闭包，安装时 apt-get 装缺失依赖（BUNDLE-INFO: variant=online）
 # 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
-# 安装顺序两种包完全一致：先 rime-inputmethod，再 rime-sync。
+# 0.6.33 起输入法与同步工具合成**一个** deb（包名 rime-sync，内含 fcitx5-rime 输入法），
+# 所以安装只有一步：装这一个 deb，输入法与同步程序一起到位。
 #
 # 行为约定：
-#   * 必须先装 rime-inputmethod，再装 rime-sync；任一步失败立即停止并保留日志
+#   * 只装一个合并后的 rime-sync_*.deb；任一步失败立即停止并保留日志
 #   * 不启动任何应用、不写 autostart
 #   * 卸载时默认保留用户数据（~/.local/share/fcitx5/rime、~/.config/com.rimesync.app、
 #     ~/.config/rime-sync）；只有显式加 --purge-data 才随卸载一起删除（破坏性、不可恢复）
 #   * 离线依赖只补缺失、不升级系统已装的包；失败判定只看本安装器解包的包，不把
 #     系统里已有的半配置/多架构不一致算成 rime-sync 的失败
-#   * 每个新版本都是「先卸载旧版（rime-inputmethod + rime-sync），再全新安装」
+#   * 每个新版本都是「先卸载旧版（rime-inputmethod + rime-sync 两个旧包名都清），再全新安装」
 #     （UNINSTALL-OLD 阶段，0.6.12 起；与 Windows 安装器一致）。卸载只删包自己的
 #     文件，用户配置与数据一律保留：~/rime、~/.config/fcitx5/rime、
 #     ~/.local/share/fcitx5/rime、~/.config/com.rimesync.app
@@ -120,7 +121,7 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
   [ -f "$UNINSTALLER" ] || UNINSTALLER=$SCRIPT_DIR/uninstall.sh
   if [ ! -f "$UNINSTALLER" ]; then
     say "找不到统一卸载脚本：/usr/lib/rime-sync/uninstall.sh 与 $SCRIPT_DIR/uninstall.sh 都不存在"
-    say "可改用：apt remove rime-sync；或 dpkg -r rime-inputmethod"
+    say "可改用：apt remove rime-sync（合并包，卸载会同时移除输入法）"
     exit 4
   fi
   uninstall_args=()
@@ -217,11 +218,13 @@ if [ ! -d "$PAYLOAD/$DISTRO_KEY" ]; then
   esac
   sync_deb=$(find_sync_deb "$PAYLOAD")
   [ -n "$sync_deb" ] || fail "离线包里没有 rime-sync_*.deb"
-  say "联网 apt 安装：fcitx5 fcitx5-rime librime-data"
-  step "apt install distro ime (network fallback)"
+  # 合并包里自带输入法，不需要再装发行版 fcitx5-rime（装了还会被合并包的
+  # Conflicts 顶掉）。这里只补 fcitx5 运行时。
+  say "联网 apt 安装：fcitx5 fcitx5-modules"
+  step "apt install fcitx5 runtime (network fallback)"
   apt-get update || fail "apt-get update 失败"
-  apt-get install -y --no-install-recommends fcitx5 fcitx5-rime librime-data ||
-    fail "apt 安装输入法失败"
+  apt-get install -y --no-install-recommends fcitx5 fcitx5-modules ||
+    fail "apt 安装 fcitx5 运行库失败"
   step "apt install rime-sync deb"
   apt-get install -y --no-install-recommends "$sync_deb" || fail "安装 $(basename "$sync_deb") 失败"
   verify_installed rime-sync || fail "rime-sync 未正确安装"
@@ -230,13 +233,26 @@ if [ ! -d "$PAYLOAD/$DISTRO_KEY" ]; then
 fi
 
 DIR=$PAYLOAD/$DISTRO_KEY
-IME_DEB=$(ls -1t "$DIR"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
 SYNC_DEB=$(ls -1t "$DIR"/rime-sync_*.deb 2>/dev/null | head -n 1 || true)
-[ -n "$IME_DEB" ] || fail "$DIR 缺少 rime-inputmethod_*.deb"
 [ -n "$SYNC_DEB" ] || fail "$DIR 缺少 rime-sync_*.deb"
 say "安装集: $DIR"
-say "  IME : $(basename "$IME_DEB")"
-say "  SYNC: $(basename "$SYNC_DEB")"
+say "  DEB : $(basename "$SYNC_DEB")（输入法 + 同步程序，合并成一个包）"
+
+# 兼容老载荷：以前是两个包（rime-inputmethod_*.deb + rime-sync_*.deb）。
+# 那种载荷就地合并成一个包再装，保证「只装一个 deb」这条规矩不破。
+OLD_IME_DEB=$(ls -1t "$DIR"/rime-inputmethod_*.deb 2>/dev/null | head -n 1 || true)
+if [ -n "$OLD_IME_DEB" ]; then
+  MERGE_SH=$SCRIPT_DIR/merge-debs.sh
+  [ -f "$MERGE_SH" ] || MERGE_SH=$(dirname "$SYNC_DEB")/merge-debs.sh
+  [ -f "$MERGE_SH" ] || fail "载荷里有独立的 rime-inputmethod_*.deb，但没有 merge-debs.sh，无法合成一个包"
+  MERGE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rime-sync-merge.XXXXXX") || fail "无法创建临时目录"
+  trap 'rm -rf "$MERGE_TMP"' EXIT
+  say "检测到老式载荷（输入法与同步程序分两个包），先合并成一个包"
+  bash "$MERGE_SH" "$OLD_IME_DEB" "$SYNC_DEB" "$MERGE_TMP/rime-sync-merged.deb" ||
+    fail "合并 rime-inputmethod 与 rime-sync 失败"
+  SYNC_DEB=$MERGE_TMP/rime-sync-merged.deb
+  say "  合并结果：$(basename "$SYNC_DEB")"
+fi
 
 # ------------------------------------------------------------- package variant
 # offline = 内置依赖闭包（vendor/*.deb）；online = 依赖由 apt 解析。
@@ -271,7 +287,6 @@ online_dep_advice() {
   say "有网络（或已挂本地仓库）时的手动步骤："
   say "  sudo apt-get update"
   say "  sudo apt-get install -y --no-install-recommends fcitx5 fcitx5-modules"
-  say "  sudo apt-get install -y --no-install-recommends $(basename "$IME_DEB")"
   say "  sudo apt-get install -y --no-install-recommends $(basename "$SYNC_DEB")"
   say "  sudo apt --fix-broken install   # 万一仍有未满足的依赖"
   say "日志：$LOG"
@@ -494,7 +509,7 @@ report_vendor_failure() { # $1... = 我们这批里未配置且本应可用的 p
   say_multiarch_advice
   say_rollback_info
   say "!! 失败的是【系统已安装包的配置状态】（多架构版本不一致 / 半配置包），"
-  say "   不是 rime-sync 的安装内容有问题；rime-inputmethod 与 rime-sync 本次没有被装上。"
+  say "   不是 rime-sync 的安装内容有问题；rime-sync 本次没有被装上。"
   say "   按上面的建议修好后重新执行本安装器即可（已装好的依赖不会重复解包）。"
   say "安装已停止。完整日志：$LOG"
   exit 3
@@ -657,10 +672,11 @@ elif [ "$VARIANT" != "online" ]; then
   say "警告：$DIR/vendor 为空，跳过依赖安装（要求系统已具备 fcitx5 与 GTK/WebKit 运行库）"
 fi
 
-# --------------------------------------------------------------- strict order
-# 两种安装包都是先 IME 后 sync。差别只在执行器：
+# ---------------------------------------------------------------- install step
+# 0.6.33 起只有一步：装合并后的 rime-sync_*.deb（输入法 + 同步程序）。
+# 差别只在执行器：
 #   offline -> dpkg -i（依赖已由内置闭包解析）
-#   online  -> apt-get install ./pkg.deb（依赖由仓库解析，顺序不变）
+#   online  -> apt-get install ./pkg.deb（依赖由仓库解析）
 install_local_deb() { # $1=deb 文件 $2=中文名称
   local deb=$1 label=$2
   if [ "$VARIANT" = "online" ]; then
@@ -681,15 +697,30 @@ install_local_deb() { # $1=deb 文件 $2=中文名称
 STEP_INSTALL="dpkg -i"
 [ "$VARIANT" = "online" ] && STEP_INSTALL="apt install"
 
-step "$STEP_INSTALL $(basename "$IME_DEB")"
-say "步骤 1/2：安装输入法 $(basename "$IME_DEB")（旧版已在 UNINSTALL-OLD 阶段卸载）"
-install_local_deb "$IME_DEB" "输入法"
-verify_installed rime-inputmethod || fail "rime-inputmethod 未正确安装"
+# 输入法组件是否真的落地：合并包把 fcitx5-rime 的文件一起装上了，
+# 所以不能再查 rime-inputmethod 这个包名（已经没有这个包了），只能查文件。
+verify_ime_payload() {
+  local ok=1
+  if [ ! -d /usr/share/rime-data ]; then
+    say "!! 找不到 /usr/share/rime-data（输入法数据没装上）"
+    ok=0
+  fi
+  if ! ls /usr/lib/*/fcitx5/rime.so >/dev/null 2>&1 && [ ! -f /usr/lib/fcitx5/rime.so ]; then
+    say "!! 找不到 fcitx5 的 rime.so（输入法插件没装上）"
+    ok=0
+  fi
+  [ "$ok" -eq 1 ] || return 1
+  say "OK: 输入法组件已就位（/usr/share/rime-data + fcitx5 rime.so）"
+  return 0
+}
 
 step "$STEP_INSTALL $(basename "$SYNC_DEB")"
-say "步骤 2/2：安装同步程序 $(basename "$SYNC_DEB")（全新安装，用户数据已保留）"
-install_local_deb "$SYNC_DEB" "同步程序"
+say "步骤 1/2：安装输入法与同步程序 $(basename "$SYNC_DEB")（合并成一个包，一次装齐；旧版已在 UNINSTALL-OLD 阶段卸载）"
+install_local_deb "$SYNC_DEB" "输入法与同步程序（合并包）"
 verify_installed rime-sync || fail "rime-sync 未正确安装"
+
+say "步骤 2/2：校验安装结果"
+verify_ime_payload || fail "输入法组件没有装齐（详见上面的提示）"
 
 # ------------------------------------------------- schema 增强配置模板
 # /usr/share/rime-sync/defaults/schemas/ 里是随包 3 个保留方案的 <schema>.custom.yaml：

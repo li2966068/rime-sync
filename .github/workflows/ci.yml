@@ -343,6 +343,7 @@ jobs:
             scripts/ime/Dockerfile \
             packaging/linux/build-offline-installer.sh \
             packaging/linux/prepare-sync-deb.sh \
+            packaging/linux/merge-debs.sh \
             packaging/linux/verify-offline.sh \
             packaging/linux/install.sh \
             packaging/linux/install-vendor-deps.sh \
@@ -380,6 +381,15 @@ jobs:
           set -euo pipefail
           bash packaging/linux/test/test-postinst-prebuilt-sha256.sh
           bash packaging/linux/test/test-offline-install-prebuilt-sha256.sh
+
+
+      # 0.6.33 起输入法包与同步程序包在打包阶段合成一个 deb（包名 rime-sync）。
+      # 合并规则（Depends 并集去重 / Provides 保留 fcitx5-rime / Conflicts 覆盖旧包名 /
+      # 两个包的维护脚本都跑 / 路径冲突必须报错）必须有回归测试守住。
+      - name: merged deb keeps control fields and both maintainer scripts
+        run: |
+          set -euo pipefail
+          bash packaging/linux/test/test-merge-debs.sh
 
 
       # postinst 必须按 fcitx5-rime 的 UserDataDirPath 解析 Rime 用户目录：

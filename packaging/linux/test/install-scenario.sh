@@ -4,7 +4,8 @@
 #   install-scenario.sh <case>
 #
 # Mounts:
-#   /bundle      current offline bundle  (install.sh + <distro>/{ime,sync}.deb + vendor/)
+#   /bundle      current offline bundle  (install.sh + <distro>/rime-sync_*.deb + vendor/)
+#                0.6.33 起离线包里只有**一个**合并后的 deb（输入法 + 同步程序）
 #   /bundle-old  previous release bundle (upgrade case only)
 #   /fixtures    writable scratch dir
 #
@@ -36,6 +37,20 @@ assert_installed() {
   ok "$p $(pkg_version "$p") 已安装并配置"
 }
 assert_absent() { [ -z "$(pkg_status "$1")" ] || fail "$1 不该存在：$(pkg_status "$1")"; ok "$1 不存在"; }
+
+# 0.6.33 起输入法与同步程序合并成一个 rime-sync 包：输入法不再是独立包名，
+# 只能查它落地的东西（方案数据 + fcitx5 插件）。
+assert_ime_payload() {
+  local d=/usr/share/rime-data
+  [ -d "$d" ] || fail "输入法组件没落地：$d 不存在"
+  [ -f "$d/default.yaml" ] || fail "输入法组件没落地：$d/default.yaml 不存在"
+  [ -f "$d/essay.txt" ] || fail "输入法组件没落地：$d/essay.txt 不存在"
+  if ls /usr/lib/*/fcitx5/rime.so >/dev/null 2>&1; then
+    ok "输入法组件已随合并包装上（fcitx5 rime.so + $d）"
+  else
+    fail "输入法组件没落地：找不到 fcitx5 的 rime.so"
+  fi
+}
 
 run_installer() { # $@ = extra args
   local rc
@@ -94,8 +109,9 @@ assert_no_system_wide_configure() {
 # ------------------------------------------------------------------ cases
 case_normal() {
   run_installer
-  assert_installed rime-inputmethod
   assert_installed rime-sync
+  assert_absent rime-inputmethod
+  assert_ime_payload
   assert_rime_data
   assert_no_system_wide_configure
   [ -z "$(dpkg --audit 2>&1)" ] || { dpkg --audit; fail "dpkg --audit 报告异常"; }
@@ -117,8 +133,9 @@ case_broken_unrelated() {
   esac
 
   run_installer                      # 旧实现会在这里 fail "配置离线依赖失败"
-  assert_installed rime-inputmethod
   assert_installed rime-sync
+  assert_absent rime-inputmethod
+  assert_ime_payload
   assert_rime_data
   # 无关包保持原样（我们不碰它，也不因它中止）
   case "$(pkg_status zz-rime-test-broken)" in
@@ -157,8 +174,8 @@ case_multiarch() {
   say "多架构前置：libbrotli1:amd64=$(pkg_version libbrotli1:amd64) i386=$(pkg_version libbrotli1:i386)"
 
   run_installer
-  assert_installed rime-inputmethod
   assert_installed rime-sync
+  assert_ime_payload
   assert_rime_data
 
   [ "$(pkg_version libbrotli1:amd64)" = "$amd64_ver" ] \
@@ -186,18 +203,15 @@ case_upgrade_fresh() {
   local old_ime_ver old_sync_ver new_ime_ver new_sync_ver seedmark f
   setup_user_data
 
-  say "步骤 A：先装旧版（$(basename "$BUNDLE_OLD"/debian-13/rime-inputmethod_*.deb) / $(basename "$BUNDLE_OLD"/debian-13/rime-sync_*.deb)）"
+  say "步骤 A：先装旧版（$(basename "$BUNDLE_OLD"/debian-13/rime-sync_*.deb)，旧版也是合并包）"
   run_installer --payload "$BUNDLE_OLD"
-  assert_installed rime-inputmethod
   assert_installed rime-sync
-  old_ime_ver=$(pkg_version rime-inputmethod)
+  assert_absent rime-inputmethod
   old_sync_ver=$(pkg_version rime-sync)
-  new_ime_ver=$(dpkg-deb -f "$BUNDLE"/debian-13/rime-inputmethod_*.deb Version)
   new_sync_ver=$(dpkg-deb -f "$BUNDLE"/debian-13/rime-sync_*.deb Version)
-  say "旧版：rime-inputmethod=$old_ime_ver rime-sync=$old_sync_ver"
-  say "新版：rime-inputmethod=$new_ime_ver rime-sync=$new_sync_ver"
-  dpkg --compare-versions "$new_ime_ver" gt "$old_ime_ver" || fail "测试前置无效：新 IME 版本不高于旧版"
-  dpkg --compare-versions "$new_sync_ver" gt "$old_sync_ver" || fail "测试前置无效：新 sync 版本不高于旧版"
+  say "旧版：rime-sync=$old_sync_ver"
+  say "新版：rime-sync=$new_sync_ver"
+  dpkg --compare-versions "$new_sync_ver" gt "$old_sync_ver" || fail "测试前置无效：新版本不高于旧版"
 
   # 旧版已经种过一轮模板：把一个文件改成"用户自己编辑过"的内容，再删掉另一个，
   # 用来验证新版只补缺失、已存在的一律沿用。
@@ -214,11 +228,11 @@ case_upgrade_fresh() {
 
   say "步骤 B：装新版（安装器先用 purge 卸掉旧版，再全新安装）"
   run_installer
-  assert_installed rime-inputmethod
   assert_installed rime-sync
-  [ "$(pkg_version rime-inputmethod)" = "$new_ime_ver" ] || fail "IME 版本不是 $new_ime_ver（$(pkg_version rime-inputmethod)）"
-  [ "$(pkg_version rime-sync)" = "$new_sync_ver" ] || fail "sync 版本不是 $new_sync_ver（$(pkg_version rime-sync)）"
-  ok "版本已换新：rime-inputmethod $old_ime_ver -> $new_ime_ver，rime-sync $old_sync_ver -> $new_sync_ver"
+  assert_absent rime-inputmethod
+  assert_ime_payload
+  [ "$(pkg_version rime-sync)" = "$new_sync_ver" ] || fail "版本不是 $new_sync_ver（$(pkg_version rime-sync)）"
+  ok "版本已换新：rime-sync $old_sync_ver -> $new_sync_ver"
 
   # 1) dpkg.log：旧版被 purge（dpkg 记的是 remove <ver> <none>，没有单独的 purge 行），
   #    新版是 install（不是 upgrade）。
@@ -227,19 +241,15 @@ case_upgrade_fresh() {
         '$3 == "remove" && $4 ~ p && $(NF-1) == v && $NF == "<none>" { f = 1 } END { exit !f }' \
         /var/log/dpkg.log
   }
-  assert_purged rime-inputmethod "$old_ime_ver" \
-    || { grep 'rime-inputmethod' /var/log/dpkg.log | tail -n 8; fail "dpkg.log 里没有 purge rime-inputmethod $old_ime_ver"; }
   assert_purged rime-sync "$old_sync_ver" \
     || { grep 'rime-sync' /var/log/dpkg.log | tail -n 8; fail "dpkg.log 里没有 purge rime-sync $old_sync_ver"; }
-  awk -v v="$old_ime_ver" '$3 == "status" && $4 == "not-installed" && $5 ~ /^rime-inputmethod(:|$)/ { f = 1 } END { exit !f }' \
-      /var/log/dpkg.log || fail "dpkg.log 里没有 rime-inputmethod 的 not-installed 记录"
-  ok "dpkg.log：旧版 $old_ime_ver / $old_sync_ver 被 purge（记录为 remove + not-installed）"
+  awk -v v="$old_sync_ver" '$3 == "status" && $4 == "not-installed" && $5 ~ /^rime-sync(:|$)/ { f = 1 } END { exit !f }' \
+      /var/log/dpkg.log || fail "dpkg.log 里没有 rime-sync 的 not-installed 记录"
+  ok "dpkg.log：旧版 $old_sync_ver 被 purge（记录为 remove + not-installed）"
 
-  awk -v v="$new_ime_ver" '$3 == "install" && $4 ~ /^rime-inputmethod(:|$)/ && $NF == v { f = 1 } END { exit !f }' \
-      /var/log/dpkg.log || fail "dpkg.log 里没有全新 install rime-inputmethod $new_ime_ver"
   awk -v v="$new_sync_ver" '$3 == "install" && $4 ~ /^rime-sync(:|$)/ && $NF == v { f = 1 } END { exit !f }' \
       /var/log/dpkg.log || fail "dpkg.log 里没有全新 install rime-sync $new_sync_ver"
-  ok "dpkg.log：新版 $new_ime_ver / $new_sync_ver 是 install（全新安装）"
+  ok "dpkg.log：新版 $new_sync_ver 是 install（全新安装）"
   if awk '$3 == "upgrade" && ($4 ~ /^rime-inputmethod(:|$)/ || $4 ~ /^rime-sync(:|$)/) { f = 1 } END { exit !f }' /var/log/dpkg.log; then
     grep ' upgrade ' /var/log/dpkg.log | tail -n 5
     fail "升级走了原地 upgrade，没有先卸载旧版"
@@ -251,7 +261,7 @@ case_upgrade_fresh() {
     || { tail -n 12 /var/log/rime-sync/install-steps.log; fail "install-steps.log 缺少 UNINSTALL-OLD 阶段"; }
   grep -q 'UNINSTALL-OLD rime-inputmethod rime-sync' /var/log/rime-sync/install.log \
     || fail "install.log 缺少 UNINSTALL-OLD 记录"
-  awk '/UNINSTALL-OLD rime-inputmethod/ { u = NR } /dpkg -i rime-inputmethod_/ { i = NR } END { exit !(u && i && u < i) }' \
+  awk '/UNINSTALL-OLD rime-inputmethod/ { u = NR } /dpkg -i rime-sync_/ { i = NR } END { exit !(u && i && u < i) }' \
       /var/log/rime-sync/install-steps.log || fail "UNINSTALL-OLD 没有排在安装之前"
   ok "install.log / install-steps.log：UNINSTALL-OLD 阶段存在且先于安装"
 
@@ -335,6 +345,7 @@ case_prebroken_multiarch() {
   done
   ok "诊断齐备：dpkg 原文 + 多架构说明 + 修复命令 + 责任归属"
   assert_absent rime-inputmethod
+  assert_absent rime-sync
   # 安装器没有再动那个包：版本与状态都是上一次安装留下的原样（unpacked = iU）
   [ "$(pkg_version libbrotli1:amd64)" = "$before_ver" ] \
     || fail "libbrotli1:amd64 版本被改成 $(pkg_version libbrotli1:amd64)（应为 $before_ver）"
@@ -357,8 +368,8 @@ case_single_arch() {
   [ -z "$(dpkg --print-foreign-architectures)" ] || fail "本用例要求没有外部架构，实际：$(dpkg --print-foreign-architectures)"
   say "外部架构：<空>"
   run_installer
-  assert_installed rime-inputmethod
   assert_installed rime-sync
+  assert_ime_payload
   assert_rime_data
   if grep -q '检测到外部架构' /var/log/rime-sync/install.log; then
     fail "单架构系统不该报多架构提示"

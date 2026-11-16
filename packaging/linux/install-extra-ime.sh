@@ -149,8 +149,9 @@ fi
 
 # 用户可能直接指向「装着 deb 的那一层」（如 out/offline/debian-13/），
 # 那一层自己没有 install.sh，但它的上一层有 —— 这种情况下上溯一层再试。
+# 0.6.33 起 deb 只有一个（合并包 rime-sync_*.deb）；老布局还有独立的 rime-inputmethod_*.deb。
 if [ ! -f "$BUNDLE/install.sh" ] && [ -f "$BUNDLE/../install.sh" ] &&
-   ls -1 "$BUNDLE"/rime-inputmethod_*.deb >/dev/null 2>&1; then
+   { ls -1 "$BUNDLE"/rime-sync_*.deb >/dev/null 2>&1 || ls -1 "$BUNDLE"/rime-inputmethod_*.deb >/dev/null 2>&1; }; then
   BUNDLE=$(cd "$BUNDLE/.." && pwd)
   say "（安装包的那一层里没有 install.sh，已上溯到上一层：$BUNDLE）"
 fi
@@ -162,17 +163,18 @@ if [ ! -f "$INSTALL_SH" ]; then
   exit 66
 fi
 
-# 找到 debian-13 里的输入法 deb（安装包必须带 rime-inputmethod_*.deb）
+# 找到 debian-13 里的 deb。0.6.33 起只有一个合并包 rime-sync_*.deb
+# （输入法 + 同步程序都在里面）；老布局还有独立的 rime-inputmethod_*.deb。
 DISTRO_DIR=""
 for d in "$BUNDLE"/debian-13 "$BUNDLE"/*/debian-13; do
   [ -d "$d" ] || continue
-  if ls -1 "$d"/rime-inputmethod_*.deb >/dev/null 2>&1; then
+  if ls -1 "$d"/rime-sync_*.deb >/dev/null 2>&1 || ls -1 "$d"/rime-inputmethod_*.deb >/dev/null 2>&1; then
     DISTRO_DIR="$d"
     break
   fi
 done
 if [ -z "$DISTRO_DIR" ]; then
-  say "安装包里找不到 rime-inputmethod_*.deb（安装包必须自带输入法本体）。"
+  say "安装包里找不到 rime-sync_*.deb（合并包：输入法 + 同步程序）。"
   say "离线安装包和在线安装包都自带完整输入法，随便哪个都行；请检查是不是选错了文件、或者文件没下完整。"
   say "两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。"
   exit 66
@@ -232,7 +234,7 @@ else
   say "  rime-inputmethod：未安装"
 fi
 if [ "$OLD_SYNC_INSTALLED" -eq 1 ]; then
-  say "  rime-sync（旧版同步程序）：已安装"
+  say "  rime-sync：已安装（0.6.33 起是合并包：输入法 + 同步程序；更早的版本只有同步程序）"
 else
   say "  rime-sync：未安装"
 fi
@@ -426,14 +428,24 @@ else
   say "发行版输入法 $DISTRO_IME_PKG 未安装，跳过"
 fi
 
-# 1b) 旧的 rime-inputmethod：
-#     - 是我们自己的旧版 → 交给统一卸载脚本 uninstall.sh（默认语义：保留用户数据）
-#     - 是发行版同名包 → 直接卸载
+# 1b) 已安装的 rime-sync（0.6.33 起是合并包，输入法 + 同步程序）与旧包名 rime-inputmethod：
+#     - 是我们自己的包 → 交给统一卸载脚本 uninstall.sh（默认语义：保留用户数据）
+#     - 是发行版同名的 rime-inputmethod → 直接卸载
 UNINSTALLER=""
 for c in /usr/lib/rime-sync/uninstall.sh "$BUNDLE/uninstall.sh"; do
   if [ -f "$c" ]; then UNINSTALLER=$c; break; fi
 done
-if [ "$OLD_IME_INSTALLED" -eq 1 ] && [ "$OLD_IME_IS_OURS" -eq 1 ]; then
+if [ "$OLD_IME_INSTALLED" -eq 1 ] && [ "$OLD_IME_IS_OURS" -ne 1 ]; then
+  say "卸载发行版同名的 rime-inputmethod 包"
+  step "purge foreign rime-inputmethod"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    dpkg --purge --force-depends rime-inputmethod || say "!! rime-inputmethod 卸载不干净，继续"
+  else
+    say "  [试运行] 将执行：dpkg --purge --force-depends rime-inputmethod"
+  fi
+elif [ "$OLD_IME_INSTALLED" -eq 1 ] || [ "$OLD_SYNC_INSTALLED" -eq 1 ]; then
+  # 我们自己的包：合并包 rime-sync（含输入法）或旧版输入法包 rime-inputmethod。
+  # 统一交给 uninstall.sh（默认语义：保留用户数据）。
   if [ -n "$UNINSTALLER" ]; then
     say "卸载 rime-sync 的旧版输入法与同步程序（用统一卸载脚本 uninstall.sh，保留用户数据）"
     step "uninstall old via uninstall.sh"
@@ -454,16 +466,8 @@ if [ "$OLD_IME_INSTALLED" -eq 1 ] && [ "$OLD_IME_IS_OURS" -eq 1 ]; then
       say "  [试运行] 将执行：dpkg --purge --force-depends rime-inputmethod rime-sync"
     fi
   fi
-elif [ "$OLD_IME_INSTALLED" -eq 1 ]; then
-  say "卸载发行版同名的 rime-inputmethod 包"
-  step "purge foreign rime-inputmethod"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    dpkg --purge --force-depends rime-inputmethod || say "!! rime-inputmethod 卸载不干净，继续"
-  else
-    say "  [试运行] 将执行：dpkg --purge --force-depends rime-inputmethod"
-  fi
 else
-  say "没有旧的 rime-inputmethod，跳过"
+  say "没有已安装的 rime-sync / rime-inputmethod，跳过"
 fi
 
 # 1c) 发行版 librime-bin：它带的 /usr/bin/rime_deployer 会和我们自建的文件同名冲突

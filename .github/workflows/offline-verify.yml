@@ -190,6 +190,21 @@ jobs:
             echo "::error::packaging/linux/build-offline-installer.sh 失败（见上方日志）"
             exit 1
           }
+          # 0.6.33 起每个安装集里只有一个**合并**后的 deb（输入法 + 同步程序）。
+          for d in packaging/linux/out/offline/debian-13 packaging/linux/out/offline/debian-13-online; do
+            [ -d "$d" ] || continue
+            mapfile -t debs < <(find "$d" -maxdepth 1 -type f -name 'rime-sync_*.deb' | sort)
+            if [ "${#debs[@]}" -ne 1 ]; then
+              echo "::error file=$d::期望恰好 1 个 rime-sync_*.deb（合并包），实际 ${#debs[@]} 个"
+              printf '  %s\n' "${debs[@]}"
+              exit 1
+            fi
+            if find "$d" -maxdepth 1 -type f -name 'rime-inputmethod_*.deb' | grep -q .; then
+              echo "::error file=$d::安装集里还有独立的 rime-inputmethod_*.deb（应合并成一个 rime-sync 包）"
+              exit 1
+            fi
+            echo "安装集 $d：$(basename "${debs[0]}")（合并包）"
+          done
 
       # 真正的验收：trixie 建一个测试镜像，分别验 offline（断网安装成功）与
       # online（断网必须明确失败 + 联网必须成功）。

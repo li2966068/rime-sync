@@ -472,9 +472,29 @@ jobs:
             echo "::error file=$online::${DISTRO} 在线安装包不小于离线安装包一半：在线安装包应显著更小"
             exit 1
           fi
+          # 0.6.33 起每个安装集里只有一个**合并**后的 deb（输入法 + 同步程序）。
+          # 断言：正好 1 个 rime-sync_*.deb，且没有独立的 rime-inputmethod_*.deb。
+          for d in packaging/linux/out/offline/$DISTRO packaging/linux/out/offline/$DISTRO-online; do
+            [ -d "$d" ] || continue
+            mapfile -t debs < <(find "$d" -maxdepth 1 -type f -name 'rime-sync_*.deb' | sort)
+            if [ "${#debs[@]}" -ne 1 ]; then
+              echo "::error file=$d::期望恰好 1 个 rime-sync_*.deb（合并包），实际 ${#debs[@]} 个"
+              printf '  %s\n' "${debs[@]}"
+              exit 1
+            fi
+            if find "$d" -maxdepth 1 -type f -name 'rime-inputmethod_*.deb' | grep -q .; then
+              echo "::error file=$d::安装集里还有独立的 rime-inputmethod_*.deb（0.6.33 起应合并成一个 rime-sync 包）"
+              exit 1
+            fi
+            pkg=$(dpkg-deb -f "${debs[0]}" Package 2>/dev/null || echo "")
+            [ "$pkg" = "rime-sync" ] ||
+              { echo "::error file=${debs[0]}::包名是 $pkg，不是 rime-sync"; exit 1; }
+            echo "安装集 $d：$(basename "${debs[0]}")（包名 rime-sync，输入法 + 同步程序）"
+          done
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             echo "- $DISTRO ($SUITE): $(basename "$offline") ${offline_mib} MiB（离线安装包）+ $(basename "$online") ${online_mib} MiB（在线安装包）/ vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
             echo "- 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。" >> "$GITHUB_STEP_SUMMARY"
+            echo"- 0.6.33 起输入法与同步程序合并成一个 deb（包名 rime-sync）：装一次就有两样东西，卸载也是一个整体。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: cleanup docker images
@@ -487,8 +507,8 @@ jobs:
       # 直传草稿 Release。资产名 = basename：
       #   rime-sync-installer_<ver>.<suite>.offline.run   离线安装包
       #   rime-sync-installer_<ver>.<suite>.online.run    在线安装包
-      # 0.6.6 起 rime-inputmethod deb 不再作为独立资产：它只在两个 .run 里
-      # （verify-artifacts 会从 online.run 里解出来做入口断言）。
+      # 0.6.6 起 rime-inputmethod deb 不再作为独立资产；0.6.33 起连合并包本身
+      # 也只存在于两个 .run 里（verify-artifacts 会从 online.run 里解出来做入口断言）。
       # 注意：不要上传 rime-smoke（与发行版同名时 --clobber 会互相覆盖）。
       - name: upload installers to draft release (${{ matrix.distro }})
         env:
@@ -1347,9 +1367,13 @@ jobs:
             --pattern '*.online.run'
           find dist -maxdepth 2 -type f -printf '%P  %s bytes\n' | sort
 
-      # 0.6.6 起 rime-inputmethod deb 不再作为独立资产发布，但"入口必须在 IME 包内"这条
-      # 断言不能丢：从 online .run 的自解压载荷里把它取出来再交给 verify-artifacts.sh。
-      - name: extract IME deb from online installer
+      # 0.6.33 起输入法与同步程序合成**一个** deb（包名 rime-sync），它不再作为
+      # 独立资产发布，只存在于两个 .run 里。但"输入法入口必须在包里"这条断言不能丢：
+      # 从 online .run 的自解压载荷里把它取出来再交给 verify-artifacts.sh。
+      # 落地用真实包名 rime-sync_<ver>_amd64.deb：verify-artifacts.sh 按 deb **内容**
+      # 认它是不是「带输入法的那个包」（含 fcitx5/rime.so 或 usr/share/rime-data），
+      # 不靠文件名伪装。
+      - name: extract merged deb from online installer
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -1363,14 +1387,18 @@ jobs:
           line=$(awk -v m="$marker" '$0 == m { print NR + 1; exit }' "${runs[0]}")
           [ -n "$line" ] || { echo "::error::${runs[0]} 里没有载荷标记"; exit 1; }
           tail -n +"$line" "${runs[0]}" | tar -xzf - -C "$tmp"
-          mapfile -t ime < <(find "$tmp" -type f -name 'rime-inputmethod_*.deb' | sort)
-          if [ "${#ime[@]}" -ne 1 ]; then
-            echo "::error::online .run 里应有恰好 1 个 rime-inputmethod deb，实际 ${#ime[@]} 个"
+          mapfile -t merged < <(find "$tmp" -type f -name 'rime-sync_*.deb' | sort)
+          if [ "${#merged[@]}" -ne 1 ]; then
+            echo "::error::online .run 里应有恰好 1 个 rime-sync deb（合并包），实际 ${#merged[@]} 个"
             find "$tmp" -type f | sed -n '1,20p'
             exit 1
           fi
-          cp -f "${ime[0]}" dist/
-          echo "从 $(basename "${runs[0]}") 取出 $(basename "${ime[0]}")（$(( $(stat -c %s "${ime[0]}") / 1024 / 1024 )) MiB）"
+          pkg=$(dpkg-deb -f "${merged[0]}" Package 2>/dev/null || echo "")
+          [ "$pkg" = "rime-sync" ] ||
+            { echo "::error::${merged[0]} 的包名是 $pkg，不是 rime-sync"; exit 1; }
+          ver=$(dpkg-deb -f "${merged[0]}" Version 2>/dev/null || echo 0)
+          cp -f "${merged[0]}" "dist/rime-sync_${ver}_amd64.deb"
+          echo "从 $(basename "${runs[0]}") 取出合并包 $(basename "${merged[0]}")（$(( $(stat -c %s "${merged[0]}") / 1024 / 1024 )) MiB）"
           rm -rf "$tmp"
           find dist -maxdepth 1 -type f -printf '%P  %s bytes\n' | sort
 

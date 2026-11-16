@@ -4,12 +4,14 @@
 #   pkexec /usr/lib/rime-sync/uninstall.sh                # 应用菜单「卸载 Rime 同步与输入法」
 #   sudo /usr/lib/rime-sync/uninstall.sh                  # 终端里交互确认
 #   sudo /usr/lib/rime-sync/uninstall.sh --yes            # 不再询问（脚本/自动化）
-#   sudo /usr/lib/rime-sync/uninstall.sh --keep-ime       # 只卸同步程序，保留输入法
+#   sudo /usr/lib/rime-sync/uninstall.sh --keep-ime       # 保留输入法（见下方说明）
 #   sudo /usr/lib/rime-sync/uninstall.sh --purge-data     # 连本地用户数据一起删（破坏性、不可恢复）
 #
 # 行为约定：
-#   * 顺序固定：先 rime-sync，再 rime-inputmethod；单个失败只打印 dpkg 给出的原因，
-#     然后继续处理下一个（两个包可能只装了一个）。
+#   * 0.6.33 起输入法与同步程序合成一个包（包名 rime-sync），卸载它就是全卸；
+#     旧包名 rime-inputmethod 仍然会被检测并清理（老版本装下来的残留）。
+#   * 顺序固定：先 rime-sync（合并包），再 rime-inputmethod（旧包名）；单个失败只打印
+#     dpkg 给出的原因，然后继续处理下一个（两个包可能只装了一个）。
 #   * 清理我们安装的桌面项与 autostart，不动其它桌面文件。
 #   * 默认不删用户数据：只有带 --purge-data，或在终端里对「是否同时删除本地用户数据」
 #     回答 y 才删（默认 N）。删除前列出全部绝对路径，删除后逐条打印成功/失败；
@@ -24,7 +26,9 @@
 #     源文件中途消失会出现 "unexpected EOF"，所以先把自己复制到临时目录再执行。
 set -u
 
+# 合并包（0.6.33 起）：输入法与同步程序都在这一个包里，卸它就是全卸。
 PKG_SYNC=rime-sync
+# 旧包名：0.6.33 之前的输入法包。老机器上可能还留着，要一并清掉。
 PKG_IME=rime-inputmethod
 ASSUME_YES=0
 KEEP_IME=0
@@ -370,10 +374,11 @@ if [ -n "$INVOKER_HOME" ]; then
 fi
 
 # -------------------------------------------------------------------- plan
-say "将要卸载：$PKG_SYNC"
-[ "$KEEP_IME" -eq 1 ] || say "将要卸载：$PKG_IME"
+say "将要卸载：$PKG_SYNC（合并包：输入法与同步程序一起卸）"
 if [ "$KEEP_IME" -eq 1 ]; then
-  say "（--keep-ime：保留输入法 $PKG_IME）"
+  say "（--keep-ime：输入法与同步程序现在合成一个包，没法只保留输入法 —— 本次保留 $PKG_SYNC，什么都不卸）"
+else
+  say "将要卸载（若已安装）：$PKG_IME（旧输入法包名，0.6.33 之前）"
 fi
 
 # 询问之前先把「会删哪些绝对路径」摆出来
@@ -415,8 +420,12 @@ if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
 fi
 
 # --------------------------------------------------------------- remove pkgs
-remove_pkg "$PKG_SYNC"
-if [ "$KEEP_IME" -eq 0 ]; then
+# 合并包：卸掉它，输入法与同步程序一起没了（卸载是一个整体）。
+if [ "$KEEP_IME" -eq 1 ]; then
+  say "按 --keep-ime 保留 $PKG_SYNC（合并包：输入法 + 同步程序）"
+else
+  remove_pkg "$PKG_SYNC"
+  # 旧包名也要清：新装的是合并包，老的 rime-inputmethod 留着会与它冲突。
   remove_pkg "$PKG_IME"
 fi
 

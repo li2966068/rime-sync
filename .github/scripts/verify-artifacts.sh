@@ -152,6 +152,27 @@ check_mode() { # $1=path $2=label $3=mode
   return 1
 }
 
+# 0.6.33 起输入法与同步程序合并成**一个** deb（包名 rime-sync）。它的文件名
+# 只匹配 rime-sync_*.deb，但内容里同时有输入法与同步程序 —— 所以认「这是不是
+# 带输入法的包」必须看内容，不能靠文件名伪装。
+# 判据：deb 里含 fcitx5 插件本体（fcitx5/rime.so）或 Rime 数据目录。
+deb_has_ime_payload() { # $1=deb
+  local deb=$1 list
+  list=$(mktemp)
+  if ! dpkg-deb -c "$deb" >"$list" 2>/dev/null; then
+    rm -f "$list"
+    return 1
+  fi
+  # 不用管道：dpkg-deb -c | grep -q 会在 grep 提前退出时把 dpkg-deb 打成
+  # SIGPIPE，配合 pipefail 会误判失败（本仓库已踩过这个坑）。
+  if grep -qE 'fcitx5/rime\.so|usr/share/rime-data/' "$list"; then
+    rm -f "$list"
+    return 0
+  fi
+  rm -f "$list"
+  return 1
+}
+
 check_ime_deb() { # $1=deb $2=workdir
   local deb=$1 root="$2/root"
   say "[ime] $(basename "$deb")"
@@ -575,9 +596,18 @@ verify_dir() {
   WORK_DIR=$work
   trap cleanup EXIT
 
-  local ime_debs=() sync_debs=() setups=() online_setups=() offline_setups=() s
+  local ime_debs=() sync_debs=() merged_debs=() setups=() online_setups=() offline_setups=() s
   mapfile -t ime_debs < <(find "$dir" -type f -name 'rime-inputmethod_*.deb' | sort)
   mapfile -t sync_debs < <(find "$dir" -type f -name 'rime-sync_*.deb' | sort)
+  # 0.6.33 起输入法与同步程序合并成**一个** deb（包名 rime-sync）。它的文件名
+  # 只匹配 rime-sync_*.deb，但内容里也有输入法，所以它同时满足两组断言 ——
+  # 按内容认，不靠改名伪装。
+  for d in "${sync_debs[@]}"; do
+    if deb_has_ime_payload "$d"; then
+      merged_debs+=("$d")
+      ime_debs+=("$d")
+    fi
+  done
   mapfile -t setups < <(find "$dir" -type f -iname '*-setup.exe' | sort)
   for s in "${setups[@]}"; do
     case "$s" in
@@ -587,23 +617,25 @@ verify_dir() {
   done
 
   say "产物目录：$dir"
-  say "  rime-inputmethod deb: ${#ime_debs[@]} 个"
+  say "  rime-inputmethod deb: ${#ime_debs[@]} 个（含合并包 ${#merged_debs[@]} 个）"
   say "  rime-sync deb:        ${#sync_debs[@]} 个"
   say "  windows setup.exe:    ${#online_setups[@]} 个（在线） + ${#offline_setups[@]} 个（离线）"
 
-  [ "${#ime_debs[@]}" -gt 0 ] || bad "没有找到 rime-inputmethod_*.deb"
+  [ "${#ime_debs[@]}" -gt 0 ] ||
+    bad "没有找到输入法 deb（rime-inputmethod_*.deb，或含输入法组件的合并包 rime-sync_*.deb）"
   [ "${#sync_debs[@]}" -gt 0 ] || bad "没有找到 rime-sync_*.deb"
   [ "${#online_setups[@]}" -gt 0 ] || bad "没有找到在线 *-setup.exe"
   if [ "$REQUIRE_OFFLINE" -eq 1 ] && [ "${#offline_setups[@]}" -eq 0 ]; then
     bad "没有找到离线包 *-offline-setup.exe（--require-offline-setup）：受限代理用户装不上"
   fi
 
-  local i=0 deb
+  local i=0 deb ime_root=""
   for deb in "${ime_debs[@]}"; do
     i=$((i + 1))
     check_ime_deb "$deb" "$work/ime-$i"
     # Linux 侧守卫：deb 自带的 librime.so 必须含 rime-sync 自研的四个输入增强组件。
     check_librime_components "$deb"
+    [ -n "$ime_root" ] || ime_root="$work/ime-$i/root"
   done
 
   local sync_root=""
@@ -614,8 +646,8 @@ verify_dir() {
     [ -n "$sync_root" ] || sync_root="$work/sync-$i/root"
   done
 
-  if [ "${#ime_debs[@]}" -gt 0 ] && [ -n "$sync_root" ]; then
-    check_installed_layout "$work/ime-1/root" "$sync_root"
+  if [ -n "$ime_root" ] && [ -n "$sync_root" ]; then
+    check_installed_layout "$ime_root" "$sync_root"
   fi
 
   i=0

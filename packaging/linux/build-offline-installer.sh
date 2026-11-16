@@ -12,17 +12,20 @@
 #
 # 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。
 #
+# 0.6.33 起：输入法包（rime-inputmethod）与同步程序包（rime-sync）在打包阶段就**合成一个**
+# deb（包名 rime-sync），所以每个安装集里只有一个 rime-sync_*.deb，用户装一次就有两样东西。
+#
 # Products (Linux is built for trixie only; the distro key stays a parameter):
 #   packaging/linux/out/offline/<distro>/...        directory bundle (offline)
 #   packaging/linux/out/offline/<distro>-online/... directory bundle (online)
 #   packaging/linux/out/offline/install.sh          shared installer
 #   packaging/linux/out/rime-sync-installer_<ver>.<suite>.offline.run
-#                                                  offline: IME + sync + dependency closure
+#                                                  offline: merged deb + dependency closure
 #   packaging/linux/out/rime-sync-installer_<ver>.<suite>.online.run
-#                                                  online: IME + sync, deps via apt
+#                                                  online: merged deb, deps via apt
 #
-# Both variants are the SAME installer (install.sh) and install rime-inputmethod
-# first, then rime-sync. Only the dependency layer differs.
+# Both variants are the SAME installer (install.sh) and install the SAME single
+# merged rime-sync deb. Only the dependency layer differs.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -87,7 +90,10 @@ fi
 mkdir -p "$OUT_ROOT" "$RUN_DIR"
 cp -f "$HERE/install.sh" "$OUT_ROOT/install.sh"
 cp -f "$HERE/uninstall.sh" "$OUT_ROOT/uninstall.sh"
-chmod 0755 "$OUT_ROOT/install.sh" "$OUT_ROOT/uninstall.sh"
+# merge-debs.sh 也放进载荷：install.sh 遇到老式载荷（输入法与同步程序分两个包）时
+# 可以就地合并成一个包再装。
+cp -f "$HERE/merge-debs.sh" "$OUT_ROOT/merge-debs.sh"
+chmod 0755 "$OUT_ROOT/install.sh" "$OUT_ROOT/uninstall.sh" "$OUT_ROOT/merge-debs.sh"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/rime-run.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
@@ -116,8 +122,12 @@ for d in "${DISTROS[@]}"; do
 
     rm -rf "$dir"
     mkdir -p "$dir"
-    cp -f "$ime" "$dir/"
-    "$HERE/prepare-sync-deb.sh" "$SYNC_DEB" "$dir/$(basename "$SYNC_DEB")"
+    # 1) 同步程序包：换上仓库里的维护脚本 + install-extra-ime.sh
+    prepared=$WORK/prepared-$(basename "$SYNC_DEB")
+    "$HERE/prepare-sync-deb.sh" "$SYNC_DEB" "$prepared"
+    # 2) 与输入法包合并成一个包（安装集里只有这一个 deb）
+    merged_name=$(basename "$SYNC_DEB")
+    "$HERE/merge-debs.sh" "$ime" "$prepared" "$dir/$merged_name"
     vendor_debs=0
     if [ "$variant" = "offline" ]; then
       mkdir -p "$dir/vendor"
@@ -131,8 +141,10 @@ for d in "${DISTROS[@]}"; do
       echo "suite=$suite"
       echo "variant=$variant"
       echo "app_version=$VERSION"
-      echo "ime_deb=$(basename "$ime")"
-      echo "sync_deb=$(basename "$SYNC_DEB")"
+      # 0.6.33 起只有一个 deb：输入法与同步程序合并在 rime-sync 里。
+      echo "deb=$(basename "$merged_name")"
+      echo "sync_deb=$(basename "$merged_name")"
+      echo "merged_from_ime_deb=$(basename "$ime")"
       echo "vendor_debs=$vendor_debs"
       echo "dir_bytes=$(du -sb "$dir" | cut -f1)"
       echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -142,7 +154,7 @@ for d in "${DISTROS[@]}"; do
     stage=$WORK/stage-$variant
     rm -rf "$stage"
     mkdir -p "$stage"
-    cp -f "$HERE/install.sh" "$HERE/uninstall.sh" "$stage/"
+    cp -f "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/merge-debs.sh" "$stage/"
     cp -a "$dir" "$stage/$d"
     tar -C "$stage" -czf "$WORK/payload-$variant.tar.gz" .
     {
@@ -162,9 +174,9 @@ RUN_STUB
     } > "$runfile"
     chmod 0755 "$runfile"
 
-    printf '%-12s %-7s %-5s ime=%s vendor=%-4s dir=%-7s run=%s\n' \
+    printf '%-12s %-7s %-5s deb=%-28s vendor=%-4s dir=%-7s run=%s\n' \
       "$d" "$suite" "$variant" \
-      "$(stat -c %s "$ime")" \
+      "$merged_name" \
       "$vendor_debs" \
       "$(du -sh "$dir" | cut -f1)" \
       "$(du -h "$runfile" | cut -f1)"
@@ -173,7 +185,7 @@ done
 
 echo
 echo "==> directory bundles: $OUT_ROOT"
-ls -1 "$OUT_ROOT" | grep -v '^install\.sh$' | grep -v '^uninstall\.sh$' || true
+ls -1 "$OUT_ROOT" | grep -v '^install\.sh$' | grep -v '^uninstall\.sh$' | grep -v '^merge-debs\.sh$' || true
 echo "==> .run installers: $RUN_DIR"
 ls -lh "$RUN_DIR"/rime-sync-installer_*.run 2>/dev/null | awk '{print "    "$5" "$9}'
 exit "$FAILED"

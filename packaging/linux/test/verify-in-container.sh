@@ -15,8 +15,11 @@ for p in rime-inputmethod rime-sync fcitx5; do
   dpkg-query -W -f='${Package} ${Version} [${Status}]\n' "$p" 2>/dev/null ||
     echo "$p [not installed]"
 done
-dpkg -s rime-inputmethod | grep -E '^(Package|Version|Depends|Conflicts|Provides):'
-dpkg -s rime-sync | grep -E '^(Package|Version|Depends):'
+# 0.6.33 起输入法与同步程序合并成一个包：只有 rime-sync 是真实存在的包，
+# rime-inputmethod 只是历史包名（可能仍装在旧机器上），查不到不算失败。
+dpkg -s rime-sync | grep -E '^(Package|Version|Depends|Conflicts|Provides):'
+dpkg -s rime-inputmethod 2>/dev/null | grep -E '^(Package|Version|Depends|Conflicts|Provides):' ||
+  echo "rime-inputmethod [not installed（0.6.33 起已合并进 rime-sync）]"
 
 echo "===== rime data ====="
 echo "files=$(find /usr/share/rime-data -maxdepth 1 -type f | wc -l)"
