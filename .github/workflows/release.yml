@@ -201,6 +201,17 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles deb,appimage
 
+      # 发布前最后一道关（界面）：桌面二进制必须**自带界面文件**。
+      #
+      # Tauri v2 有两种模式：不带 custom-protocol feature 时是 dev 模式 —— 界面文件
+      # 不打进程序，程序一跑就是白屏（只有开发机上开着 vite 才有界面）。
+      # 发布链用 `pnpm tauri build`（tauri-cli 会自己加 feature），理论上一直是对的；
+      # 但这条断言就是防「将来有人改了构建方式，悄悄发出去一个白屏程序」。
+      #
+      # 判据与自检在 scripts/ci/assert-frontend-embedded.sh（用合成产物证明双向有效）。
+      - name: assert desktop binary embeds the frontend
+        run: bash scripts/ci/assert-frontend-embedded.sh src-tauri/target/release/rime-sync-app
+
       - name: assert rime-sync deb
         run: |
           set -euo pipefail
@@ -1088,7 +1099,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --bundles nsis
 
-      # 验收断言：最终 setup.exe ≥ 12 MiB（内嵌的 Weasel 安装器约 10 MiB，未被 LZMA 压没）。
+      # 与 Linux 侧同一道关、同一份判据（同一脚本，避免两处逻辑漂移）。
+      - name: assert desktop binary embeds the frontend
+        shell: bash
+        run: bash scripts/ci/assert-frontend-embedded.sh src-tauri/target/release/rime-sync-app.exe
+
       - name: assert nsis setup embeds weasel
         shell: pwsh
         run: |

@@ -256,17 +256,25 @@ jobs:
           install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
           ls -l "target/release/rime-sync-cli-$triple"
 
+      # --no-default-features：src-tauri 的 default feature 是 custom-protocol
+      # （界面文件打进程序）。custom-protocol 模式下 tauri-build 要求 ../dist 存在，
+      # 而单元测试根本不需要界面文件 —— 加上这个参数就不必在前端构建之前跑，
+      # 也不必等 pnpm install + vite build。
+      # 「默认带 custom-protocol」这件事本身由下面的护栏断言盯着。
       - name: cargo test · src-tauri
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --no-default-features
 
-  # 断言脚本自检：用合成产物证明"少一个功能入口就会红"。
-  # 真实产物验收在 release.yml 的 verify-artifacts job（那里才有 deb / setup.exe）；
-  # 这里每次 push/PR 都跑，成本约 20 秒（无需编译）。
-  verify-artifacts:
-    name: verify-artifacts · 断言脚本自检
-    runs-on: ubuntu-22.04
-    steps:
+      # 护栏：桌面程序的 default feature 必须带 custom-protocol。
+      #
+      # 不带的话，`cargo build --release` 出来的是 **dev 模式**的程序：界面文件
+      # 没打包进去，一跑就白屏（2026-11-16 踩过，还一度误判成自己代码的问题）。
+      # CI 与发布链用 `pnpm tauri build`（tauri-cli 自己会加 feature），所以发布
+      # 产物一直是对的；但本地任何人用 cargo build 构桌面程序就会踩坑。
+      # 这里把「默认正确」钉死，防止将来有人把 default 改回去。
+      - name: guard · desktop default feature 包含 custom-protocol
+        run: bash scripts/ci/assert-desktop-default-feature.sh src-tauri/Cargo.toml
+
       - name: checkout
         uses: actions/checkout@v4
 
@@ -277,6 +285,16 @@ jobs:
 
       - name: verifier selftest
         run: bash .github/scripts/verify-artifacts.sh --selftest
+
+      # 「桌面二进制必须自带界面」这道断言的自检：用合成产物证明双向有效 ——
+      # 含前端资源的放行，dev 模式的（没打包界面）必须被拦住。
+      # 只做断言脚本没意义：断言写错了照样放行。
+      - name: frontend-embedded assertion selftest
+        run: bash scripts/ci/assert-frontend-embedded.sh --selftest
+
+      # 「桌面 default feature 必须含 custom-protocol」这道断言的自检。
+      - name: desktop-default-feature assertion selftest
+        run: bash scripts/ci/assert-desktop-default-feature.sh --selftest
 
   e2e:
     name: e2e · rclone webdav transport

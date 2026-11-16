@@ -233,11 +233,25 @@ rime-sync-cli apply
 
 ```bash
 pnpm install
-pnpm tauri dev                 # 开发
+pnpm tauri dev                 # 开发（走 devUrl，改前端即时生效）
 cargo test --workspace         # Rust 单测
+cd src-tauri && cargo test --no-default-features   # 桌面端单测（不需要先构建前端）
 pnpm exec tsc --noEmit         # 前端类型检查
 bash .github/scripts/e2e-rclone.sh   # 本地 rclone E2E（需先 cargo build -p rime-sync-cli）
 ```
+
+> **桌面程序的两种模式（容易踩）**
+>
+> Tauri v2 不带 `custom-protocol` feature 时是 **dev 模式**：界面文件不打包进程序，
+> 运行时去 `http://localhost:1420` 现场取 —— 那台机器上没开 vite 的话，**界面一片白**。
+>
+> 本仓库把 `custom-protocol` 设成了 `src-tauri/Cargo.toml` 里的 default，所以
+> `cargo build` / `cargo build --release` 出来的程序**自带界面**，拷到任何机器都能用。
+> 代价是这类构建要求 `dist/` 已存在（先跑一次 `pnpm exec vite build`）；
+> 只想跑桌面端单元测试、不需要界面时加 `--no-default-features` 即可。
+>
+> `pnpm tauri dev` 不受影响：tauri-cli 会自动传 `--no-default-features`，那才是
+> 前端开发想要的模式。
 
 出包（会产出安装包，非必要不要跑）：
 

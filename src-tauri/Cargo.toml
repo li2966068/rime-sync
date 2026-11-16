@@ -10,6 +10,19 @@ license = "MIT"
 name = "rime_sync_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# custom-protocol 决定界面文件（dist）是「打进程序里」还是「从 devUrl 现场取」。
+#
+# Tauri v2 的坑：不带这个 feature 时是 **dev 模式** —— 程序里没有界面文件，
+# 一跑就白屏，只有开发机上同时开着 vite 才有界面（2026-11-16 踩过：
+# 本地 cargo build 出来的程序白屏，还误以为是自己代码的问题）。
+#
+# 默认打开 ⇒ cargo build --release 出来的桌面程序自带界面，拷到任何机器都能正常显示。
+# 本地做前端开发时用 pnpm tauri dev：tauri-cli 会自动传 --no-default-features，
+# 那时才是我们要的 dev 模式（改前端即时生效）。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
