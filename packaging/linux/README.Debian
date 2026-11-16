@@ -23,6 +23,8 @@ GNOME/Wayland 下还需要在「设置 → 键盘 → 输入源」里加入「Fc
 本包不会自动启动程序，也不会写入任何开机自启项（不碰 ~/.config/autostart）。
 需要做设置时从应用菜单手动打开「Rime 同步（完成设置）」
 （对应 /usr/share/applications/rime-sync-setup.desktop，Exec=rime-sync-app --setup）。
+输入法设置页里的「打开 Rime 同步」按钮走的是同一个主程序
+（--panel sync --setup）：程序已在运行时会把请求转给它，由它切到同步页并把窗口带到前台。
 
 首次使用会在 ~/.local/share/fcitx5/rime/ 里生成默认配置与词典快照。
 若方案列表里找不到朙月拼音（luna_pinyin），把本包提供的模板复制过去：

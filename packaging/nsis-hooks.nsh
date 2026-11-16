@@ -649,8 +649,8 @@ Function RimeSyncCreateOwnShortcuts
     "$R6" "" \
     "$R6" 0 SW_SHOWNORMAL "" "Rime 词库与配置的 WebDAV 双向同步"
   CreateShortcut "$SMPROGRAMS\${RIMESYNC_NAME}\${RIMESYNC_SETUP_NAME}.lnk" \
-    "$R6" "--setup" \
-    "$R6" 0 SW_SHOWNORMAL "" "打开 Rime 同步设置（--setup，不启动主窗口）"
+    "$R6" "--panel sync --setup" \
+    "$R6" 0 SW_SHOWNORMAL "" "打开 Rime 同步设置（--panel sync --setup）"
 
   DetailPrint "[rime-sync] 已创建开始菜单快捷方式：$SMPROGRAMS\${RIMESYNC_NAME}"
 FunctionEnd

@@ -606,6 +606,8 @@ export const api = {
   needsSetup: () => invoke<boolean>("cmd_needs_setup"),
   // --setup 启动参数：读取即清除，true = 本次强制进入同步设置向导。
   takeSetupRequest: () => invoke<boolean>("cmd_take_setup_request"),
+  // --panel <页面> 启动参数：读取即清除，返回要切换到的页面名（没有则 null）。
+  takePanelRequest: () => invoke<string | null>("cmd_take_panel_request"),
   secretStatus: () => invoke<SecretStatus>("cmd_secret_status"),
   firstTransport: (strategy: "pull" | "bidirectional") =>
     invoke<FirstRunResult>("cmd_first_transport", { strategy }),

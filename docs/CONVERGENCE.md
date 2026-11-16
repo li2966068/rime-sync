@@ -74,13 +74,13 @@ rime-sync 的这个骨架**大部分已经存在**：Tauri 应用已有托盘（
 
 ## 落地阶段
 
-| 阶段 | 内容 | 顺带修掉的审计发现 |
-|---|---|---|
-| **一** | 抽出单一的 processors 规格，让三条路径共用；统一模板与 Rust 侧顺序；补 punct | ③、模板顺序违规 |
-| **二** | 统一重编译通道：所有配置变更走一处 | ②⑥ |
-| **三** | 路径解析收敛为一份（shell 改调 `rime-sync-cli detect --json`） | ⑤⑬ |
-| **四** | 界面合一：输入法内的同步入口 = 主程序同一界面；托盘统一 | ⑩ |
-| **五** | Linux 两个 deb 合并成一个 | 交付体感 |
+| 阶段 | 内容 | 顺带修掉的审计发现 | 状态 |
+|---|---|---|---|
+| **一** | 抽出单一的 processors 规格，让三条路径共用；统一模板与 Rust 侧顺序；补 punct | ③、模板顺序违规 | ✅ 已落地 |
+| **二** | 统一重编译通道：所有配置变更走一处 | ②⑥ | ✅ 已落地 |
+| **三** | 路径解析收敛为一份（shell 改调 `rime-sync-cli detect --json`） | ⑤⑬ | ✅ 已落地 |
+| **四** | 界面合一：输入法内的同步入口 = 主程序同一界面；托盘统一 | ⑩ | ✅ 已落地 |
+| **五** | Linux 两个 deb 合并成一个 | 交付体感 | ✅ 已落地（v0.6.33） |
 
 阶段一、二、三**并行推进**（文件边界不重叠）。
 
@@ -97,9 +97,29 @@ rime-sync 的这个骨架**大部分已经存在**：Tauri 应用已有托盘（
 numpad / punct / vnum / vselect 四个处理器，没有任何 WebDAV 代码），所以这一步是纯调用改动，
 不触碰 C++ 侧。
 
+**已落地（阶段四）**：
+
+- 后端新增 `--panel <页面>` 启动参数（白名单：connection / sync / conflicts / devices /
+  settings）与 `cmd_take_panel_request` 命令；页面名进白名单才生效，外部参数不能决定
+  前端切到哪个视图。
+- 接入 `tauri-plugin-single-instance`：主程序已在跑时，第二次启动（输入法设置页按钮、
+  开始菜单项）把参数**转交给已有实例**，由它切页并把窗口带到前台，第二次启动随即退出
+  —— 不再出现「两个窗口」。
+- 前端 `init()` 取一次启动参数（切页），并在运行时监听 `panel://request` / `setup://request`
+  事件（第二次启动走这条路）。
+- 顺手修掉托盘「查看冲突」点了没反应的缺陷：托盘此前只 emit `tray://action` 而前端
+  没有监听方，现在前端接上了。
+- 入口侧改用 `--panel sync --setup`：切到同步页，同时保留「未配置时仍开设置向导」。
+  Linux 的 `rime-sync-open-setup.sh` 与 Windows 开始菜单「同步设置」都已改。
+
 ### 阶段五：Linux 两个 deb 合并
 
-现状（已核实）：`.run` 自解包后是**两个独立的 deb**——
+**已落地（v0.6.33）**：两个 deb 由 `packaging/linux/merge-debs.sh` 合成单个
+`rime-sync` 包（`Provides: fcitx5-rime`，`Conflicts/Replaces` 覆盖旧包名与发行版
+`fcitx5-rime`/`librime1*`/`rime-data*`），输入法判定用的 shim 随包下发
+（`/usr/lib/rime-sync/ime-detect-shim.sh`）。
+
+下面是合并前的可行性分析（保留作背景）：现状（已核实）：`.run` 自解包后是**两个独立的 deb**——
 
 - 同步程序 deb：Tauri bundler 产出（`src-tauri/tauri.conf.json` 的 `bundle.linux.deb`），
   维护脚本由 `packaging/linux/prepare-sync-deb.sh` 重打包
@@ -113,8 +133,12 @@ numpad / punct / vnum / vselect 四个处理器，没有任何 WebDAV 代码）�
 `rime-data` 冲突，尚未在装过发行版 rime-data 的机器上验过）——把同步程序塞进这个包会
 让它的卸载语义与 `rime-inputmethod` 绑死，**用户单独卸载同步程序时可能连带卸掉输入法**。
 
-⇒ 阶段五**先不做**，等阶段一~四落地、发行链稳定后再单独评估。Windows 侧不受影响
+⇒ 阶段五当时**先不做**，等阶段一~四落地、发行链稳定后再单独评估。Windows 侧不受影响
 （本来就是单个 setup.exe）。
+
+> **更新（v0.6.33）**：阶段五已按上面的思路落地并发布验证——合并后的单个 `rime-sync`
+> 包在 Debian 13 上实测可装可卸，输入法载荷完整，离线 `.run` 内 269 个 vendor deb 的
+> sha256 全部校验通过。上面这段「硬约束」是合并**之前**的判断，留作背景。
 
 ### 与审计清单的关系
 

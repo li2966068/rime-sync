@@ -42,8 +42,18 @@ import { api, type Report, type Progress, type ConflictChoice, type WatchEvent }
 import { getLang, setLang, t, applyI18n } from "./i18n";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
+import { isKnownPanel } from "./panels";
 
 // 应用装配：标签切换、事件绑定、订阅与启动。
+
+/** 切到指定页面；页面名不合法时什么都不做。 */
+export function switchToRequestedPanel(name: string | undefined | null): void {
+  if (!isKnownPanel(name)) {
+    return;
+  }
+  localLog("切换到页面：" + name);
+  switchPanel(name);
+}
 
 export function switchPanel(name: string): void {
   for (const tab of el.tabs) {
@@ -518,6 +528,31 @@ export async function subscribe(): Promise<void> {
   if (focus.status === "rejected") {
     localLog("设置页聚焦监听注册失败：" + errorText(focus.reason));
   }
+  // 主程序已在运行时，第二次启动带来的 --panel 请求走事件（状态那份已在启动时取过）。
+  // 托盘的「查看冲突」也走这里：托盘此前只把窗口叫到前台，却没人切页，
+  // 点了看起来像没反应。
+  const [panel, tray, setup] = await Promise.allSettled([
+    listen<string>("panel://request", (event) => {
+      switchToRequestedPanel(event.payload);
+    }),
+    listen<{ action: string }>("tray://action", (event) => {
+      switchToRequestedPanel(event.payload?.action);
+    }),
+    // 主程序已在运行时，第二次启动带 --setup：让已有实例把设置向导打开。
+    listen("setup://request", () => {
+      localLog("收到 --setup 请求：打开同步设置向导");
+      openWizard("settings");
+    }),
+  ]);
+  if (panel.status === "rejected") {
+    localLog("切页请求监听注册失败：" + errorText(panel.reason));
+  }
+  if (tray.status === "rejected") {
+    localLog("托盘动作监听注册失败：" + errorText(tray.reason));
+  }
+  if (setup.status === "rejected") {
+    localLog("设置向导请求监听注册失败：" + errorText(setup.reason));
+  }
 }
 
 export async function init(): Promise<void> {
@@ -541,6 +576,8 @@ export async function init(): Promise<void> {
   try {
     // --setup：安装完成后由安装器带参数启动，无论是否首次运行都强制进设置向导。
     const forcedSetup = await api.takeSetupRequest();
+    // --panel <页面>：输入法设置页 / 开始菜单的入口，要求直接落到那一页。
+    const requestedPanel = await api.takePanelRequest();
     const needsSetup = forcedSetup || (await api.needsSetup());
     const loaded = await api.getConfig();
     renderConfig(loaded);
@@ -564,6 +601,11 @@ export async function init(): Promise<void> {
     setFooter(t("footer.ready"));
     if (needsSetup) {
       openWizard(forcedSetup ? "settings" : "first-run");
+    }
+    // --panel 指定的页面在向导之后切：向导是浮层，切页不影响它。
+    // 没指定页面时保持默认的连接页。
+    if (requestedPanel) {
+      switchToRequestedPanel(requestedPanel);
     }
   } catch (error) {
     const text = errorText(error);

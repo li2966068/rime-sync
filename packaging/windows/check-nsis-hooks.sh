@@ -212,9 +212,10 @@ assert_fn_no_abort RimeSyncUninstallOldRimeSync
 assert_fn_no_abort RimeSyncUninstallOldVersion
 assert_fn_has RimeSyncUninstallOldRimeSync "注册表兜底扫 32 + 64 位视图" '!insertmacro RIMESYNC_SCAN_OUR_UNINST 32'
 
-# 快捷方式：两个入口（主程序 + --setup）；POSTINSTALL 调用一次
+# 快捷方式：两个入口（主程序 + 同步设置）；POSTINSTALL 调用一次
+# 同步设置带 --panel sync --setup：切到同步页，未配置时仍开设置向导。
 assert_fn_has RimeSyncCreateOwnShortcuts "建主程序快捷方式" '${RIMESYNC_NAME}.lnk"'
-assert_fn_has RimeSyncCreateOwnShortcuts "建 --setup 快捷方式" '"--setup"'
+assert_fn_has RimeSyncCreateOwnShortcuts "建同步设置快捷方式" '"--panel sync --setup"'
 assert_macro_has NSIS_HOOK_POSTINSTALL "POSTINSTALL 建快捷方式" 'Call RimeSyncCreateOwnShortcuts'
 assert_count "POSTINSTALL 只建自己的快捷方式" 'Call RimeSyncCreateOwnShortcuts' 1
 

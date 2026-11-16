@@ -31,7 +31,7 @@ fcitx5 没有「addon 自带 QWidget」的接口，配置页由 fcitx5-configtoo
 | 远端目录 | String | `webdav.remote_dir`（空 → `rime-sync`） |
 | 设备名 / device_id | String | `device_id`（空 → 不写，主程序按 Rime 安装自动生成） |
 | 应用同步时暂停 fcitx5 | Boolean | `stop_fcitx5_during_apply` |
-| 打开 Rime 同步（WebDAV 设置向导） | External | 执行 `rime-sync-open-setup` |
+| 打开 Rime 同步（WebDAV 设置向导） | External | 执行 `rime-sync-open-setup`（带 `--panel sync --setup`） |
 
 写盘：`QSaveFile` 原子替换 + `chmod 0600`；先把整份 JSON 读出来再改字段，
 `schema_version`、`sync_kinds`、`exclude_globs` 等未知键原样保留。
@@ -101,7 +101,8 @@ cmake -S . -B build -DRIMESYNC_BUILD_FCITX5_ADDON=OFF ...
 - 在界面上把「远端目录」改成 `ui-dir` 后点 OK，config.json 里 `webdav.remote_dir` 变成
   `ui-dir`，权限 `0600`，`schema_version`/`sync_kinds` 等键仍在；
 - 点「打开 Rime 同步」按钮，进程真的被执行：用一个假的 `rime-sync-app` 记录到
-  参数是 `--setup`（说明 External 按钮 → `rime-sync-open-setup` → 向导这条链是通的）。
+  参数是 `--panel sync --setup`（说明 External 按钮 → `rime-sync-open-setup` →
+  主程序同一界面这条链是通的）。
 
 手工验证（桌面环境）：
 

@@ -30,6 +30,7 @@ serde_yaml = "0.9"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rime-sync-core = { path = "../crates/core" }
+tauri-plugin-single-instance = "2"
 
 [profile.release]
 # SPEC-4 §B4：瘦身。strip 去掉符号表，thin LTO 兼顾体积与构建时长，

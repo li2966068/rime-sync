@@ -185,12 +185,40 @@ None => rime_dir::detect(None).ok().map(|detection| detection.path),
 
 **约束**：入口侧**只做调用**，绝不把 WebDAV 写进 C++。
 
-## 简报 G：阶段五 Linux 两 deb 合并（暂缓）
+**✅ 已落地**：
 
-可行性已核实（见 `docs/CONVERGENCE.md`），但有个硬约束：
-`rime-inputmethod` 与发行版 `fcitx5-rime`/`librime-data` 的 `Conflicts`/`Replaces` 关系
-（2026-10-22 记忆：Debian 13 上发行版 `rime-data-*` 与自带 `rime-data` 冲突，
-**尚未在装过发行版 rime-data 的机器上验过**）——把同步程序塞进这个包会让卸载语义绑死，
-**用户单独卸载同步程序时可能连带卸掉输入法**。
+- `src-tauri/src/lib.rs`：新增 `--panel <页面>` 解析（白名单 `PANEL_NAMES`）、
+  `Inner.panel_request` 状态、`cmd_take_panel_request` 命令、`request_panel()` 统一入口；
+  接入 `tauri-plugin-single-instance`，`handle_second_instance()` 处理第二次启动的
+  `--panel` / `--setup`（切页 + 把窗口带到前台）。
+- `src/panels.ts` + `src/panels.test.ts`：页面名白名单的纯逻辑单测（node --test，
+  零测试框架依赖），CI 的 frontend job 会跑。
+- `src/api.ts`：`takePanelRequest`。
+- `src/app.ts`：`switchToRequestedPanel()`（只认白名单）、`init()` 取启动参数切页、
+  监听 `panel://request` / `setup://request` / `tray://action`（后者修掉了托盘
+  「查看冲突」点了没反应的缺陷）。
+- 入口侧：`packaging/fcitx5-addon/scripts/rime-sync-open-setup.sh` 与
+  `packaging/nsis-hooks.nsh` 的「同步设置」都改成 `--panel sync --setup`。
 
-⇒ **阶段五先不做**，等阶段一~四落地、发行链稳定后再单独评估。Windows 侧不受影响。
+**实测结论**：第二个实例退出码 0、已有实例的 stderr 记录 `--panel conflicts requested`
+且继续存活 —— 转交链路通。
+
+## 简报 G：阶段五 Linux 两 deb 合并（✅ 已落地，v0.6.33）
+
+做法：`packaging/linux/merge-debs.sh` 把输入法 deb 与同步 deb 合成单个 `rime-sync` 包
+（`Provides: fcitx5-rime`，`Conflicts/Replaces` 覆盖旧包名与发行版
+`fcitx5-rime`/`librime1*`/`rime-data*`），输入法判定用的 shim 随包下发。
+
+**下面这段是合并之前的判断，留作背景**：
+
+> 可行性已核实（见 `docs/CONVERGENCE.md`），但有个硬约束：
+> `rime-inputmethod` 与发行版 `fcitx5-rime`/`rime-data` 的 `Conflicts`/`Replaces` 关系
+> （2026-10-22 记忆：Debian 13 上发行版 `rime-data-*` 与自带 `rime-data` 冲突，
+> **尚未在装过发行版 rime-data 的机器上验过**）——把同步程序塞进这个包会让卸载语义绑死，
+> **用户单独卸载同步程序时可能连带卸掉输入法**。
+>
+> ⇒ 阶段五先不做，等阶段一~四落地、发行链稳定后再单独评估。Windows 侧不受影响。
+
+**发布后验收**：合并后的 deb 在 Debian 13 上可装可卸，输入法载荷完整（`rime.so` /
+`rime.conf` / `usr/share/rime-data`），离线 `.run` 内 269 个 vendor deb 的 sha256
+全部校验通过，公开资产里 0 个 `.deb`（搜狗词库从未进包）。

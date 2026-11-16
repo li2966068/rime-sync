@@ -48,6 +48,8 @@ pub(crate) struct Inner {
     pub(crate) running: AtomicBool,
     /// 启动参数 --setup：前端取走一次后清除，保证只强制打开一次向导。
     pub(crate) setup_request: AtomicBool,
+    /// 启动参数 --panel <页面>：前端取走一次后清除，保证只切一次页面。
+    pub(crate) panel_request: Mutex<Option<String>>,
     pub(crate) log: Mutex<Vec<String>>,
     pub(crate) secret: Mutex<Option<Arc<SecretSelection>>>,
     pub(crate) watch: Mutex<Option<watch_cmds::WatchSession>>,
@@ -61,6 +63,7 @@ impl Default for Inner {
             cancel: Mutex::new(None),
             running: AtomicBool::new(false),
             setup_request: AtomicBool::new(false),
+            panel_request: Mutex::new(None),
             log: Mutex::new(Vec::new()),
             secret: Mutex::new(None),
             watch: Mutex::new(None),
@@ -985,6 +988,24 @@ async fn cmd_pick_folder(app: AppHandle, title: Option<String>) -> Option<String
     .map(|path| path.display().to_string())
 }
 
+/// 把「切到某页」的请求交给前端。
+///
+/// 两条路径共用它：
+/// - 首次启动：命令行里的 --panel（前端可能还没加载完）
+/// - 已有实例在跑：单实例插件把第二次启动的参数转过来（前端早就在跑了）
+///
+/// 状态里放一份（前端启动时取走），同时发一个事件（前端已在跑时用）。
+/// 两条都留：事件可能早于前端注册监听，状态则能兜住那一刻的请求。
+fn request_panel(app: &AppHandle, panel: Option<String>, source: &str) {
+    let Some(panel) = panel else { return };
+    let inner = &app.state::<AppState>().0;
+    if let Ok(mut slot) = inner.panel_request.lock() {
+        *slot = Some(panel.clone());
+    }
+    push_log(inner, format!("收到切页请求：{panel}（来源：{source}）"));
+    let _ = app.emit("panel://request", panel.clone());
+}
+
 #[tauri::command]
 fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
     let requested = state.0.setup_request.swap(false, Ordering::SeqCst);
@@ -993,6 +1014,22 @@ fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
         eprintln!(
             "[rime-sync] setup wizard: frontend consumed --setup request; opening sync setup dialog"
         );
+    }
+    requested
+}
+
+/// --panel 请求：读取即清除，返回要切换到的页面名（没有则 None）。
+#[tauri::command]
+fn cmd_take_panel_request(state: State<'_, AppState>) -> Option<String> {
+    let requested = state
+        .0
+        .panel_request
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(panel) = &requested {
+        push_log(&state.0, format!("前端已接管 --panel：切换到 {panel} 页"));
+        eprintln!("[rime-sync] panel request: frontend consumed --panel {panel}");
     }
     requested
 }
@@ -1100,6 +1137,31 @@ const SETUP_FLAG: &str = "--setup";
 const AUTOSTART_FLAG: &str = "--autostart";
 /// 旧版自启条目用的参数，继续兼容：行为与 --autostart 相同。
 const MINIMIZED_FLAG: &str = "--minimized";
+/// 启动参数 --panel <页面>：唤起主程序并直接落到指定页面。
+const PANEL_FLAG: &str = "--panel";
+
+/// 五个可切换的页面（与 index.html 的 data-panel 一致）。
+const PANEL_NAMES: [&str; 5] = ["connection", "sync", "conflicts", "devices", "settings"];
+
+/// 解析 --panel <页面>：返回合法的页面名，缺失或非法时返回 None。
+///
+/// 入口侧（输入法配置页、开始菜单、托盘）用它把用户送到指定页面，
+/// 而不是拉起一个只能看到默认页的窗口。非法页面名一律忽略，
+/// 绝不让外部参数决定前端切到哪个视图。
+fn panel_requested(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg != PANEL_FLAG {
+            continue;
+        }
+        let value = args.next()?;
+        if PANEL_NAMES.contains(&value.as_str()) {
+            return Some(value);
+        }
+        return None;
+    }
+    None
+}
 
 /// 安装完成后用 --setup 启动：无论是否首次运行，都强制进入同步设置向导。
 fn setup_requested(args: impl IntoIterator<Item = String>) -> bool {
@@ -1125,8 +1187,51 @@ fn autostart_requested(args: impl IntoIterator<Item = String>) -> Option<&'stati
     }
 }
 
+/// 第二次启动（主程序已在跑）时，把这次的请求转给已有实例。
+///
+/// argv 是第二次启动的完整命令行。处理两件事：
+/// - `--panel <页面>`：切到该页
+/// - `--setup`：强制打开同步设置向导
+///
+/// 然后把主窗口带到前台——用户在输入法设置里点了按钮，
+/// 期望看到窗口，而不是「程序已在运行，什么都没发生」。
+fn handle_second_instance(app: &AppHandle, argv: Vec<String>) {
+    let inner = &app.state::<AppState>().0;
+    push_log(inner, "收到第二次启动的请求：转交给已在运行的实例");
+    eprintln!("[rime-sync] second instance: forwarding request to the running instance");
+
+    // --setup 只发事件，不写 setup_request 状态位：
+    // 那个状态位的语义是「前端下次取走时开向导」，而此时前端早已在跑、不会再取，
+    // 写进去会一直挂着，导致**下次重启程序时莫名弹出设置向导**。
+    if setup_requested(argv.iter().cloned()) {
+        push_log(inner, "第二次启动带 --setup：让已有实例打开同步设置向导");
+        eprintln!("[rime-sync] second instance: --setup requested; asking the running instance to open the wizard");
+        let _ = app.emit("setup://request", ());
+    }
+    if let Some(panel) = panel_requested(argv.iter().cloned()) {
+        eprintln!("[rime-sync] second instance: --panel {panel} requested");
+        request_panel(app, Some(panel), "第二次启动");
+    }
+
+    // 窗口带到前台：unminimize + show + set_focus。
+    // 顺序有讲究：先 unminimize 再 show，否则最小化的窗口可能仍看不见。
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        push_log(inner, "已有实例的窗口已带到前台");
+    }
+}
+
 pub fn run() {
     let builder = tauri::Builder::default()
+        // 单实例：输入法设置页、开始菜单、托盘点「打开同步」时，
+        // 如果主程序已在跑（多半缩在托盘里），就把请求转给已有实例，
+        // 由它切到对应页面并把窗口带到前台；第二次启动的进程随即退出。
+        // 这样「输入法里的入口」与「主程序的界面」才是同一个界面。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            handle_second_instance(app, argv);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
@@ -1152,6 +1257,12 @@ pub fn run() {
             if setup_requested {
                 push_log(&state.0, "检测到 --setup：强制进入同步设置向导");
                 eprintln!("[rime-sync] setup wizard: --setup detected; forcing sync setup dialog");
+            }
+            // --panel <页面>：启动即落在该页（输入法设置页 / 开始菜单的入口）。
+            // 放进状态里，前端起来后取走；前端已在跑时走事件（见 request_panel）。
+            let panel = panel_requested(std::env::args());
+            if panel.is_some() {
+                request_panel(&handle, panel, "启动参数");
             }
             // 0.6.16：预编译产物自举。安装器钩子没跑（/S 静默安装实测不执行）、
             // WeaselDeployer 返回 0 却不写 build 时，由程序自己把随包产物铺进用户目录。
@@ -1215,6 +1326,7 @@ pub fn run() {
             cmd_get_log,
             cmd_needs_setup,
             cmd_take_setup_request,
+            cmd_take_panel_request,
             cmd_pick_folder,
             cmd_secret_status,
             cmd_first_transport,
@@ -1450,5 +1562,60 @@ mod tests {
         };
         // 本机有没有 Rime 目录不确定：两种结果都合法，但都不许 panic。
         let _ = detect_rime(&config);
+    }
+
+    /// --panel 指向五个合法页面之一时，必须解析出该页面名。
+    #[test]
+    fn panel_request_parses_every_known_panel() {
+        for name in PANEL_NAMES {
+            let args = vec!["rime-sync-app".to_string(), "--panel".to_string(), name.to_string()];
+            assert_eq!(
+                panel_requested(args),
+                Some(name.to_string()),
+                "--panel {name} 必须被解析出来"
+            );
+        }
+    }
+
+    /// 没有 --panel、--panel 后缺值、或页面名非法时，一律不切页。
+    #[test]
+    fn panel_request_ignores_missing_or_unknown_panel() {
+        // 没有 --panel
+        assert_eq!(panel_requested(vec!["rime-sync-app".to_string()]), None);
+        // --panel 后面没有值
+        assert_eq!(
+            panel_requested(vec!["rime-sync-app".to_string(), "--panel".to_string()]),
+            None
+        );
+        // 页面名不在白名单里：绝不能让外部参数决定前端切到哪个视图
+        assert_eq!(
+            panel_requested(vec![
+                "rime-sync-app".to_string(),
+                "--panel".to_string(),
+                "evil".to_string()
+            ]),
+            None
+        );
+        // 页面名是空串
+        assert_eq!(
+            panel_requested(vec![
+                "rime-sync-app".to_string(),
+                "--panel".to_string(),
+                String::new()
+            ]),
+            None
+        );
+    }
+
+    /// --panel 与其它启动参数混用时，仍能正确解析出页面名。
+    #[test]
+    fn panel_request_works_alongside_other_flags() {
+        let args = vec![
+            "rime-sync-app".to_string(),
+            "--autostart".to_string(),
+            "--panel".to_string(),
+            "sync".to_string(),
+        ];
+        assert_eq!(panel_requested(args), Some("sync".to_string()));
     }
 }
