@@ -1618,4 +1618,28 @@ mod tests {
         ];
         assert_eq!(panel_requested(args), Some("sync".to_string()));
     }
+
+    /// panel_request 状态槽的语义：取走即清，且可以再存一次。
+    ///
+    /// 前端会取两次（初始化时取一次、注册监听后再取一次兜底），所以
+    /// 「取走即清」和「取空后还能再存」这两条都必须成立。
+    #[test]
+    fn panel_request_slot_is_take_once_but_can_be_refilled() {
+        let slot = Mutex::new(None);
+
+        // 存一次、取一次
+        *slot.lock().unwrap() = Some("sync".to_string());
+        let first = slot.lock().unwrap().take();
+        assert_eq!(first, Some("sync".to_string()));
+
+        // 取走即清：再取是空的（前端第一次取值后，不该重复切页）
+        let second = slot.lock().unwrap().take();
+        assert_eq!(second, None, "取走必须清空，不能重复切同一页");
+
+        // 取空后可以再存：兜底路径依赖这一点
+        // （第一次取走之后、监听注册之前到达的请求，就靠这第二次存取到）
+        *slot.lock().unwrap() = Some("conflicts".to_string());
+        let third = slot.lock().unwrap().take();
+        assert_eq!(third, Some("conflicts".to_string()));
+    }
 }

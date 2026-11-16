@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "rime-sync-app"
-version = "0.6.33"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "rime-sync-core"
-version = "0.6.33"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "keyring",

@@ -14,6 +14,18 @@
 
 #include "rimesyncstore.h"
 
+namespace {
+
+// 启动主程序时带的参数。
+// --panel sync：主程序已在跑（多半缩在托盘里）时，这个请求会被转交给已有实例，
+// 由它切到「同步」页并把窗口带到前台 —— 输入法里的入口与主程序是同一个界面。
+// --setup：保留原来的语义 —— 未配置 WebDAV 的用户点这个按钮仍要看到设置向导。
+QStringList rimeSyncLaunchArgs() {
+    return QStringList{QStringLiteral("--panel"), QStringLiteral("sync"), QStringLiteral("--setup")};
+}
+
+} // namespace
+
 RimeSyncConfigDialog::RimeSyncConfigDialog(QWidget *parent) : QDialog(parent) {
     setWindowTitle(QStringLiteral("Rime 同步 · WebDAV 配置"));
     setMinimumWidth(460);
@@ -103,11 +115,11 @@ bool RimeSyncConfigDialog::launchApp() {
     QStringList args;
     if (program.isEmpty()) {
         program = qEnvironmentVariable("RIME_SYNC_BIN");
-        args << QStringLiteral("--setup");
+        args = rimeSyncLaunchArgs();
     }
     if (program.isEmpty()) {
         program = QStandardPaths::findExecutable(QStringLiteral("rime-sync-app"));
-        args = QStringList{QStringLiteral("--setup")};
+        args = rimeSyncLaunchArgs();
     }
     if (program.isEmpty() || !QFileInfo::exists(program)) {
         QMessageBox::warning(

@@ -588,6 +588,11 @@ export async function init(): Promise<void> {
     }
     await loadPresets();
     await subscribe();
+    // 再取一次 panel 请求：上面 takePanelRequest() 与 subscribe() 之间有几百毫秒
+    // （多次 IPC 往返），这段时间里到达的请求既不在第一次取到的值里，
+    // 事件又早于监听注册 —— 会丢。后端状态是「取走即清」，再取一次是安全的，
+    // 这次取到的就是那段窗口里到达的请求。
+    const latePanel = await api.takePanelRequest();
     await loadLog();
     await refreshSecretStatus();
     await refreshNetwork();
@@ -604,8 +609,12 @@ export async function init(): Promise<void> {
     }
     // --panel 指定的页面在向导之后切：向导是浮层，切页不影响它。
     // 没指定页面时保持默认的连接页。
+    // 两个都切：先切启动参数里的，再切监听注册前到达的（后到的优先）。
     if (requestedPanel) {
       switchToRequestedPanel(requestedPanel);
+    }
+    if (latePanel) {
+      switchToRequestedPanel(latePanel);
     }
   } catch (error) {
     const text = errorText(error);
