@@ -378,6 +378,42 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
 
+      # 「文件存在 + 语法正确」不够：CI 与发布链会**直接执行**这些脚本，
+      # 而本仓库 core.fileMode=false（文件系统不保留 unix 位），新加的脚本在 git
+      # 索引里默认是 100644 —— checkout 到 runner 上就没有执行位，
+      # 直接执行会得到 "Permission denied"（0.6.33 发布时踩过：
+      # packaging/linux/merge-debs.sh 被直接执行，构建当场失败）。
+      # 凡是「不带 bash 直接执行」的脚本，索引里必须是 100755。
+      - name: directly-executed scripts carry the executable bit
+        run: |
+          set -euo pipefail
+          bad=0
+          for f in \
+            packaging/linux/merge-debs.sh \
+            packaging/linux/prepare-sync-deb.sh \
+            packaging/linux/build-offline-installer.sh \
+            packaging/linux/install.sh \
+            packaging/linux/uninstall.sh \
+            packaging/linux/verify-offline.sh \
+            packaging/linux/install-vendor-deps.sh \
+            packaging/linux/fetch-vendor-debs.sh \
+            packaging/linux/test/verify-in-container.sh \
+            scripts/ime/build-linux.sh \
+            scripts/ime/container-build.sh \
+            scripts/ime/package-ime-deb.sh \
+            scripts/ime/fetch-vendor-deps.sh \
+            scripts/ime/build-fcitx5-addon.sh; do
+            [ -f "$f" ] || { echo "::error::缺少 $f"; bad=1; continue; }
+            # 用索引里的位（git ls-files -s），不是工作区的 —— 工作区的权限
+            # 取决于 checkout 方式与 core.fileMode，不可靠。
+            mode=$(git ls-files -s "$f" | awk '{print $1}')
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$f::git 索引里的模式是 $mode，应为 100755（该脚本会被直接执行，没有执行位会 Permission denied）"
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+
       - name: bash -n every packaging shell script
         run: |
           set -euo pipefail
