@@ -422,6 +422,131 @@ jobs:
           for f in "${files[@]}"; do bash -n "$f"; done
           echo "bash -n OK: ${#files[@]} 个脚本"
 
+      # workflow 里的 run: 块是嵌入式 shell，YAML 解析器看不出 shell 语法错。
+      # 0.6.33 发布时踩过：写 `echo"- xxx"`（echo 后少一个空格），bash 把
+      # `echo-` 当命令名 → "command not found"（exit 127），构建到最后一步才炸。
+      #
+      # 按**步骤实际用的 shell** 分别检查：bash 的用 bash -n，pwsh 的用
+      # pwsh -NoProfile -Command 的解析器（CI 的 windows runner 上有 pwsh；
+      # Linux runner 上没有 pwsh，跳过 pwsh 片段 —— 它们只在 Windows job 跑）。
+      # shell 的判定顺序（与 GitHub 一致）：步骤级 shell: > job 级
+      # defaults.run.shell > workflow 级 defaults.run.shell > bash。
+      - name: shell snippets inside workflows parse
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess, sys, pathlib
+          import yaml
+
+          def shell_of(step, job, wf):
+              s = step.get('shell')
+              if s:
+                  return s
+              for src in (job, wf):
+                  d = (src or {}).get('defaults') or {}
+                  r = d.get('run') or {}
+                  if r.get('shell'):
+                      return r['shell']
+              return 'bash'
+
+          def is_pwsh(shell):
+              return str(shell).lower().startswith('pwsh') or str(shell).lower() == 'powershell'
+
+          total = {'bash': 0, 'pwsh': 0, 'skipped': 0}
+          bad = 0
+          for wf_path in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
+              wf = yaml.safe_load(wf_path.read_text(encoding='utf-8')) or {}
+              for job_name, job in (wf.get('jobs') or {}).items():
+                  for step in (job.get('steps') or []):
+                      if 'run' not in step:
+                          continue
+                      snippet = step.get('run') or ''
+                      shell = shell_of(step, job, wf)
+                      label = step.get('name') or step.get('uses') or '(无名步骤)'
+                      if is_pwsh(shell):
+                          # Linux runner 上没有 pwsh，跳过（这些片段只在 Windows job 跑）。
+                          total['skipped'] += 1
+                          continue
+                      total['bash'] += 1
+                      p = subprocess.run(['bash', '-n'], input=snippet, text=True,
+                                         capture_output=True)
+                      if p.returncode != 0:
+                          bad += 1
+                          print(f'::error file={wf_path}::job「{job_name}」步骤「{label}」'
+                                f'的 shell 片段语法错：{p.stderr.strip()}')
+          print(f"检查了 {total['bash']} 个 bash 片段（跳过 pwsh {total['skipped']} 个），语法错 {bad} 个")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # bash -n 抓不到的另一类错：命令名与引号之间少一个空格。
+      #   echo"- xxx"   ← 语法合法（解析成一个词），运行时才 "command not found"（127）
+      # shellcheck 也抓不到（它不检查词内粘连）。
+      # 0.6.33 发布时正是这类错：组装 .run 全部成功，最后写 README 时才炸。
+      # 判据：命令位置（行首 / | & ; ( / then / do / else 之后）出现
+      #       「标识符 + 零空格 + 引号」。heredoc 正文（Python 等）不算命令位置。
+      - name: command names are not glued to quotes
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, sys
+          import yaml
+
+          def shell_of(step, job, wf):
+              s = step.get('shell')
+              if s:
+                  return s
+              for src in (job, wf):
+                  d = (src or {}).get('defaults') or {}
+                  r = d.get('run') or {}
+                  if r.get('shell'):
+                      return r['shell']
+              return 'bash'
+
+          def is_pwsh(shell):
+              return str(shell).lower().startswith('pwsh') or str(shell).lower() == 'powershell'
+
+          HEREDOC = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+          # 命令位置 + 标识符与引号之间「零空格」
+          CMD_POS = re.compile(
+              r'(?:^\s*|[|;&(]\s*|\bthen\s+|\bdo\s+|\belse\s+)'
+              r'([A-Za-z_][A-Za-z0-9_.\-]*)["\']')
+
+          def bash_lines(snippet):
+              """只返回真正的 bash 命令行（跳过 heredoc 正文）。"""
+              out = []
+              delim = None
+              for line in snippet.splitlines():
+                  if delim is not None:
+                      if line.strip() == delim:
+                          delim = None
+                      continue
+                  m = HEREDOC.search(line)
+                  if m:
+                      delim = m.group(1)
+                      out.append(line)
+                      continue
+                  out.append(line)
+              return out
+
+          hits = 0
+          for wf_path in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
+              wf = yaml.safe_load(wf_path.read_text(encoding='utf-8')) or {}
+              for job_name, job in (wf.get('jobs') or {}).items():
+                  for step in (job.get('steps') or []):
+                      if 'run' not in step:
+                          continue
+                      if is_pwsh(shell_of(step, job, wf)):
+                          continue
+                      for lineno, line in enumerate(bash_lines(step.get('run') or ''), 1):
+                          for m in CMD_POS.finditer(line):
+                              hits += 1
+                              print(f'::error file={wf_path}::job「{job_name}」步骤'
+                                    f'「{step.get("name")}」第 {lineno} 行：命令名与引号之间'
+                                    f'少了空格（{m.group(1)}）—— 运行时会 command not found')
+          print(f'命令名粘连引号：{hits} 处')
+          sys.exit(1 if hits else 0)
+          PY
+
 
       # 随包预编译产物复制前必须按 MANIFEST.json 校验 sha256：
       # 包在下载/打包环节损坏一个 .bin 时，用户装完就是「切不出五笔」，

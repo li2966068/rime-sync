@@ -494,7 +494,7 @@ jobs:
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             echo "- $DISTRO ($SUITE): $(basename "$offline") ${offline_mib} MiB（离线安装包）+ $(basename "$online") ${online_mib} MiB（在线安装包）/ vendor $(find packaging/linux/vendor/$DISTRO -name "*.deb" | wc -l) debs" >> "$GITHUB_STEP_SUMMARY"
             echo "- 两个包都自带完整输入法，区别只在依赖库：离线包把依赖打包在内（断网可装），在线包安装时联网下载依赖。" >> "$GITHUB_STEP_SUMMARY"
-            echo"- 0.6.33 起输入法与同步程序合并成一个 deb（包名 rime-sync）：装一次就有两样东西，卸载也是一个整体。" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 0.6.33 起输入法与同步程序合并成一个 deb（包名 rime-sync）：装一次就有两样东西，卸载也是一个整体。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: cleanup docker images
