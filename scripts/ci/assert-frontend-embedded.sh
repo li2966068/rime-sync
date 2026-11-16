@@ -20,6 +20,16 @@ assert_embedded() {
     echo "::error::找不到 $bin"
     return 1
   fi
+  # 只对**桌面程序**用这道断言：命令行工具（rime-sync-cli）本来就没有界面，
+  # 拿它来跑这道断言必然被拦住 —— 那不是缺陷，是用错了对象。
+  local base
+  base=$(basename "$bin")
+  case "$base" in
+    rime-sync-cli|rime-sync-cli.exe)
+      echo "::error::$base 是命令行工具，没有界面 —— 这道断言只适用于桌面程序（rime-sync-app）"
+      return 1
+      ;;
+  esac
   local hits
   hits=$(strings "$bin" | grep -cE 'assets/index-[A-Za-z0-9_-]+\.(js|css)' || true)
   if [ "$hits" -lt 1 ]; then
@@ -62,7 +72,13 @@ if [ "${1:-}" = "--selftest" ]; then
     echo "!! 自检失败：不存在的文件应当被断言拦住" >&2
     exit 1
   fi
-  echo "自检通过：好二进制放行、dev 模式二进制与缺失文件都被拦住。"
+  # 4) 命令行工具 → 必须报错（它本来就没有界面，拿它跑这道断言是用错了对象）
+  cp "$work/bad.bin" "$work/rime-sync-cli"
+  if assert_embedded "$work/rime-sync-cli" >/dev/null 2>&1; then
+    echo "!! 自检失败：命令行工具应当被断言拦住（这道断言只适用于桌面程序）" >&2
+    exit 1
+  fi
+  echo "自检通过：好二进制放行，dev 模式二进制、缺失文件、命令行工具都被拦住。"
   exit 0
 fi
 
