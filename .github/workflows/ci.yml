@@ -234,6 +234,22 @@ jobs:
             libxdo-dev libssl-dev \
             curl wget file
 
+      # Tauri 的 build.rs 会检查 bundle.externalBin 指向的 sidecar 是否存在：
+      # ../target/release/rime-sync-cli-<host triple>（相对 src-tauri，即仓库根的
+      # target/）。干净 runner 上没有这个文件，cargo test 会在 build script 阶段
+      # 就失败：resource path `.../rime-sync-cli-x86_64-unknown-linux-gnu` doesn't exist。
+      # 本地之所以能过，是因为工作区里碰巧留着历史构建产物 —— 干净环境才暴露它。
+      # 做法与 release.yml 的「build CLI sidecar for the bundle」一致。
+      - name: build CLI sidecar (externalBin 要求它存在)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo build -p rime-sync-cli --release --locked
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          [ -n "$triple" ] || { echo "::error::rustc -vV 里没有 host triple"; exit 1; }
+          install -Dm755 target/release/rime-sync-cli "target/release/rime-sync-cli-$triple"
+          ls -l "target/release/rime-sync-cli-$triple"
+
       - name: cargo test · src-tauri
         working-directory: src-tauri
         run: cargo test
