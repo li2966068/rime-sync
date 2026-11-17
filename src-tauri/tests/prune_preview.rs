@@ -16,10 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rime_sync_app_lib::prune_cmds;
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-prune-ui-{}-{}-{}",
-        tag,
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-prune-ui-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

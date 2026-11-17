@@ -12,13 +12,16 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-cli-shared-{}-{tag}-{}",
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-cli-shared-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or(0)
     ));

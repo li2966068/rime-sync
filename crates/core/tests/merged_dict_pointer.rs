@@ -8,18 +8,21 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rime_sync_core::merged_dict::{
     detect, ensure_pointers, ensure_pointers_with, ensure_pointers_with_hook, schema_dictionary,
     PointerChange,
 };
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
         "rime-sync-merged-pointer-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or(0)
     ));

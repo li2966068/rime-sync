@@ -48,6 +48,18 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --all-targets
 
+      # 收尾：把测试留下的临时目录清掉。
+      #
+      # 为什么需要：集成测试大量用「临时目录 + 跑完删」，但删不干净的情况很常见
+      # （测试中途 panic、进程被 kill、测试故意造只读目录验证降级路径）。
+      # runner 每次都是新的，攒不久；但**本地**跑一次能攒出几千个目录、2G 以上
+      # （2026-11-17 实测），磁盘被撑满会让所有工具 ENOSPC 瘫痪
+      # （用户 2026-11-08 明确交代过：临时产物用完就清，别攒着）。
+      # 这个脚本只按名字前缀删 /tmp/rime-sync-*，不碰别的东西。
+      - name: 清理测试临时目录
+        if: always()
+        run: bash scripts/ci/clean-test-tmp.sh
+
   # 护栏：发布出去的 CLI 二进制必须与当前源码一致。
   #
   # 为什么不直接 grep 二进制里的字符串：Rust/LLVM 会把短字符串常量拆成 8 字节
@@ -271,6 +283,11 @@ jobs:
       - name: cargo test · src-tauri
         working-directory: src-tauri
         run: cargo test --no-default-features
+
+      # 同上：清掉桌面端测试留下的临时目录（脚本只删 /tmp/rime-sync-*）。
+      - name: 清理测试临时目录
+        if: always()
+        run: bash scripts/ci/clean-test-tmp.sh
 
       # 护栏：桌面程序的 default feature 必须带 custom-protocol。
       #

@@ -25,10 +25,11 @@ const LOCAL_OLD: &[u8] = b"local only\n";
 const DEVICE: &str = "devB";
 const REMOTE_PREFIX: &str = "/dav/rime-sync";
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-transport-backup-{}-{}-{}",
-        tag,
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-transport-backup-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

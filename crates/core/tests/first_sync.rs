@@ -19,10 +19,11 @@ const DEVICE: &str = "other-dev";
 /// 客户端 base = <url>/<remote_dir>，即 http://<addr>/dav/rime-sync。
 const REMOTE_PREFIX: &str = "/dav/rime-sync";
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-first-sync-{}-{}-{}",
-        tag,
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-first-sync-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -17,9 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rime_sync_app_lib::frontend_config::{clean_url, sanitize};
 use rime_sync_core::config::Config;
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-frontend-cfg-{}-{tag}-{}",
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-frontend-cfg-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

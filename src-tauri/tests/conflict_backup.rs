@@ -16,10 +16,11 @@ use rime_sync_core::backup::BackupManager;
 const TARGET: &str = "default.custom.yaml";
 const CONFLICT: &str = "default.custom.yaml.conflict-devA-1700000000";
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-conflict-{}-{}-{}",
-        tag,
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-conflict-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

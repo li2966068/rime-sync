@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rime_sync_app_lib::paths;
 
@@ -22,12 +23,14 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// 受影响的环境变量（测完必须原样恢复）。
 const ENV_KEYS: [&str; 4] = ["HOME", "XDG_CONFIG_HOME", "APPDATA", "RIME_SYNC_CONFIG"];
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-state-dirs-{}-{tag}-{}",
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-state-dirs-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or(0)
     ));

@@ -7,17 +7,20 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rime_sync_core::ime_state::{self, ExtraSupport};
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let path = std::env::temp_dir().join(format!(
-        "rime-sync-core-engine-lib-scan-{}-{seq}-{tag}",
-        std::process::id()
+    let path = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-core-engine-lib-scan-{tag}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
     ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("create temp dir");

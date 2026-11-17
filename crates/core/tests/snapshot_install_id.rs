@@ -24,10 +24,11 @@ const USERDB: &str = "luna_pinyin.userdb.txt";
 const SNAPSHOT: &[u8] = b"ci\t1\n";
 const REMOTE_SNAPSHOT: &[u8] = b"ci\t2\nxin\t3\n";
 
+const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-inst-{}-{}-{}",
-        tag,
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "rime-sync-inst-{tag}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

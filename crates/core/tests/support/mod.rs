@@ -20,9 +20,22 @@ use rime_sync_core::platform::FakeTrigger;
 
 const REMOTE_PREFIX: &str = "/dav/rime-sync";
 
+/// 测试临时目录的**统一根目录**。
+///
+/// 为什么统一（2026-11-17）：原先每个测试文件各自 `std::env::temp_dir().join(...)`，
+/// 目录名散落在 /tmp 下（`rime-sync-first-sync-*`、`rime-sync-cli-*` …），
+/// 清理脚本只能靠前缀猜。统一收进一个根目录后，清理就是「删一个目录」，
+/// 不会漏也不会误伤。
+pub const TEST_TMP_ROOT: &str = "rime-sync-tests";
+
+/// 造一个测试临时目录（调用方负责用完删）。
+///
+/// 目录名带 pid + 纳秒时间戳 ⇒ 并行跑多个测试二进制不会撞名。
+/// **跑完不删是允许的**（很多测试故意留只读目录验证降级路径），
+/// 统一根目录 + scripts/ci/clean-test-tmp.sh 负责收尾。
 pub fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rime-sync-read-only-{}-{}-{}",
+    let dir = std::env::temp_dir().join(TEST_TMP_ROOT).join(format!(
+        "{}-{}-{}",
         tag,
         std::process::id(),
         SystemTime::now()
