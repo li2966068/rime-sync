@@ -44,8 +44,26 @@ GEN = REPO / "scripts" / "ime" / "gen-schema-custom.py"
 RIME_DATA = REPO / "third_party" / "rime-data"
 OUT = REPO / "packaging" / "rime" / "schemas"
 USER_DEFAULT = REPO / "packaging" / "rime" / "default.custom.yaml"
+PLUGIN_TABLE = (
+    REPO / "third_party" / "librime" / "plugins" / "rimesync-extra" / "punct_table.h"
+)
 
 FAILS = []
+
+
+# 生成器的兜底表（PUNCT_PRIMARY）与插件表（punct_table.h）之间的**已知差异**。
+# 每一处都必须写清楚原因；改了插件表而不同步这里（或反过来），CI 就要变红。
+PUNCT_DIVERGENCE = {
+    "\\": "插件直出全角反斜杠 '＼'（2026-11-11 起），生成器仍是顿号 '、'；"
+          "改它会牵动 packaging/rime 的产物（custom.yaml + 编译好的 "
+          "build/*.schema.yaml），必须连同编译产物一起重新生成",
+    "|": "插件故意**不含** '|' 这一项：它是 '\\' 的 Shift 孪生，菜单挂在 "
+         "'\\' 上（见 punct_table.h 的 FindShiftAlternatives）",
+}
+
+# 插件有、生成器没有覆盖的键：这些键在 Rime 自带的 punctuator 里本来就直出
+# 全角，生成器不需要再写一遍 half_shape 覆盖。插件表增删键时这里也要跟着改。
+PLUGIN_ONLY_KEYS = {"!", ",", ".", "/", ":", ";", "?"}
 
 
 def check(ok, label, detail=""):
@@ -150,6 +168,123 @@ def static_checks(gen):
             ("symbols" in punct) == ("symbols" in source),
             "%s punctuator/symbols 与源方案一致" % sid,
         )
+
+
+def parse_plugin_table():
+    """从 punct_table.h 里读出插件的标点表：{键: (主字符, [备选…])}。
+
+    插件表是运行时的权威（rimesync_punct 排在 punctuator 之前，命中即上屏），
+    生成器的 PUNCT_PRIMARY 只是「没装插件时 punctuator 的兜底」，两者必须对得上。
+    """
+    text = PLUGIN_TABLE.read_text(encoding="utf-8")
+    entry = re.compile(
+        r"table\['((?:\\.|[^'\\])*)'\]\s*=\s*PunctEntry\{u8\"([^\"]*)\",\s*\{([^}]*)\}\};"
+    )
+    table = {}
+    for key, main, alternatives in entry.findall(text):
+        table[unescape_cpp(key)] = (main, re.findall(r'u8"([^"]*)"', alternatives))
+    return table
+
+
+def parse_base_key_of():
+    """从 punct_table.h 里读出 BaseKeyOf()（Shift 字符 → 基础键）。"""
+    text = PLUGIN_TABLE.read_text(encoding="utf-8")
+    cases = re.findall(
+        r"case '((?:\\.|[^'\\])*)'\s*:\s*return '((?:\\.|[^'\\])*)';", text
+    )
+    return {unescape_cpp(src): unescape_cpp(dst) for src, dst in cases}
+
+
+def unescape_cpp(text):
+    """C++ 字符字面量里的转义（只处理本表用得到的那几种）。"""
+    return (
+        text.replace("\\\\", "\\")
+        .replace("\\'", "'")
+        .replace('\\"', '"')
+    )
+
+
+# 菜单首项规则的例外：'\\' 的 Shift 孪生是 '|'，而 '|' 故意不在插件表里
+# （菜单挂在 '\\' 上），所以它的菜单首项是全角竖线 '｜'，不是 '\\' 自己的
+# 主字符 '＼'（按约定，菜单不提供这个键自己的主字符）。
+MENU_FIRST_ITEM_EXCEPTIONS = {"\\": "Shift 孪生 '|' 不在插件表里"}
+
+
+def punct_table_consistency(gen):
+    """锁住「生成器的兜底表 ↔ 插件的标点表」的一致性。"""
+    if not PLUGIN_TABLE.exists():
+        check(False, "插件表存在", str(PLUGIN_TABLE))
+        return
+    table = parse_plugin_table()
+    check(bool(table), "插件表解析出条目", "%d 条" % len(table))
+
+    # 插件表里不得有 '|'：它是 '\\' 的 Shift 孪生，菜单挂在 '\\' 上。
+    check("|" not in table, "插件表不含 '|'")
+
+    base_of = parse_base_key_of()
+    check(len(base_of) >= 20, "BaseKeyOf 解析出条目", "%d 条" % len(base_of))
+
+    # 带备选的项：菜单首项必须是「Shift 孪生的主字符」（例外见上）。
+    bad_first = []
+    for key, (main, alternatives) in table.items():
+        if not alternatives or key in MENU_FIRST_ITEM_EXCEPTIONS:
+            continue
+        if alternatives[0] != main:
+            bad_first.append(key)
+    check(not bad_first, "插件表带备选项的备选首项 = 主字符", repr(bad_first))
+
+    # 带备选的项：菜单里不能出现这个键**不按 Shift**时的主字符
+    # （即该键的基础键的主字符；基础键不在表里就没有这条约束）。
+    bad_include = []
+    for key, (main, alternatives) in table.items():
+        if not alternatives:
+            continue
+        base = base_of.get(key)
+        if base is None or base not in table:
+            continue
+        if table[base][0] in alternatives:
+            bad_include.append(key)
+    check(not bad_include, "插件菜单不含该键自己的主字符", repr(bad_include))
+
+    # 生成器覆盖的键：与插件同名时主字符必须一致（已知差异除外）。
+    mismatched = []
+    for key, char in gen.PUNCT_PRIMARY.items():
+        if key in PUNCT_DIVERGENCE:
+            continue
+        if key not in table:
+            mismatched.append("%s: 生成器有、插件没有" % key)
+            continue
+        if table[key][0] != char:
+            mismatched.append("%s: 生成器 %r vs 插件 %r" % (key, char, table[key][0]))
+    check(not mismatched, "生成器与插件的主字符一致（已知差异除外）", repr(mismatched))
+
+    # 生成器有、插件没有的键：必须都写进了已知差异清单。
+    unknown = [
+        key for key in gen.PUNCT_PRIMARY if key not in table and key not in PUNCT_DIVERGENCE
+    ]
+    check(not unknown, "生成器独有的键都登记在已知差异里", repr(unknown))
+
+    # 已知差异清单里的键不能悄悄失效（差异消失了也要改清单）。
+    stale = [
+        key
+        for key in PUNCT_DIVERGENCE
+        if key in table and key in gen.PUNCT_PRIMARY and table[key][0] == gen.PUNCT_PRIMARY[key]
+    ]
+    check(not stale, "已知差异清单没有过期项", repr(stale))
+
+    # 插件有、生成器没覆盖的键：集合必须与登记的一致。
+    plugin_only = set(table) - set(gen.PUNCT_PRIMARY)
+    check(
+        plugin_only == PLUGIN_ONLY_KEYS,
+        "插件独有键集合与登记的一致",
+        "%s vs %s" % (sorted(plugin_only), sorted(PLUGIN_ONLY_KEYS)),
+    )
+
+    with_alts = sorted(k for k, (_m, alts) in table.items() if alts)
+    print(
+        "  info 插件表 %d 项，其中带备选 %d 项：%s"
+        % (len(table), len(with_alts), " ".join(with_alts))
+    )
 
 
 def check_reproducible(gen):
@@ -296,15 +431,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     gen = load_gen()
-    print("[1/3] 静态检查")
+    print("[1/4] 静态检查")
     static_checks(gen)
-    print("[2/3] 可复现性 / --check")
+    print("[2/4] 标点表一致性（生成器 ↔ 插件）")
+    punct_table_consistency(gen)
+    print("[3/4] 可复现性 / --check")
     check_reproducible(gen)
     if args.deploy:
-        print("[3/3] 真实 librime 部署验证")
+        print("[4/4] 真实 librime 部署验证")
         deploy_checks(gen, args.keep)
     else:
-        print("[3/3] 跳过真实部署验证（加 --deploy 开启）")
+        print("[4/4] 跳过真实部署验证（加 --deploy 开启）")
 
     if FAILS:
         print("\n!! %d 项失败：" % len(FAILS))

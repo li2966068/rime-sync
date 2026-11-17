@@ -254,6 +254,12 @@ fn shared_dict_baseline_survives_profile_seed_and_syncs() {
     ]);
     let (root, rime, state) = workspace("profile-dict-baseline");
     fs::write(rime.join("custom_phrase.txt"), dict).expect("dict");
+    // 只有被 *.dict.yaml 的 import_tables 引用过的 .txt 才算词库源（缺陷 3）。
+    fs::write(
+        rime.join("phrase.dict.yaml"),
+        "name: phrase\nversion: \"1\"\nimport_tables:\n  - custom_phrase.txt\n...\n",
+    )
+    .expect("dict yaml");
     fs::write(rime.join(REL), b"patch:\n  menu/page_size: 8\n").expect("config");
     let mut engine = engine_for(&mock, &rime, &state, "devA");
 
@@ -329,6 +335,12 @@ fn shared_dict_baseline_survives_legacy_profile_migration() {
     ]);
     let (root, rime, state) = workspace("profile-legacy-migrate");
     fs::write(rime.join("custom_phrase.txt"), dict).expect("dict");
+    // 只有被 *.dict.yaml 的 import_tables 引用过的 .txt 才算词库源（缺陷 3）。
+    fs::write(
+        rime.join("phrase.dict.yaml"),
+        "name: phrase\nversion: \"1\"\nimport_tables:\n  - custom_phrase.txt\n...\n",
+    )
+    .expect("dict yaml");
     fs::write(rime.join(REL), config).expect("config");
     // 旧布局的本机基线（迁移后应搬到 state/sync/devA/config/manifest.json）。
     let legacy_dir = state.join("profiles").join("devA");

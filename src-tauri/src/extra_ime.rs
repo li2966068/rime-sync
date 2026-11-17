@@ -126,27 +126,39 @@ pub fn cmd_install_extra_ime(app: AppHandle, package_path: String) -> Result<Str
 }
 
 /// 让用户挑一个本地的安装包（Rust 侧直接调系统文件选择器，不需要前端插件）。
+///
+/// 不占 worker 线程：原生对话框的回调跑在插件自己起的线程上，
+/// 用异步通道把结果送回来即可（旧的 10 分钟超时写法会把线程占住，
+/// 六个 spawn_blocking 命令一起排队就是「点了没反应」）。
+///
+/// 同样不设超时：等待期间占的是异步任务而不是线程池名额，
+/// 而且插件在「选定」和「取消」时都会准时回调，取消不会挂住。
 #[tauri::command]
 pub async fn cmd_pick_extra_package(app: AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        handle
-            .dialog()
-            .file()
-            .set_title("选择安装包".to_string())
-            .add_filter("安装包", &["deb", "run", "AppImage", "gz", "zip"])
-            .pick_file(move |path| {
-                let _ = tx.send(path);
-            });
-        rx.recv_timeout(std::time::Duration::from_secs(600))
-            .ok()
-            .flatten()
-    })
-    .await
-    .ok()
-    .flatten()
-    .and_then(|path| path.into_path().ok())
-    .map(|path| path.display().to_string())
+    tracing::info!("打开安装包选择器");
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title("选择安装包".to_string())
+        .add_filter("安装包", &["deb", "run", "AppImage", "gz", "zip"])
+        .pick_file(move |path| {
+            // 前端已经不等的时候，把用户选中的包记进日志，别让它消失。
+            if tx.try_send(path.clone()).is_err() {
+                if let Some(picked) = path {
+                    tracing::info!("前端已不再等待，用户选中的安装包：{}", picked);
+                }
+            }
+        });
+    let picked = rx.recv().await.flatten();
+    match picked.and_then(|path| path.into_path().ok()) {
+        Some(path) => {
+            tracing::info!("用户选定了安装包：{}", path.display());
+            Some(path.display().to_string())
+        }
+        None => {
+            tracing::info!("用户取消了安装包选择");
+            None
+        }
+    }
 }

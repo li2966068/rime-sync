@@ -95,7 +95,16 @@ impl DavClient {
         let url = url.trim().trim_end_matches('/');
         ensure!(
             url.starts_with("http://") || url.starts_with("https://"),
-            "webdav url must be http(s): {url}"
+            "webdav url must be http(s): {}",
+            redact_userinfo(url)
+        );
+        // 明文账号密码（https://user:pass@host/dav）一律拒绝：
+        // 它会被原样写进 base，随后出现在错误信息、日志和诊断包里。
+        // 账号密码必须填在「用户名/密码」两个字段里。
+        ensure!(
+            !has_userinfo(url),
+            "WebDAV 地址里不能带账号密码（{}）：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里",
+            redact_userinfo(url)
         );
         let remote = remote_dir.trim().trim_matches('/');
         if !remote.is_empty() {
@@ -253,7 +262,7 @@ impl DavClient {
             dav: probe.dav,
             dav_class,
             preset: preset.map(|value| value.id().to_string()),
-            base_url: self.base.clone(),
+            base_url: redact_userinfo(&self.base),
             remote_dir,
             remote_dir_missing,
             message,
@@ -287,7 +296,10 @@ impl DavClient {
     }
 
     /// 连接失败时把「代理」写清楚：用户需要知道该查代理还是查服务器。
+    ///
+    /// URL 一律脱敏（userinfo → `***`）：错误信息会进日志，日志会进诊断包。
     fn failure_context(&self, method: &str, url: &str) -> String {
+        let url = redact_userinfo(url);
         match self.proxy_note.as_deref() {
             Some(note) => format!(
                 "{method} {url} failed（已启用代理 {note}：请确认代理在运行、地址与认证正确）"
@@ -362,7 +374,8 @@ impl DavClient {
             }
         }
         Err(anyhow!(
-            "{method} {url} failed after {MAX_RETRIES} retries{}: {last_error}",
+            "{method} {} failed after {MAX_RETRIES} retries{}: {last_error}",
+            redact_userinfo(url),
             self.proxy_suffix()
         ))
     }
@@ -384,9 +397,10 @@ impl DavClient {
         }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
+            // 响应体可能回显带凭据的地址，落进日志前先脱敏。
             bail!(
                 "PROPFIND {rel} -> {status}: {}",
-                body.chars().take(300).collect::<String>()
+                redact_userinfo(&body.chars().take(300).collect::<String>())
             );
         }
         let body = response
@@ -625,6 +639,118 @@ pub fn origin_of(url: &str) -> String {
         }
         None => format!("{}/", url.trim_end_matches('/')),
     }
+}
+
+/// URL 里是否带了 userinfo（`https://user:pass@host/dav`）。
+///
+/// 只看 authority 部分（`://` 之后第一个 `/` 之前），
+/// 路径里的 `@`（比如文件名带 @）不算凭据。
+pub fn has_userinfo(url: &str) -> bool {
+    let Some(index) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[index + 3..];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.contains('@')
+}
+
+/// 把 URL 里的 userinfo 换成 `***`（保留主机与路径）。
+///
+/// 为什么需要：错误信息会进日志，日志会进诊断包；明文密码一旦写进去
+/// 就等于把 WebDAV 密码贴到了用户能随手打开的文本文件里。
+pub fn redact_userinfo(url: &str) -> String {
+    let Some(index) = url.find("://") else {
+        return url.to_string();
+    };
+    let head = &url[..index + 3];
+    let rest = &url[index + 3..];
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, ""),
+    };
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!("{head}***@{}{tail}", &authority[at + 1..])
+}
+
+/// 从 URL 里拆出来的账号密码（userinfo）。
+///
+/// `password` 为 None 表示地址里只有用户名、没有密码（`https://user@host/dav`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlCredentials {
+    pub username: String,
+    pub password: Option<String>,
+    /// 剥掉凭据后的地址：scheme / 主机 / 端口 / 路径 / 查询串 / 片段原样保留。
+    pub clean_url: String,
+}
+
+/// 从 URL 里拆出账号密码。
+///
+/// 规则（与浏览器一致）：
+/// * 只看 authority 段（`://` 之后、第一个 `/ ? #` 之前），路径里的 `@` 不算凭据；
+/// * 账号密码取 authority 里**最后一个** `@` 之前的那段 ⇒ 密码里可以含 `@`；
+/// * 账号与密码用**第一个** `:` 分开 ⇒ 密码里可以含 `:`；
+/// * 百分号编码会被解开（`%40` → `@`）；不认识的 `%` 原样保留。
+///
+/// 拆不出用户名（没有 `@`、用户名为空、主机为空）时返回 None —— 调用方按
+/// 「原样保留、不猜」处理。
+pub fn split_userinfo(url: &str) -> Option<UrlCredentials> {
+    let trimmed = url.trim();
+    let (head, rest) = match trimmed.find("://") {
+        Some(index) => (&trimmed[..index + 3], &trimmed[index + 3..]),
+        None => ("", trimmed),
+    };
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, ""),
+    };
+    let at = authority.rfind('@')?;
+    let userinfo = &authority[..at];
+    let host = &authority[at + 1..];
+    if host.is_empty() {
+        return None;
+    }
+    let (username, password) = match userinfo.find(':') {
+        Some(pos) => (&userinfo[..pos], Some(&userinfo[pos + 1..])),
+        None => (userinfo, None),
+    };
+    if username.is_empty() {
+        return None;
+    }
+    Some(UrlCredentials {
+        username: percent_decode(username),
+        password: password.map(percent_decode),
+        clean_url: format!("{head}{host}{tail}"),
+    })
+}
+
+/// 解开百分号编码；不是合法转义（`%` 后面不是两个十六进制）的 `%` 原样保留。
+fn percent_decode(input: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(byte);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn extract_path(url: &str) -> String {
@@ -1205,5 +1331,88 @@ mod write_probe_tests {
         assert_eq!(json["ok"], false);
         assert_eq!(json["steps"][0]["status"], 403);
         assert_eq!(json["preset"], "alist");
+    }
+}
+
+// -------------------------------------------------------------------------
+// 缺陷 5：地址里的账号密码不许流进错误信息（错误信息会进日志与诊断包）。
+// -------------------------------------------------------------------------
+
+#[cfg(test)]
+mod userinfo_tests {
+    use super::*;
+
+    /// 带 userinfo 的地址必须被直接拒绝，并明确告诉用户账号密码该填在哪。
+    #[test]
+    fn urls_with_userinfo_are_rejected() {
+        let error = DavClient::new(
+            "https://alice:s3cr3t@example.com/dav",
+            "u",
+            "p",
+            "rime-sync",
+        )
+        .expect_err("带账号密码的地址必须被拒绝");
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("s3cr3t"),
+            "明文密码不许出现在错误信息里：{text}"
+        );
+        assert!(
+            text.contains("***@example.com"),
+            "脱敏后要保留主机名：{text}"
+        );
+        assert!(
+            text.contains("用户名") && text.contains("密码"),
+            "要告诉用户账号密码该填在哪：{text}"
+        );
+    }
+
+    /// 其它错误路径（网络失败、PROPFIND 失败）里的 URL 也必须脱敏。
+    #[test]
+    fn failure_context_redacts_the_userinfo() {
+        let client =
+            DavClient::new("https://example.com/dav", "u", "p", "rime-sync").expect("client");
+        let text = client.failure_context("PROPFIND", "https://alice:s3cr3t@example.com/dav/files");
+        assert!(!text.contains("s3cr3t"), "{text}");
+        assert!(text.contains("***@example.com"), "{text}");
+    }
+
+    /// userinfo 只看 authority 段：路径里的 @ 不是账号密码。
+    #[test]
+    fn userinfo_detection_only_looks_at_the_authority() {
+        assert!(has_userinfo("https://user:pass@host/dav"));
+        assert!(has_userinfo("https://user@host"));
+        assert!(!has_userinfo("https://host/dav"));
+        assert!(!has_userinfo("https://host/dav@weird"));
+        assert!(!has_userinfo("host/dav"));
+        assert!(!has_userinfo("https://host/dav/user@name"));
+    }
+
+    /// 拆账号密码：最后一个 @ 之前的是账号密码段，第一个 : 分开账号与密码。
+    #[test]
+    fn userinfo_is_split_by_the_last_at_and_the_first_colon() {
+        let creds = split_userinfo("https://alice:p@ss:word@example.com:8443/dav/sub?x=1#frag")
+            .expect("split");
+        assert_eq!(creds.username, "alice");
+        assert_eq!(creds.password.as_deref(), Some("p@ss:word"));
+        assert_eq!(creds.clean_url, "https://example.com:8443/dav/sub?x=1#frag");
+    }
+
+    /// 拆不出用户名时返回 None（调用方按「原样保留、不猜」处理）。
+    #[test]
+    fn unparsable_userinfo_yields_nothing() {
+        assert!(split_userinfo("https://host/dav").is_none());
+        assert!(split_userinfo("https://:pass@host/dav").is_none());
+        assert!(split_userinfo("https://user@/dav").is_none());
+    }
+
+    /// 百分号编码会被解开；不合法的转义原样保留。
+    #[test]
+    fn percent_escapes_are_decoded() {
+        let creds = split_userinfo("https://user%40mail:p%40ss@host/dav").expect("split");
+        assert_eq!(creds.username, "user@mail");
+        assert_eq!(creds.password.as_deref(), Some("p@ss"));
+        let creds = split_userinfo("https://user:pa%ss@host/dav").expect("split");
+        assert_eq!(creds.password.as_deref(), Some("pa%ss"));
     }
 }

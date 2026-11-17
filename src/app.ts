@@ -24,6 +24,8 @@ import {
 import { applyAppVersion, renderUpdate, checkUpdate, installUpdate } from "./ui/update";
 import { applyWatchEvent, renderWatch, toggleWatch, loadWatchStatus } from "./ui/watch";
 import { loadPresets, applyPresetTo } from "./ui/presets";
+import { loadCloseToTray, toggleCloseToTray } from "./ui/tray_prefs";
+import { forcedSetupMode, lateSetupMode } from "./setup_request";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { runFixIme } from "./ui/fix_ime";
 import {
@@ -345,6 +347,11 @@ export function bindEvents(): void {
     void toggleAutostart(el.autostartToggle.checked);
   });
 
+  // 关闭窗口时隐藏到托盘：开关写回后端（platform.json）。
+  el.closeToTray.addEventListener("change", () => {
+    void toggleCloseToTray(el.closeToTray.checked);
+  });
+
   el.saveSettings.addEventListener("click", () => {
     void saveSettings().catch((error: unknown) => {
       toast(t("conn.saveFail", { error: errorText(error) }));
@@ -509,6 +516,12 @@ export async function subscribe(): Promise<void> {
   await listen<Report>("sync://done", (event) => {
     setLastReport(event.payload);
     renderReport(event.payload);
+    // 托盘触发的同步没有界面在等结果：失败必须弹提示，
+    // 否则用户只看到「点了没反应」。取消不算失败，不打扰。
+    const error = event.payload.error;
+    if (!event.payload.ok && error && error !== "cancelled by user") {
+      toast(t("sync.failed", { error }));
+    }
   });
   await listen<WatchEvent>("sync://watch", (event) => {
     applyWatchEvent(event.payload);
@@ -593,6 +606,9 @@ export async function init(): Promise<void> {
     // 事件又早于监听注册 —— 会丢。后端状态是「取走即清」，再取一次是安全的，
     // 这次取到的就是那段窗口里到达的请求。
     const latePanel = await api.takePanelRequest();
+    // --setup 同样有「事件早于监听注册就丢」的窗口：第二次启动带 --setup 时，
+    // 后端除了发事件还留了一份短命槽位（只在进程内活着），这里兜底取一次。
+    const lateSetup = await api.takeSetupSlot();
     await loadLog();
     await refreshSecretStatus();
     await refreshNetwork();
@@ -602,10 +618,19 @@ export async function init(): Promise<void> {
     await refreshImeStatus();
     await refreshInstallWarning();
     await loadAutostart();
+    await loadCloseToTray();
     localLog("界面已就绪");
     setFooter(t("footer.ready"));
+    const forcedMode = forcedSetupMode(forcedSetup);
     if (needsSetup) {
-      openWizard(forcedSetup ? "settings" : "first-run");
+      openWizard(forcedMode ?? "first-run");
+    }
+    // 事件丢了也不能丢请求：短命槽位里还留着 --setup 就补开一次向导。
+    // 已经开过向导（强制 --setup 或首次运行）就不再开：重复 openWizard
+    // 会把用户刚填的表单重置掉。
+    const lateSetupWizard = lateSetupMode(lateSetup, needsSetup);
+    if (lateSetupWizard) {
+      openWizard(lateSetupWizard);
     }
     // --panel 指定的页面在向导之后切：向导是浮层，切页不影响它。
     // 没指定页面时保持默认的连接页。

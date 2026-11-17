@@ -4,6 +4,7 @@
 // src 内的单测模块只在 cfg(test) 下编译，同样不受影响。
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod atomic;
 pub mod backup;
 pub mod cancel;
 pub mod config;

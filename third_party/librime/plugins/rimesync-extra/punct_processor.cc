@@ -2,14 +2,15 @@
 //
 // Notes on key codes: librime delivers printable keys as X11 keysyms, so a
 // shifted key already arrives as its shifted character (Shift+, is '<').  The
-// table is therefore indexed by character, and a Shift modifier means "give me
-// the alternatives of the key this character belongs to".  When that base key
-// is not intercepted (e.g. '$' from Shift+4) the character's own main symbol is
-// committed, which is what the table says for '\$'.
+// table is therefore indexed by character.  A Shift modifier means "give me the
+// alternatives of the character I just pressed" (see FindShiftAlternatives in
+// punct_table.h); when no menu is opened, the character's own main symbol is
+// committed.
 // Set rimesync_punct/shift_alternatives: false to always commit the main
 // symbol and skip the alternatives menu.
 //
-// '/' is not intercepted on purpose (see DefaultTable()).
+// The '/' key is intercepted on purpose (it commits the Chinese comma), but
+// it has no alternatives of its own: Shift+/ opens the '?' menu.
 
 #include "punct_processor.h"
 
@@ -37,34 +38,8 @@ namespace {
 const char kAltTag[] = "rimesync_punct_alt";
 const char kComponentName[] = "rimesync_punct";
 
-// Maps a shifted symbol back to the ASCII key it is produced from on a US
-// layout.  Unmapped characters are their own base.
-char BaseKeyOf(char ch) {
-  switch (ch) {
-    case '<': return ',';
-    case '>': return '.';
-    case '?': return '/';
-    case ':': return ';';
-    case '{': return '[';
-    case '}': return ']';
-    case '|': return '\\';
-    case '~': return '`';
-    case '!': return '1';
-    case '@': return '2';
-    case '#': return '3';
-    case '$': return '4';
-    case '%': return '5';
-    case '^': return '6';
-    case '&': return '7';
-    case '*': return '8';
-    case '(': return '9';
-    case ')': return '0';
-    case '_': return '-';
-    case '+': return '=';
-    case '"': return '\'';
-    default: return ch;
-  }
-}
+// BaseKeyOf() and the Shift lookup live in punct_table.h so that the unit
+// test can check that every entry is reachable without librime.
 
 bool IsMenuNavigationKey(int keycode) {
   switch (keycode) {
@@ -132,7 +107,7 @@ bool PunctProcessor::AltMenuActive() const {
 }
 
 bool PunctProcessor::ShowAlternatives(Context* ctx,
-                                      char base,
+                                      char pressed,
                                       const PunctEntry& entry) {
   if (entry.alternatives.empty())
     return false;
@@ -148,7 +123,7 @@ bool PunctProcessor::ShowAlternatives(Context* ctx,
   // set_input() rebuilds the composition through the engine, so install the
   // hand-made segment afterwards: it only lives until the next composition
   // update, which is exactly the lifetime of the alternatives menu.
-  ctx->set_input(string(1, base));
+  ctx->set_input(string(1, pressed));
   Composition composition;
   Segment segment(0, 1);
   segment.status = Segment::kGuess;
@@ -226,9 +201,17 @@ ProcessResult PunctProcessor::ProcessKeyEvent(const KeyEvent& key_event) {
   const char ch = static_cast<char>(keycode);
 
   if (key_event.shift() && shift_alternatives_) {
-    const char base = BaseKeyOf(ch);
-    auto it = table_.find(base);
-    if (it != table_.end() && ShowAlternatives(ctx, base, it->second))
+    // Look the menu up by the character the user actually pressed: Shift+,
+    // already arrives as '<' and '<' is an entry of its own, so its menu
+    // opens.  Only when that character is not in the table (or has no
+    // alternatives) do we fall back to its base key — Shift+\ arrives as
+    // '|', which is deliberately not an entry, and the backslash menu lives
+    // on the '\\' entry.
+    // Before 2026-11-17 the base key was always used first, so every entry
+    // whose key is a shifted character ('$', '%', '*', '~', '!', '?', ':',
+    // '<', '>', '{', '}') could never be opened.
+    const PunctEntry* entry = FindShiftAlternatives(table_, ch);
+    if (entry && ShowAlternatives(ctx, ch, *entry))
       return kAccepted;
   }
 

@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use rime_sync_core::engine::Report;
 use serde::Serialize;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -103,12 +104,69 @@ fn show_main(app: &AppHandle) {
 }
 
 /// 同步是阻塞流程（reqwest::blocking 自带 runtime），必须离开 UI 线程。
+///
+/// 失败必须让用户看见：从托盘触发的同步没有界面在等结果，
+/// 只写日志的话用户只看到「点了没反应」。所以失败时也发 `sync://done`
+/// （ok=false + error），前端收到后会弹提示。
+/// 成功的路径由 run_sync_inner 自己发 `sync://done`，这里不重复发。
 fn spawn_sync(app: &AppHandle, mode: SyncMode) {
     let app = app.clone();
     std::thread::spawn(move || {
         let inner = Arc::clone(&app.state::<AppState>().0);
         if let Err(error) = run_sync(&app, &inner, mode) {
             push_log(&inner, format!("托盘任务失败：{error}"));
+            let _ = app.emit("sync://done", &failure_report(mode, &error));
         }
     });
+}
+
+/// 托盘同步失败时发给前端的报告（纯函数，方便单测钉住字段）。
+///
+/// 前端只要看到 ok=false 就弹提示并把错误显示出来；
+/// error 里带原始错误文本，mode 让用户知道是搬运还是合并生效失败。
+pub(crate) fn failure_report(mode: SyncMode, error: &str) -> Report {
+    Report {
+        ok: false,
+        error: Some(error.to_string()),
+        mode: mode_label(mode).to_string(),
+        ..Report::default()
+    }
+}
+
+/// 同步模式的短标签（写进失败报告里，前端能看出是搬运还是合并生效失败）。
+fn mode_label(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Transport => "transport",
+        SyncMode::Apply => "apply",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 托盘同步失败时发给前端的报告：ok=false + 原始错误 + 模式。
+    ///
+    /// 前端收到 `sync://done` 且 ok=false 就会弹提示 —— 托盘触发的同步
+    /// 没有界面在等结果，不发这个事件用户就只看到「点了没反应」。
+    /// （emit 本身需要 AppHandle，headless 单测跑不了；这里钉住的是事件载荷。）
+    #[test]
+    fn failure_report_marks_the_sync_as_failed() {
+        let report = failure_report(
+            SyncMode::Transport,
+            "已有同步任务正在运行，请等待完成或先取消",
+        );
+        assert!(!report.ok, "失败的报告必须是 ok=false");
+        assert_eq!(
+            report.error.as_deref(),
+            Some("已有同步任务正在运行，请等待完成或先取消")
+        );
+        assert_eq!(report.mode, "transport");
+        assert_eq!(report.pulled, 0);
+        assert_eq!(report.pushed, 0);
+
+        let apply = failure_report(SyncMode::Apply, "网络不通");
+        assert_eq!(apply.mode, "apply");
+        assert_eq!(apply.error.as_deref(), Some("网络不通"));
+    }
 }

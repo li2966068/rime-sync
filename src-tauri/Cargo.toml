@@ -44,6 +44,11 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rime-sync-core = { path = "../crates/core" }
 tauri-plugin-single-instance = "2"
+# 落盘日志：core 里的 tracing:: 调用（70 多处）此前在桌面端无处可去，
+# 现在统一写进 <app_config_dir>/log.txt（与壳层的 push_log 同一个文件）。
+# env-filter 让用户能用 RUST_LOG 调级别，默认 info。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 # SPEC-4 §B4：瘦身。strip 去掉符号表，thin LTO 兼顾体积与构建时长，

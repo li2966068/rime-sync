@@ -324,6 +324,20 @@ pub fn ensure_pointers_with(
     data_dirs: &[PathBuf],
     template_dirs: &[PathBuf],
 ) -> Vec<PointerChange> {
+    // 没有备份钩子时用空实现：桌面程序（ime_state）自己管备份。
+    ensure_pointers_with_hook(rime_dir, data_dirs, template_dirs, &mut |_path| Ok(()))
+}
+
+/// 写入前的备份钩子：每次真正覆盖文件前调用一次。
+///
+/// 引擎会把钩子接到自己的备份闸门（BackupManager 会话）上，
+/// 于是指针写入也会出现在用户可见的备份列表里，可以回滚。
+pub fn ensure_pointers_with_hook(
+    rime_dir: &Path,
+    data_dirs: &[PathBuf],
+    template_dirs: &[PathBuf],
+    backup: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Vec<PointerChange> {
     let Some(merged) = detect(rime_dir) else {
         return Vec::new();
     };
@@ -334,7 +348,7 @@ pub fn ensure_pointers_with(
         let created = if path.is_file() {
             false
         } else {
-            match seed_from_template(&path, &schema, rime_dir, template_dirs) {
+            match seed_from_template(&path, &schema, rime_dir, template_dirs, backup) {
                 Ok(Seed::Created) => true,
                 Ok(Seed::NoTemplate) => {
                     changes.push(PointerChange::Skipped {
@@ -388,7 +402,7 @@ pub fn ensure_pointers_with(
             });
             continue;
         }
-        match write_pointer(&path, &merged.name, !created) {
+        match write_pointer(&path, &merged.name, !created, backup) {
             Ok(PointerWrite::Written) => changes.push(PointerChange::Written { schema, path }),
             Ok(PointerWrite::Present) => changes.push(PointerChange::Present { schema }),
             Ok(PointerWrite::NoPatchBlock) => changes.push(PointerChange::Skipped {
@@ -494,6 +508,7 @@ fn seed_from_template(
     schema: &str,
     rime_dir: &Path,
     template_dirs: &[PathBuf],
+    backup: &mut dyn FnMut(&Path) -> Result<()>,
 ) -> Result<Seed> {
     let name = format!("{schema}.custom.yaml");
     let mut found: Option<PathBuf> = None;
@@ -511,7 +526,13 @@ fn seed_from_template(
     if !engine_supports_extra(rime_dir, schema) {
         return Ok(Seed::EngineUnsupported);
     }
-    fs::copy(&src, path).with_context(|| format!("复制模板 {}", src.display()))?;
+    // 目标已存在（极少见的竞态）时也要先备份，别默默覆盖用户的文件。
+    if path.exists() {
+        backup(path)?;
+    }
+    let bytes = fs::read(&src).with_context(|| format!("读取模板 {}", src.display()))?;
+    crate::atomic::write_atomic(path, &bytes)
+        .with_context(|| format!("复制模板 {}", src.display()))?;
     set_private_mode(path)?;
     Ok(Seed::Created)
 }
@@ -544,7 +565,12 @@ enum PointerWrite {
 }
 
 /// 在 custom.yaml 的 `patch` 块里补 `"translator/dictionary": <name>`。
-fn write_pointer(path: &Path, dict_name: &str, make_backup: bool) -> Result<PointerWrite> {
+fn write_pointer(
+    path: &Path,
+    dict_name: &str,
+    make_backup: bool,
+    backup: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<PointerWrite> {
     let bytes = fs::read(path).with_context(|| format!("读取 {}", path.display()))?;
     let text = String::from_utf8(bytes.clone())
         .map_err(|_| anyhow!("{} 不是 UTF-8，跳过（不覆盖用户文件）", path.display()))?;
@@ -584,18 +610,23 @@ fn write_pointer(path: &Path, dict_name: &str, make_backup: bool) -> Result<Poin
         bail_pointer(path)?;
     }
 
+    // 备份两道闸：
+    // ① 外部钩子（引擎的 BackupManager 会话）—— 用户能在 App 里看到并回滚；
+    // ② .rimesync-orig —— 引擎外的兜底，**每次覆盖前都刷新**（不再是只建一次），
+    //    否则第一次覆盖后的旧内容会被后续覆盖悄悄顶掉。
     if make_backup {
-        let backup = crate::data_patch::backup_path(path);
-        if !backup.exists() {
-            fs::write(&backup, &bytes).with_context(|| format!("备份 {}", backup.display()))?;
-        }
+        backup(path)?;
+        let backup_file = crate::data_patch::backup_path(path);
+        crate::atomic::write_atomic(&backup_file, &bytes)
+            .with_context(|| format!("备份 {}", backup_file.display()))?;
     }
     let output = if has_bom {
         format!("\u{feff}{patched}")
     } else {
         patched
     };
-    fs::write(path, output.as_bytes())
+    // 原子写：中途断电不会留下半个 YAML。
+    crate::atomic::write_atomic(path, output.as_bytes())
         .map_err(|error| anyhow!("写入 {}：{error}", path.display()))?;
     Ok(PointerWrite::Written)
 }

@@ -473,9 +473,8 @@ impl Engine {
             tracing::error!("transport failed: {error:#}");
         }
         // 新设备接入：把合并词典指针补进本机各方案的 custom.yaml（只在键缺失时写）。
-        if report.ok {
-            self.write_merged_dict_pointer(&mut report);
-        }
+        // 指针补写已挪进 do_transport 内部：它要和本轮其它覆盖共用同一个备份会话，
+        // 否则指针的旧内容不在用户可见的备份列表里，出问题没法回滚。
         match self.index.save(&self.index_path) {
             Ok(()) => self.index_existed = true,
             Err(error) => {
@@ -542,8 +541,24 @@ impl Engine {
         template_dirs: &[PathBuf],
         report: &mut Report,
     ) {
-        let changes =
-            crate::merged_dict::ensure_pointers_with(&self.rime_dir, data_dirs, template_dirs);
+        // 指针写入也要走备份闸门：否则用户目录里的 <schema>.custom.yaml
+        // 被改写后，App 的备份列表里看不到这一份，出问题没法回滚。
+        let rime_dir = self.rime_dir.clone();
+        let changes = {
+            let mut backup = |path: &Path| -> Result<()> {
+                let rel = path
+                    .strip_prefix(&rime_dir)
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .map_err(|_| anyhow!("pointer path outside rime dir: {}", path.display()))?;
+                self.backup_before_overwrite_with_reason(&rel, "merged-pointer")
+            };
+            crate::merged_dict::ensure_pointers_with_hook(
+                &rime_dir,
+                data_dirs,
+                template_dirs,
+                &mut backup,
+            )
+        };
         for change in &changes {
             match change {
                 crate::merged_dict::PointerChange::Written { schema, path } => {
@@ -757,10 +772,15 @@ impl Engine {
 
     /// 覆盖前把旧内容存进本轮备份会话；备份失败即中止（宁可不覆盖）。
     fn backup_before_overwrite(&mut self, rel: &str) -> Result<()> {
+        self.backup_before_overwrite_with_reason(rel, "pre-transport")
+    }
+
+    /// 同上，但可以指定这份备份的用途（用户在备份列表里看到的就是它）。
+    fn backup_before_overwrite_with_reason(&mut self, rel: &str, reason: &str) -> Result<()> {
         if self.backup_session.is_none() {
             let manager = BackupManager::new(&self.rime_dir, &self.backup_root);
             let session = manager
-                .start_session("pre-transport")
+                .start_session(reason)
                 .context("create transport backup session")?;
             self.backup_session = Some(session);
         }
@@ -1018,6 +1038,12 @@ impl Engine {
     fn do_transport(&mut self, report: &mut Report) -> Result<()> {
         self.backup_session = None;
         let result = self.do_transport_round(report);
+        // 指针补写也在这轮备份会话里完成：它同样会覆盖用户目录里的
+        // custom.yaml，必须能回滚（否则 App 备份列表里看不到这一份）。
+        // 预演（dry-run）一律不写盘。
+        if result.is_ok() && !self.dry_run {
+            self.write_merged_dict_pointer(report);
+        }
         self.finish_transport_backup(report);
         result
     }
@@ -1510,22 +1536,51 @@ impl Engine {
             let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
             let hash = sha256_hex(&bytes);
             let previous = self.index.snapshots.get(&rel).cloned();
-            let already = match previous {
+            let already = match &previous {
                 Some(meta) if meta.sha256 == hash => {
-                    self.dav.remote_unchanged(&rel, &meta).unwrap_or(false)
+                    self.dav.remote_unchanged(&rel, meta).unwrap_or(false)
                 }
                 _ => false,
             };
             if already {
                 continue;
             }
+            // 并发保护（不是优化，是义务）：远端可能已经被**另一台设备**改过，
+            // 这时直接 PUT 就是静默覆盖。做法是：
+            //   ① 有本地基线时先 HEAD 一次拿到远端 ETag，与本地记录的 ETag 比；
+            //      不一致 ⇒ 远端被别人写过，记冲突并跳过本轮上传；
+            //   ② 上传时带上 If-Match（远端 ETag），让服务端在 HEAD→PUT 之间
+            //      又被人改动时直接回 412，同样记成冲突而不是覆盖。
+            // 没有 ETag 的服务器不做 If-Match，但仍走 ① 的比对（能比就比）。
+            let known_etag = previous.as_ref().and_then(|meta| meta.etag.clone());
+            let remote_etag = if previous.is_some() {
+                // HEAD 失败（服务器不支持 HEAD、临时 5xx）不能把整轮同步搞挂：
+                // 取不到 ETag 就退回到「不带 If-Match」的旧行为，只是少了并发保护。
+                match self.dav.head(&rel) {
+                    Ok(entry) => entry.and_then(|item| item.etag),
+                    Err(error) => {
+                        tracing::debug!("HEAD {rel} failed, upload without If-Match: {error:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let (Some(known), Some(remote)) = (&known_etag, &remote_etag) {
+                if known != remote {
+                    report.conflicts.push(format!(
+                        "{rel}: 另一台设备刚写过这个词库（远端版本与本机记录不一致，本轮未覆盖）"
+                    ));
+                    continue;
+                }
+            }
             self.emit("push", index, total, format!("upload {rel}"));
-            match self.put(&rel, &bytes, None, "snapshot upload")? {
+            match self.put(&rel, &bytes, remote_etag.as_deref(), "snapshot upload")? {
                 PutOutcome::Written => {}
                 PutOutcome::PreconditionFailed => {
-                    report
-                        .conflicts
-                        .push(format!("{rel}: remote changed during upload"));
+                    report.conflicts.push(format!(
+                        "{rel}: 另一台设备刚写过这个词库（服务端拒绝覆盖，本轮未上传）"
+                    ));
                     continue;
                 }
             }
@@ -1585,7 +1640,11 @@ impl Engine {
             }
         }
 
-        let local_files = self.scan_local_tree(scope.kind)?;
+        // .txt 只在被某个 *.dict.yaml 的 import_tables 引用时才算词库源：
+        // 用户目录里随手放的文件（notes.txt 之类）既不上传，也不被远端同名文件覆盖。
+        // 索引只扫一次，本地扫描与下面的合并判定共用。
+        let dict_sources = plan::scan_dict_source_index(&self.rime_dir);
+        let local_files = self.scan_local_tree(scope.kind, &dict_sources)?;
         // 设备本地键：只在 *.custom.yaml 上生效；克隆一份避免与 &mut self 借用冲突。
         let device_local = self.config.device_local_keys.clone();
         let mut base_index = match &scope.local_manifest {
@@ -1596,6 +1655,8 @@ impl Engine {
         base_index
             .files
             .retain(|rel, _| scope.allows(plan::classify(rel).category));
+        // .txt 只在被某个 *.dict.yaml 的 import_tables 引用时才算词库源：
+        // 用户目录里随手放的文件（notes.txt 之类）既不上传，也不被远端同名文件覆盖。
         let mut keys: BTreeSet<String> = BTreeSet::new();
         for key in manifest
             .files
@@ -1603,7 +1664,8 @@ impl Engine {
             .chain(base_index.files.keys())
             .chain(local_files.keys())
         {
-            if scope.allows(plan::classify(key).category) {
+            let class = plan::classify_with(key, Some(&dict_sources));
+            if scope.allows(class.category) {
                 keys.insert(key.clone());
             }
         }
@@ -1612,7 +1674,7 @@ impl Engine {
         for (index, rel) in keys.iter().enumerate() {
             self.cancelled()?;
             plan::validate_rel_path(rel).with_context(|| format!("unsafe path: {rel}"))?;
-            let class = plan::classify(rel);
+            let class = plan::classify_with(rel, Some(&dict_sources));
             if !scope.allows(class.category) || !self.config.wants(class.category) {
                 report
                     .skipped
@@ -2346,9 +2408,15 @@ impl Engine {
         Ok(false)
     }
 
-    fn scan_local_tree(&self, kind: TreeKind) -> Result<BTreeMap<String, PathBuf>> {
+    fn scan_local_tree(
+        &self,
+        kind: TreeKind,
+        dict_sources: &plan::DictSourceIndex,
+    ) -> Result<BTreeMap<String, PathBuf>> {
         let mut out = BTreeMap::new();
-        self.walk_local(&self.rime_dir, 0, kind, &mut out)?;
+        // 只有被 *.dict.yaml 的 import_tables 引用过的 .txt 才是词库源，
+        // 其余 .txt（随手放的文件、备份片段）不参与同步。
+        self.walk_local(&self.rime_dir, 0, kind, dict_sources, &mut out)?;
         Ok(out)
     }
 
@@ -2357,6 +2425,7 @@ impl Engine {
         dir: &Path,
         depth: usize,
         kind: TreeKind,
+        dict_sources: &plan::DictSourceIndex,
         out: &mut BTreeMap<String, PathBuf>,
     ) -> Result<()> {
         if depth > 4 {
@@ -2374,7 +2443,7 @@ impl Engine {
                 if plan::is_excluded_dir(&name) {
                     continue;
                 }
-                self.walk_local(&entry.path(), depth + 1, kind, out)?;
+                self.walk_local(&entry.path(), depth + 1, kind, dict_sources, out)?;
                 continue;
             }
             if !file_type.is_file() {
@@ -2385,7 +2454,7 @@ impl Engine {
                 continue;
             };
             let rel = relative.to_string_lossy().replace('\\', "/");
-            let class = plan::classify(&rel);
+            let class = plan::classify_with(&rel, Some(dict_sources));
             if !kind.allows(class.category)
                 || !self.config.wants(class.category)
                 || plan::is_conflict_copy(&name)

@@ -411,6 +411,13 @@ export const zh = {
   "settings.autostartOnDone": "已开启开机自启动（登录后静默驻留托盘）",
   "settings.autostartOffDone": "已关闭开机自启动",
   "settings.autostartAppImageHint": "AppImage 移动位置或改名后，自启条目会指向旧路径，需要重新开启一次。",
+
+  "settings.closeToTray": "关闭窗口时隐藏到托盘",
+  "settings.closeToTraySub": "关闭后程序仍在后台运行，点托盘图标可以随时叫回来",
+  "settings.closeToTrayOnDone": "已开启：关闭窗口时隐藏到托盘",
+  "settings.closeToTrayOffDone": "已关闭：关闭窗口时直接退出程序",
+  "settings.closeToTrayFail": "设置关闭窗口时的行为失败：{error}",
+  "settings.closeToTrayReadFail": "读取关闭窗口时的行为失败：{error}",
   "autostart.mechanism.xdg": "XDG 自启动（~/.config/autostart）",
   "autostart.mechanism.registry": "Windows 用户注册表（HKCU Run）",
   "autostart.mechanism.launchAgent": "macOS LaunchAgent",

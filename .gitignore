@@ -46,3 +46,8 @@ packaging/linux/rime-sync-cli
 # 跑 rimesync-extra 冒烟测试时 librime 会把 user.yaml 写在当前工作目录
 # （v0.6.8 时误提交进仓库的就是它），别让它再进版本库
 /user.yaml
+
+# 崩溃转储：core.<pid>。v0.6.8 那次误提交进仓库的就是 core.134 / core.15。
+# 只锚定仓库根目录（/core.*），否则会连带忽略
+# third_party/librime/include/utf8/core.h 这种正经头文件。
+/core.*

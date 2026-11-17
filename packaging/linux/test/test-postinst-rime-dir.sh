@@ -23,10 +23,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 postinst=$here/../postinst
 uninstaller=$here/../uninstall.sh
 extra=$here/../install-extra-ime.sh
+installer=$here/../install.sh
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/postinst-rime-dir.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-for f in "$postinst" "$uninstaller" "$extra"; do
+for f in "$postinst" "$uninstaller" "$extra" "$installer"; do
     if [ ! -f "$f" ]; then
         echo "找不到 $f" >&2
         exit 1
@@ -56,6 +57,10 @@ extract "$extra" resolve_config_home "$tmp/extra_config.sh"
 extract "$uninstaller" parse_rime_user_data_dir "$tmp/uninst_parse.sh"
 extract "$uninstaller" rime_user_dir_from_cli "$tmp/uninst_cli.sh"
 extract "$uninstaller" rime_user_dir "$tmp/uninst_resolve.sh"
+extract "$installer" resolve_config_home "$tmp/inst_config.sh"
+extract "$installer" parse_rime_user_data_dir "$tmp/inst_parse.sh"
+extract "$installer" rime_user_dir_from_cli "$tmp/inst_cli.sh"
+extract "$installer" resolve_rime_user_dir "$tmp/inst_resolve.sh"
 
 # 假的 rime-sync-cli：默认「没装」（退出码 127 语义 = 命令不可用），
 # 让测试走本地回退解析这条路径。
@@ -95,7 +100,7 @@ run_in() { # $1=前缀 $2=函数 $3=HOME
     )
 }
 
-mkdir -p "$tmp/p" "$tmp/u" "$tmp/e"
+mkdir -p "$tmp/p" "$tmp/u" "$tmp/e" "$tmp/i"
 cp "$tmp/postinst_config.sh" "$tmp/p/config.sh"
 cp "$tmp/postinst_parse.sh" "$tmp/p/parse.sh"
 cp "$tmp/postinst_cli.sh" "$tmp/p/cli.sh"
@@ -105,18 +110,24 @@ cp "$tmp/extra_config.sh" "$tmp/e/config.sh"
 cp "$tmp/uninst_parse.sh" "$tmp/u/parse.sh"
 cp "$tmp/uninst_cli.sh" "$tmp/u/cli.sh"
 cp "$tmp/uninst_resolve.sh" "$tmp/u/resolve.sh"
+cp "$tmp/inst_config.sh" "$tmp/i/config.sh"
+cp "$tmp/inst_parse.sh" "$tmp/i/parse.sh"
+cp "$tmp/inst_cli.sh" "$tmp/i/cli.sh"
+cp "$tmp/inst_resolve.sh" "$tmp/i/resolve.sh"
 
 # check <描述> <期望> <HOME>
+# 四个实现（postinst / uninstall.sh / install.sh）必须给出同一个目录。
 check() {
     local desc=$1 expect=$2 chome=$3
     got_p=$(run_in "$tmp/p" resolve_rime_user_dir "$chome" | tr -d '\n')
     got_u=$(run_in "$tmp/u" rime_user_dir "$chome" | tr -d '\n')
-    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ]; then
+    got_i=$(run_in "$tmp/i" resolve_rime_user_dir "$chome" | tr -d '\n')
+    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ] && [ "$got_i" = "$expect" ]; then
         printf '  OK   %s -> %s\n' "$desc" "$got_p"
         pass=$((pass + 1))
     else
-        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s]\n' \
-            "$desc" "$expect" "$got_p" "$got_u"
+        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s] install=[%s]\n' \
+            "$desc" "$expect" "$got_p" "$got_u" "$got_i"
         fail=$((fail + 1))
     fi
 }
@@ -165,16 +176,18 @@ check "路径里含 = 时不截断" "/tmp/dir=with=equals" "$home"
 # 「XDG_CONFIG_HOME 优先，缺省 ~/.config」。这里断言 postinst 与 uninstall.sh
 # 两边的解析结果一致，且与期望值相符。
 check_config_home() { # $1=描述 $2=期望 $3=HOME
-    local desc=$1 expect=$2 chome=$3 got_p got_u got_e
+    local desc=$1 expect=$2 chome=$3 got_p got_u got_e got_i
     got_p=$(run_in "$tmp/p" resolve_config_home "$chome" | tr -d '\n')
     got_u=$(run_in "$tmp/u" resolve_config_home "$chome" | tr -d '\n')
     got_e=$(run_in "$tmp/e" resolve_config_home "$chome" | tr -d '\n')
-    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ] && [ "$got_e" = "$expect" ]; then
+    got_i=$(run_in "$tmp/i" resolve_config_home "$chome" | tr -d '\n')
+    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ] \
+        && [ "$got_e" = "$expect" ] && [ "$got_i" = "$expect" ]; then
         printf '  OK   %s -> %s\n' "$desc" "$got_p"
         pass=$((pass + 1))
     else
-        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s] extra-ime=[%s]\n' \
-            "$desc" "$expect" "$got_p" "$got_u" "$got_e"
+        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s] extra-ime=[%s] install=[%s]\n' \
+            "$desc" "$expect" "$got_p" "$got_u" "$got_e" "$got_i"
         fail=$((fail + 1))
     fi
 }
@@ -243,11 +256,21 @@ cli_u=$(
     . "$tmp/u/resolve.sh"
     rime_user_dir "$home" | tr -d '\n'
 )
-if [ "$cli_p" = "/cli/authoritative" ] && [ "$cli_u" = "/cli/authoritative" ]; then
+cli_i=$(
+    PATH="$tmp/bin2:$PATH"
+    . "$tmp/i/config.sh"
+    . "$tmp/i/parse.sh"
+    . "$tmp/i/cli.sh"
+    . "$tmp/i/resolve.sh"
+    resolve_rime_user_dir "$home" | tr -d '\n'
+)
+if [ "$cli_p" = "/cli/authoritative" ] && [ "$cli_u" = "/cli/authoritative" ] \
+    && [ "$cli_i" = "/cli/authoritative" ]; then
     printf '  OK   CLI 权威值优先 -> %s\n' "$cli_p"
     pass=$((pass + 1))
 else
-    printf '  FAIL CLI 权威值优先 -> postinst=[%s] uninstall=[%s]\n' "$cli_p" "$cli_u"
+    printf '  FAIL CLI 权威值优先 -> postinst=[%s] uninstall=[%s] install=[%s]\n' \
+        "$cli_p" "$cli_u" "$cli_i"
     fail=$((fail + 1))
 fi
 
@@ -261,11 +284,56 @@ sig_of() { # $1=抽取文件
 sig_p=$(sig_of "$tmp/postinst_config.sh")
 sig_u=$(sig_of "$tmp/uninst_config.sh")
 sig_e=$(sig_of "$tmp/extra_config.sh")
-if [ "$sig_p" = "$sig_u" ] && [ "$sig_p" = "$sig_e" ]; then
-    printf '  OK   三个脚本的 resolve_config_home 逐字一致\n'
+sig_i=$(sig_of "$tmp/inst_config.sh")
+if [ "$sig_p" = "$sig_u" ] && [ "$sig_p" = "$sig_e" ] && [ "$sig_p" = "$sig_i" ]; then
+    printf '  OK   四个脚本的 resolve_config_home 逐字一致\n'
     pass=$((pass + 1))
 else
-    printf '  FAIL 三个脚本的 resolve_config_home 不一致\n'
+    printf '  FAIL 四个脚本的 resolve_config_home 不一致\n'
+    fail=$((fail + 1))
+fi
+
+# install.sh（.run 离线安装器入口）与 postinst 的三个解析函数必须**逐字一致**：
+# 离线安装器以前硬编码 ~/.local/share/fcitx5/rime，把配置写到了 fcitx5 根本不读的
+# 目录；两者不一致就会重演同一个缺陷。
+# 说明：uninstall.sh 的对应函数改过名字（rime_user_dir）且有一处引号差异，
+# 所以这里只锁 install.sh ↔ postinst 这一对（install.sh 的副本就是从 postinst 复制的）。
+sig_same() { # $1=描述 $2=文件A $3=文件B
+    local desc=$1 a b
+    a=$(sig_of "$2")
+    b=$(sig_of "$3")
+    if [ "$a" = "$b" ]; then
+        printf '  OK   %s 逐字一致\n' "$desc"
+        pass=$((pass + 1))
+    else
+        printf '  FAIL %s 不一致（%s vs %s）\n' "$desc" "$2" "$3"
+        diff -u "$2" "$3" | sed -n '1,40p'
+        fail=$((fail + 1))
+    fi
+}
+sig_same "install.sh 与 postinst 的 resolve_config_home" \
+    "$tmp/postinst_config.sh" "$tmp/inst_config.sh"
+sig_same "install.sh 与 postinst 的 parse_rime_user_data_dir" \
+    "$tmp/postinst_parse.sh" "$tmp/inst_parse.sh"
+sig_same "install.sh 与 postinst 的 rime_user_dir_from_cli" \
+    "$tmp/postinst_cli.sh" "$tmp/inst_cli.sh"
+sig_same "install.sh 与 postinst 的 resolve_rime_user_dir" \
+    "$tmp/postinst_resolve.sh" "$tmp/inst_resolve.sh"
+
+# install.sh 不得再硬编码默认 Rime 用户目录（缺陷回归护栏）：
+# 硬编码会把配置写进 fcitx5 根本不读的目录。
+if grep -q 'RIME_USER_DIR="\$TARGET_HOME/\.local/share/fcitx5/rime"' "$installer"; then
+    printf '  FAIL install.sh 仍硬编码默认 Rime 用户目录\n'
+    fail=$((fail + 1))
+else
+    printf '  OK   install.sh 不再硬编码默认 Rime 用户目录\n'
+    pass=$((pass + 1))
+fi
+if grep -q 'resolve_rime_user_dir' "$installer"; then
+    printf '  OK   install.sh 使用 resolve_rime_user_dir 解析用户目录\n'
+    pass=$((pass + 1))
+else
+    printf '  FAIL install.sh 没有 resolve_rime_user_dir\n'
     fail=$((fail + 1))
 fi
 

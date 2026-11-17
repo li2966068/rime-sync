@@ -9,10 +9,15 @@
 // schema to a real Engine and presses keys through the whole processor chain
 // (that is the part that proves the schema wiring: punctuation, v-mode).
 //
-// Key map as of 2026-11-11: the slash commits 、, the backslash commits
-// ＼, Shift+slash commits ？, Shift+comma opens the 《〈＜ alternatives
-// menu.  The expectations below were checked against a real librime build
-// on 2026-11-13.
+// Key map as of 2026-11-17: the slash commits 、, the backslash commits
+// ＼, Shift+comma opens the 《〈＜ alternatives menu, and Shift+digit
+// (Shift+4 -> '$') opens the ￥＄€ menu — the menu is looked up by the
+// character that was actually pressed, so every entry of the table is
+// reachable.
+// The expectations below were checked against a real librime build on
+// 2026-11-13; the 2026-11-17 menu expectations follow the table in
+// punct_table.h (checked by test/punct_table_test.cc) and were not
+// re-verified against a real librime build yet.
 
 #include <cstdio>
 #include <memory>
@@ -141,19 +146,30 @@ void TestProcessor() {
         "period accepted");
   CheckEq(committed, u8"。", "period commits 。");
 
-  // Shift+4 is '$' with the Shift bit on X11; its base key is not
-  // intercepted, so the main symbol is committed directly.
+  // Shift+4 is '$' with the Shift bit on X11.  Since 2026-11-17 the Shift
+  // menu is looked up by the character that was actually pressed, so '$'
+  // opens its own menu; before that it was mapped back to the base key '4',
+  // which is not in the table, and the main symbol was committed directly.
   committed.clear();
   Check(processor->ProcessKeyEvent(KeyEvent('$', kShiftMask)) == kAccepted,
         "shift+4 accepted");
-  CheckEq(committed, u8"￥", "shift+4 commits ￥");
+  Check(ctx->HasMenu(), "shift+4 opens the alternatives menu");
+  CheckEq(CandidateText(ctx, 0), u8"￥", "first alternative of dollar is ￥");
+  Check(processor->ProcessKeyEvent(KeyEvent('1', 0)) == kAccepted,
+        "digit selects a candidate");
+  CheckEq(committed, u8"￥", "selecting the first alternative commits ￥");
+  Check(!ctx->IsComposing(), "menu is gone after selection");
 
-  // The question mark has no alternatives on its base key (the slash), so it
-  // is committed directly.
+  // Shift+/ presses '?', which opens the question mark menu ('？' '?').
   committed.clear();
   Check(processor->ProcessKeyEvent(KeyEvent('?', kShiftMask)) == kAccepted,
         "shift+slash accepted");
-  CheckEq(committed, u8"？", "shift+slash commits ？ directly");
+  Check(ctx->HasMenu(), "shift+slash opens the alternatives menu");
+  CheckEq(CandidateText(ctx, 0), u8"？", "first alternative of slash is ？");
+  Check(processor->ProcessKeyEvent(KeyEvent(XK_Escape, 0)) == kAccepted,
+        "escape closes the question mark menu");
+  Check(!ctx->IsComposing() && committed.empty(),
+        "escape cancels the question mark menu");
 
   // Shift+, is '<' with the Shift bit; the ',' alternatives menu opens.
   committed.clear();

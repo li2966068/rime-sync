@@ -414,6 +414,13 @@ export const en: Record<keyof Dict, string> = {
   "settings.autostartOnDone": "Launch at login enabled (starts silently in the tray)",
   "settings.autostartOffDone": "Launch at login disabled",
   "settings.autostartAppImageHint": "After moving or renaming the AppImage, the entry points at the old path — switch it off and on again.",
+
+  "settings.closeToTray": "Hide to the tray when the window is closed",
+  "settings.closeToTraySub": "The app keeps running in the background; click the tray icon to bring it back",
+  "settings.closeToTrayOnDone": "Enabled: closing the window hides to the tray",
+  "settings.closeToTrayOffDone": "Disabled: closing the window quits the app",
+  "settings.closeToTrayFail": "Could not change the close-window behaviour: {error}",
+  "settings.closeToTrayReadFail": "Could not read the close-window behaviour: {error}",
   "autostart.mechanism.xdg": "XDG autostart (~/.config/autostart)",
   "autostart.mechanism.registry": "Windows user registry (HKCU Run)",
   "autostart.mechanism.launchAgent": "macOS LaunchAgent",

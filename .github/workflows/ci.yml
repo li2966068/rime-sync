@@ -286,6 +286,13 @@ jobs:
       - name: verifier selftest
         run: bash .github/scripts/verify-artifacts.sh --selftest
 
+      # 随包产物「逐字节没变」断言的自检：合成仓库证明双向有效 ——
+      # 完整产物必须放行；把随包产物移出索引（空过场景）、清单少一条 / 多一条、
+      # 字节被改（模拟 checkout 转行尾）都必须被拦住。
+      # 只做断言脚本没意义：断言写错了照样放行（这就是「空过」）。
+      - name: payload eol assertion selftest
+        run: bash .github/scripts/check-rime-payload-eol.sh --selftest
+
       # 「桌面二进制必须自带界面」这道断言的自检：用合成产物证明双向有效 ——
       # 含前端资源的放行，dev 模式的（没打包界面）必须被拦住。
       # 只做断言脚本没意义：断言写错了照样放行。
@@ -596,6 +603,8 @@ jobs:
       # postinst 必须按 fcitx5-rime 的 UserDataDirPath 解析 Rime 用户目录：
       # 硬编码 ~/.local/share/fcitx5/rime 会把受管 custom.yaml 与预编译产物
       # seed 到没人读的目录，用户真正在用的目录反而缺文件（切不到五笔）。
+      # 同样的规则必须覆盖 .run 离线安装器的入口 packaging/linux/install.sh
+      # （它以前硬编码默认目录，用户从 .run 装完输入法仍然缺配置）。
       - name: postinst resolves the real Rime user dir
         run: |
           set -euo pipefail
@@ -606,6 +615,14 @@ jobs:
           fi
           grep -q 'resolve_rime_user_dir' packaging/linux/postinst || {
             echo "::error::postinst 缺少 resolve_rime_user_dir"
+            exit 1
+          }
+          if grep -q 'RIME_USER_DIR="\$TARGET_HOME/\.local/share/fcitx5/rime"' packaging/linux/install.sh; then
+            echo "::error::install.sh 不得硬编码 Rime 用户目录，必须走 resolve_rime_user_dir"
+            exit 1
+          fi
+          grep -q 'resolve_rime_user_dir' packaging/linux/install.sh || {
+            echo "::error::install.sh 缺少 resolve_rime_user_dir"
             exit 1
           }
 
@@ -1071,6 +1088,12 @@ jobs:
       - name: schema custom template check
         run: python3 scripts/ime/gen-schema-custom.py --check
 
+      # 生成器的兜底表（punctuator/half_shape）与插件的标点表必须对得上：
+      # 两边漂移了，装了插件与没装插件就会打出不同的标点。
+      # 这个检查同时锁住「插件表里不得出现 '|'」等约定。
+      - name: punctuation table consistency check
+        run: python3 scripts/ime/test_gen_schema_custom.py
+
   # 0.6.24：NSIS 钩子的**运行期**冒烟 —— wine 跑的就是发布用的那个 Windows
   # 二进制（NSIS stub + 钩子），验的是静态断言看不出来的东西：静默安装/卸载的
   # 退出码、/PURGEDATA 有没有生效、两条用户数据目录删没删、卸载日志写没写全。
@@ -1128,6 +1151,18 @@ jobs:
             libboost-dev libboost-regex-dev \
             libopencc-dev libyaml-cpp-dev libleveldb-dev \
             libgoogle-glog-dev libmarisa-dev
+
+      # 标点表单元测试不需要 librime（只依赖 punct_table.h），几秒钟就能跑完：
+      # 它逐条核对表的内容，并断言「每一项带备选的，都有某个 Shift 键能打开」
+      # —— 2026-11-17 修的就是这个（改之前 18 项里有 11 项永远打不开）。
+      - name: punctuation table unit test
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -Wall \
+            -I third_party/librime/plugins/rimesync-extra \
+            third_party/librime/plugins/rimesync-extra/test/punct_table_test.cc \
+            -o /tmp/rimesync_extra_punct_test
+          /tmp/rimesync_extra_punct_test
 
       # 只编这一个目标（会连带把 librime 编出来），然后直接运行它。
       # BUILD_TEST=OFF：不注册上游那套 gtest 用例，这里只跑 rimesync-extra 的冒烟测试。

@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rime_sync_core::backup::BackupManager;
 use rime_sync_core::cancel::CancelToken;
@@ -24,6 +25,7 @@ use rime_sync_core::webdav::DavClient;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod app_log;
 mod autostart;
 mod backup_cmds;
 mod conflict_cmds;
@@ -43,11 +45,19 @@ mod watch_cmds;
 
 const LOG_CAPACITY: usize = 1000;
 
+/// --setup 短命槽位的有效期：第二次启动带来的请求，超过这个时间就当没来过。
+///
+/// 槽位是**进程内**的（不落盘），所以程序重启后必然为空 ——
+/// 这正是要的：落盘的话就会变成「下次重启程序时莫名弹出设置向导」。
+const SETUP_SLOT_TTL: Duration = Duration::from_secs(5 * 60);
+
 pub(crate) struct Inner {
     pub(crate) cancel: Mutex<Option<CancelToken>>,
     pub(crate) running: AtomicBool,
     /// 启动参数 --setup：前端取走一次后清除，保证只强制打开一次向导。
     pub(crate) setup_request: AtomicBool,
+    /// 第二次启动带来的 --setup：短命槽位（到期时间），前端注册监听后再兜底取一次。
+    pub(crate) setup_slot: Mutex<Option<Instant>>,
     /// 启动参数 --panel <页面>：前端取走一次后清除，保证只切一次页面。
     pub(crate) panel_request: Mutex<Option<String>>,
     pub(crate) log: Mutex<Vec<String>>,
@@ -63,6 +73,7 @@ impl Default for Inner {
             cancel: Mutex::new(None),
             running: AtomicBool::new(false),
             setup_request: AtomicBool::new(false),
+            setup_slot: Mutex::new(None),
             panel_request: Mutex::new(None),
             log: Mutex::new(Vec::new()),
             secret: Mutex::new(None),
@@ -76,18 +87,16 @@ impl Default for Inner {
 pub(crate) struct AppState(pub(crate) Arc<Inner>);
 
 pub(crate) fn push_log(inner: &Inner, message: impl Into<String>) {
-    let line = format!(
-        "[{}] {}",
-        chrono::Local::now().format("%H:%M:%S"),
-        message.into()
-    );
+    let line = app_log::stamp(&message.into());
     if let Ok(mut log) = inner.log.lock() {
-        log.push(line);
+        log.push(line.clone());
         if log.len() > LOG_CAPACITY {
             let excess = log.len() - LOG_CAPACITY;
             log.drain(0..excess);
         }
     }
+    // 同一份内容落盘：内存里那 1000 行只是给界面看的，程序崩了之后能查的是文件。
+    app_log::append_line(&line);
 }
 
 pub(crate) fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -961,31 +970,46 @@ fn cmd_needs_setup(app: AppHandle, _state: State<'_, AppState>) -> Result<bool, 
     Ok(config.webdav.url.trim().is_empty())
 }
 
-/// 前端启动时读取并清除 --setup 请求：true 表示本次必须进入同步设置向导。
-///
-/// 用 swap 而不是单纯读取：一次启动只强制打开一次，之后用户手动关闭不会被重新弹出。
 /// 原生目录选择器（设置页 / 向导里的「浏览…」）。取消时返回 None。
+///
+/// 不占 worker 线程：原生对话框的回调跑在插件自己起的线程上，
+/// 这里用一个异步通道把结果送回来，命令本身 await 即可。
+/// （旧写法是 spawn_blocking + 10 分钟超时：用户不点「取消」时那个线程会被占住十分钟，
+///  六个 spawn_blocking 命令一起排队，表现就是「点了没反应」。）
+///
+/// 为什么不再设超时：等待期间占的是「异步任务」而不是「线程池名额」，
+/// 对另外五个命令没有任何影响；而插件的回调在「用户选定」和「用户取消」时
+/// 都会准时送达（取消 = None），所以「等不到结果」只会出现在对话框压根没弹出来的
+/// 异常情况上。为了不把用户选好的目录丢掉，这里选择等到底而不是超时放弃。
 #[tauri::command]
 async fn cmd_pick_folder(app: AppHandle, title: Option<String>) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        app2.dialog()
-            .file()
-            .set_title(title.unwrap_or_else(|| "选择 Rime 用户目录".to_string()))
-            .pick_folder(move |path| {
-                let _ = tx.send(path);
-            });
-        rx.recv_timeout(std::time::Duration::from_secs(600))
-            .ok()
-            .flatten()
-    })
-    .await
-    .ok()
-    .flatten()
-    .and_then(|path| path.into_path().ok())
-    .map(|path| path.display().to_string())
+    tracing::info!("打开原生目录选择器");
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title(title.unwrap_or_else(|| "选择 Rime 用户目录".to_string()))
+        .pick_folder(move |path| {
+            // 通道容量 1 且只回一次，try_send 不会失败。
+            // 万一前端已经不等了（命令被丢弃），把用户选中的目录记进日志，
+            // 别让它悄无声息地消失。
+            if tx.try_send(path.clone()).is_err() {
+                if let Some(picked) = path {
+                    tracing::info!("前端已不再等待，用户选中的目录：{}", picked);
+                }
+            }
+        });
+    let picked = rx.recv().await.flatten();
+    match picked.and_then(|path| path.into_path().ok()) {
+        Some(path) => {
+            tracing::info!("用户选定了目录：{}", path.display());
+            Some(path.display().to_string())
+        }
+        None => {
+            tracing::info!("用户取消了目录选择");
+            None
+        }
+    }
 }
 
 /// 把「切到某页」的请求交给前端。
@@ -1006,6 +1030,9 @@ fn request_panel(app: &AppHandle, panel: Option<String>, source: &str) {
     let _ = app.emit("panel://request", panel.clone());
 }
 
+/// 前端启动时读取并清除 --setup 请求：true 表示本次必须进入同步设置向导。
+///
+/// 用 swap 而不是单纯读取：一次启动只强制打开一次，之后用户手动关闭不会被重新弹出。
 #[tauri::command]
 fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
     let requested = state.0.setup_request.swap(false, Ordering::SeqCst);
@@ -1013,6 +1040,42 @@ fn cmd_take_setup_request(state: State<'_, AppState>) -> bool {
         push_log(&state.0, "前端已接管 --setup：打开同步设置向导");
         eprintln!(
             "[rime-sync] setup wizard: frontend consumed --setup request; opening sync setup dialog"
+        );
+    }
+    requested
+}
+
+/// 记下一次「第二次启动带来的 --setup」请求（短命槽位）。
+///
+/// 与 `setup_request` 状态位分开：那个位是「本次启动的参数」（只在本进程启动时读一次），
+/// 这个槽位是「运行期间收到的请求」，前端注册完监听后还要再兜底取一次。
+/// 槽位只在进程内活着且带有效期 → 程序重启后读不到，不会莫名再弹向导。
+fn write_setup_slot(inner: &Inner) {
+    if let Ok(mut slot) = inner.setup_slot.lock() {
+        *slot = Some(Instant::now() + SETUP_SLOT_TTL);
+    }
+}
+
+/// 取出短命槽位：读到即清（只开一次向导），过期的当作没有。
+fn take_setup_slot(inner: &Inner) -> bool {
+    let deadline = match inner.setup_slot.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    match deadline {
+        Some(deadline) => Instant::now() <= deadline,
+        None => false,
+    }
+}
+
+/// 短命槽位：前端注册完监听后再兜底取一次（取走即清）。
+#[tauri::command]
+fn cmd_take_setup_slot(state: State<'_, AppState>) -> bool {
+    let requested = take_setup_slot(&state.0);
+    if requested {
+        push_log(&state.0, "前端已接管 --setup 短命槽位：打开同步设置向导");
+        eprintln!(
+            "[rime-sync] setup wizard: frontend consumed the short-lived --setup slot; opening sync setup dialog"
         );
     }
     requested
@@ -1200,12 +1263,14 @@ fn handle_second_instance(app: &AppHandle, argv: Vec<String>) {
     push_log(inner, "收到第二次启动的请求：转交给已在运行的实例");
     eprintln!("[rime-sync] second instance: forwarding request to the running instance");
 
-    // --setup 只发事件，不写 setup_request 状态位：
-    // 那个状态位的语义是「前端下次取走时开向导」，而此时前端早已在跑、不会再取，
-    // 写进去会一直挂着，导致**下次重启程序时莫名弹出设置向导**。
+    // --setup 发事件 + 写短命槽位（两条都留）：
+    // 事件可能早于前端注册监听而丢失，槽位让前端在注册完监听后还能兜底取一次。
+    // 但**不写** setup_request 状态位：那个位是「本次启动的参数」，
+    // 运行期间写进去会一直挂着，变成**下次重启程序时莫名弹出设置向导**。
     if setup_requested(argv.iter().cloned()) {
         push_log(inner, "第二次启动带 --setup：让已有实例打开同步设置向导");
         eprintln!("[rime-sync] second instance: --setup requested; asking the running instance to open the wizard");
+        write_setup_slot(inner);
         let _ = app.emit("setup://request", ());
     }
     if let Some(panel) = panel_requested(argv.iter().cloned()) {
@@ -1224,6 +1289,10 @@ fn handle_second_instance(app: &AppHandle, argv: Vec<String>) {
 }
 
 pub fn run() {
+    // panic 钩子装在最外层入口：release 是 panic = "abort"，
+    // panic 展开后直接 abort，catch_unwind 永远抓不到（prebuilt_cmds 里的兜底同理），
+    // 这个钩子是唯一能把「消息 + 位置 + 线程名」留下来并让用户看见的地方。
+    app_log::install_panic_hook();
     let builder = tauri::Builder::default()
         // 单实例：输入法设置页、开始菜单、托盘点「打开同步」时，
         // 如果主程序已在跑（多半缩在托盘里），就把请求转给已有实例，
@@ -1238,6 +1307,15 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
+            // 落盘日志先建起来：后面的 push_log、core 的 tracing::、panic 钩子
+            // 全都写进这同一个文件。
+            match app_log::init(&handle) {
+                Ok(path) => push_log(&state.0, format!("日志文件：{}", path.display())),
+                Err(error) => push_log(&state.0, format!("日志文件不可用：{error}")),
+            }
+            // 上次启动崩过的话，弹一次提示（abort 会带走同进程的弹窗，
+            // 跨进程的这次提示才是真正能被用户看到的）。
+            app_log::notify_previous_crash();
             push_log(&state.0, "Rime 同步已启动");
             // 环境变量覆盖：启动时先说一声，免得用户以为设置没生效
             //（只报被接管的字段名，绝不打印密码）。
@@ -1326,6 +1404,7 @@ pub fn run() {
             cmd_get_log,
             cmd_needs_setup,
             cmd_take_setup_request,
+            cmd_take_setup_slot,
             cmd_take_panel_request,
             cmd_pick_folder,
             cmd_secret_status,
@@ -1568,7 +1647,11 @@ mod tests {
     #[test]
     fn panel_request_parses_every_known_panel() {
         for name in PANEL_NAMES {
-            let args = vec!["rime-sync-app".to_string(), "--panel".to_string(), name.to_string()];
+            let args = vec![
+                "rime-sync-app".to_string(),
+                "--panel".to_string(),
+                name.to_string(),
+            ];
             assert_eq!(
                 panel_requested(args),
                 Some(name.to_string()),
@@ -1641,5 +1724,73 @@ mod tests {
         *slot.lock().unwrap() = Some("conflicts".to_string());
         let third = slot.lock().unwrap().take();
         assert_eq!(third, Some("conflicts".to_string()));
+    }
+
+    /// --setup 短命槽位的语义：写一次、取一次（取走即清），过期的一律当作没有。
+    ///
+    /// 这是「第二次启动带 --setup，但事件早于前端注册监听而丢失」的兜底通道：
+    /// 前端注册完监听后再取一次，取到就开向导。
+    #[test]
+    fn setup_slot_is_take_once_and_expires() {
+        let inner = Inner::default();
+
+        // 没有请求时取不到
+        assert!(!take_setup_slot(&inner), "没有请求时不能凭空开向导");
+
+        // 写一次、取一次
+        write_setup_slot(&inner);
+        assert!(take_setup_slot(&inner), "刚写进去的请求必须能取到");
+
+        // 取走即清：不会重复开向导
+        assert!(!take_setup_slot(&inner), "取走必须清空，不能重复弹向导");
+
+        // 过期的一律当作没有（免得几小时前的请求在用户回来时突然弹窗）
+        *inner.setup_slot.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!take_setup_slot(&inner), "过期的请求必须被忽略");
+    }
+
+    /// 短命槽位只在进程内：Inner 是纯内存状态，重启后必然读不到。
+    ///
+    /// 这条是「下次重启程序时莫名弹出设置向导」的防线：只要不落盘就不会中招。
+    #[test]
+    fn setup_slot_never_survives_a_restart() {
+        let inner = Inner::default();
+        write_setup_slot(&inner);
+        assert!(take_setup_slot(&inner));
+
+        // 模拟重启：全新的进程状态里没有任何槽位
+        let restarted = Inner::default();
+        assert!(
+            !take_setup_slot(&restarted),
+            "重启后不该还留着 --setup 请求"
+        );
+    }
+
+    /// push_log 必须同时落到磁盘文件：内存里那 1000 行只是给界面看的，
+    /// 程序崩了之后能查的只有文件。
+    #[test]
+    fn push_log_writes_to_the_log_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rime-sync-pushlog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        // 全局句柄只能装一次：拿到「实际生效」的路径再断言。
+        let path = app_log::use_log_for_test(dir.join("log.txt")).expect("日志句柄已就绪");
+
+        let inner = Inner::default();
+        push_log(&inner, "落盘自检：这一行必须能在文件里找到");
+
+        let content = std::fs::read_to_string(&path).expect("读取日志文件");
+        assert!(content.contains("落盘自检"), "{content}");
+        // 界面那份内存日志也要有同一行。
+        assert!(log_tail(&inner, 10)
+            .iter()
+            .any(|line| line.contains("落盘自检")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

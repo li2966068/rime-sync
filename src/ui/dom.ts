@@ -116,6 +116,8 @@ export const el = {
   kindDict: byId<HTMLInputElement>("kind-dict"),
   excludes: byId<HTMLTextAreaElement>("excludes"),
   stopFcitx5: byId<HTMLInputElement>("stop-fcitx5"),
+  closeToTray: byId<HTMLInputElement>("close-to-tray"),
+  closeToTrayError: byId<HTMLParagraphElement>("close-to-tray-error"),
   schemaList: byId<HTMLDivElement>("schema-list"),
   schemaEmpty: byId<HTMLParagraphElement>("schema-empty"),
   schemaStatus: byId<HTMLParagraphElement>("schema-status"),

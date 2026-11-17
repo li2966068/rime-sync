@@ -158,8 +158,9 @@ resolve_config_home() { # $1=目标用户 HOME
 #      见 third_party/fcitx5-rime/src/rimeengine.cpp 的 resolveRimeUserDir；
 #      不统一的话 rime-sync 与引擎会各读各的目录）；
 #   7. 去掉末尾斜杠（根目录除外）。
-# 改规则时必须同步四处：crates/core/src/rime_dir.rs、packaging/linux/postinst、
-# packaging/linux/uninstall.sh、packaging/linux/install-extra-ime.sh。
+# 改规则时必须同步五处：crates/core/src/rime_dir.rs、packaging/linux/postinst、
+# packaging/linux/uninstall.sh、packaging/linux/install-extra-ime.sh、
+# packaging/linux/install.sh（.run 离线安装器）。
 #
 # 注意：bash 的 case pattern 与 ${var#pattern} 都会先做 tilde 展开，
 # 连双引号包住的 ~ 也也不例外（pattern 里的 ~ 会被换成 HOME），所以

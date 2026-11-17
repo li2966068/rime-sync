@@ -1035,25 +1035,34 @@ fn log_prune(log: &dyn Fn(String), inner: &crate::Inner, pruned: &prune::PruneRe
 
 pub(crate) fn bootstrap(app: &AppHandle) {
     let handle = app.clone();
-    std::thread::spawn(move || {
-        // panic 兜底：自举线程崩了，状态不能永远停在 running（界面一直显示「在忙」，
-        // 用户以为程序卡死了）。catch_unwind 之后补发一个 failed 状态。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bootstrap_body(&handle);
-        }));
-        if outcome.is_err() {
-            let state = handle.state::<AppState>();
-            publish_failed_if_not_terminal(
-                &handle,
-                "crashed",
-                "输入法自举异常终止（内部错误）".to_string(),
-            );
-            push_log(
-                &state.0,
-                "[bootstrap] 自举线程异常终止（panic）".to_string(),
-            );
-        }
-    });
+    // 线程名给 panic 钩子用：崩在这个线程上时，钩子会弹「输入法自举失败」。
+    let _ = std::thread::Builder::new()
+        .name(crate::app_log::BOOTSTRAP_THREAD_NAME.to_string())
+        .spawn(move || {
+            // panic 兜底：自举线程崩了，状态不能永远停在 running（界面一直显示「在忙」，
+            // 用户以为程序卡死了）。catch_unwind 之后补发一个 failed 状态。
+            //
+            // 但注意：release 是 panic = "abort"，panic 展开后直接 abort，
+            // **catch_unwind 抓不到**（只有 debug 构建才会走这条路）。
+            // release 下真正兜底的是 app_log 里的 panic 钩子：它把现场写进日志文件，
+            // 并弹「输入法自举失败」的原生对话框。下面这段在 release 里是保险，
+            // 在 debug 里才是主路径。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bootstrap_body(&handle);
+            }));
+            if outcome.is_err() {
+                let state = handle.state::<AppState>();
+                publish_failed_if_not_terminal(
+                    &handle,
+                    "crashed",
+                    "输入法自举异常终止（内部错误）".to_string(),
+                );
+                push_log(
+                    &state.0,
+                    "[bootstrap] 自举线程异常终止（panic）".to_string(),
+                );
+            }
+        });
 }
 
 /// 自举主体：判据 → 铺产物 → 装输入法 → 评估 → 发布状态（见 bootstrap）。

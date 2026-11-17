@@ -606,6 +606,9 @@ export const api = {
   needsSetup: () => invoke<boolean>("cmd_needs_setup"),
   // --setup 启动参数：读取即清除，true = 本次强制进入同步设置向导。
   takeSetupRequest: () => invoke<boolean>("cmd_take_setup_request"),
+  // 第二次启动带来的 --setup 短命槽位：读取即清除（只在进程内活着，重启必为空）。
+  // 事件可能早于前端注册监听而丢失，注册完监听后再兜底取一次。
+  takeSetupSlot: () => invoke<boolean>("cmd_take_setup_slot"),
   // --panel <页面> 启动参数：读取即清除，返回要切换到的页面名（没有则 null）。
   takePanelRequest: () => invoke<string | null>("cmd_take_panel_request"),
   secretStatus: () => invoke<SecretStatus>("cmd_secret_status"),
@@ -680,4 +683,9 @@ export const api = {
   autostartStatus: () => invoke<AutostartState>("cmd_autostart_status"),
   // 开关自启：成功返回写入后的真实状态，失败 reject 可读错误（权限、路径变化等）。
   setAutostart: (enabled: boolean) => invoke<AutostartState>("cmd_set_autostart", { enabled }),
+
+  // 关闭窗口时是否隐藏到托盘（后端存 platform.json，与 config.json 同目录）。
+  getCloseToTray: () => invoke<boolean>("cmd_get_close_to_tray"),
+  // 开关后返回写入后的真实状态，失败 reject 可读错误。
+  setCloseToTray: (enabled: boolean) => invoke<boolean>("cmd_set_close_to_tray", { enabled }),
 };

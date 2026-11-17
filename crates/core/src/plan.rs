@@ -62,6 +62,20 @@ pub struct Classification {
 }
 
 pub fn classify(relative_path: &str) -> Classification {
+    classify_with(relative_path, None)
+}
+
+/// 带「哪些 .txt 词表被 *.dict.yaml 引用过」上下文的分类。
+///
+/// 为什么需要上下文：Rime 用户目录里任何 .txt 都不一定是词表 ——
+/// 随手放个 notes.txt / 备份片段也会被当成词库源上传到 shared/。
+/// 真正的判据是「有没有被某个 *.dict.yaml 的 import_tables 引用」。
+/// 传 None（没有上下文，例如校验远端清单里的路径）时保持旧行为：
+/// .txt 一律当作词库源，允许通过。
+pub fn classify_with(
+    relative_path: &str,
+    dict_sources: Option<&DictSourceIndex>,
+) -> Classification {
     let rel = relative_path.replace('\\', "/");
     let rel = rel.trim_start_matches("./");
     let components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
@@ -103,13 +117,135 @@ pub fn classify(relative_path: &str) -> Classification {
     if name == "user.yaml" || name.ends_with(".custom.yaml") || name.ends_with(".schema.yaml") {
         return make(Category::CustomYaml, "rime config");
     }
-    if name.ends_with(".dict.yaml") || name.ends_with(".txt") {
+    if name.ends_with(".dict.yaml") {
+        return make(Category::DictSource, "dictionary source");
+    }
+    if name.ends_with(".txt") {
+        // 有上下文时只认被 import_tables 引用过的 .txt，其余按未知文件处理（不同步）。
+        if let Some(index) = dict_sources {
+            if !index.contains(name) {
+                return make(Category::Unknown, "not referenced by any *.dict.yaml");
+            }
+        }
         return make(Category::DictSource, "dictionary source");
     }
     if is_conflict_copy(name) {
         return make(Category::Private, "local conflict copy");
     }
     make(Category::Unknown, "not a synced file kind")
+}
+
+/// 被某个 *.dict.yaml 的 import_tables 引用过的 .txt 词表集合。
+///
+/// 只存文件名（import_tables 里写的就是文件名），跨目录取并集。
+#[derive(Debug, Clone, Default)]
+pub struct DictSourceIndex {
+    names: std::collections::BTreeSet<String>,
+}
+
+impl DictSourceIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一个被引用的词表文件名（只取 basename，import_tables 里可能带路径）。
+    ///
+    /// import_tables 里既可能写全名（`words.txt`），也可能只写表名
+    /// （`words`，librime 自己去补 .txt）—— 两种写法都要认。
+    pub fn insert(&mut self, name: &str) {
+        let base = name.rsplit('/').next().unwrap_or(name).trim();
+        if base.is_empty() {
+            return;
+        }
+        self.names.insert(base.to_string());
+        if !base.ends_with(".txt") {
+            self.names.insert(format!("{base}.txt"));
+        }
+    }
+
+    pub fn contains(&self, file_name: &str) -> bool {
+        self.names.contains(file_name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+/// 从一个 *.dict.yaml 的文本里抽出 import_tables 列出的词表名。
+///
+/// 只做「行首 import_tables: + 下面 - xxx」这种最小解析：
+/// 词典头格式是 librime 自己定的（头几行就结束），不需要完整 YAML 解析器；
+/// 解析失败返回空集合，绝不 panic。
+pub fn parse_import_tables(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_import_tables = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+            continue;
+        }
+        if trimmed == "..." {
+            break;
+        }
+        if in_import_tables {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !item.is_empty() {
+                    out.push(item.to_string());
+                }
+                continue;
+            }
+            in_import_tables = false;
+        }
+        if trimmed.starts_with("import_tables:") {
+            in_import_tables = true;
+        }
+    }
+    out
+}
+
+/// 扫描 Rime 用户目录，收集所有 *.dict.yaml 的 import_tables 里引用过的 .txt。
+///
+/// 解析失败的 .dict.yaml 一律当作「没有引用」（不 panic、不影响其它文件）。
+pub fn scan_dict_source_index(root: &std::path::Path) -> DictSourceIndex {
+    let mut index = DictSourceIndex::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 4 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if file_type.is_dir() {
+                if is_excluded_dir(&name) {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+                continue;
+            }
+            if !file_type.is_file() || !name.ends_with(".dict.yaml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for table in parse_import_tables(&text) {
+                index.insert(&table);
+            }
+        }
+    }
+    index
 }
 
 /// 冲突副本形如 default.custom.yaml.conflict-devA-1700000000。
@@ -300,6 +436,7 @@ mod tests {
             Category::CustomYaml
         );
         assert_eq!(classify("words.dict.yaml").category, Category::DictSource);
+        // 没有上下文时 .txt 沿用旧行为（当作词库源），保证远端清单校验不受影响。
         assert_eq!(classify("words.txt").category, Category::DictSource);
         assert_eq!(
             classify("build/main.bin").category,
@@ -372,6 +509,30 @@ mod tests {
         assert!(assert_remote_snapshot_path("sync/devA/main.yaml").is_err());
         assert!(assert_remote_snapshot_path("sync/devA/x.userdb/CURRENT").is_err());
         assert!(assert_remote_snapshot_path("shared/x.userdb.txt").is_err());
+    }
+
+    #[test]
+    fn import_tables_are_parsed_minimally() {
+        let text = "name: a\nimport_tables:\n  - words.txt\n  - 'quoted'\n...\n";
+        assert_eq!(
+            parse_import_tables(text),
+            vec!["words.txt".to_string(), "quoted".to_string()]
+        );
+        // 解析不了就当没有引用，绝不 panic。
+        assert!(parse_import_tables("broken: [").is_empty());
+        assert!(parse_import_tables("").is_empty());
+    }
+
+    #[test]
+    fn dict_source_index_accepts_bare_table_names() {
+        let mut index = DictSourceIndex::new();
+        // librime 的词典头里常常写表名（不带 .txt）。
+        index.insert("cangjie5.base");
+        assert!(index.contains("cangjie5.base"));
+        assert!(index.contains("cangjie5.base.txt"));
+        index.insert("words.txt");
+        assert!(index.contains("words.txt"));
+        assert!(!index.contains("notes.txt"));
     }
 
     #[test]

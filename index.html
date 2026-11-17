@@ -324,6 +324,13 @@
               <input type="checkbox" id="stop-fcitx5" />
               <span><span data-i18n="settings.stopFcitx5">Linux 合并生效时临时停止 fcitx5</span><em data-i18n="settings.stopFcitx5Sub">避免 LevelDB 锁冲突</em></span>
             </label>
+
+            <!-- 关闭窗口时隐藏到托盘：偏好存在 platform.json（后端读同一份）。 -->
+            <label class="check">
+              <input type="checkbox" id="close-to-tray" />
+              <span><span data-i18n="settings.closeToTray">关闭窗口时隐藏到托盘</span><em data-i18n="settings.closeToTraySub">关闭后程序仍在后台运行，点托盘图标可以随时叫回来</em></span>
+            </label>
+            <p class="hint warn-text" id="close-to-tray-error" hidden></p>
           </div>
 
           <!-- 开机自启动：Linux 写 ~/.config/autostart/rime-sync.desktop，

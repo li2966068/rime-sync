@@ -1060,13 +1060,181 @@ prune_extra_schemas() { # 参数 1 = Rime 用户目录（可为空）
   return 0
 }
 
+# ---------------------------------------------------------------- Rime 用户目录
+# fcitx5-rime 可以在 ~/.config/fcitx5/conf/rime.conf 里用 UserDataDirPath 指定
+# 用户数据目录（自建 fcitx5-rime 新增的选项）。fcitx5 真正读写的正是那个目录，
+# 不是默认的 ~/.local/share/fcitx5/rime。
+# 以前这个离线安装器硬编码默认目录，于是受管 custom.yaml 与预编译产物都 seed 到了
+# 没人读的目录，用户真正在用的目录反而缺文件（表现为「切不到五笔 / check-ime 恒 failed」）。
+#
+# 权威实现在 crates/core/src/rime_dir.rs（parse_fcitx5_user_data_dir + detect）。
+# 本地解析规则与它**逐条相同**（下面 resolve_config_home / parse_rime_user_data_dir /
+# resolve_rime_user_dir 与 packaging/linux/postinst 里的同名函数逐字一致，由
+# packaging/linux/test/test-postinst-rime-dir.sh 锁住）。
+#
+# 改规则时必须同步五处：crates/core/src/rime_dir.rs、packaging/linux/postinst、
+# packaging/linux/uninstall.sh、packaging/linux/install-extra-ime.sh、
+# packaging/linux/install.sh。
+#
+# 注意：bash 的 case pattern 与 ${var#pattern} 都会先做 tilde 展开，
+# 连双引号包住的 ~ 也也不例外（pattern 里的 ~ 会被换成 HOME），所以
+# 这里一律不用 glob，改用字符串切片判断前缀。
+
+resolve_config_home() { # $1=目标用户 HOME
+    local home=$1 value="" file=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    if [ -n "${RIMESYNC_TARGET_CONFIG_HOME:-}" ]; then
+        printf '%s' "$RIMESYNC_TARGET_CONFIG_HOME"
+        return 0
+    fi
+    for file in "$home/.pam_environment" "$home/.config/environment" \
+        "$home/.profile" "$home/.bashrc"; do
+        [ -r "$file" ] || continue
+        value=$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?XDG_CONFIG_HOME=' \
+            "$file" 2>/dev/null || true)
+        [ -n "$value" ] || continue
+        value=${value#*=}
+        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        value=${value#\"}
+        value=${value%\"}
+        value=${value#\'}
+        value=${value%\'}
+        # $HOME / ~ 展开成目标用户的 home（用字符串切片，不用 glob）。
+        if [ "${value:0:6}" = '$HOME/' ]; then
+            value=$home/${value:6}
+        elif [ "${value:0:2}" = '~/' ]; then
+            value=$home/${value:2}
+        fi
+        # 只认绝对路径（相对路径按未设置处理）。
+        case "$value" in
+            /*) printf '%s' "$value"; return 0 ;;
+        esac
+    done
+    if [ "$home" = "${HOME:-}" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s' "$XDG_CONFIG_HOME"
+        return 0
+    fi
+    printf '%s' "$home/.config"
+}
+
+parse_rime_user_data_dir() { # $1=目标用户的 HOME
+    local home=$1 conf="" line="" key="" value=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    conf=$(resolve_config_home "$home")/fcitx5/conf/rime.conf
+    if [ -r "$conf" ]; then
+        # 逐行找**第一处**匹配 UserDataDirPath 的行（后面的同名键不覆盖）。
+        # 切分规则与 Rust 的 split_conf_entry 一致：先按 = 切（这样 Windows 盘符
+        # C:\foo 不会被冒号切坏），键名对不上再按第一个 : 切。
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            case "$line" in
+                ""|\#*|\[* ) continue ;;
+            esac
+            key=""
+            value=""
+            case "$line" in
+                *=*) key=${line%%=*}; value=${line#*=} ;;
+            esac
+            key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ "$key" != "UserDataDirPath" ]; then
+                key=""
+                value=""
+                case "$line" in
+                    *:*) key=${line%%:*}; value=${line#*:} ;;
+                esac
+                key=$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                [ "$key" = "UserDataDirPath" ] || continue
+            fi
+            break
+        done <"$conf"
+    fi
+    # 值规范化：去空白 → 剥成对引号 → 剥完再去一次空白。
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$value" ] || { printf ''; return 0; }
+    if [ "$value" = "~" ]; then
+        value=$home
+    elif [ "${value:0:2}" = "~/" ]; then
+        value=$home/${value:2}
+    fi
+    # 必须是绝对路径：相对路径按未设置处理（与 fcitx5 引擎一致）。
+    case "$value" in
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*) : ;;
+        *) printf ''; return 0 ;;
+    esac
+    # 去掉末尾斜杠（根目录除外）。
+    while [ "${value%/}" != "$value" ] && [ "$value" != "/" ]; do value=${value%/}; done
+    # 盘符根 C:/ 去掉斜杠会变成 C:（语义变了），补回来。
+    if [ ${#value} -eq 2 ] && [ "${value:1:1}" = ":" ]; then value="$value/"; fi
+    printf '%s' "$value"
+}
+
+rime_user_dir_from_cli() { # $1=目标用户的 HOME
+    local home=$1 json="" path="" source=""
+    [ -n "$home" ] || return 0
+    command -v rime-sync-cli >/dev/null 2>&1 || return 0
+    # HOME / XDG_CONFIG_HOME 指向目标用户（Rust 侧 config_home 优先用后者），
+    # 并清掉 RIME_USER_DATA_DIR：那是 root 的环境，不是目标用户的。
+    json=$(HOME="$home" XDG_CONFIG_HOME="$(resolve_config_home "$home")" RIME_USER_DATA_DIR= \
+        rime-sync-cli detect --json 2>/dev/null || true)
+    path=$(printf '%s' "$json" | sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    source=$(printf '%s' "$json" | sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$path" ] || return 0
+    printf '%s|%s' "$path" "$source"
+}
+
+resolve_rime_user_dir() { # $1=目标用户的 HOME
+    local home=$1 local_value="" cli_value="" cli_source=""
+    [ -n "$home" ] || { printf ''; return 0; }
+    local_value=$(parse_rime_user_data_dir "$home")
+    cli_value=$(rime_user_dir_from_cli "$home")
+    cli_source=${cli_value#*|}
+    cli_value=${cli_value%%|*}
+    # CLI 的来源决定优先级，与 Rust 的 detect 优先级一一对应：
+    #   argument / env:... ⇒ 用户显式指定，权威值就是它；
+    #   fcitx5-rime:... ⇒ 与本地解析结果相同（都用 rime.conf 的值）；
+    #   known:...        ⇒ CLI 因为该目录当时不存在而回退到了候选目录列表。
+    #     这种情况下 fcitx5 引擎用的仍是 rime.conf 里的目录（引擎自己会创建它），
+    #     所以以本地解析结果为准，否则受管 custom.yaml 会被 seed 到没人读的目录。
+    if [ -n "$cli_value" ] && [ "${cli_source#known:}" != "$cli_source" ]; then
+        cli_value=""
+    fi
+    if [ -n "$cli_value" ]; then
+        printf '%s' "$cli_value"
+        return 0
+    fi
+    if [ -n "$local_value" ]; then
+        printf '%s' "$local_value"
+        return 0
+    fi
+    printf '%s' "$home/.local/share/fcitx5/rime"
+}
 # --------------------------------------------------- recommended user config
 # 与 Windows 安装器一致：缺失才补，已存在的一律沿用（不覆盖、不改名、不备份）。
 # 每装一个版本都会走这一步——卸载旧版不会动用户目录，所以升级后仍是"沿用"。
 if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ] && [ -f /usr/share/rime-sync/defaults/default.custom.yaml ]; then
-  RIME_USER_DIR="$TARGET_HOME/.local/share/fcitx5/rime"
-  install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
-  chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
+  # 用户目录必须与 fcitx5 引擎真正读写的目录一致：用户在
+  # ~/.config/fcitx5/conf/rime.conf 里配了 UserDataDirPath 时，引擎用的是那个目录，
+  # 不是默认的 ~/.local/share/fcitx5/rime（以前这里硬编码默认目录 ⇒ 配置写到了
+  # 没人读的目录，用户真正在用的目录反而缺文件）。
+  RIME_USER_DIR=$(resolve_rime_user_dir "$TARGET_HOME")
+  if [ -z "$RIME_USER_DIR" ]; then
+    say "!! 未能确定 Rime 用户目录，跳过用户配置种子"
+    RIME_USER_DIR=""
+  fi
+  # 只在目录不存在时创建，且不动用户 home 本身的权限。
+  if [ "$RIME_USER_DIR" != "$TARGET_HOME" ] && [ ! -d "$RIME_USER_DIR" ]; then
+    install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
+  fi
+  [ -d "$RIME_USER_DIR" ] && chown "$TARGET_USER" "$RIME_USER_DIR" 2>/dev/null || true
+  # 兼容旧行为：默认目录 ~/.local/share/fcitx5 下可能已有 root 拥有的历史文件。
+  if [ -d "$TARGET_HOME/.local/share/fcitx5" ]; then
+    chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true
+  fi
   if [ ! -f /usr/share/rime-data/wubi86.schema.yaml ]; then
     # 模板只列 3 个保留方案；/usr/share/rime-data 不是随包数据（例如只装了应用、
     # 用发行版 librime-data）时写进去会让 rime 因缺 schema 部署失败。

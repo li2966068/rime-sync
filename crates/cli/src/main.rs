@@ -321,6 +321,18 @@ struct ProbeFailed;
 #[derive(Debug)]
 struct FixImeFailed;
 
+/// transport/apply 同步失败：报告已经打印过（JSON 或人读），main 只负责退出码。
+///
+/// 为什么要有这个标记：同步失败走的是 Report.ok=false 而不是 Err，
+/// 如果让 main 照常打印错误，JSON 模式会多出一行 {"ok":false,...}，
+/// 脚本解析时会看到两条结果。标记让 main 静默退出 1。
+#[derive(Debug)]
+struct SyncFailed;
+
+/// repair-* 修补失败：报告已经打印过，main 只负责退出码（理由同 SyncFailed）。
+#[derive(Debug)]
+struct RepairFailed;
+
 /// repair-schema-list 的 JSON 报告。
 #[derive(Serialize)]
 struct RepairSchemaListJson {
@@ -331,6 +343,8 @@ struct RepairSchemaListJson {
     present: Vec<String>,
     /// 没动：文件不存在 / 没有 schema_list / 列表为空 / 该方案在 data 里不存在。
     skipped: Vec<String>,
+    /// 处理失败（补齐过程报错）。
+    failed: Vec<String>,
     ok: bool,
 }
 
@@ -514,12 +528,30 @@ impl std::fmt::Display for ProbeFailed {
 
 impl std::error::Error for ProbeFailed {}
 
+impl std::fmt::Display for SyncFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sync failed")
+    }
+}
+
+impl std::error::Error for SyncFailed {}
+
+impl std::fmt::Display for RepairFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("repair failed")
+    }
+}
+
+impl std::error::Error for RepairFailed {}
+
 fn main() {
     let cli = Cli::parse();
     let wants_json = cli.json;
     if let Err(error) = run(cli) {
         if error.downcast_ref::<ProbeFailed>().is_some()
             || error.downcast_ref::<FixImeFailed>().is_some()
+            || error.downcast_ref::<SyncFailed>().is_some()
+            || error.downcast_ref::<RepairFailed>().is_some()
         {
             std::process::exit(1);
         }
@@ -614,6 +646,16 @@ fn run(cli: Cli) -> Result<()> {
         }
         if let Err(error) = config.load_proxy_password(secrets.store()) {
             eprintln!("warning: 读取已保存的代理密码失败（继续，按无代理认证处理）: {error:#}");
+        }
+        // 地址里的账号密码自动迁移：成功时不打扰用户；降级（钥匙串存不进去）
+        // 时把原因说清楚 —— 用户的地址没被动过，同步照常能走。
+        if let Some(note) = &config.credential_note {
+            eprintln!("warning: {note}");
+        }
+        // 迁移可能改写了配置文件（地址被剥干净）：重新读一次，
+        // 免得后面 prepare_sync 把旧值（带密码的地址）写回去。
+        if config.credential_migrated {
+            stored = Config::load(&config_path)?;
         }
     }
 
@@ -1475,13 +1517,16 @@ fn run(cli: Cli) -> Result<()> {
                     Err(error) => failed.push(format!("{id}:{error:#}")),
                 }
             }
+            // ok 必须如实反映失败项：之前这里硬编码 ok=true，
+            // 于是 JSON 里同时出现 failed 非空与 ok=true，自相矛盾，脚本会误判成功。
+            let failed_count = failed.len();
             let report = RepairCustomsJson {
                 rime_dir: rime_dir.display().to_string(),
                 repaired,
                 unchanged,
                 skipped,
                 failed,
-                ok: true,
+                ok: failed_count == 0,
             };
             if cli.json {
                 print_json(&report)?;
@@ -1502,7 +1547,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             if !report.failed.is_empty() {
-                bail!("有 {} 个 custom.yaml 修补失败", report.failed.len());
+                eprintln!("error: 有 {} 个 custom.yaml 修补失败", report.failed.len());
+                return Err(anyhow::Error::new(RepairFailed));
             }
             Ok(())
         }
@@ -1534,6 +1580,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut added = Vec::new();
             let mut present = Vec::new();
             let mut skipped = Vec::new();
+            let mut failed = Vec::new();
             match managed_custom::repair_default_schema_list_in(&rime_dir, Some(&allowed)) {
                 Ok(managed_custom::RepairOutcome::Repaired { backup }) => {
                     added = allowed.clone();
@@ -1547,14 +1594,17 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(managed_custom::RepairOutcome::Skipped(reason)) => {
                     skipped.push(reason);
                 }
-                Err(error) => bail!("补齐 schema_list 失败：{error:#}"),
+                Err(error) => failed.push(format!("{error:#}")),
             }
+            // ok 必须如实反映失败项（之前硬编码 true，JSON 自相矛盾）。
+            let failed_count = failed.len();
             let report = RepairSchemaListJson {
                 rime_dir: rime_dir.display().to_string(),
                 added,
                 present,
                 skipped,
-                ok: true,
+                failed,
+                ok: failed_count == 0,
             };
             if cli.json {
                 print_json(&report)?;
@@ -1569,6 +1619,13 @@ fn run(cli: Cli) -> Result<()> {
                 for item in &report.skipped {
                     println!("repair_skipped_reason={item}");
                 }
+                for item in &report.failed {
+                    eprintln!("warning: {item}");
+                }
+            }
+            if !report.failed.is_empty() {
+                eprintln!("error: 补齐 schema_list 失败");
+                return Err(anyhow::Error::new(RepairFailed));
             }
             Ok(())
         }
@@ -1658,16 +1715,33 @@ fn run(cli: Cli) -> Result<()> {
                     );
                 }));
             }
-            let report = if apply_mode {
+            let mut report = if apply_mode {
                 engine.apply()
             } else {
                 engine.transport()
             };
+            // 同步失败必须让脚本看见：报告里带备份 id，用户可以据此回滚。
+            if !report.ok {
+                if let Some(backup_id) = report.backup_id.clone() {
+                    let detail = report
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "同步失败".to_string());
+                    report.error = Some(format!(
+                        "{detail}（还原点备份 {backup_id}，可用 rime-sync-cli rollback {backup_id} 回滚）"
+                    ));
+                }
+            }
+            let succeeded = report.ok;
             if cli.json {
-                print_json(&report)
+                print_json(&report)?;
             } else {
                 print_report(&report);
+            }
+            if succeeded {
                 Ok(())
+            } else {
+                Err(anyhow::Error::new(SyncFailed))
             }
         }
         Command::Watch { debounce_secs } => {
@@ -1945,6 +2019,8 @@ fn print_report(report: &Report) {
 fn count_local(root: &Path) -> Result<(usize, usize)> {
     let mut shared = 0;
     let mut snapshots = 0;
+    // 与引擎一致：只有被 *.dict.yaml 引用过的 .txt 才算词库源。
+    let dict_sources = plan::scan_dict_source_index(root);
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         if depth > 4 {
@@ -1975,7 +2051,10 @@ fn count_local(root: &Path) -> Result<(usize, usize)> {
                 continue;
             };
             let rel = relative.to_string_lossy().replace('\\', "/");
-            if plan::classify(&rel).category.is_shared() {
+            if plan::classify_with(&rel, Some(&dict_sources))
+                .category
+                .is_shared()
+            {
                 shared += 1;
             }
         }

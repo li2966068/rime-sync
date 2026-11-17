@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rime_sync_core::merged_dict::{
-    detect, ensure_pointers, ensure_pointers_with, schema_dictionary, PointerChange,
+    detect, ensure_pointers, ensure_pointers_with, ensure_pointers_with_hook, schema_dictionary,
+    PointerChange,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -487,4 +488,95 @@ fn non_schema_templates_are_not_seeded() {
         "weasel.custom.yaml is a config file, not a schema"
     );
     assert!(changes.iter().all(|change| !change.wrote()));
+}
+
+// -------------------------------------------------------------------------
+// 缺陷 4：指针写入必须走备份闸门 + 原子写盘。
+//
+// 改前：write_pointer 自己写了一份 .rimesync-orig（一次性），并且用 fs::write
+// 直接覆盖 —— 这一份改动在 App 的备份列表里看不到，用户没法回滚；
+// 而且写到一半崩溃会留下半截文件。
+// -------------------------------------------------------------------------
+
+/// 覆盖前必须先过备份闸门（引擎里接的是 BackupManager）。
+#[test]
+fn pointer_write_goes_through_the_backup_hook() {
+    let (rime_dir, data_dir) = scene("backup-hook");
+    let custom = rime_dir.join("luna_pinyin_simp.custom.yaml");
+    write(&custom, &custom_yaml_without_pointer());
+    let dirs = vec![data_dir];
+
+    let mut backed_up: Vec<PathBuf> = Vec::new();
+    // hook 里读到的必须还是**旧内容** ⇒ 备份发生在改写之前。
+    let mut content_at_backup: Vec<String> = Vec::new();
+    let mut backup = |path: &Path| -> anyhow::Result<()> {
+        backed_up.push(path.to_path_buf());
+        content_at_backup.push(fs::read_to_string(path).unwrap_or_default());
+        Ok(())
+    };
+
+    let changes = ensure_pointers_with_hook(&rime_dir, &dirs, &[], &mut backup);
+
+    assert!(
+        change_for(&changes, "luna_pinyin_simp")
+            .expect("change")
+            .wrote(),
+        "指针应当被写入：{changes:?}"
+    );
+    assert_eq!(
+        backed_up,
+        vec![custom.clone()],
+        "改写指针前必须先备份那一份文件：{backed_up:?}"
+    );
+    assert!(
+        content_at_backup
+            .first()
+            .map(|text| text.contains("menu/page_size"))
+            .unwrap_or(false),
+        "备份必须发生在改写之前：{content_at_backup:?}"
+    );
+}
+
+/// 写盘必须是原子的：写完之后目录里不留临时文件，旧内容另存一份。
+#[test]
+fn pointer_write_is_atomic_and_keeps_a_copy_of_the_old_content() {
+    let (rime_dir, data_dir) = scene("atomic");
+    let custom = rime_dir.join("luna_pinyin_simp.custom.yaml");
+    let original = custom_yaml_without_pointer();
+    write(&custom, &original);
+    let dirs = vec![data_dir];
+
+    let changes = ensure_pointers(&rime_dir, &dirs);
+    assert!(change_for(&changes, "luna_pinyin_simp")
+        .expect("change")
+        .wrote());
+
+    let text = fs::read_to_string(&custom).expect("read");
+    assert!(
+        text.contains("\"translator/dictionary\": merged"),
+        "指针应当写进去了：{text}"
+    );
+    // 旧内容留底（.rimesync-orig），出问题能手工还原。
+    let orig = rime_sync_core::data_patch::backup_path(&custom);
+    assert!(orig.is_file(), "旧内容必须留底：{}", orig.display());
+    assert_eq!(
+        fs::read_to_string(&orig).expect("read orig"),
+        original,
+        "留底的内容必须是改动前的那一份"
+    );
+    // 原子写：临时文件必须已经消失（不能留在用户目录里）。
+    let leftovers: Vec<PathBuf> = fs::read_dir(&rime_dir)
+        .expect("read dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().contains("rimesync-tmp"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "原子写不许留下临时文件：{leftovers:?}"
+    );
 }

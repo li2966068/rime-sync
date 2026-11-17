@@ -78,6 +78,36 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release tag: $tag"
 
+      # 版本闸：tag 的版本号必须与 tauri.conf.json 的 version 一致。
+      # 两者不一致时，latest.json 里的版本（取自 tag）与资产文件名里的版本
+      # （取自 tauri.conf.json）会各说各话，更新器一比就报「有新版本」，
+      # 而且错的那个版本号已经进了公开 release，撤不干净。
+      # 所以这一闸必须**最先**跑：早于建草稿（草稿一旦建出来，tag 打错也已经
+      # 在仓库里留痕）、早于任何 runner 时间开销。
+      - name: checkout tag ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: gate tag version matches manifest version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_version="${TAG#v}"
+          manifest_version=$(grep -m1 '"version"' src-tauri/tauri.conf.json \
+            | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          if [ -z "$manifest_version" ]; then
+            echo "::error::读不出 src-tauri/tauri.conf.json 的 version 字段"
+            exit 1
+          fi
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag 版本与清单版本不一致：tag=${TAG}（${tag_version}）vs src-tauri/tauri.conf.json（${manifest_version}）。请把 tauri.conf.json 的 version 改成 ${tag_version} 后重打 tag。"
+            exit 1
+          fi
+          echo "版本闸通过：${tag_version}"
+
       - name: create or reuse draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
