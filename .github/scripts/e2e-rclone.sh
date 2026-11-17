@@ -63,10 +63,16 @@ cat > "$RIME/luna_pinyin.dict.yaml" <<'YAML'
 name: luna_pinyin
 version: "1.0"
 sort: by_weight
+import_tables:
+  - custom_phrase.txt
 ...
 你好	ni hao	100
 YAML
+# 被 luna_pinyin.dict.yaml 的 import_tables 引用的词表：应该跟着同步。
 printf '# 词表\n你好\n世界\n' > "$RIME/custom_phrase.txt"
+# 没人引用的孤立 .txt：按 2026-11-17 的新规则（只同步被 import_tables 引用的
+# .txt）不该上云 —— 它多半是用户目录里的临时文件或别人的词库残留。
+printf '# 孤立词表\n不该上云\n' > "$RIME/orphan_phrase.txt"
 # 红线样本：LevelDB 目录本体绝不能被搬运
 printf 'leveldb-current\n' > "$RIME/luna_pinyin.userdb/CURRENT"
 printf 'leveldb-log\n' > "$RIME/luna_pinyin.userdb/LOG"
@@ -132,7 +138,10 @@ grep -q "rime-sync/sync/$DEVICE/config/files/default.custom.yaml" <<<"$MANIFEST1
   || fail "远端缺少 sync/$DEVICE/config/files/default.custom.yaml（每设备配置目录）"
 grep -q "rime-sync/sync/$DEVICE/luna_pinyin.userdb.txt" <<<"$MANIFEST1" \
   || fail "远端缺少 sync/$DEVICE/luna_pinyin.userdb.txt"
-grep -q "custom_phrase.txt" <<<"$MANIFEST1" || fail "远端缺少 custom_phrase.txt"
+grep -q "custom_phrase.txt" <<<"$MANIFEST1" \
+  || fail "远端缺少 custom_phrase.txt（它被 luna_pinyin.dict.yaml 的 import_tables 引用，应当同步）"
+grep -q "orphan_phrase.txt" <<<"$MANIFEST1" \
+  && fail "远端出现 orphan_phrase.txt（没人引用它的 .txt 不该上云）"
 
 log "断言红线（*.userdb / shared 下的 *.userdb.txt）"
 USERDB_HITS="$(find "$REMOTE" -name '*.userdb' -print)"

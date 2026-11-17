@@ -275,17 +275,6 @@ jobs:
       - name: guard · desktop default feature 包含 custom-protocol
         run: bash scripts/ci/assert-desktop-default-feature.sh src-tauri/Cargo.toml
 
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: install extraction tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
-
-      - name: verifier selftest
-        run: bash .github/scripts/verify-artifacts.sh --selftest
-
       # 随包产物「逐字节没变」断言的自检：合成仓库证明双向有效 ——
       # 完整产物必须放行；把随包产物移出索引（空过场景）、清单少一条 / 多一条、
       # 字节被改（模拟 checkout 转行尾）都必须被拦住。
@@ -302,6 +291,29 @@ jobs:
       # 「桌面 default feature 必须含 custom-protocol」这道断言的自检。
       - name: desktop-default-feature assertion selftest
         run: bash scripts/ci/assert-desktop-default-feature.sh --selftest
+
+  # 断言脚本自检：用合成产物证明「少一个功能入口就会红」。
+  # 真实产物验收在 release.yml 的 verify-artifacts job（那里才有 deb / setup.exe）；
+  # 这里每次 push/PR 都跑，成本约 20 秒（无需编译）。
+  #
+  # 2026-11-17：这个 job 在阶段四那批只在本地的提交里被连带删掉了 ——
+  # 因为那些提交没推送过，CI 从来没验证过它，删了也没人发现。
+  # 下面 packaging-scripts 里那道「ci.yml 必须有 verify-artifacts job」的护栏
+  # 就是这次把它抓出来的。
+  verify-artifacts:
+    name: verify-artifacts · 断言脚本自检
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install extraction tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: verifier selftest
+        run: bash .github/scripts/verify-artifacts.sh --selftest
 
   e2e:
     name: e2e · rclone webdav transport
