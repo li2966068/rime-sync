@@ -33,6 +33,7 @@ export const el = {
   listRemote: byId<HTMLButtonElement>("btn-list-remote"),
   connStatus: byId<HTMLDivElement>("conn-status"),
   networkStatus: byId<HTMLParagraphElement>("network-status"),
+  probeNetwork: byId<HTMLButtonElement>("btn-probe-network"),
   remoteList: byId<HTMLDivElement>("remote-list"),
   secretStatus: byId<HTMLSpanElement>("secret-status"),
 

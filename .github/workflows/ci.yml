@@ -197,8 +197,15 @@ jobs:
       # 纯逻辑单测（Node 自带 node:test，不引测试框架）。
       # 覆盖的是「外部参数能指定哪些页面」这条安全性质：
       # 启动参数 --panel、单实例转发、托盘动作都只能切到白名单里的五个页面。
+      #
+      # 用 find 收集**全部** *.test.ts（不只 src/ 顶层）：
+      # 以前写死 `src/*.test.ts`，于是 src/ui/ 下的测试（密码遮罩等）
+      # 根本没被 CI 跑过 —— 改了也不报错，等于没护栏。
       - name: unit tests (node --test)
-        run: node --experimental-strip-types --test src/*.test.ts
+        run: |
+          mapfile -t tests < <(find src -name '*.test.ts' | sort)
+          echo "running: ${tests[*]}"
+          node --experimental-strip-types --test "${tests[@]}"
 
   # 桌面端（src-tauri）的单元测试护栏。
   #

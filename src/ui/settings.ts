@@ -18,6 +18,7 @@ import { refreshSecretStatus } from "./secret";
 import { proxyDraft, proxyValidationError, renderProxy } from "./proxy";
 import { loadDevices } from "./devices";
 import { renderDeviceKeys } from "./device_keys";
+import { resetPasswordField } from "./password";
 
 // 设置页：配置回填、草稿与保存、Rime 目录、设备名称（label）。
 
@@ -28,8 +29,8 @@ export function renderConfig(next: Config): void {
   setConfig(next);
   el.url.value = next.webdav.url;
   el.user.value = next.webdav.username;
-  // 后端序列化时跳过 password，这里可能是 undefined。
-  el.pass.value = next.webdav.password ?? "";
+  // 后端不返回密码（也不该返回）：密码框显示掩码，占位表示「已保存，留空即沿用」。
+  resetPasswordField(next.webdav.password ?? "");
   el.dir.value = next.webdav.remote_dir;
   renderProxy(next.proxy);
   el.rimeDir.value = next.rime_dir ?? "";

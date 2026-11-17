@@ -163,3 +163,164 @@ fn snapshot_upload_proceeds_when_remote_etag_matches() {
         report.error
     );
 }
+
+/// 没有本地基线时**也要**先 HEAD 一次：没基线恰恰是最危险的窗口
+/// （那正是「别的设备先上传过」的时段）。上传时带上远端当前的 ETag。
+#[test]
+fn a_snapshot_without_a_local_baseline_still_uses_if_match() {
+    let rime = temp_dir("snap-nobaseline");
+    let state = temp_dir("snap-nobaseline-state");
+    let local_bytes = b"local snapshot content".to_vec();
+    let remote_bytes = b"already on the server".to_vec();
+
+    let snapshot_dir = rime.join("sync").join("devA");
+    fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot dir");
+    fs::write(
+        snapshot_dir.join("luna_pinyin_simp.userdb.txt"),
+        &local_bytes,
+    )
+    .expect("write snapshot");
+
+    let mock = MockDav::start(vec![(SNAPSHOT_REL, remote_bytes.clone())]);
+
+    // 故意不写 index.json ⇒ 本机没有任何基线。
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let report = engine.transport();
+
+    assert!(
+        mock.requests()
+            .iter()
+            .any(|(method, path)| method == "HEAD" && path == SNAPSHOT_REL),
+        "没有基线时也必须先 HEAD：{:?}",
+        mock.requests()
+    );
+    let if_match = mock.if_match_headers();
+    assert!(
+        if_match
+            .iter()
+            .any(|(path, value)| path == SNAPSHOT_REL && value == &etag_for(&remote_bytes)),
+        "上传必须带远端当前的 ETag（If-Match）：{:?}",
+        if_match
+    );
+    assert!(
+        !report.upload_conflict,
+        "没有基线不等于冲突：conflicts={:?}",
+        report.conflicts
+    );
+}
+
+/// 弱 ETag（`W/"..."`）**不能**进 If-Match：RFC 用强比较 ⇒ 发了就永远 412。
+/// 所以客户端要把弱 ETag 剥掉再比较，并且干脆不发 If-Match。
+#[test]
+fn a_weak_etag_is_never_sent_as_if_match() {
+    let rime = temp_dir("snap-weak");
+    let state = temp_dir("snap-weak-state");
+    let local_bytes = b"local snapshot content".to_vec();
+    let remote_bytes = b"server returns a weak etag".to_vec();
+
+    let snapshot_dir = rime.join("sync").join("devA");
+    fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot dir");
+    fs::write(
+        snapshot_dir.join("luna_pinyin_simp.userdb.txt"),
+        &local_bytes,
+    )
+    .expect("write snapshot");
+
+    let mock = MockDav::start(vec![(SNAPSHOT_REL, remote_bytes.clone())]);
+    mock.set_weak_etag(SNAPSHOT_REL);
+
+    // 本地基线记的是同一个 ETag（但写成弱的形式）⇒ 归一化后应当判定「没变」。
+    let mut index = FileIndex {
+        version: INDEX_VERSION,
+        ..FileIndex::default()
+    };
+    index.snapshots.insert(
+        SNAPSHOT_REL.to_string(),
+        FileMeta {
+            sha256: sha256_hex(b"older content"),
+            size: local_bytes.len() as u64,
+            mtime: "0".to_string(),
+            etag: Some(format!("W/{}", etag_for(&remote_bytes))),
+        },
+    );
+    fs::write(
+        state.join("index.json"),
+        serde_json::to_string_pretty(&index).expect("index json"),
+    )
+    .expect("write index");
+
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let report = engine.transport();
+
+    // 弱 ETag 一律不发进 If-Match（否则服务端永远 412，同步直接瘫掉）。
+    for (path, value) in mock.if_match_headers() {
+        assert!(
+            !value.starts_with("W/") && !value.starts_with("w/"),
+            "弱 ETag 不许进 If-Match：{path} => {value}"
+        );
+    }
+    assert!(
+        !report
+            .conflicts
+            .iter()
+            .any(|item| item.contains("另一台设备刚写过这个词库")),
+        "弱 ETag 归一化后应当判定「没变」，不该报冲突：{:?}",
+        report.conflicts
+    );
+    assert_eq!(
+        mock.snapshot()
+            .get(SNAPSHOT_REL)
+            .map(|bytes| bytes.as_slice()),
+        Some(local_bytes.as_slice()),
+        "本机快照应当上传成功（不能因为弱 ETag 变成永久 412）：{:?}",
+        report.error
+    );
+}
+
+/// ETag 对不上时，除了记冲突，还必须把「这轮没上传成功」标出来
+/// —— CLI 的退出码与桌面端的成败提示都靠它（否则用户以为已经推上去了）。
+#[test]
+fn an_etag_mismatch_marks_the_run_as_an_upload_conflict() {
+    let rime = temp_dir("snap-flag");
+    let state = temp_dir("snap-flag-state");
+    let local_bytes = b"local snapshot content".to_vec();
+    let remote_bytes = b"written by another device".to_vec();
+
+    let snapshot_dir = rime.join("sync").join("devA");
+    fs::create_dir_all(&snapshot_dir).expect("mkdir snapshot dir");
+    fs::write(
+        snapshot_dir.join("luna_pinyin_simp.userdb.txt"),
+        &local_bytes,
+    )
+    .expect("write snapshot");
+
+    let mock = MockDav::start(vec![(SNAPSHOT_REL, remote_bytes.clone())]);
+
+    let mut index = FileIndex {
+        version: INDEX_VERSION,
+        ..FileIndex::default()
+    };
+    index.snapshots.insert(
+        SNAPSHOT_REL.to_string(),
+        FileMeta {
+            sha256: sha256_hex(b"previous version"),
+            size: local_bytes.len() as u64,
+            mtime: "0".to_string(),
+            etag: Some("\"stale-etag-from-last-sync\"".to_string()),
+        },
+    );
+    fs::write(
+        state.join("index.json"),
+        serde_json::to_string_pretty(&index).expect("index json"),
+    )
+    .expect("write index");
+
+    let mut engine = engine_for(&mock, &rime, &state, FirstSyncPolicy::Normal);
+    let report = engine.transport();
+
+    assert!(
+        report.upload_conflict,
+        "上传被拒时必须标出 upload_conflict（CLI 的退出码靠它）：conflicts={:?}",
+        report.conflicts
+    );
+}

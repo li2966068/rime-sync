@@ -304,3 +304,302 @@ fn an_overridden_address_leaves_the_stored_one_untouched() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// 回归（2026-11-17 复核发现）：钥匙串不可用时迁移会「降级」——
+/// 内存里是剥干净的地址，磁盘上仍是带凭据的老地址。这种情况下
+/// **用户在设置页里改的地址必须能存下去**，不能被还原逻辑无声吞掉。
+///
+/// 吞掉的路径：save 只看「要不要还原」，不看「用户改没改过」⇒ 用户换了地址
+/// 一保存就又变回老地址，界面上看着改了、磁盘上没改。
+#[test]
+fn a_users_own_change_is_not_swallowed_by_the_restore_logic() {
+    let dir = scratch("user-edit");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    // 钥匙串不可用 ⇒ 走降级分支（内存里剥干净、磁盘上保持原样）。
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut config = Config::load(&path).expect("load config");
+    config.load_password(&store).expect("load password");
+    assert_eq!(
+        config.webdav.url, "https://example.com/dav",
+        "降级时内存里用的是剥干净的地址"
+    );
+
+    // 用户在设置页里换了一个新地址（这是用户明确的意思，必须存下来）。
+    config.webdav.url = "https://my-new-server.example.com/dav".to_string();
+    config.webdav.username = "bob".to_string();
+    config.save(&path).expect("save config");
+
+    let json = read_json(&path);
+    assert_eq!(
+        json["webdav"]["url"], "https://my-new-server.example.com/dav",
+        "用户自己改的地址必须存下来，不能被还原成老地址"
+    );
+    assert_eq!(
+        json["webdav"]["username"], "bob",
+        "用户自己填的用户名也要存下来"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 同上，但用户**只**改地址、没改用户名 —— 只还原没被改过的那一半。
+#[test]
+fn only_the_untouched_field_is_restored() {
+    let dir = scratch("user-edit-partial");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut config = Config::load(&path).expect("load config");
+    config.load_password(&store).expect("load password");
+
+    // 用户只换了地址。
+    config.webdav.url = "https://my-new-server.example.com/dav".to_string();
+    config.save(&path).expect("save config");
+
+    let json = read_json(&path);
+    assert_eq!(
+        json["webdav"]["url"],
+        "https://my-new-server.example.com/dav"
+    );
+    // 用户名没被改过 ⇒ 仍按老规矩还原（内存里是 alice、磁盘上是空）。
+    assert_eq!(
+        json["webdav"]["username"], "",
+        "没被用户改过的字段按原规则还原"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 用户什么都没改时，老规矩不变：磁盘上仍是带凭据的原地址（密码没搬走）。
+#[test]
+fn an_untouched_config_keeps_the_original_address_on_disk() {
+    let dir = scratch("untouched");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut config = Config::load(&path).expect("load config");
+    config.load_password(&store).expect("load password");
+    config.save(&path).expect("save config");
+
+    let raw = fs::read_to_string(&path).expect("read config");
+    assert!(
+        raw.contains("alice:s3cr3t@example.com"),
+        "用户没动过 ⇒ 磁盘上保持原地址（密码没搬进后端，剥干净会丢密码）：{raw}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 回归（缺陷 D1，降级模式）：密码后端写不进去时，密码**只**存在于磁盘配置的
+/// 地址里（`https://alice:s3cr3t@example.com/dav`）。用户在界面上**只改地址**
+/// 保存，密码必须跟着地址一起保住 —— 既不能被还原逻辑吞掉（地址退回旧的），
+/// 也不能凭空消失（下次启动再也连不上）。
+///
+/// 界面上没有密码（后端不外泄），所以密码只能从**磁盘原值**里取，
+/// 再随新地址一起写回去。
+#[test]
+fn degraded_mode_keeps_the_password_when_the_address_changes() {
+    let dir = scratch("degraded-carry");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    // 这一轮读配置：迁移降级（内存里剥干净，磁盘上保持原样）。
+    let mut session = Config::load(&path).expect("load config");
+    session.load_password(&store).expect("load password");
+    assert_eq!(session.webdav.url, "https://example.com/dav");
+    assert_eq!(session.webdav.password, "s3cr3t");
+
+    // 界面回传的配置：地址被用户改了，密码字段是空的（前端拿不到密码）。
+    let disk = Config::load(&path).expect("reload disk config");
+    let mut submitted = Config::default();
+    submitted.webdav.url = "https://my-new-server.example.com/dav".to_string();
+
+    // 后端在保存前把磁盘上的凭据搬到新地址上。
+    assert!(
+        submitted.carry_webdav_credentials(&disk),
+        "凭据必须被搬走，否则唯一那份密码就丢了"
+    );
+    assert_eq!(submitted.webdav.password, "s3cr3t", "内存里也要有密码");
+    submitted.save(&path).expect("save config");
+
+    let json = read_json(&path);
+    assert_eq!(
+        json["webdav"]["url"], "https://alice:s3cr3t@my-new-server.example.com/dav",
+        "新地址必须存下来，密码也必须还在地址里"
+    );
+    assert_eq!(json["webdav"]["username"], "", "用户名没改过就不该动");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 同上，但用户**没改地址**：磁盘上的原样保留（密码不能被剥干净）。
+#[test]
+fn degraded_mode_keeps_the_password_when_nothing_changes() {
+    let dir = scratch("degraded-untouched");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut session = Config::load(&path).expect("load config");
+    session.load_password(&store).expect("load password");
+
+    let disk = Config::load(&path).expect("reload disk config");
+    let mut submitted = Config::default();
+    submitted.webdav.url = "https://example.com/dav".to_string();
+    assert!(
+        !submitted.carry_webdav_credentials(&disk),
+        "没改地址 ⇒ 不搬（只是把还原基准立起来）"
+    );
+    submitted.save(&path).expect("save config");
+
+    let raw = fs::read_to_string(&path).expect("read config");
+    assert!(
+        raw.contains("alice:s3cr3t@example.com"),
+        "用户没动过 ⇒ 磁盘上保持原地址（密码没搬进后端，剥干净会丢密码）：{raw}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 用户**换了账号**（用户名和地址里的那个不一样）：旧密码多半不适用，
+/// 更不能把旧凭据塞进新地址 —— 那会让下次启动直接报「地址里还有密码」的
+/// 冲突，用户彻底连不上。这种情况下宁可不搬，让用户重新填密码。
+#[test]
+fn a_different_username_does_not_carry_the_old_credentials() {
+    let dir = scratch("degraded-other-user");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut session = Config::load(&path).expect("load config");
+    session.load_password(&store).expect("load password");
+
+    let disk = Config::load(&path).expect("reload disk config");
+    let mut submitted = Config::default();
+    submitted.webdav.url = "https://my-new-server.example.com/dav".to_string();
+    submitted.webdav.username = "bob".to_string();
+    assert!(
+        !submitted.carry_webdav_credentials(&disk),
+        "换了账号就不该搬旧凭据"
+    );
+    submitted.save(&path).expect("save config");
+
+    let json = read_json(&path);
+    assert_eq!(
+        json["webdav"]["url"],
+        "https://my-new-server.example.com/dav"
+    );
+    assert_eq!(json["webdav"]["username"], "bob");
+    let raw = fs::read_to_string(&path).expect("read config");
+    assert!(
+        !raw.contains("s3cr3t"),
+        "换了账号 ⇒ 旧密码不许被塞进新地址：{raw}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 搬过去的凭据必须还能被原样拆回来：密码里带 `@` `:` 等字符时要编码。
+#[test]
+fn carried_credentials_can_be_split_back() {
+    let dir = scratch("degraded-tricky");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:p@ss:word@example.com/dav", "", "none");
+    let store = FakeStore::new(SecretBackend::Keyring, true);
+
+    let mut session = Config::load(&path).expect("load config");
+    session.load_password(&store).expect("load password");
+
+    let disk = Config::load(&path).expect("reload disk config");
+    let mut submitted = Config::default();
+    submitted.webdav.url = "https://my-new-server.example.com/dav".to_string();
+    assert!(submitted.carry_webdav_credentials(&disk));
+    submitted.save(&path).expect("save config");
+
+    let json = read_json(&path);
+    let url = json["webdav"]["url"].as_str().expect("url");
+    let creds = rime_sync_core::webdav::split_userinfo(url).expect("凭据必须还在地址里");
+    assert_eq!(creds.username, "alice");
+    assert_eq!(creds.password.as_deref(), Some("p@ss:word"));
+    assert_eq!(creds.clean_url, "https://my-new-server.example.com/dav");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 地址里带账号密码、且能拆开：**不算错**。
+///
+/// 以前的做法是直接拒绝 ⇒ 用户从老配置升级后同步直接不能用；
+/// 现在客户端自己会拆（凭据只进请求头），所以配置检查应当放行。
+#[test]
+fn a_credential_url_that_can_be_split_passes_validation() {
+    let dir = scratch("validate-ok");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "", "none");
+
+    let config = Config::load(&path).expect("load config");
+    config.validate().expect("能拆开的凭据地址不该被拒绝");
+
+    // 「用户名」字段填的正好就是地址里那个账号 ⇒ 同样放行。
+    let dir = scratch("validate-same-user");
+    let path = dir.join("config.json");
+    write_config(
+        &path,
+        "https://alice:s3cr3t@example.com/dav",
+        "alice",
+        "none",
+    );
+    let config = Config::load(&path).expect("load config");
+    config.validate().expect("账号一致时不该被拒绝");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 地址里的账号与「用户名」字段打架 ⇒ 报错，但报错里不许出现明文密码。
+#[test]
+fn a_conflicting_username_is_reported_without_the_plaintext_password() {
+    let dir = scratch("validate-conflict");
+    let path = dir.join("config.json");
+    write_config(&path, "https://alice:s3cr3t@example.com/dav", "bob", "none");
+
+    let config = Config::load(&path).expect("load config");
+    let error = format!("{:#}", config.validate().expect_err("必须报错"));
+    assert!(error.contains("用户名"), "{error}");
+    assert!(!error.contains("s3cr3t"), "报错里不许出现明文密码：{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 畸形地址（主机为空）⇒ 报错并说清该怎么改。
+#[test]
+fn an_unparsable_credential_url_is_rejected() {
+    let dir = scratch("validate-broken");
+    let path = dir.join("config.json");
+    write_config(&path, "https://host@/dav", "", "none");
+
+    let config = Config::load(&path).expect("load config");
+    let error = format!("{:#}", config.validate().expect_err("必须报错"));
+    assert!(error.contains("用户名"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// 地址里**只有密码、没有账号**（`https://:pass@host`）：这种服务器是有的。
+///
+/// 密码后端以「用户名」为键，空账号没法当键用 ⇒ 密码只在内存里用，
+/// 磁盘上的地址保持原样（用户下次启动仍然能用），同步照常能走。
+#[test]
+fn an_empty_username_with_only_a_password_still_works() {
+    let dir = scratch("empty-user");
+    let path = dir.join("config.json");
+    write_config(&path, "https://:s3cr3t@example.com/dav", "", "none");
+    let before = fs::read_to_string(&path).expect("read config");
+    let store = FakeStore::new(SecretBackend::Keyring, false);
+
+    let mut config = Config::load(&path).expect("load config");
+    let password = config.load_password(&store).expect("降级不算错误");
+    assert_eq!(password.as_deref(), Some("s3cr3t"), "凭据不能丢");
+    assert_eq!(config.webdav.url, "https://example.com/dav");
+    assert_eq!(store.set_count(), 0, "空账号不许写进密码后端");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read config"),
+        before,
+        "磁盘上的地址必须原样保留"
+    );
+    config.validate().expect("这种地址不该让同步直接不能用");
+    let _ = fs::remove_dir_all(&dir);
+}

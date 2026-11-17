@@ -78,7 +78,13 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release tag: $tag"
 
-      # 版本闸：tag 的版本号必须与 tauri.conf.json 的 version 一致。
+      # 版本闸：tag 的版本号必须与**四处**版本来源一致。
+      # 只有 tauri.conf.json 一处是不够的（2026-11-17 复核发现）：
+      # root Cargo.toml 忘了改的话，桌面程序显示 0.7.1、随包的
+      # rime-sync-cli 却显示 0.7.0 —— 全链路没人拦（assert-cli-matches-source.sh
+      # 只断言「CLI 版本 == Cargo.toml 版本」，不与 tag 比）。
+      # 四处都要一致：root Cargo.toml（workspace 版本，CLI/core 继承它）、
+      # src-tauri/Cargo.toml、src-tauri/tauri.conf.json、package.json。
       # 两者不一致时，latest.json 里的版本（取自 tag）与资产文件名里的版本
       # （取自 tauri.conf.json）会各说各话，更新器一比就报「有新版本」，
       # 而且错的那个版本号已经进了公开 release，撤不干净。
@@ -90,23 +96,39 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 1
 
-      - name: gate tag version matches manifest version
+      - name: gate tag version matches every version source
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           tag_version="${TAG#v}"
+
           manifest_version=$(grep -m1 '"version"' src-tauri/tauri.conf.json \
             | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-          if [ -z "$manifest_version" ]; then
-            echo "::error::读不出 src-tauri/tauri.conf.json 的 version 字段"
-            exit 1
-          fi
-          if [ "$tag_version" != "$manifest_version" ]; then
-            echo "::error::tag 版本与清单版本不一致：tag=${TAG}（${tag_version}）vs src-tauri/tauri.conf.json（${manifest_version}）。请把 tauri.conf.json 的 version 改成 ${tag_version} 后重打 tag。"
-            exit 1
-          fi
-          echo "版本闸通过：${tag_version}"
+          workspace_version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -1)
+          tauri_cargo_version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src-tauri/Cargo.toml | head -1)
+          package_version=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' package.json | head -1)
+
+          missing=0
+          for pair in \
+            "src-tauri/tauri.conf.json:${manifest_version}" \
+            "Cargo.toml:${workspace_version}" \
+            "src-tauri/Cargo.toml:${tauri_cargo_version}" \
+            "package.json:${package_version}"; do
+            file="${pair%%:*}"
+            value="${pair#*:}"
+            if [ -z "$value" ]; then
+              echo "::error::读不出 ${file} 的 version 字段"
+              missing=1
+              continue
+            fi
+            if [ "$value" != "$tag_version" ]; then
+              echo "::error::版本不一致：${file}（${value}）vs tag ${TAG}（${tag_version}）。请把 ${file} 的 version 改成 ${tag_version} 后重打 tag。"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "版本闸通过：${tag_version}（四处版本来源一致）"
 
       - name: create or reuse draft release
         env:

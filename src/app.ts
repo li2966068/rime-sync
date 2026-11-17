@@ -5,9 +5,10 @@ import { toast } from "./ui/toast";
 import { clearLog, localLog, loadLog } from "./ui/logs";
 import { settleModal } from "./ui/modal";
 import { refreshSecretStatus } from "./ui/secret";
+import { markPasswordEdited } from "./ui/password";
 import { beginSaveBackupKeep, loadBackups, createBackup, deleteBackup, pruneBackups, restoreBackup } from "./ui/backups";
 import { renderConfig, switchToTwoWay, saveRimeDir, pickRimeDir, detectRimeDir, randomDeviceId, settleDeviceChoice, settleMigrateChoice, saveSettings } from "./ui/settings";
-import { saveConnection, testConnection, probeWrite, listRemote, refreshNetwork } from "./ui/connection";
+import { saveConnection, testConnection, probeWrite, listRemote, refreshNetwork, probeNetworkStatus } from "./ui/connection";
 import { syncProxyDisabled } from "./ui/proxy";
 import { renderProgress, renderReport, run } from "./ui/sync";
 import { previewSync } from "./ui/plan";
@@ -28,6 +29,7 @@ import { loadCloseToTray, toggleCloseToTray } from "./ui/tray_prefs";
 import { forcedSetupMode, lateSetupMode } from "./setup_request";
 import { loadSchemas, ensureSchemasLoaded, toggleSchema, moveSchema, saveSchemas } from "./ui/schemas";
 import { runFixIme } from "./ui/fix_ime";
+import { mountPruneCard } from "./ui/prune";
 import {
   elevateForIme,
   pickExtraPackage,
@@ -99,6 +101,9 @@ export function bindEvents(): void {
     el.togglePass.setAttribute("aria-pressed", String(!showing));
   });
 
+  // 用户手动改密码框 ⇒ 掩码失效（提交时按用户填的值走）。
+  el.pass.addEventListener("input", markPasswordEdited);
+
   el.proxyEnabled.addEventListener("change", syncProxyDisabled);
 
   el.saveConn.addEventListener("click", () => {
@@ -112,6 +117,9 @@ export function bindEvents(): void {
   });
   el.listRemote.addEventListener("click", () => {
     void listRemote();
+  });
+  el.probeNetwork.addEventListener("click", () => {
+    void probeNetworkStatus();
   });
   el.preset.addEventListener("change", () => {
     void applyPresetTo(el.preset.value, el.url, el.presetHint, el.preset);
@@ -570,6 +578,8 @@ export async function subscribe(): Promise<void> {
 
 export async function init(): Promise<void> {
   bindEvents();
+  // 方案清理卡片：运行时挂上去（见 ui/prune.ts 的说明）。
+  mountPruneCard();
   el.language.value = getLang();
   applyI18n();
   // 尽早把界面语言告诉后端（失败对话框是原生窗口，语言要靠后端自己判断）。

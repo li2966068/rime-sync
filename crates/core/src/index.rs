@@ -40,6 +40,20 @@ pub struct FileIndex {
     /// 已推送到远端 sync/<device>/ 的快照，避免重复上传。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub snapshots: BTreeMap<String, FileMeta>,
+    /// 这份基线对应的**远端身份**（服务器地址 + 远端目录的指纹）。
+    ///
+    /// 为什么要有：CLI 与桌面端现在共用同一个状态目录（`~/.config/rime-sync`），
+    /// 但两边的 config.json 仍是两份 —— 用户完全可能把两端配成**不同的服务器**。
+    /// 那时它们会共用同一份基线：一端刚推上去的文件在另一端眼里成了
+    /// 「本地被改过」，于是凭空冒出一堆假冲突。
+    ///
+    /// 有了这个字段就能认出来：基线属于别的远端 ⇒ 把它当作「没有基线」
+    /// （等于该设备第一次接入那个服务器），而不是拿它去比。
+    ///
+    /// 老文件没有这个字段（空串）⇒ 不做强校验，直接沿用，避免升级就把
+    /// 老用户的基线作废。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote: String,
 }
 
 fn default_version() -> u32 {
@@ -52,6 +66,7 @@ impl Default for FileIndex {
             version: INDEX_VERSION,
             files: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            remote: String::new(),
         }
     }
 }

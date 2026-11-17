@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::{data_dir, ensure_config, log_tail, state_dir, AppState};
+use crate::{config_dir, data_dir, ensure_config, log_tail, state_dir, AppState};
 
 const LOG_LINES: usize = 500;
 
@@ -237,7 +237,9 @@ fn install_deps_present() -> bool {
 }
 
 fn read_install_warning(app: &AppHandle) -> InstallWarning {
-    let Ok(dir) = state_dir(app) else {
+    // 注意：告警文件由 postinst 写在**应用配置目录**里（~/.config/com.rimesync.app/），
+    // 不是共享状态目录 —— 安装器那边写死了这个位置，状态目录搬家不影响它。
+    let Ok(dir) = config_dir(app) else {
         return InstallWarning::default();
     };
     let path = dir.join(INSTALL_WARNING_FILE);
@@ -362,7 +364,9 @@ pub fn cmd_export_diagnostics(
         "rime_dir": config.rime_dir,
         "device_id": config.device_id,
         "secret_backend": format!("{:?}", config.password_ref).to_lowercase(),
-        "config_dir": state_dir(&app).map(|path| path.display().to_string()).unwrap_or_default(),
+        // config_dir = 配置文件所在目录（升级不搬它）；state_dir = 基线与备份所在目录。
+        "config_dir": config_dir(&app).map(|path| path.display().to_string()).unwrap_or_default(),
+        "state_dir": state_dir(&app).map(|path| path.display().to_string()).unwrap_or_default(),
         "backup_count": backups.len(),
         "watch_running": watching,
         "generated_at": rime_sync_core::backup::now_secs(),

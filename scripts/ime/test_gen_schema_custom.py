@@ -52,13 +52,25 @@ FAILS = []
 
 
 # 生成器的兜底表（PUNCT_PRIMARY）与插件表（punct_table.h）之间的**已知差异**。
-# 每一处都必须写清楚原因；改了插件表而不同步这里（或反过来），CI 就要变红。
+#
+# 2026-11-17 复核发现：原来这里只是「键集合」，比对时遇到就 `continue` 跳过 ——
+# 那等于**掩盖差异**：插件表里 '\\' 的主字符被改成第三个值（既不是生成器的
+# '、'、也不是当前的 '＼'）时，两处检查都不命中，CI 全绿。
+# 现在登记成「键 → 插件侧必须精确等于的值」：值变了就报错，差异消失了也报错。
+#
+# plugin 为 None 表示「插件故意没有这一项」。
 PUNCT_DIVERGENCE = {
-    "\\": "插件直出全角反斜杠 '＼'（2026-11-11 起），生成器仍是顿号 '、'；"
-          "改它会牵动 packaging/rime 的产物（custom.yaml + 编译好的 "
-          "build/*.schema.yaml），必须连同编译产物一起重新生成",
-    "|": "插件故意**不含** '|' 这一项：它是 '\\' 的 Shift 孪生，菜单挂在 "
-         "'\\' 上（见 punct_table.h 的 FindShiftAlternatives）",
+    "\\": {
+        "plugin": "＼",
+        "reason": "插件直出全角反斜杠 '＼'（2026-11-11 起），生成器仍是顿号 '、'；"
+                  "改它会牵动 packaging/rime 的产物（custom.yaml + 编译好的 "
+                  "build/*.schema.yaml），必须连同编译产物一起重新生成",
+    },
+    "|": {
+        "plugin": None,
+        "reason": "插件故意**不含** '|' 这一项：它是 '\\' 的 Shift 孪生，菜单挂在 "
+                  "'\\' 上（见 punct_table.h 的 FindShiftAlternatives）",
+    },
 }
 
 # 插件有、生成器没有覆盖的键：这些键在 Rime 自带的 punctuator 里本来就直出
@@ -250,6 +262,15 @@ def punct_table_consistency(gen):
     mismatched = []
     for key, char in gen.PUNCT_PRIMARY.items():
         if key in PUNCT_DIVERGENCE:
+            # 已知差异：不是「跳过」，而是「插件侧必须精确等于登记的值」——
+            # 登记值变了（或者差异悄悄消失了）都要报错。
+            expected = PUNCT_DIVERGENCE[key]["plugin"]
+            actual = table[key][0] if key in table else None
+            if actual != expected:
+                mismatched.append(
+                    "%s: 已知差异登记的插件值是 %r，实际 %r（登记或插件表改了？）"
+                    % (key, expected, actual)
+                )
             continue
         if key not in table:
             mismatched.append("%s: 生成器有、插件没有" % key)

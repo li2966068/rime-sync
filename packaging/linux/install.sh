@@ -1230,7 +1230,11 @@ if [ -n "$TARGET_USER" ] && [ -n "$TARGET_HOME" ] && [ -f /usr/share/rime-sync/d
   if [ "$RIME_USER_DIR" != "$TARGET_HOME" ] && [ ! -d "$RIME_USER_DIR" ]; then
     install -d -m 700 "$RIME_USER_DIR" 2>/dev/null || true
   fi
-  [ -d "$RIME_USER_DIR" ] && chown "$TARGET_USER" "$RIME_USER_DIR" 2>/dev/null || true
+  # Rime 用户目录就是 home 本身时（用户把 rime.conf 的 UserDataDirPath 指到了 ~），
+  # **绝不能 chown home**（2026-11-17 复核发现）：那会动整个家目录的属主。
+  if [ -n "$RIME_USER_DIR" ] && [ "$RIME_USER_DIR" != "$TARGET_HOME" ] && [ -d "$RIME_USER_DIR" ]; then
+    chown "$TARGET_USER" "$RIME_USER_DIR" 2>/dev/null || true
+  fi
   # 兼容旧行为：默认目录 ~/.local/share/fcitx5 下可能已有 root 拥有的历史文件。
   if [ -d "$TARGET_HOME/.local/share/fcitx5" ]; then
     chown -R "$TARGET_USER" "$TARGET_HOME/.local/share/fcitx5" 2>/dev/null || true

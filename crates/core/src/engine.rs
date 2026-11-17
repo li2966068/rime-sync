@@ -91,6 +91,13 @@ pub struct Report {
     /// apply 合并后本地词库的条目数（merge 后 userdb 导出）；导出失败或未 apply 时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_entries: Option<usize>,
+    /// 本轮有上传因为远端已被别人改动而被拒绝（快照上传冲突）。
+    ///
+    /// 为什么单独一个字段而不是直接置 `ok = false`：`apply` 路径里
+    /// `ok = false` 会在合并**之前**就返回（备份已经建了但一个字都没合并），
+    /// 上传冲突不该把整轮 apply 掐死 —— 但它必须让调用方看见「这轮没推上去」。
+    #[serde(default)]
+    pub upload_conflict: bool,
 }
 
 /// 预演里的单个动作类型。语义与真实 transport 的写操作一一对应。
@@ -353,8 +360,24 @@ impl Engine {
             Some(&config.proxy),
         )?;
         let index_path = state_dir.join("index.json");
-        let index_existed = index_path.is_file();
-        let index = FileIndex::load(&index_path)?;
+        let mut index_existed = index_path.is_file();
+        let mut index = FileIndex::load(&index_path)?;
+        // 基线归属校验：CLI 与桌面端现在共用同一个状态目录，但两边的
+        // config.json 仍是两份 —— 用户可能把两端配成不同的服务器。
+        // 基线属于别的远端时不能拿它去比（会凭空冒出假冲突），
+        // 应当当作「这台设备第一次接入这个服务器」。
+        let identity = remote_identity(&config);
+        if !index.remote.is_empty() && index.remote != identity {
+            tracing::info!(
+                "index belongs to another remote, treating as first sync: {} != {}",
+                index.remote,
+                identity
+            );
+            index = FileIndex::default();
+            // 基线作废 ⇒ 这一轮按「首次接入」走（首同步保护会接管）。
+            index_existed = false;
+        }
+        index.remote = identity;
         let retry_path = state_dir.join("retry.json");
         // 退避状态读不出来（文件损坏 / 读不动）不能静默当成「从没失败过」：
         // 用户看到的必须是「状态丢了」，而不是一份假的干净状态。
@@ -1547,40 +1570,47 @@ impl Engine {
             }
             // 并发保护（不是优化，是义务）：远端可能已经被**另一台设备**改过，
             // 这时直接 PUT 就是静默覆盖。做法是：
-            //   ① 有本地基线时先 HEAD 一次拿到远端 ETag，与本地记录的 ETag 比；
-            //      不一致 ⇒ 远端被别人写过，记冲突并跳过本轮上传；
-            //   ② 上传时带上 If-Match（远端 ETag），让服务端在 HEAD→PUT 之间
+            //   ① **一律**先 HEAD 一次拿到远端 ETag（哪怕本机还没有基线 ——
+            //      没基线时恰恰最危险：那正是「别人先上传过」的窗口）；
+            //   ② 有本地基线时，把基线 ETag 与远端 ETag 比；不一致 ⇒ 远端被别人
+            //      写过，记冲突并跳过本轮上传；
+            //   ③ 上传时带上 If-Match（远端当前 ETag），让服务端在 HEAD→PUT 之间
             //      又被人改动时直接回 412，同样记成冲突而不是覆盖。
-            // 没有 ETag 的服务器不做 If-Match，但仍走 ① 的比对（能比就比）。
+            // 没有 ETag（服务器不给）或 HEAD 失败的服务器不做 If-Match，
+            // 但仍走 ② 的比对（能比就比）。
             let known_etag = previous.as_ref().and_then(|meta| meta.etag.clone());
-            let remote_etag = if previous.is_some() {
-                // HEAD 失败（服务器不支持 HEAD、临时 5xx）不能把整轮同步搞挂：
-                // 取不到 ETag 就退回到「不带 If-Match」的旧行为，只是少了并发保护。
-                match self.dav.head(&rel) {
-                    Ok(entry) => entry.and_then(|item| item.etag),
-                    Err(error) => {
-                        tracing::debug!("HEAD {rel} failed, upload without If-Match: {error:#}");
-                        None
-                    }
+            let remote_etag = match self.dav.head(&rel) {
+                Ok(entry) => entry.and_then(|item| item.etag),
+                Err(error) => {
+                    // HEAD 失败（服务器不支持 HEAD、临时 5xx）不能把整轮同步搞挂：
+                    // 取不到 ETag 就退回到「不带 If-Match」的旧行为，只是少了并发保护。
+                    tracing::debug!("HEAD {rel} failed, upload without If-Match: {error:#}");
+                    None
                 }
-            } else {
-                None
             };
             if let (Some(known), Some(remote)) = (&known_etag, &remote_etag) {
-                if known != remote {
+                // 比较用归一化后的形式：同一文件的 ETag 在 HEAD 与 PROPFIND 里
+                // 可能一个带 `W/` 一个不带，直接比字符串会把「没变」判成「变了」。
+                if crate::webdav::etag_token(known) != crate::webdav::etag_token(remote) {
                     report.conflicts.push(format!(
                         "{rel}: 另一台设备刚写过这个词库（远端版本与本机记录不一致，本轮未覆盖）"
                     ));
+                    report.upload_conflict = true;
                     continue;
                 }
             }
             self.emit("push", index, total, format!("upload {rel}"));
-            match self.put(&rel, &bytes, remote_etag.as_deref(), "snapshot upload")? {
+            // 弱 ETag 不能进 If-Match（RFC 强比较 ⇒ 永远 412）；过滤在 put 里做。
+            let if_match = remote_etag
+                .as_deref()
+                .and_then(crate::webdav::if_match_value);
+            match self.put(&rel, &bytes, if_match.as_deref(), "snapshot upload")? {
                 PutOutcome::Written => {}
                 PutOutcome::PreconditionFailed => {
                     report.conflicts.push(format!(
                         "{rel}: 另一台设备刚写过这个词库（服务端拒绝覆盖，本轮未上传）"
                     ));
+                    report.upload_conflict = true;
                     continue;
                 }
             }
@@ -2468,6 +2498,24 @@ impl Engine {
     }
 }
 
+/// 远端身份指纹：服务器地址 + 远端目录。
+///
+/// 用来判断「本地这份基线是不是属于这个远端」。
+/// CLI 与桌面端共用同一个状态目录，但两边的配置文件仍是两份 ——
+/// 用户可能把两端配成不同的服务器，这时共用基线就会互相污染。
+fn remote_identity(config: &Config) -> String {
+    let url = config.webdav.url.trim();
+    let dir = config.webdav.remote_dir.trim();
+    // 归一化：末尾斜杠有与否、大小写差异都算同一个远端，
+    // 否则用户改个斜杠就会凭空丢一份基线。
+    let normalized = format!(
+        "{}\n{}",
+        url.trim_end_matches('/').to_ascii_lowercase(),
+        dir.trim_end_matches('/')
+    );
+    sha256_hex(normalized.as_bytes())
+}
+
 /// SPEC-4 §A1 判定核心：本地无基线，且远端已有别的设备目录或 shared 文件。
 pub fn first_sync_needed(index_existed: bool, other_devices: usize, shared_files: usize) -> bool {
     !index_existed && (other_devices > 0 || shared_files > 0)
@@ -2514,10 +2562,12 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+    // 原子写（先写同目录临时文件再改名）：断电/进程被杀不会留下**半个**词库文件
+    // （半个 userdb.txt 会让 librime 直接读坏）。
+    // 权限：目标已存在 ⇒ 保留原权限（用户的 custom.yaml 可能是 600）；
+    // 新文件 ⇒ 由 umask 决定（用户目录本身通常是 700）。
+    crate::atomic::write_atomic(path, bytes)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -2820,6 +2870,7 @@ mod tests {
             merged_pointer_written: true,
             pending_merge: true,
             merged_entries: Some(42),
+            upload_conflict: false,
         };
         let json = serde_json::to_value(&report).expect("json");
         assert_eq!(json["pushed"], 2);

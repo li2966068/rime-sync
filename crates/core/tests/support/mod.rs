@@ -52,10 +52,27 @@ pub fn etag_for(bytes: &[u8]) -> String {
     format!("\"{}\"", rime_sync_core::index::sha256_hex(bytes))
 }
 
+/// 弱 ETag（`W/"..."`）：有些服务器就这么返回。
+///
+/// 弱 ETag **不能**进 If-Match（RFC 7232 用强比较 ⇒ 永远 412），
+/// 所以客户端必须先把它剥掉再比较、并且干脆不发。
+fn etag_for_rel(bytes: &[u8], weak: bool) -> String {
+    let strong = etag_for(bytes);
+    if weak {
+        format!("W/{strong}")
+    } else {
+        strong
+    }
+}
+
 #[derive(Default)]
 struct RemoteState {
     files: BTreeMap<String, Vec<u8>>,
     requests: Vec<(String, String)>,
+    /// 这些路径的 ETag 要按**弱 ETag**（`W/"..."`）返回：模拟某些服务器。
+    weak: BTreeSet<String>,
+    /// 每次带 If-Match 的请求：(路径, If-Match 的原值)。
+    if_match_log: Vec<(String, String)>,
 }
 
 pub struct MockDav {
@@ -169,6 +186,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<RemoteState>) -> std::io::Result<(
     let rel = rel_from_path(&path);
     let mut guard = state.lock().expect("lock");
     guard.requests.push((method.clone(), rel.clone()));
+    if let Some(value) = if_match.as_deref() {
+        guard.if_match_log.push((rel.clone(), value.to_string()));
+    }
 
     match method.as_str() {
         "PROPFIND" => {
@@ -178,10 +198,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<RemoteState>) -> std::io::Result<(
         }
         "GET" => {
             let bytes = guard.files.get(&rel).cloned();
+            let weak = guard.weak.contains(&rel);
             drop(guard);
             match bytes {
                 Some(bytes) => {
-                    let etag = etag_for(&bytes);
+                    let etag = etag_for_rel(&bytes, weak);
                     respond(&mut stream, "200 OK", &bytes, true, Some(&etag))
                 }
                 None => respond(&mut stream, "404 Not Found", b"", true, None),
@@ -189,10 +210,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<RemoteState>) -> std::io::Result<(
         }
         "HEAD" => {
             let bytes = guard.files.get(&rel).cloned();
+            let weak = guard.weak.contains(&rel);
             drop(guard);
             match bytes {
                 Some(bytes) => {
-                    let etag = etag_for(&bytes);
+                    let etag = etag_for_rel(&bytes, weak);
                     respond(&mut stream, "200 OK", &bytes, false, Some(&etag))
                 }
                 None => respond(&mut stream, "404 Not Found", b"", false, None),
@@ -280,7 +302,7 @@ fn propfind(state: &RemoteState, rel: &str) -> (&'static str, Vec<u8>) {
 
     let mut xml = String::from("<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\">");
     if is_file {
-        push_file_entry(&mut xml, rel, &state.files[rel]);
+        push_file_entry(&mut xml, rel, &state.files[rel], state.weak.contains(rel));
     } else {
         if !rel.is_empty() {
             push_dir_entry(&mut xml, rel);
@@ -294,7 +316,7 @@ fn propfind(state: &RemoteState, rel: &str) -> (&'static str, Vec<u8>) {
             if is_dir {
                 push_dir_entry(&mut xml, &child_rel);
             } else if let Some(bytes) = state.files.get(&child_rel) {
-                push_file_entry(&mut xml, &child_rel, bytes);
+                push_file_entry(&mut xml, &child_rel, bytes, state.weak.contains(&child_rel));
             }
         }
     }
@@ -308,8 +330,8 @@ fn push_dir_entry(xml: &mut String, rel: &str) {
     ));
 }
 
-fn push_file_entry(xml: &mut String, rel: &str, bytes: &[u8]) {
-    let etag = etag_for(bytes);
+fn push_file_entry(xml: &mut String, rel: &str, bytes: &[u8], weak: bool) {
+    let etag = etag_for_rel(bytes, weak);
     xml.push_str(&format!(
         "<D:response><D:href>{REMOTE_PREFIX}/{rel}</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getetag>{etag}</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
         bytes.len()
@@ -385,5 +407,19 @@ impl MockDav {
     /// 完整请求记录（method, rel），用于断言具体路径。
     pub fn requests(&self) -> Vec<(String, String)> {
         self.state.lock().expect("lock").requests.clone()
+    }
+
+    /// 让这个路径的 ETag 按**弱 ETag**（`W/"..."`）返回。
+    pub fn set_weak_etag(&self, rel: &str) {
+        self.state
+            .lock()
+            .expect("lock")
+            .weak
+            .insert(rel.to_string());
+    }
+
+    /// 所有带过 If-Match 的请求：(路径, If-Match 原值)。
+    pub fn if_match_headers(&self) -> Vec<(String, String)> {
+        self.state.lock().expect("lock").if_match_log.clone()
     }
 }

@@ -2,6 +2,8 @@
 //!
 //! 这些函数是所有上传/下载的唯一闸门：引擎不允许绕过它们直接拼远端路径。
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
@@ -122,8 +124,9 @@ pub fn classify_with(
     }
     if name.ends_with(".txt") {
         // 有上下文时只认被 import_tables 引用过的 .txt，其余按未知文件处理（不同步）。
+        // 比较用相对路径优先、basename 兜底：同名但不同目录的文件不算被引用。
         if let Some(index) = dict_sources {
-            if !index.contains(name) {
+            if !index.contains_rel(rel) {
                 return make(Category::Unknown, "not referenced by any *.dict.yaml");
             }
         }
@@ -135,12 +138,24 @@ pub fn classify_with(
     make(Category::Unknown, "not a synced file kind")
 }
 
-/// 被某个 *.dict.yaml 的 import_tables 引用过的 .txt 词表集合。
+/// 作用域目录的「未知」标记：只知道文件名、不知道在哪个目录（宽松匹配）。
+const UNKNOWN_DIR: &str = "*";
+
+/// 被某个 *.dict.yaml 的 import_tables 引用过的 .txt 词表索引。
 ///
-/// 只存文件名（import_tables 里写的就是文件名），跨目录取并集。
+/// 索引同时记两样东西：
+///
+/// 1. **候选相对路径**（相对 rime 用户目录根，`/` 分隔）。import_tables 里写
+///    `dict/words.txt` 时就是它本身；写纯文件名 `words.txt` 时按 librime 的解析
+///    基准（用户目录根）记成 `words.txt`，同时把引用它的 `*.dict.yaml` 所在目录
+///    也算一份候选（很多用户把词典和词表放在同一个 `dict/` 子目录下）。
+/// 2. **basename → 作用域目录集合**。比较时优先用相对路径，basename 只作兜底，
+///    并且能表达「同名但不同目录 ⇒ 不算被引用」：引用 `dict/a.dict.yaml` 里的
+///    `a.txt` 不会让 `extra/a.txt` 变成被引用的词表。
 #[derive(Debug, Clone, Default)]
 pub struct DictSourceIndex {
-    names: std::collections::BTreeSet<String>,
+    paths: BTreeSet<String>,
+    by_basename: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl DictSourceIndex {
@@ -148,104 +163,353 @@ impl DictSourceIndex {
         Self::default()
     }
 
-    /// 记录一个被引用的词表文件名（只取 basename，import_tables 里可能带路径）。
+    /// 记录一次引用：只知道文件名、不知道在哪个目录（宽松，命中任何同名文件）。
     ///
     /// import_tables 里既可能写全名（`words.txt`），也可能只写表名
     /// （`words`，librime 自己去补 .txt）—— 两种写法都要认。
     pub fn insert(&mut self, name: &str) {
-        let base = name.rsplit('/').next().unwrap_or(name).trim();
-        if base.is_empty() {
+        let name = name.trim();
+        if name.is_empty() {
             return;
         }
-        self.names.insert(base.to_string());
-        if !base.ends_with(".txt") {
-            self.names.insert(format!("{base}.txt"));
+        self.paths.insert(name.to_string());
+        if !name.ends_with(".txt") {
+            self.paths.insert(format!("{name}.txt"));
+        }
+        self.by_basename
+            .entry(name.to_string())
+            .or_default()
+            .insert(UNKNOWN_DIR.to_string());
+        if !name.ends_with(".txt") {
+            self.by_basename
+                .entry(format!("{name}.txt"))
+                .or_default()
+                .insert(UNKNOWN_DIR.to_string());
         }
     }
 
+    /// 记录一次引用：`dir` 是引用它的 `*.dict.yaml` 所在目录
+    /// （相对 rime 用户目录根，`""` 表示根目录）。
+    pub fn insert_ref(&mut self, dir: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let dir = dir.trim_matches('/');
+        let (own_dir, base) = match name.rsplit_once('/') {
+            Some((dir, base)) => (dir.trim_matches('/').to_string(), base.to_string()),
+            None => (String::new(), name.to_string()),
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        let mut scopes: Vec<String> = Vec::new();
+        if !own_dir.is_empty() {
+            // import_tables 自带目录 ⇒ 相对 rime 根，librime 也按用户目录根解析。
+            candidates.push(format!("{own_dir}/{base}"));
+            scopes.push(own_dir);
+        } else {
+            // 纯文件名：librime 按用户目录根找；同时把词典所在目录算一份候选。
+            candidates.push(base.clone());
+            scopes.push(String::new());
+            if !dir.is_empty() {
+                candidates.push(format!("{dir}/{base}"));
+                scopes.push(dir.to_string());
+            }
+        }
+        for candidate in &candidates {
+            self.paths.insert(candidate.clone());
+            if !candidate.ends_with(".txt") {
+                self.paths.insert(format!("{candidate}.txt"));
+            }
+        }
+        for scope in &scopes {
+            self.by_basename
+                .entry(base.clone())
+                .or_default()
+                .insert(scope.clone());
+        }
+        if !base.ends_with(".txt") {
+            let variant = format!("{base}.txt");
+            for scope in &scopes {
+                self.by_basename
+                    .entry(variant.clone())
+                    .or_default()
+                    .insert(scope.clone());
+            }
+        }
+    }
+
+    /// 把远端（其它设备）上某个 `*.dict.yaml` 的内容并进索引。
+    ///
+    /// 远端清单里的 `.txt` 不能只看本机有没有引用：别的设备引用的词表，
+    /// 本机没引用它时若判成 Unknown，那个文件就既不同步也拉不下来（半迁移）。
+    /// `rel_path` 是该 dict.yaml 相对 rime 根的路径，用来定位它引用的词表目录。
+    pub fn insert_remote_dict_yaml(&mut self, rel_path: &str, text: &str) {
+        let dir = rel_path
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.to_string())
+            .unwrap_or_default();
+        for table in parse_import_tables(text) {
+            self.insert_ref(&dir, &table);
+        }
+    }
+
+    /// 合并另一份索引（远端字典源）。
+    pub fn merge(&mut self, other: &DictSourceIndex) {
+        self.paths.extend(other.paths.iter().cloned());
+        for (base, scopes) in &other.by_basename {
+            self.by_basename
+                .entry(base.clone())
+                .or_default()
+                .extend(scopes.iter().cloned());
+        }
+    }
+
+    /// 宽松查询：这个**文件名**（不含目录）是否被引用过。
     pub fn contains(&self, file_name: &str) -> bool {
-        self.names.contains(file_name)
+        let base = file_name.rsplit('/').next().unwrap_or(file_name).trim();
+        self.by_basename.contains_key(base)
+    }
+
+    /// 严格查询：这个**相对路径**指向的 `.txt` 是否被引用过。
+    ///
+    /// 相对路径优先；basename 只作兜底，而且同名不同目录不算命中。
+    pub fn contains_rel(&self, relative_path: &str) -> bool {
+        let rel = relative_path.replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        if rel.is_empty() {
+            return false;
+        }
+        if self.paths.contains(rel) {
+            return true;
+        }
+        let (dir, base) = match rel.rsplit_once('/') {
+            Some((dir, base)) => (dir.to_string(), base.to_string()),
+            None => (String::new(), rel.to_string()),
+        };
+        match self.by_basename.get(&base) {
+            Some(scopes) => scopes.contains(&dir) || scopes.contains(UNKNOWN_DIR),
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.paths.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.paths.is_empty()
     }
 }
 
 /// 从一个 *.dict.yaml 的文本里抽出 import_tables 列出的词表名。
 ///
-/// 只做「行首 import_tables: + 下面 - xxx」这种最小解析：
+/// 认得三种写法（词表名可以带引号，引号会被剥掉）：
+///
+/// ```yaml
+/// import_tables: [words.txt, "quoted.txt"]   # 内联数组
+/// import_tables:                             # 缩进列表
+///   - words.txt
+///   - 'quoted.txt'
+/// ```
+///
 /// 词典头格式是 librime 自己定的（头几行就结束），不需要完整 YAML 解析器；
 /// 解析失败返回空集合，绝不 panic。
 pub fn parse_import_tables(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_import_tables = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+    let mut lines = text.lines().peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line == "---" {
             continue;
         }
-        if trimmed == "..." {
+        if line == "..." {
             break;
         }
-        if in_import_tables {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
-                if !item.is_empty() {
-                    out.push(item.to_string());
+        let Some(rest) = line.strip_prefix("import_tables") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            // 缩进列表：下面连续的 `- xxx` 都算引用。
+            for item in lines.by_ref() {
+                let item = item.trim();
+                if item.is_empty() || item.starts_with('#') {
+                    continue;
                 }
-                continue;
+                let Some(value) = item.strip_prefix('-') else {
+                    break;
+                };
+                push_table_name(&mut out, value);
             }
-            in_import_tables = false;
+            continue;
         }
-        if trimmed.starts_with("import_tables:") {
-            in_import_tables = true;
+        if rest.starts_with('[') {
+            // 内联数组：允许跨行（`[` 之后没 `]` 就接着读下一行）。
+            let mut buffer = rest.to_string();
+            while !buffer.contains(']') {
+                let Some(next) = lines.next() else {
+                    break;
+                };
+                buffer.push(' ');
+                buffer.push_str(next.trim());
+            }
+            for item in split_flow_items(&buffer) {
+                push_table_name(&mut out, &item);
+            }
         }
     }
     out
 }
 
+/// 去掉行尾注释与引号后，把一个表名塞进结果。
+fn push_table_name(out: &mut Vec<String>, raw: &str) {
+    let value = strip_comment(raw);
+    let value = value.trim();
+    let value = unquote(value);
+    if !value.is_empty() {
+        out.push(value.to_string());
+    }
+}
+
+/// 去掉 YAML 行尾注释（`#` 必须在引号外）。
+fn strip_comment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if *byte == open {
+                    quote = None;
+                }
+            }
+            None => {
+                if *byte == b'"' || *byte == b'\'' {
+                    quote = Some(*byte);
+                } else if *byte == b'#' && (index == 0 || bytes[index - 1].is_ascii_whitespace()) {
+                    return &raw[..index];
+                }
+            }
+        }
+    }
+    raw
+}
+
+/// 剥掉成对的单/双引号。
+fn unquote(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+/// 拆内联数组 `[a.txt, "b.txt"]` 里的元素。
+fn split_flow_items(buffer: &str) -> Vec<String> {
+    let inner = buffer.trim();
+    let inner = inner.strip_prefix('[').unwrap_or(inner);
+    let inner = inner.strip_suffix(']').unwrap_or(inner);
+    inner
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
 /// 扫描 Rime 用户目录，收集所有 *.dict.yaml 的 import_tables 里引用过的 .txt。
 ///
 /// 解析失败的 .dict.yaml 一律当作「没有引用」（不 panic、不影响其它文件）。
+///
+/// 软链处理：`*.dict.yaml` 常用软链指向共享词典目录，所以判定「是不是文件」
+/// 用 `fs::metadata`（跟随软链）而不是 `symlink_metadata`。为防软链成环：
+/// 递归深度照旧封顶 4 层，另外按 canonical 路径去重目录与文件，并限制
+/// 跟随软链的总跳数。
 pub fn scan_dict_source_index(root: &std::path::Path) -> DictSourceIndex {
+    const MAX_SYMLINK_HOPS: usize = 32;
     let mut index = DictSourceIndex::new();
+    let mut visited_dirs: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    let mut parsed_files: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    let mut symlink_hops = 0usize;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         if depth > 4 {
+            continue;
+        }
+        let Ok(canonical) = dir.canonicalize() else {
+            continue;
+        };
+        if !visited_dirs.insert(canonical) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            // metadata 会跟随软链：软链指向的 *.dict.yaml 也要认。
+            let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
-            let name = entry.file_name().to_string_lossy().to_string();
-            if file_type.is_dir() {
+            let is_symlink = entry
+                .file_type()
+                .map(|kind| kind.is_symlink())
+                .unwrap_or(false);
+            if meta.is_dir() {
                 if is_excluded_dir(&name) {
                     continue;
                 }
-                stack.push((entry.path(), depth + 1));
+                if is_symlink {
+                    // 软链指向目录：不递归进去（可能是环，也可能是同一份目录的另一个入口）。
+                    symlink_hops += 1;
+                    continue;
+                }
+                stack.push((path, depth + 1));
                 continue;
             }
-            if !file_type.is_file() || !name.ends_with(".dict.yaml") {
+            if !meta.is_file() || !name.ends_with(".dict.yaml") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            if is_symlink {
+                symlink_hops += 1;
+                if symlink_hops > MAX_SYMLINK_HOPS {
+                    continue;
+                }
+            }
+            let Ok(canonical_file) = path.canonicalize() else {
                 continue;
             };
+            if !parsed_files.insert(canonical_file) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let dir_rel = relative_dir(root, &path);
             for table in parse_import_tables(&text) {
-                index.insert(&table);
+                index.insert_ref(&dir_rel, &table);
             }
         }
     }
     index
+}
+
+/// 文件所在目录相对 rime 根的路径（根目录返回空串）。
+fn relative_dir(root: &std::path::Path, path: &std::path::Path) -> String {
+    let parent = match path.parent() {
+        Some(parent) => parent,
+        None => return String::new(),
+    };
+    parent
+        .strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 /// 冲突副本形如 default.custom.yaml.conflict-devA-1700000000。

@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -183,6 +184,306 @@ impl PruneReport {
     }
 }
 
+/// 一次裁剪的「预演报告」：只读算出来，一个字节都没落盘。
+///
+/// 桌面端首启自举不再直接删用户的方案：先拿这份报告给用户看（哪些文件会被删、
+/// 删完之后 schema_list 长什么样、哪些方案会因此消失），用户确认后凭
+/// [PrunePreview::token] 回来执行。
+///
+/// CLI 的 `prune-schemas --dry-run` 仍走原来的 [PruneOptions::dry_run]，
+/// 两条路共用同一份判定逻辑（见 `plan_prune`），所以两端结论必然一致。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PrunePreview {
+    /// 预演令牌：确认执行时必须带上它（内容变了就得重新预演）。
+    pub token: String,
+    /// 会被删除的文件（绝对路径）。
+    pub files: Vec<String>,
+    /// 会被改写的 schema_list 文件。
+    pub schema_lists: Vec<SchemaListPreview>,
+    /// 会因此在输入法里消失的方案 id。
+    pub affected_schemas: Vec<String>,
+    /// 保留集合（保留清单 + 追加白名单 + 依赖闭包）。
+    pub keep: Vec<String>,
+    /// 随包保留清单。
+    pub retained: Vec<String>,
+    /// 扫描过的 data 目录。
+    pub data_dirs: Vec<String>,
+    /// 扫描过的 Rime 用户目录（探测不到时为空）。
+    pub user_dir: String,
+    /// 告警（用户目录探测失败、白名单非法等）。
+    pub warnings: Vec<String>,
+    /// 有没有东西会被删或被改。
+    pub has_changes: bool,
+    /// 被 RIMESYNC_PRUNE_SCHEMAS=0 关闭。
+    pub disabled: bool,
+}
+
+/// 一个 schema_list 文件的改动预览。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SchemaListPreview {
+    /// 文件路径。
+    pub path: String,
+    /// 改写后的完整内容（用户能直接看到「删完之后长这样」）。
+    pub after: String,
+    /// 被删掉的条目数。
+    pub dropped: usize,
+    /// 被删掉的方案 id。
+    pub removed_schemas: Vec<String>,
+}
+
+/// 预演的内部结果：预览 + 这次探测到的目录（确认执行时复用同一份探测结果）。
+struct PreviewPlan {
+    preview: PrunePreview,
+    dirs: Vec<PathBuf>,
+    user: Option<PathBuf>,
+    extra_keep: Vec<String>,
+}
+
+/// 预演：算出「将被删什么、将改成什么」，一个字节都不落盘。
+pub fn prune_preview_auto() -> PrunePreview {
+    let (extra_keep, warnings) = env_keep();
+    preview_plan(None, None, &extra_keep, warnings).preview
+}
+
+/// 同 [prune_preview_auto]，但允许显式指定目录（测试 / 排错用）。
+pub fn prune_preview_with(data_dirs: Option<&[PathBuf]>, user_dir: Option<&Path>) -> PrunePreview {
+    let (extra_keep, warnings) = env_keep();
+    preview_plan(data_dirs, user_dir, &extra_keep, warnings).preview
+}
+
+/// 同 [prune_preview_with]，但保留清单外的追加白名单由调用方指定。
+///
+/// 为什么单独给一个口子：环境变量 RIMESYNC_PRUNE_KEEP 是**进程级**的，
+/// 并行跑的测试会互相干扰（一个测试刚设好白名单，另一个测试的预演指纹就变了）。
+/// 测试用这个入口拿确定性的结果。
+pub fn prune_preview_with_keep(
+    data_dirs: Option<&[PathBuf]>,
+    user_dir: Option<&Path>,
+    extra_keep: &[String],
+) -> PrunePreview {
+    preview_plan(data_dirs, user_dir, extra_keep, Vec::new()).preview
+}
+
+/// 凭预演令牌执行裁剪。
+///
+/// 令牌里编码了「这次预演的指纹」（待删文件清单 + schema_list 的新旧内容）：
+/// 确认时重新算一遍指纹，对不上就拒绝 —— 用户在预演之后又改了配置时，
+/// 不能拿一份过期的预演去删新的东西。
+///
+/// 确认执行用的目录与预演时**完全一致**（同一份探测结果），所以「预演里
+/// 看到的」与「真正删掉的」是同一批文件。
+pub fn prune_confirm(token: &str) -> Result<PruneReport, String> {
+    prune_confirm_with(token, None, None)
+}
+
+/// 同 [prune_confirm]，但允许显式指定目录（测试 / 排错用）。
+pub fn prune_confirm_with(
+    token: &str,
+    data_dirs: Option<&[PathBuf]>,
+    user_dir: Option<&Path>,
+) -> Result<PruneReport, String> {
+    let (extra_keep, warnings) = env_keep();
+    prune_confirm_with_keep(token, data_dirs, user_dir, &extra_keep, warnings)
+}
+
+/// 同 [prune_confirm_with]，但保留清单外的追加白名单由调用方指定（测试用）。
+pub fn prune_confirm_with_keep(
+    token: &str,
+    data_dirs: Option<&[PathBuf]>,
+    user_dir: Option<&Path>,
+    extra_keep: &[String],
+    warnings: Vec<String>,
+) -> Result<PruneReport, String> {
+    let plan = preview_plan(data_dirs, user_dir, extra_keep, warnings);
+    if plan.preview.disabled {
+        return Err(format!("方案清理已被 {ENV_PRUNE}=0 关闭"));
+    }
+    if plan.preview.token != token {
+        return Err("预演已过期：方案配置在预演之后发生了变化，请重新预演再确认".to_string());
+    }
+    if !plan.preview.has_changes {
+        return Ok(PruneReport {
+            retained: plan.preview.retained.clone(),
+            keep: plan.preview.keep.clone(),
+            data_dirs: plan.preview.data_dirs.clone(),
+            user_dir: plan.preview.user_dir.clone(),
+            warnings: plan.preview.warnings.clone(),
+            ..PruneReport::default()
+        });
+    }
+    let report = prune_paths_with_keep(
+        &plan.dirs,
+        plan.user.as_deref(),
+        &unix_timestamp(),
+        PruneOptions::default(),
+        &plan.extra_keep,
+    );
+    Ok(report)
+}
+
+/// 算预演（只读）。
+fn preview_plan(
+    data_dirs: Option<&[PathBuf]>,
+    user_dir: Option<&Path>,
+    extra_keep: &[String],
+    mut warnings: Vec<String>,
+) -> PreviewPlan {
+    let extra_keep = extra_keep.to_vec();
+    let retained: Vec<String> = retained_schemas().into_iter().map(str::to_string).collect();
+    if disabled_by_env() {
+        return PreviewPlan {
+            preview: PrunePreview {
+                disabled: true,
+                retained,
+                warnings,
+                ..PrunePreview::default()
+            },
+            dirs: Vec::new(),
+            user: None,
+            extra_keep,
+        };
+    }
+    let dirs = match data_dirs {
+        Some(dirs) if !dirs.is_empty() => dirs.to_vec(),
+        _ => data_patch::resolve_data_dirs().dirs,
+    };
+    // 探测不到用户目录时不能静默跳过：用户目录里的 build 产物、用户
+    // *.custom.yaml 与 default.custom.yaml 的 schema_list 这次**没有**被裁剪，
+    // 报告里必须看得出来。
+    let (user, user_warning) = match user_dir {
+        Some(dir) => (Some(dir.to_path_buf()), None),
+        None => match rime_dir::detect(None) {
+            Ok(detection) => (Some(detection.path), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "未能探测 Rime 用户目录：{error:#}；用户目录（build 产物、用户 *.custom.yaml、default.custom.yaml 的 schema_list）本次不会裁剪。"
+                )),
+            ),
+        },
+    };
+    if let Some(warning) = user_warning {
+        warnings.push(warning);
+    }
+    let known = known_schemas(&dirs);
+    let keep = keep_set(&known, &extra_keep);
+    let ops = plan_prune(&dirs, user.as_deref(), &keep, &known);
+    let preview = build_preview(&ops, &keep, &retained, &dirs, user.as_deref(), warnings);
+    PreviewPlan {
+        preview,
+        dirs,
+        user,
+        extra_keep,
+    }
+}
+
+/// 由计划拼出预演报告。
+fn build_preview(
+    ops: &[PlanOp],
+    keep: &BTreeSet<String>,
+    retained: &[String],
+    dirs: &[PathBuf],
+    user: Option<&Path>,
+    warnings: Vec<String>,
+) -> PrunePreview {
+    let mut files: Vec<String> = Vec::new();
+    let mut schema_lists: Vec<SchemaListPreview> = Vec::new();
+    let mut affected: BTreeSet<String> = BTreeSet::new();
+    for op in ops {
+        match op {
+            PlanOp::Delete(path) => {
+                files.push(path.display().to_string());
+                // 用户目录里的 <id>.custom.yaml 被删 = 这个方案的自定义配置没了。
+                if let Some(id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".custom.yaml"))
+                {
+                    affected.insert(id.to_string());
+                }
+            }
+            PlanOp::RewriteSchemaList {
+                path,
+                body,
+                dropped,
+                removed_ids,
+            } => {
+                for id in removed_ids {
+                    affected.insert(id.clone());
+                }
+                schema_lists.push(SchemaListPreview {
+                    path: path.display().to_string(),
+                    after: body.clone(),
+                    dropped: *dropped,
+                    removed_schemas: removed_ids.clone(),
+                });
+            }
+        }
+    }
+    PrunePreview {
+        token: preview_token(ops),
+        files,
+        schema_lists,
+        affected_schemas: affected.into_iter().collect(),
+        keep: keep.iter().cloned().collect(),
+        retained: retained.to_vec(),
+        data_dirs: dirs.iter().map(|dir| dir.display().to_string()).collect(),
+        user_dir: user
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+        warnings,
+        has_changes: !ops.is_empty(),
+        disabled: false,
+    }
+}
+
+/// 预演令牌：把「这次要做什么」的内容摘要进去。
+///
+/// 为什么要摘要内容而不是只记时间戳：用户在预演之后改了 default.custom.yaml，
+/// 这时拿旧令牌确认就会删掉与预演不一致的东西。摘要覆盖待删文件清单与
+/// schema_list 的新旧内容，内容一变令牌就变，确认会被拒绝。
+fn preview_token(ops: &[PlanOp]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rime-sync-prune-preview-v1\0");
+    for op in ops {
+        match op {
+            PlanOp::Delete(path) => {
+                hasher.update(b"D\0");
+                hasher.update(path.to_string_lossy().as_bytes());
+                hasher.update(b"\0");
+            }
+            PlanOp::RewriteSchemaList {
+                path,
+                body,
+                dropped,
+                removed_ids,
+            } => {
+                hasher.update(b"R\0");
+                hasher.update(path.to_string_lossy().as_bytes());
+                hasher.update(b"\0");
+                // 原文也要进摘要：用户改了原文就必须重新预演。
+                let original = fs::read(path).unwrap_or_default();
+                hasher.update(&original);
+                hasher.update(b"\0");
+                hasher.update(body.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(dropped.to_string().as_bytes());
+                hasher.update(b"\0");
+                for id in removed_ids {
+                    hasher.update(id.as_bytes());
+                    hasher.update(b"\0");
+                }
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let mut token = String::from("prune-");
+    for byte in digest.iter().take(8) {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+
 /// 解析 data 目录并清理（CLI / 设置页 / 启动自举统一入口）。
 pub fn prune_auto() -> PruneReport {
     prune_auto_with(None, None, PruneOptions::default())
@@ -290,34 +591,101 @@ pub fn prune_paths_with_keep(
     let keep = keep_set(&known, extra_keep);
     report.keep = keep.iter().cloned().collect();
 
+    // 预演与执行共用同一份计划：判定逻辑只有一处，两边结论必然一致
+    // （预演说删哪些，执行就只删哪些）。
+    let ops = plan_prune(data_dirs, user_dir, &keep, &known);
+    execute_plan(&ops, timestamp, options, &mut report);
+    report
+}
+
+/// 裁剪计划里的一步。
+enum PlanOp {
+    /// 删除一个文件（先在原目录改名备份，可回滚）。
+    Delete(PathBuf),
+    /// 改写一个 schema_list 文件。
+    RewriteSchemaList {
+        path: PathBuf,
+        /// 改写后的完整内容（按原行尾逐行拼回）。
+        body: String,
+        /// 被删掉的条目数。
+        dropped: usize,
+        /// 被删掉的方案 id。
+        removed_ids: Vec<String>,
+    },
+}
+
+/// 只读地算出「这次要做什么」，不碰磁盘。
+fn plan_prune(
+    data_dirs: &[PathBuf],
+    user_dir: Option<&Path>,
+    keep: &BTreeSet<String>,
+    known: &[(String, PathBuf)],
+) -> Vec<PlanOp> {
+    let mut ops: Vec<PlanOp> = Vec::new();
     for dir in data_dirs {
-        prune_schema_files(dir, &keep, &known, timestamp, options, &mut report);
+        for path in plan_schema_deletes(dir, keep, known) {
+            ops.push(PlanOp::Delete(path));
+        }
         // data/default.yaml 仍列着上游的 16 个方案时，删掉 schema 文件会让下一次
         // 部署整次失败（librime 把缺失 schema 计为 failure），所以 schema_list 也要裁。
-        prune_schema_list_file(
-            &dir.join("default.yaml"),
-            &keep,
-            timestamp,
-            options,
-            &mut report,
-        );
+        if let Some(op) = plan_schema_list(&dir.join("default.yaml"), keep) {
+            ops.push(op);
+        }
     }
-
     if let Some(user) = user_dir {
         let build = user.join("build");
-        let mut build_known = known.clone();
+        let mut build_known = known.to_vec();
         build_known.extend(known_schemas(std::slice::from_ref(&build)));
-        prune_schema_files(&build, &keep, &build_known, timestamp, options, &mut report);
-        prune_user_customs(user, &keep, timestamp, options, &mut report);
-        prune_schema_list_file(
-            &user.join(USER_DEFAULT_CUSTOM),
-            &keep,
-            timestamp,
-            options,
-            &mut report,
-        );
+        for path in plan_schema_deletes(&build, keep, &build_known) {
+            ops.push(PlanOp::Delete(path));
+        }
+        for path in plan_user_custom_deletes(user, keep) {
+            ops.push(PlanOp::Delete(path));
+        }
+        if let Some(op) = plan_schema_list(&user.join(USER_DEFAULT_CUSTOM), keep) {
+            ops.push(op);
+        }
     }
-    report
+    ops
+}
+
+/// 执行计划（dry_run 时只报告不落盘）。
+fn execute_plan(ops: &[PlanOp], timestamp: &str, options: PruneOptions, report: &mut PruneReport) {
+    for op in ops {
+        match op {
+            PlanOp::Delete(path) => backup_and_remove(path, timestamp, options, report),
+            PlanOp::RewriteSchemaList {
+                path,
+                body,
+                dropped,
+                ..
+            } => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let backup = backup_path(path, timestamp);
+                report.backups.push(backup.display().to_string());
+                if options.dry_run {
+                    report
+                        .removed
+                        .push(format!("{name}: schema_list -{dropped}"));
+                    continue;
+                }
+                if let Err(error) = fs::copy(path, &backup) {
+                    report.failures.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+                match fs::write(path, body) {
+                    Ok(()) => report.removed.push(format!(
+                        "{name}: schema_list -{dropped}（{}）",
+                        path.display()
+                    )),
+                    Err(error) => report.failures.push(format!("{}: {error}", path.display())),
+                }
+            }
+        }
+    }
 }
 
 fn unix_timestamp() -> String {
@@ -442,17 +810,14 @@ fn collect_dictionaries(value: &serde_yaml::Value, out: &mut Vec<String>) {
     }
 }
 
-/// 删除 data/ 或 build/ 里非保留方案的 <id>.schema.yaml 与配套产物。
-fn prune_schema_files(
+/// data/ 或 build/ 里非保留方案的 <id>.schema.yaml 与配套产物（只算，不删）。
+fn plan_schema_deletes(
     dir: &Path,
     keep: &BTreeSet<String>,
     known: &[(String, PathBuf)],
-    timestamp: &str,
-    options: PruneOptions,
-    report: &mut PruneReport,
-) {
+) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -464,6 +829,7 @@ fn prune_schema_files(
         .iter()
         .filter_map(|name| name.strip_suffix(".schema.yaml").map(str::to_string))
         .collect();
+    let mut out: Vec<PathBuf> = Vec::new();
     for name in names {
         let remove = if let Some(id) = name.strip_suffix(".schema.yaml") {
             !keep.contains(id)
@@ -475,9 +841,10 @@ fn prune_schema_files(
             false
         };
         if remove {
-            backup_and_remove(&dir.join(&name), timestamp, options, report);
+            out.push(dir.join(&name));
         }
     }
+    out
 }
 
 fn strip_product(name: &str) -> Option<String> {
@@ -489,16 +856,10 @@ fn strip_product(name: &str) -> Option<String> {
     None
 }
 
-/// 用户目录里非保留方案的 <id>.custom.yaml。
-fn prune_user_customs(
-    user: &Path,
-    keep: &BTreeSet<String>,
-    timestamp: &str,
-    options: PruneOptions,
-    report: &mut PruneReport,
-) {
+/// 用户目录里非保留方案的 <id>.custom.yaml（只算，不删）。
+fn plan_user_custom_deletes(user: &Path, keep: &BTreeSet<String>) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(user) else {
-        return;
+        return Vec::new();
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -506,6 +867,7 @@ fn prune_user_customs(
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     names.sort();
+    let mut out: Vec<PathBuf> = Vec::new();
     for name in names {
         let Some(id) = name.strip_suffix(".custom.yaml") else {
             continue;
@@ -513,24 +875,21 @@ fn prune_user_customs(
         if NON_SCHEMA_CUSTOM.contains(&id) || keep.contains(id) {
             continue;
         }
-        backup_and_remove(&user.join(&name), timestamp, options, report);
+        out.push(user.join(&name));
     }
+    out
 }
 
 /// default.custom.yaml / data/default.yaml 的 schema_list：删掉已移除方案的条目
 /// （否则部署会因为「schema 不存在」整次失败）。其余行（注释、page_size…）原样保留。
-fn prune_schema_list_file(
-    path: &Path,
-    keep: &BTreeSet<String>,
-    timestamp: &str,
-    options: PruneOptions,
-    report: &mut PruneReport,
-) {
+///
+/// 只算改写后的内容，不落盘（预演与执行都用这一份计算）。
+fn plan_schema_list(path: &Path, keep: &BTreeSet<String>) -> Option<PlanOp> {
     let Ok(bytes) = fs::read(path) else {
-        return;
+        return None;
     };
     let Ok(text) = String::from_utf8(bytes) else {
-        return;
+        return None;
     };
     // 逐行保真：BOM、每一行原有的行尾、文件末尾「有没有空行」这个属性全部原样
     // 保留（真机 227 的 default.custom.yaml 就是 BOM + 混合行尾：正文 LF、末尾
@@ -541,6 +900,7 @@ fn prune_schema_list_file(
     let mut in_list = false;
     let mut key_indent = 0usize;
     let mut dropped = 0usize;
+    let mut removed_ids: Vec<String> = Vec::new();
     for (index, line) in doc.lines.iter().enumerate() {
         let trimmed = line.trim();
         let indent = line.len() - line.trim_start().len();
@@ -557,6 +917,7 @@ fn prune_schema_list_file(
             if let Some(id) = schema_list_item(line) {
                 if !keep.contains(id) {
                     dropped += 1;
+                    removed_ids.push(id.to_string());
                     continue;
                 }
             }
@@ -564,33 +925,16 @@ fn prune_schema_list_file(
         kept.push(index);
     }
     if dropped == 0 {
-        return;
-    }
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let backup = backup_path(path, timestamp);
-    report.backups.push(backup.display().to_string());
-    if options.dry_run {
-        report
-            .removed
-            .push(format!("{name}: schema_list -{dropped}"));
-        return;
-    }
-    if let Err(error) = fs::copy(path, &backup) {
-        report.failures.push(format!("{}: {error}", path.display()));
-        return;
+        return None;
     }
     // 按原行尾逐行拼回去（不统一行尾、不丢末尾空行）。
     let body = doc.select(&kept).render();
-    match fs::write(path, body) {
-        Ok(()) => report.removed.push(format!(
-            "{name}: schema_list -{dropped}（{}）",
-            path.display()
-        )),
-        Err(error) => report.failures.push(format!("{}: {error}", path.display())),
-    }
+    Some(PlanOp::RewriteSchemaList {
+        path: path.to_path_buf(),
+        body,
+        dropped,
+        removed_ids,
+    })
 }
 
 /// - {schema: x} / - schema: x 到 x。
@@ -1004,6 +1348,211 @@ mod tests {
         let second = backup_path(&file, "T0");
         assert_ne!(first, second);
         assert!(second.to_string_lossy().ends_with("T0.1"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 造一个「有东西要删」的场景。
+    fn fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let data = root.join("data");
+        let user = root.join("user");
+        write(
+            &data.join("terra_pinyin.schema.yaml"),
+            "schema:\n  schema_id: terra_pinyin\n",
+        );
+        write(&data.join("terra_pinyin.table.bin"), "bin");
+        write(&user.join("terra_pinyin.custom.yaml"), "patch: {}\n");
+        write(&user.join("wubi86.custom.yaml"), "patch: {}\n");
+        write(
+            &user.join("default.custom.yaml"),
+            "patch:\n  schema_list:\n    - {schema: luna_pinyin_simp}\n    - {schema: wubi86}\n    - {schema: terra_pinyin}\n",
+        );
+        (data, user)
+    }
+
+    /// 目录树快照（相对路径 + 文件内容）：用来证明「一个字节都没变」。
+    fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.is_file() {
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    out.push((relative, fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// 预演不能动磁盘：整个目录树逐字节比对。
+    #[test]
+    fn preview_does_not_touch_a_single_byte() {
+        let root = scratch("preview-readonly");
+        let (data, user) = fixture(&root);
+        let before = snapshot(&root);
+        let preview = prune_preview_with_keep(Some(std::slice::from_ref(&data)), Some(&user), &[]);
+        let after = snapshot(&root);
+        assert_eq!(before, after, "预演不能动磁盘上的任何一个字节");
+        assert!(preview.has_changes, "这个场景确实有东西要删");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 预演要说清三件事：删哪些文件、schema_list 变成什么样、哪些方案会消失。
+    #[test]
+    fn preview_reports_files_schema_list_and_affected_schemas() {
+        let root = scratch("preview-content");
+        let (data, user) = fixture(&root);
+        let preview = prune_preview_with_keep(Some(std::slice::from_ref(&data)), Some(&user), &[]);
+        assert!(preview.has_changes);
+        // 1) 待删文件
+        assert!(
+            preview
+                .files
+                .iter()
+                .any(|path| path.ends_with("terra_pinyin.schema.yaml")),
+            "{:?}",
+            preview.files
+        );
+        assert!(
+            preview
+                .files
+                .iter()
+                .any(|path| path.ends_with("terra_pinyin.custom.yaml")),
+            "{:?}",
+            preview.files
+        );
+        // 保留方案的 custom.yaml 不在待删清单里
+        assert!(
+            !preview
+                .files
+                .iter()
+                .any(|path| path.ends_with("wubi86.custom.yaml")),
+            "{:?}",
+            preview.files
+        );
+        // 2) 删除后的 schema_list
+        let list = preview
+            .schema_lists
+            .iter()
+            .find(|item| item.path.ends_with("default.custom.yaml"))
+            .expect("必须有 default.custom.yaml 的预览");
+        assert!(!list.after.contains("terra_pinyin"), "{}", list.after);
+        assert!(list.after.contains("wubi86"), "{}", list.after);
+        assert!(list.after.contains("luna_pinyin_simp"), "{}", list.after);
+        assert_eq!(list.dropped, 1);
+        assert_eq!(list.removed_schemas, vec!["terra_pinyin".to_string()]);
+        // 3) 受影响的方案
+        assert_eq!(
+            preview.affected_schemas,
+            vec!["terra_pinyin".to_string()],
+            "{:?}",
+            preview.affected_schemas
+        );
+        assert!(preview.token.starts_with("prune-"), "{}", preview.token);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 确认执行与原来的 prune_auto 行为一致，且可重复执行（幂等）。
+    #[test]
+    fn confirm_matches_direct_prune_and_is_idempotent() {
+        let root_a = scratch("confirm-a");
+        let root_b = scratch("confirm-b");
+        let (data_a, user_a) = fixture(&root_a);
+        let (data_b, user_b) = fixture(&root_b);
+
+        // A：老路径（直接裁剪）。
+        let direct = prune_paths(
+            std::slice::from_ref(&data_a),
+            Some(&user_a),
+            "T0",
+            PruneOptions::default(),
+        );
+        // B：新路径（先预演，再凭令牌确认）。
+        let preview =
+            prune_preview_with_keep(Some(std::slice::from_ref(&data_b)), Some(&user_b), &[]);
+        let confirmed = prune_confirm_with_keep(
+            &preview.token,
+            Some(std::slice::from_ref(&data_b)),
+            Some(&user_b),
+            &[],
+            Vec::new(),
+        )
+        .expect("确认应成功");
+        let normalize = |items: &[String], root: &Path| -> Vec<String> {
+            let root = root.display().to_string();
+            let mut out: Vec<String> = items
+                .iter()
+                .map(|item| item.replace(&root, "<root>"))
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            normalize(&direct.removed, &root_a),
+            normalize(&confirmed.removed, &root_b),
+            "确认执行必须与原来的 prune_auto 删掉同一批东西"
+        );
+        assert!(!data_b.join("terra_pinyin.schema.yaml").exists());
+        assert!(!user_b.join("terra_pinyin.custom.yaml").exists());
+        let text = fs::read_to_string(user_b.join("default.custom.yaml")).expect("read");
+        assert!(!text.contains("terra_pinyin"), "{text}");
+        assert!(text.contains("wubi86"), "{text}");
+
+        // 幂等：再预演一次已经没有东西可删，再确认也不动磁盘。
+        let again =
+            prune_preview_with_keep(Some(std::slice::from_ref(&data_b)), Some(&user_b), &[]);
+        assert!(!again.has_changes, "{:?}", again.files);
+        let before = snapshot(&root_b);
+        let second = prune_confirm_with_keep(
+            &again.token,
+            Some(std::slice::from_ref(&data_b)),
+            Some(&user_b),
+            &[],
+            Vec::new(),
+        )
+        .expect("没有东西可删时确认也应成功");
+        assert_eq!(second.removed.len(), 0);
+        assert_eq!(before, snapshot(&root_b), "重复确认不能改动任何文件");
+        fs::remove_dir_all(&root_a).ok();
+        fs::remove_dir_all(&root_b).ok();
+    }
+
+    /// 预演之后用户又改了配置 ⇒ 旧令牌必须被拒绝，且不产生任何副作用。
+    #[test]
+    fn stale_token_is_rejected_without_side_effects() {
+        let root = scratch("confirm-stale");
+        let (data, user) = fixture(&root);
+        let preview = prune_preview_with_keep(Some(std::slice::from_ref(&data)), Some(&user), &[]);
+        // 用户在预演之后改了 schema_list。
+        write(
+            &user.join("default.custom.yaml"),
+            "patch:\n  schema_list:\n    - {schema: luna_pinyin_simp}\n    - {schema: wubi86}\n    - {schema: terra_pinyin}\n    - {schema: bopomofo}\n",
+        );
+        let error = prune_confirm_with_keep(
+            &preview.token,
+            Some(std::slice::from_ref(&data)),
+            Some(&user),
+            &[],
+            Vec::new(),
+        )
+        .expect_err("过期的令牌必须被拒绝");
+        assert!(error.contains("预演已过期"), "{error}");
+        // 一个字节都没被删。
+        assert!(data.join("terra_pinyin.schema.yaml").is_file());
+        assert!(user.join("terra_pinyin.custom.yaml").is_file());
+        let text = fs::read_to_string(user.join("default.custom.yaml")).expect("read");
+        assert!(text.contains("terra_pinyin"), "{text}");
         fs::remove_dir_all(&root).ok();
     }
 }

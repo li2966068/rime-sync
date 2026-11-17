@@ -201,11 +201,14 @@ pub struct OriginalWebdav {
     /// 磁盘上的原始用户名（多半是空）。
     pub username: String,
     /// 本轮内存里用的、剥掉凭据后的地址（降级时密码没搬走，磁盘上仍是原地址）。
+    ///
+    /// 这是**判断「用户有没有自己改过地址」的基准**：写回配置时，只有内存里的
+    /// 地址还等于它，才说明用户没动过 —— 这时才该还原成磁盘上的原值。
+    /// 用户改过了就存用户的改动，绝不吞掉。
     pub clean_url: String,
-    /// 本轮内存里用的、从地址里拆出来的用户名。
+    /// 本轮内存里用的、从地址里拆出来的用户名。同上，是「用户改没改过」的基准。
     pub migrated_username: String,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebDavConfig {
@@ -344,7 +347,8 @@ impl Config {
                     url: config.webdav.url.clone(),
                     username: config.webdav.username.clone(),
                     clean_url: config.webdav.url.clone(),
-                    migrated_username: String::new(),
+                    // 刚读进来、还没迁移过 ⇒ 内存里的用户名就是磁盘上的那个。
+                    migrated_username: config.webdav.username.clone(),
                 });
                 Ok(config)
             }
@@ -434,7 +438,11 @@ impl Config {
         if let Some(original) = self.original_webdav.clone() {
             if original.url.trim() != raw {
                 // 临时地址：把凭据拆出来只放进内存，本轮照常能用。
+                let mut clean_url = raw.clone();
+                let mut migrated_username = String::new();
                 if let Some(creds) = crate::webdav::split_userinfo(&raw) {
+                    clean_url = creds.clean_url.clone();
+                    migrated_username = creds.username.clone();
                     self.webdav.username = creds.username.clone();
                     self.webdav.url = creds.clean_url.clone();
                     if let Some(password) = creds.password.clone() {
@@ -444,7 +452,15 @@ impl Config {
                     }
                 }
                 // 写回配置时还原成磁盘上的原值：命令行的地址不是用户存的值。
-                self.original_webdav = Some(original);
+                // clean_url 记的是「本轮内存里那个命令行地址」—— 写回时拿它当
+                // 「用户没改过」的基准：用户没动就还原成磁盘原值；用户动了
+                // （换了地址/用户名）就存用户的改动。
+                self.original_webdav = Some(OriginalWebdav {
+                    url: original.url,
+                    username: original.username,
+                    clean_url,
+                    migrated_username,
+                });
                 self.restore_webdav_on_save = true;
                 return Ok(CredentialMigration::Ephemeral {
                     username: self.webdav.username.clone(),
@@ -454,22 +470,31 @@ impl Config {
         if !crate::webdav::has_userinfo(&raw) {
             return Ok(CredentialMigration::NotNeeded);
         }
-        // 用户自己填过 ⇒ 不迁移、不改地址（别覆盖用户的显式设置）。
-        if !self.webdav.username.trim().is_empty()
-            || self.password_ref != PasswordRef::None
-            || !self.webdav.password.is_empty()
-        {
+        let creds = crate::webdav::split_userinfo(&raw);
+        // 用户自己填过密码 ⇒ 不迁移、不改地址（别覆盖用户的显式设置）。
+        if self.password_ref != PasswordRef::None || !self.webdav.password.is_empty() {
             return Ok(CredentialMigration::Skipped {
                 reason: "「用户名/密码」字段已经填过了，地址里的账号密码请手工去掉（地址只留主机与路径）".to_string(),
             });
         }
-        let Some(creds) = crate::webdav::split_userinfo(&raw) else {
+        // 用户名填过：只有「填的正好就是地址里那个账号」才算同一账号（照常迁移）；
+        // 填的是别的账号 ⇒ 不动，交给 `validate` 去解释冲突。
+        if let Some(creds) = creds.as_ref() {
+            let typed = self.webdav.username.trim();
+            if !typed.is_empty() && typed != creds.username {
+                return Ok(CredentialMigration::Skipped {
+                    reason: "「用户名/密码」字段已经填过了，地址里的账号密码请手工去掉（地址只留主机与路径）".to_string(),
+                });
+            }
+        }
+        let Some(creds) = creds else {
             // 拆不出用户名：原样保留，让 validate 去报错（绝不猜）。
             self.original_webdav = Some(OriginalWebdav {
                 url: raw.clone(),
                 username: self.webdav.username.clone(),
                 clean_url: raw.clone(),
-                migrated_username: String::new(),
+                // 内存里的用户名没变过 ⇒ 基准就是它本身。
+                migrated_username: self.webdav.username.clone(),
             });
             self.restore_webdav_on_save = true;
             return Ok(CredentialMigration::Deferred {
@@ -477,6 +502,26 @@ impl Config {
             });
         };
         let password = creds.password.clone().filter(|value| !value.is_empty());
+        // 用户名为空（`https://:pass@host`）：密码后端以「用户名」为账号，
+        // 空账号没法当键用（钥匙串会直接拒绝，文件后端会跟别的空账号串在一起）。
+        // 所以不往后端写，只在本轮内存里用：地址剥干净、密码留在内存，
+        // 磁盘上的地址保持原样（用户下次启动仍然能用，行为与「存不进去」一致）。
+        if creds.username.is_empty() {
+            self.original_webdav = Some(OriginalWebdav {
+                url: raw.clone(),
+                username: self.webdav.username.clone(),
+                clean_url: creds.clean_url.clone(),
+                migrated_username: creds.username.clone(),
+            });
+            self.restore_webdav_on_save = true;
+            self.webdav.url = creds.clean_url.clone();
+            if let Some(password) = password {
+                self.webdav.password = password;
+            }
+            return Ok(CredentialMigration::Deferred {
+                reason: "地址里的账号为空、只有密码：已在本轮使用剥干净的地址（磁盘上的地址保持原样，没有改动）".to_string(),
+            });
+        }
         if let Some(password) = password.as_deref() {
             if let Err(error) = store.set(&creds.username, password) {
                 // 存不进去：磁盘上的地址保持原样，但内存里仍用地址里的密码
@@ -523,6 +568,58 @@ impl Config {
         Ok(CredentialMigration::Migrated {
             username: creds.username,
         })
+    }
+
+    /// 降级模式（密码存不进密码后端）下的凭据搬运。
+    ///
+    /// 场景：老配置把密码写在地址里（`https://user:pass@host/dav`），而这台机器
+    /// 的密码后端写不进去 ⇒ 磁盘上**唯一**那份密码就在地址里。这时候用户在
+    /// 界面上把地址换掉（换个主机、换个路径），旧地址一被替换，密码就没了 ——
+    /// 用户下次启动再也连不上，界面上却看不出任何异常。
+    ///
+    /// 这里把地址里的凭据搬到新地址上：地址更新了，密码也还在（仍然只存在于
+    /// 地址里 —— 没有别的地方能放它；密码后端一旦可用，下次启动就会自动搬走）。
+    ///
+    /// `disk` 必须是**当前进程从磁盘重新读出**的那份原配置（用户改地址之前的）。
+    ///
+    /// 返回 true = 凭据已随新地址一起搬走；false = 没有可搬的凭据，或用户根本没
+    /// 改地址（此时只是把「写回时还原成原地址」的基准重新立起来）。
+    pub fn carry_webdav_credentials(&mut self, disk: &Config) -> bool {
+        // 用户自己在新地址里填了凭据 ⇒ 不碰（那是用户的显式设置）。
+        if crate::webdav::has_userinfo(&self.webdav.url) {
+            return false;
+        }
+        let Some(creds) = crate::webdav::split_userinfo(&disk.webdav.url) else {
+            return false;
+        };
+        let Some(password) = creds.password.clone().filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        // 用户换了账号：旧密码多半不适用。更不能把旧账号的凭据塞进新地址 ——
+        // 那会让下次启动直接报「地址里还有密码」的冲突，用户彻底连不上。
+        let typed_username = self.webdav.username.trim();
+        if !typed_username.is_empty() && typed_username != creds.username {
+            return false;
+        }
+        // 内存里补上密码（同步要用；密码绝不进日志）。
+        if self.webdav.password.is_empty() {
+            self.webdav.password = password.clone();
+        }
+        let disk_clean = creds.clean_url.clone();
+        if self.webdav.url.trim() == disk_clean.trim() {
+            // 用户没改地址：写回时还原成磁盘上的原地址（密码还在里面）。
+            self.original_webdav = Some(OriginalWebdav {
+                url: disk.webdav.url.clone(),
+                username: disk.webdav.username.clone(),
+                clean_url: disk_clean,
+                migrated_username: disk.webdav.username.clone(),
+            });
+            self.restore_webdav_on_save = true;
+            return false;
+        }
+        // 用户改了地址：凭据跟着搬到新地址上，密码不丢、地址也更新。
+        self.webdav.url = url_with_userinfo(&self.webdav.url, &creds.username, &password);
+        true
     }
 
     /// 旧配置的明文 password → 后端，然后重写不含 password 的 JSON。
@@ -634,10 +731,19 @@ impl Config {
         // 但密码谁都没存 ⇒ 不能把这个半迁移状态落盘，否则用户下次启动
         // 就变成「地址干净了、密码没了」。这里把原始值还原回去。
         // 地址来自命令行/环境变量时同理：那不是用户存下来的值，不该被写进去。
+        //
+        // 但只在**用户自己没改过**的时候才还原（2026-11-17 修）：
+        // 用户在设置页里换了地址或用户名，那就该存用户的改动。
+        // 少了这个判断，钥匙串不可用的机器上（2026-11-17 实测 228 就是）
+        // 用户改完地址一保存就被无声吞掉，磁盘上还是老地址。
         if snapshot.restore_webdav_on_save {
             if let Some(original) = snapshot.original_webdav.clone() {
-                snapshot.webdav.url = original.url;
-                snapshot.webdav.username = original.username;
+                if snapshot.webdav.url.trim() == original.clean_url.trim() {
+                    snapshot.webdav.url = original.url;
+                }
+                if snapshot.webdav.username.trim() == original.migrated_username.trim() {
+                    snapshot.webdav.username = original.username;
+                }
             }
         }
         snapshot.backup_keep = clamp_backup_keep(snapshot.backup_keep);
@@ -702,23 +808,38 @@ impl Config {
         if !(self.webdav.url.starts_with("http://") || self.webdav.url.starts_with("https://")) {
             bail!("webdav.url must start with http:// or https://");
         }
-        // 地址里带账号密码会被原样写进日志与诊断包 —— 早一步拦下来，
-        // 并明确告诉用户账号密码该填在哪。
+        // 地址里带账号密码时，**能拆出来就不算错**：
+        // 客户端会自己把它拆成「用户名/密码」用（`DavClient::with_proxy`），
+        // 凭据只进请求头，不会流进日志与诊断包。
+        //
+        // 真正要拦的是两种「说不清该用哪个凭据」的情况：
+        // * 地址里的账号解析不出来（畸形写法）；
+        // * 地址里的账号与「用户名」字段填的不是同一个；
+        // * 地址里带密码，而密码已经另有出处（字段/钥匙串）。
         //
         // 注意：正常情况下 `load_password` 已经把地址里的凭据搬走了
-        // （见 `migrate_url_credentials`），走到这里只剩两种情况：
-        // 用户自己填过用户名/密码（与地址里的凭据冲突），或者地址里的凭据
-        // 拆不出来。两种都要说清楚该怎么改。
+        // （见 `migrate_url_credentials`），走到这里只剩上面那几种。
         if crate::webdav::has_userinfo(self.webdav.url.trim()) {
-            let redacted = crate::webdav::redact_userinfo(self.webdav.url.trim());
-            if !self.webdav.username.trim().is_empty() || self.password_ref != PasswordRef::None {
+            let raw = self.webdav.url.trim();
+            let redacted = crate::webdav::redact_userinfo(raw);
+            let Some(creds) = crate::webdav::split_userinfo(raw) else {
                 bail!(
-                    "webdav.url 里带了账号密码（{redacted}），而「用户名/密码」字段也填了：请把地址里的密码去掉（地址只留主机与路径），账号与密码分别填在「用户名」「密码」里"
+                    "webdav.url 里带了账号密码（{redacted}）但解析不出来：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里"
+                );
+            };
+            let typed_username = self.webdav.username.trim();
+            if !typed_username.is_empty() && typed_username != creds.username {
+                bail!(
+                    "webdav.url 里带了账号密码（{redacted}），与「用户名」字段填的账号不一致：请把地址里的账号密码去掉，账号与密码分别填在「用户名」「密码」里"
                 );
             }
-            bail!(
-                "webdav.url 里带了账号密码（{redacted}）：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里"
-            );
+            let password_elsewhere =
+                !self.webdav.password.is_empty() || self.password_ref != PasswordRef::None;
+            if creds.password.is_some() && password_elsewhere {
+                bail!(
+                    "webdav.url 里带了账号密码（{redacted}），而密码已经填在别处了：请把地址里的密码去掉，密码只填在「密码」字段里"
+                );
+            }
         }
         // 代理启用时才校验：非法地址必须在发起任何请求之前报错（CLI 也不会先落盘）。
         self.proxy.validate().context("invalid proxy config")?;
@@ -756,6 +877,43 @@ impl Config {
         self.device_id = id.clone();
         id
     }
+}
+
+/// 把账号密码插进 URL 的 authority 段：`https://host/dav` → `https://user:pass@host/dav`。
+///
+/// userinfo 必须做百分号编码：密码里可能有 `@` `:` `/` 等字符，不编码的话
+/// `split_userinfo`（按最后一个 `@` / 第一个 `:` 拆）会拆错。
+pub fn url_with_userinfo(url: &str, username: &str, password: &str) -> String {
+    let trimmed = url.trim();
+    let Some(index) = trimmed.find("://") else {
+        return trimmed.to_string();
+    };
+    let head = &trimmed[..index + 3];
+    let rest = &trimmed[index + 3..];
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, ""),
+    };
+    format!(
+        "{head}{}:{}@{authority}{tail}",
+        percent_encode_userinfo(username),
+        percent_encode_userinfo(password)
+    )
+}
+
+/// userinfo 的百分号编码：只留 unreserved（字母数字与 `-._~`），其余按 UTF-8 字节转义。
+fn percent_encode_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~') {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// 旧配置里 webdav.password 是非空字符串 → 需要迁移进钥匙串。

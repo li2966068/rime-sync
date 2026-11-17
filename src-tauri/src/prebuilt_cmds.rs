@@ -351,6 +351,10 @@ fn fix_ime_blocking(
         &data_dirs,
         &ime_state::Options::fix()
             .with_force(force.unwrap_or(false))
+            // 桌面端不再自动裁剪方案：删用户的 <id>.custom.yaml 必须由用户在
+            // 设置页看过预演清单再确认（见 prune_cmds）。这里是「修复输入法」，
+            // 用户点它是为了修输入法，不是为了删方案。
+            .with_prune(false)
             .with_version(Some(app_version(app)))
             .with_exe_dir(exe_dir())
             .with_source(location.source.clone())
@@ -1240,9 +1244,24 @@ fn bootstrap_body(handle: &AppHandle) {
                 if !weasel.ok() {
                     show_ime_failure_dialog(&handle, &weasel.summary(), &weasel.log);
                 }
-                // 开关关闭时 ensure 不走，裁剪在这里补一次（保持「启动即裁剪」）。
-                let pruned = prune::prune_auto();
-                log_prune(&log, &state.0, &pruned);
+                // 开关关闭时 ensure 不走。以前这里会**直接裁一次**方案
+                // （保持「启动即裁剪」），那正是「用户既没确认也没法预演」的
+                // 老毛病：现在只做预演、把清单记进日志，删不删由用户在设置页
+                // 看过清单后自己确认（见 prune_cmds）。
+                let preview = prune::prune_preview_auto();
+                log(format!(
+                    "prune preview only files={} schema_lists={} affected={} warnings={}",
+                    preview.files.len(),
+                    preview.schema_lists.len(),
+                    preview.affected_schemas.join(","),
+                    preview.warnings.len()
+                ));
+                for path in &preview.files {
+                    log(format!("prune preview file={path}"));
+                }
+                for warning in &preview.warnings {
+                    log(format!("prune preview warning={warning}"));
+                }
             }
             Some(force) => {
                 let payload = prebuilt::resolve_payload(exe.as_deref());
@@ -1267,6 +1286,11 @@ fn bootstrap_body(handle: &AppHandle) {
                     // 不跑部署器、Linux 不 fcitx5-remote -r），否则每次开机都会打断用户。
                     &ime_state::Options::bootstrap()
                         .with_force(force)
+                        // 首启自举**不删**用户的方案：以前这里会自动裁掉不在
+                        // 保留名单里的 <id>.custom.yaml，用户既没确认也没法预演，
+                        // 「我正在用的方案凭空消失」就是这么来的。现在只预演，
+                        // 清单交给用户在设置页确认（见 prune_cmds）。
+                        .with_prune(false)
                         .with_version(Some(app_version(&handle)))
                         .with_exe_dir(exe.clone())
                         // 同 fix_ime_blocking：显式注入 GUI 自己的触发器，

@@ -329,6 +329,45 @@ PY
   printf 'schema: mock\r\nchanged\r\n' >"$dirty/$PAYLOAD_DIR/build/mock.schema.yaml"
   expect_fail "随包产物字节被改（行尾被转换）" "$dirty" "与索引里的字节不同"
 
+  # ---- 只动清单、不动工作区：第 2 条断言（清单承诺的字节 vs 磁盘字节）----
+  # 2026-11-17 复核发现：上面 6 个场景都同时触发第 1 条（工作区 vs 索引），
+  # 所以第 2 条即使写坏了也轮不到它生效，自检照样全绿。
+  # 这里把清单改坏**再重新 add**（让工作区 == 索引）⇒ 第 1 条通过，
+  # 只有第 2 条能抓住。
+  local manifest_sha="$SELFTEST_BASE/manifest-sha"
+  make_fixture_repo "$manifest_sha" || exit 2
+  python3 - "$manifest_sha/$MANIFEST" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as handle:
+    data = json.load(handle)
+for entry in data["files"]:
+    if entry["path"].endswith(".bin"):
+        entry["sha256"] = "0" * 64
+        break
+with open(path, "w") as handle:
+    handle.write(json.dumps(data, indent=2) + "\n")
+PY
+  ( cd "$manifest_sha" && git add -A . )
+  expect_fail "清单里的 sha256 与磁盘字节不符（第 2 条断言）" "$manifest_sha" "sha256 expected="
+
+  local manifest_size="$SELFTEST_BASE/manifest-size"
+  make_fixture_repo "$manifest_size" || exit 2
+  python3 - "$manifest_size/$MANIFEST" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as handle:
+    data = json.load(handle)
+for entry in data["files"]:
+    if entry["path"].endswith(".bin"):
+        entry["bytes"] = entry["bytes"] + 7
+        break
+with open(path, "w") as handle:
+    handle.write(json.dumps(data, indent=2) + "\n")
+PY
+  ( cd "$manifest_size" && git add -A . )
+  expect_fail "清单里的字节数与磁盘不符（第 2 条断言）" "$manifest_size" "大小 expected="
+
   printf '\n自检失败 %d 项\n' "$failures"
   [ "$failures" -eq 0 ]
 }

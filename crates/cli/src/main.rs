@@ -295,6 +295,15 @@ struct StatusReport {
     install_warning: Option<serde_json::Value>,
 }
 
+/// prune-schemas 的 JSON 报告：core 的 PruneReport + 一个如实反映失败的 ok。
+/// （core 的 PruneReport 没有 ok 字段，失败只体现在 failures 里。）
+#[derive(Serialize)]
+struct PruneReportJson<'a> {
+    ok: bool,
+    #[serde(flatten)]
+    report: &'a prune::PruneReport,
+}
+
 #[derive(Serialize)]
 struct BackupReport {
     ok: bool,
@@ -302,6 +311,10 @@ struct BackupReport {
     path: String,
     reason: String,
     pruned: Vec<String>,
+    /// 清理旧备份失败时的原因：备份本身已经成功，但旧的还原点没清掉，
+    /// 用户得知道（不然磁盘会越攒越多，而且他以为自己清理过了）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prune_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -328,6 +341,11 @@ struct FixImeFailed;
 /// 脚本解析时会看到两条结果。标记让 main 静默退出 1。
 #[derive(Debug)]
 struct SyncFailed;
+
+/// 只读检查类命令（status / test-conn / prune-schemas）判定为失败：
+/// 报告已经打印过（JSON 或人读），main 只负责退出码，不能再打第二份 JSON。
+#[derive(Debug)]
+struct CheckFailed;
 
 /// repair-* 修补失败：报告已经打印过，main 只负责退出码（理由同 SyncFailed）。
 #[derive(Debug)]
@@ -536,6 +554,14 @@ impl std::fmt::Display for SyncFailed {
 
 impl std::error::Error for SyncFailed {}
 
+impl std::fmt::Display for CheckFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("check failed")
+    }
+}
+
+impl std::error::Error for CheckFailed {}
+
 impl std::fmt::Display for RepairFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("repair failed")
@@ -551,6 +577,7 @@ fn main() {
         if error.downcast_ref::<ProbeFailed>().is_some()
             || error.downcast_ref::<FixImeFailed>().is_some()
             || error.downcast_ref::<SyncFailed>().is_some()
+            || error.downcast_ref::<CheckFailed>().is_some()
             || error.downcast_ref::<RepairFailed>().is_some()
         {
             std::process::exit(1);
@@ -568,10 +595,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let config_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(config::default_config_path);
+    let config_path = cli.config.clone().unwrap_or_else(default_config_path);
     init_logging(&config_path);
     let mut stored = Config::load(&config_path)?;
     let mut config = stored.clone();
@@ -694,8 +718,9 @@ fn run(cli: Cli) -> Result<()> {
                 remote_dir_missing: check.remote_dir_missing,
                 message: check.message,
             };
+            let ok = report.ok;
             if cli.json {
-                print_json(&report)
+                print_json(&report)?;
             } else {
                 println!(
                     "ok={} status={} latency={}ms server={} dav_class={} preset={} remote_dir_missing={}",
@@ -720,8 +745,20 @@ fn run(cli: Cli) -> Result<()> {
                 if let Some(hint) = report.hint {
                     println!("{hint}");
                 }
-                Ok(())
             }
+            // 连不上就是失败：退出码必须非 0，否则脚本（cron、E2E）看到 0
+            // 就以为服务器可用。报告已经打印过，这里只负责退出码，
+            // 不再追加第二份 JSON。
+            if !ok {
+                if !cli.json {
+                    eprintln!(
+                        "error: 连接检查失败（HTTP {}）：{}",
+                        report.status, report.message
+                    );
+                }
+                return Err(anyhow::Error::new(CheckFailed));
+            }
+            Ok(())
         }
         Command::Status => {
             let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
@@ -763,6 +800,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             let lock_status = lock::inspect(&state_dir(&config_path).join("sync.lock"));
             let network = NetworkPolicy::system();
+            // 一次探测拿全部结论（available / metered / state），
+            // 免得 available()、is_metered()、state() 各探一次。
+            let network_snapshot = network.probe_once();
             let retry =
                 RetryState::load(&state_dir(&config_path).join("retry.json")).unwrap_or_default();
             let install_warning = read_install_warning(&state_dir(&config_path));
@@ -780,10 +820,10 @@ fn run(cli: Cli) -> Result<()> {
                 remote_error,
                 secret_backend: secrets.describe(),
                 password_stored: config.password_ref != config::PasswordRef::None,
-                network_state: network.state().as_str().to_string(),
-                network_message: network.state().message().to_string(),
-                network_available: network.available(),
-                network_metered: network.is_metered(),
+                network_state: network_snapshot.state.as_str().to_string(),
+                network_message: network_snapshot.state.message().to_string(),
+                network_available: network_snapshot.available,
+                network_metered: network_snapshot.metered,
                 next_retry_at: retry.next_retry_at,
                 lock_held: lock_status.held,
                 lock_stale: lock_status.stale,
@@ -792,8 +832,9 @@ fn run(cli: Cli) -> Result<()> {
                     .map(|info| format!("pid={} host={}", info.pid, info.hostname)),
                 install_warning,
             };
+            let remote_failed = report.remote_error.is_some();
             if cli.json {
-                print_json(&report)
+                print_json(&report)?;
             } else {
                 println!("config={}", report.config_path);
                 println!("rime_dir={}", report.rime_dir);
@@ -833,20 +874,32 @@ fn run(cli: Cli) -> Result<()> {
                 if let Some(error) = report.remote_error {
                     eprintln!("remote_error: {error}");
                 }
-                Ok(())
             }
+            // 远端不可达 ⇒ 退出码非 0（status 是只读命令，不做任何副作用）。
+            // JSON 模式里 remote_error 字段已经如实带上错误，
+            // 不再追加第二份 JSON。
+            if remote_failed {
+                return Err(anyhow::Error::new(CheckFailed));
+            }
+            Ok(())
         }
         Command::Backup { reason } => {
             let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
             let manager = BackupManager::new(&detection, &app_data.join("backups"));
             let id = manager.create(&reason)?;
-            let pruned = manager.prune(DEFAULT_KEEP).unwrap_or_default();
+            // 清理旧备份失败**不能吞掉**：备份本身成功了，但旧还原点没清掉，
+            // 磁盘会越攒越多，而且用户完全看不出来。
+            let (pruned, prune_error) = match manager.prune(DEFAULT_KEEP) {
+                Ok(removed) => (removed, None),
+                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+            };
             let report = BackupReport {
                 ok: true,
                 path: manager.root().join(&id).display().to_string(),
                 id,
                 reason,
                 pruned,
+                prune_error,
             };
             if cli.json {
                 print_json(&report)
@@ -858,6 +911,9 @@ fn run(cli: Cli) -> Result<()> {
                     report.reason,
                     report.pruned.len()
                 );
+                if let Some(error) = report.prune_error.as_deref() {
+                    eprintln!("警告：清理旧备份失败（旧还原点还留在磁盘上）：{error}");
+                }
                 Ok(())
             }
         }
@@ -955,6 +1011,9 @@ fn run(cli: Cli) -> Result<()> {
                 &data_dirs,
                 &ime_state::Options::fix()
                     .with_force(force)
+                    // CLI 的 ensure-ime 是用户**显式敲的命令**，裁剪语义照旧
+                    // （core 那边默认已改成 false：删方案必须用户确认过）。
+                    .with_prune(true)
                     .with_patch_data(!no_data_patch)
                     .with_exe_dir(exe_dir())
                     .with_source(location.source.clone()),
@@ -1311,7 +1370,10 @@ fn run(cli: Cli) -> Result<()> {
                 ime_state::Mode::Install => ime_state::Options::install(),
                 ime_state::Mode::Fix => ime_state::Options::fix(),
                 ime_state::Mode::Bootstrap => ime_state::Options::bootstrap(),
-            };
+            }
+            // CLI 的 ensure-ime 是用户**显式敲的命令**，裁剪语义照旧
+            // （core 那边默认已改成 false：删方案必须用户确认过）。
+            .with_prune(true);
             let rime_dir = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
             let (payload_location, payload_error) = resolve_check_payload(payload);
             let data_dirs = data_patch::data_dirs();
@@ -1643,8 +1705,12 @@ fn run(cli: Cli) -> Result<()> {
                 user_dir.as_deref(),
                 prune::PruneOptions { dry_run },
             );
+            let failed_count = report.failures.len();
             if cli.json {
-                print_json(&report)
+                print_json(&PruneReportJson {
+                    ok: failed_count == 0,
+                    report: &report,
+                })?;
             } else {
                 println!("{}", report.summary());
                 println!("prune_disabled={}", report.disabled);
@@ -1671,8 +1737,16 @@ fn run(cli: Cli) -> Result<()> {
                         "hint: 清理 data 目录需要管理员权限；请以管理员/root 身份重新运行 rime-sync-cli prune-schemas"
                     );
                 }
-                Ok(())
             }
+            // 有文件没能删掉（多半是权限）⇒ 退出码非 0，
+            // 否则安装脚本 / CI 会以为清理已经做完。
+            if failed_count > 0 {
+                if !cli.json {
+                    eprintln!("error: 有 {failed_count} 个文件未能清理（详见上面的 warning）");
+                }
+                return Err(anyhow::Error::new(CheckFailed));
+            }
+            Ok(())
         }
         Command::History { limit } => {
             let entries = history::read(&state_dir(&config_path).join("history.jsonl"), limit)?;
@@ -1732,7 +1806,16 @@ fn run(cli: Cli) -> Result<()> {
                     ));
                 }
             }
-            let succeeded = report.ok;
+            // 上传被远端拒绝（别的设备刚写过）也算这轮没成：
+            // 退出码必须是 1，否则脚本会以为词库已经推上去了。
+            if report.upload_conflict {
+                let detail = report
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "远端词库已被其它设备改动，本轮未上传".to_string());
+                report.error = Some(format!("{detail}（上传冲突：远端词库已被其它设备改动）"));
+            }
+            let succeeded = report.ok && !report.upload_conflict;
             if cli.json {
                 print_json(&report)?;
             } else {
@@ -1801,7 +1884,11 @@ fn run(cli: Cli) -> Result<()> {
                     }));
                 }
                 // SPEC-3 §B7：定时/自动搬运在离线或计量网络下跳过，手动同步不受影响。
-                if let Some(reason) = NetworkPolicy::system().scheduled_block_reason(false) {
+                //
+                // 用 cached 版：只看不探测。Windows 上探测一次要起一个 powershell.exe，
+                // watch 是自动循环，不该每轮悄悄起进程；没检测过时一律放行
+                // （绝不能因探测缺失阻止同步）。
+                if let Some(reason) = NetworkPolicy::system().scheduled_block_reason_cached(false) {
                     eprintln!("watch: {reason}");
                     continue;
                 }
@@ -1887,6 +1974,75 @@ fn state_dir(config_path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// CLI 的默认配置文件路径。
+///
+/// 与桌面端（src-tauri/src/paths.rs）**同一处**：`~/.config/rime-sync`
+/// （Windows `%APPDATA%\rime-sync`）。CLI 的状态目录就是配置文件所在目录
+/// （index.json / backups 都在那儿），所以默认配置路径落在哪儿，
+/// 两端的基线就在哪儿 —— 落歪了就会出现「桌面端刚改过、CLI 又改回来」的假冲突。
+///
+/// core 的默认路径在 Unix 上是 `~/.config/rime-sync/config.json`；
+/// Windows 上没有 HOME，core 会退到当前目录下的相对文件名，那里补一条
+/// `%APPDATA%` 分支。当前目录里那份老配置先复制过来（不删），
+/// 别让人重填一遍 WebDAV 地址。
+fn default_config_path() -> PathBuf {
+    // RIME_SYNC_CONFIG 优先级最高（core 的默认路径也是这个优先级）。
+    if let Some(path) = std::env::var("RIME_SYNC_CONFIG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    let path = config::default_config_path();
+    // core 已经在 XDG_CONFIG_HOME / HOME 下给出绝对路径。
+    if path
+        .parent()
+        .map(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(false)
+    {
+        return path;
+    }
+    // Windows：core 退到了当前目录下的相对文件名。改用 %APPDATA%\rime-sync，
+    // 与桌面端同一处。
+    let appdata = match std::env::var("APPDATA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(appdata) => appdata,
+        None => return path,
+    };
+    let target = PathBuf::from(appdata).join("rime-sync").join("config.json");
+    copy_legacy_config(Path::new("rime-sync-config.json"), &target);
+    target
+}
+
+/// 把旧位置上的配置文件复制到新位置（新位置还没有才复制）。
+///
+/// 只复制不删：旧位置可能是用户的项目目录，替用户删文件越界。
+/// 复制失败只警告：老配置还在原地，用户还可以用 `--config` 指回去。
+fn copy_legacy_config(legacy: &Path, target: &Path) {
+    if target.exists() || !legacy.is_file() {
+        return;
+    }
+    if let Some(parent) = target.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    match fs::copy(legacy, target) {
+        Ok(_) => eprintln!(
+            "warning: 已把 {} 复制到 {}（原文件保留）",
+            legacy.display(),
+            target.display()
+        ),
+        Err(error) => eprintln!(
+            "warning: 复制 {} 到 {} 失败：{error}",
+            legacy.display(),
+            target.display()
+        ),
+    }
 }
 
 /// 读 <config 目录>/install-warning.json（packaging/linux/postinst 的 wrapper 写）。

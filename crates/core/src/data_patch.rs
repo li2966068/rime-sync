@@ -1281,7 +1281,9 @@ pub fn weasel_registry() -> WeaselRegistryValues {
 
 #[cfg(windows)]
 fn reg_query(key: &str, view: Option<&str>) -> Option<String> {
-    let mut command = std::process::Command::new("reg");
+    // 走统一入口：reg.exe 是控制台子系统程序，直接 Command::new 会给用户弹一个
+    // 黑框（Windows 上 GUI 程序没有控制台，起控制台程序系统就给它新建一个）。
+    let mut command = crate::process::command("reg");
     command.args(["query", key]);
     if let Some(view) = view {
         command.arg(view);

@@ -29,14 +29,21 @@ mod app_log;
 mod autostart;
 mod backup_cmds;
 mod conflict_cmds;
+/// 冲突解决的文件操作（覆盖前备份、删副本前归档）：单独成模块便于集成测试。
+pub mod conflict_files;
 mod dedupe_cmds;
 mod device_cmds;
 mod diagnostics;
 mod extra_ime;
+/// 交给前端的配置（地址去凭据、密码不外泄）：单独成模块便于集成测试。
+pub mod frontend_config;
 mod ime_text;
+/// 共享状态目录的解析 + 旧目录的一次性迁移（单独成模块便于集成测试）。
+pub mod paths;
 mod platform_prefs;
 mod prebuilt_cmds;
 mod preset_cmds;
+pub mod prune_cmds;
 mod remote_tree;
 mod schema_cmds;
 mod tray;
@@ -99,13 +106,41 @@ pub(crate) fn push_log(inner: &Inner, message: impl Into<String>) {
     app_log::append_line(&line);
 }
 
-pub(crate) fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
+/// 应用自己的配置目录（**历史位置**，状态已经搬走了）。
+///
+/// 里面只剩两样东西：用户的 config.json（**路径不动** —— 搬配置等于丢用户配置）
+/// 与 Linux postinst 写的 install-warning.json（安装器写死在应用配置目录里，
+/// 应用仍然从这里读它）。
+pub(crate) fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|error| format!("无法解析应用配置目录：{error}"))?;
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("创建配置目录 {} 失败：{error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// 共享状态目录：桌面端与 CLI 共用同一份基线（index.json）与还原点（backups/）。
+///
+/// 为什么不再用应用自己的配置目录：CLI 的状态目录是「配置文件所在目录」
+/// （`~/.config/rime-sync`），桌面端原来用的是应用配置目录
+/// （`~/.config/com.rimesync.app`）—— 两端各存一份 index.json，
+/// 基线算不到一处去，于是同一台机器上反复出现假冲突。
+pub(crate) fn state_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = match paths::shared_state_dir() {
+        Ok(dir) => dir,
+        Err(_error) => {
+            // 环境变量一个都没有（极少见）：退回系统配置目录，
+            // 宁可让两端不一致，也不要让应用起不来。
+            app.path()
+                .config_dir()
+                .map_err(|fallback_error| format!("无法定位用户配置目录：{fallback_error}"))?
+                .join(paths::SHARED_DIR_NAME)
+        }
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("创建状态目录 {} 失败：{error}", dir.display()))?;
     Ok(dir)
 }
 
@@ -119,8 +154,9 @@ pub(crate) fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// 配置文件路径：**保持原样**（仍在应用配置目录里，升级不搬用户的配置）。
 pub(crate) fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(state_dir(app)?.join("config.json"))
+    Ok(config_dir(app)?.join("config.json"))
 }
 
 /// 读配置文件（磁盘原值，**不含**环境变量覆盖）。
@@ -418,7 +454,17 @@ fn cmd_get_config(app: AppHandle, state: State<'_, AppState>) -> Result<Config, 
     if let Some(problem) = config::rime_dir_problem(config.rime_dir.as_deref()) {
         push_log(&state.0, problem);
     }
-    Ok(config)
+    // 磁盘上的地址还带着凭据 ⇒ 说明这台机器的密码后端用不了，密码只能活在
+    // 地址里。界面上的地址已经隐去账号密码（见 frontend_config），这里告诉
+    // 用户一声，免得以为密码被清掉了。提示里绝不含密码本身。
+    if rime_sync_core::webdav::has_userinfo(&config.webdav.url) {
+        push_log(
+            &state.0,
+            "WebDAV 密码目前保存在地址里：界面上的地址已隐去账号密码，保存时会原样保留（若密码后端可用，下次启动会自动搬进钥匙串）",
+        );
+    }
+    // 交给前端的配置：地址里不许有 `user:pass`，密码字段也不许是明文。
+    Ok(frontend_config::sanitize(config))
 }
 
 #[tauri::command]
@@ -429,6 +475,36 @@ fn cmd_set_config(
 ) -> Result<Config, String> {
     config.webdav.url = config.webdav.url.trim().to_string();
     config.webdav.username = config.webdav.username.trim().to_string();
+    // 地址里带账号密码（https://user:pass@host/dav）：**不再直接拒绝**，
+    // 而是自己拆开（与 CLI 完全一致）：账号填进「用户名」，密码存进密码后端，
+    // 地址只留主机与路径 ⇒ 密码从此不进配置文件、不进日志、不进诊断包。
+    //
+    // 拆不出来（畸形写法）或账号跟「用户名」字段打架时才报错。
+    let mut url_password = String::new();
+    if rime_sync_core::webdav::has_userinfo(&config.webdav.url) {
+        match rime_sync_core::webdav::split_userinfo(&config.webdav.url) {
+            Some(creds) => {
+                let typed = config.webdav.username.trim().to_string();
+                if !typed.is_empty() && !creds.username.is_empty() && typed != creds.username {
+                    return Err(
+                        "WebDAV 地址里的账号与「用户名」字段填的账号不一致，请把账号与密码分别填在「用户名」「密码」里"
+                            .to_string(),
+                    );
+                }
+                if typed.is_empty() {
+                    config.webdav.username = creds.username.clone();
+                }
+                url_password = creds.password.clone().unwrap_or_default();
+                config.webdav.url = creds.clean_url.clone();
+            }
+            None => {
+                return Err(
+                    "WebDAV 地址里的账号密码解析不出来，请把账号与密码分别填在「用户名」「密码」里"
+                        .to_string(),
+                );
+            }
+        }
+    }
     // 远端目录留空 = 服务器根（SPEC-3 §A4），不再回填默认值。
     config.webdav.remote_dir = config
         .webdav
@@ -477,7 +553,12 @@ fn cmd_set_config(
                 .map_err(|error| format!("设备 ID 无效：{error:#}"))?;
         }
     }
-    let typed_password = std::mem::take(&mut config.webdav.password);
+    let mut typed_password = std::mem::take(&mut config.webdav.password);
+    // 地址里带出来的密码（用户把 `https://user:pass@host/dav` 粘进了地址框）
+    // ⇒ 与手工填进「密码」框完全同等待遇：一样存进密码后端。
+    if typed_password.is_empty() && !url_password.is_empty() {
+        typed_password = url_password;
+    }
     if typed_password.is_empty() {
         // 前端只拿得到空的密码字段（Config 序列化时已跳过 password）。
         // 用户名换了就把旧账号的密码搬到新账号名下，避免用户被迫重新输入。
@@ -496,14 +577,51 @@ fn cmd_set_config(
         if let Ok(Some(secret)) = selection.store.get(&config.password_account()) {
             config.webdav.password = secret;
         }
+        if config.webdav.password.is_empty() {
+            // 密码后端里没有这个账号的密码 ⇒ 可能是「降级模式」：
+            // 密码只存在于磁盘配置的地址里（`https://user:pass@host/dav`）。
+            // 这时绝不能让用户改个地址就把唯一那份密码弄丢 ——
+            // 把地址里的凭据随新地址一起搬过去（地址更新，密码也还在）。
+            //
+            // 磁盘原值从**当前进程重新读出的配置**里取，密码从磁盘读，
+            // 不从界面那边取（界面上根本没有密码）。
+            if let Ok(disk) = read_stored_config(&path) {
+                if config.carry_webdav_credentials(&disk) {
+                    push_log(
+                        &state.0,
+                        "系统密码后端不可用：已把地址里的账号密码随新地址一起保留（密码仍在地址里，未写进日志）",
+                    );
+                }
+            }
+        }
     } else {
-        selection
+        // 存进密码后端。存不进去（这台机器没有可用的系统钥匙串）⇒ 别把密码丢掉：
+        // 退回到「密码留在地址里」的老形态（磁盘上的地址仍然带凭据，
+        // 但日志/诊断包里不会出现明文），功能照样能用。
+        match selection
             .store
             .set(&config.password_account(), &typed_password)
-            .map_err(|error| format!("保存密码失败：{error:#}"))?;
-        config.password_ref = selection.backend.password_ref();
-        config.webdav.password = typed_password;
-        push_log(&state.0, "密码已写入系统密码后端");
+        {
+            Ok(()) => {
+                config.password_ref = selection.backend.password_ref();
+                config.webdav.password = typed_password;
+                push_log(&state.0, "密码已写入系统密码后端");
+            }
+            Err(error) => {
+                config.webdav.url = config::url_with_userinfo(
+                    &config.webdav.url,
+                    &config.webdav.username,
+                    &typed_password,
+                );
+                config.webdav.password = typed_password;
+                push_log(
+                    &state.0,
+                    format!(
+                        "系统密码后端不可用（{error:#}）：密码已保留在 WebDAV 地址里（未写进日志）"
+                    ),
+                );
+            }
+        }
     }
 
     // 代理密码：与 WebDAV 同一套语义——前端只拿得到空字段，空 = 沿用后端已有值。
@@ -548,6 +666,9 @@ fn cmd_set_config(
     // 返回给界面的是**生效值**（含环境变量覆盖）：界面显示的必须等于真正会用上的。
     let mut effective = config;
     effective.apply_env();
+    // 密码不进界面：前端只要知道「密码已设置」，具体值它拿不到、也不需要。
+    effective.webdav.password = String::new();
+    effective.proxy.password = String::new();
     Ok(effective)
 }
 
@@ -644,26 +765,63 @@ struct NetworkStatus {
     message: String,
     available: bool,
     metered: bool,
+    /// 本次结果是不是真的探测出来的。false = 还没探测过（只回了默认值）。
+    detected: bool,
     failures: u32,
     next_retry_at: Option<u64>,
     next_retry_in_secs: Option<u64>,
 }
 
 /// SPEC-3 §B/C10：UI 展示网络状态与下次重试时间。
+///
+/// **这里不探测**。Windows 上探测「是否按流量计费」要起一个 powershell.exe，
+/// 以前这条命令被界面刷新和同步结束后的自动刷新带着跑，等于每 10 分钟
+/// 白白起两个 PowerShell 进程。现在只有用户点「检测网络状态」才探一次。
 #[tauri::command]
 fn cmd_network_status(app: AppHandle) -> Result<NetworkStatus, String> {
     let policy = NetworkPolicy::system();
-    let state = policy.state();
+    // 只回已知结论，绝不启动子进程；没检测过就是 None。
+    let snapshot = policy.last_known_snapshot();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let retry = RetryState::load(&state_dir(&app)?.join("retry.json")).unwrap_or_default();
     Ok(NetworkStatus {
-        state: state.as_str().to_string(),
-        message: state.message().to_string(),
-        available: policy.available(),
-        metered: policy.is_metered(),
+        state: snapshot
+            .map(|item| item.state.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        message: snapshot
+            .map(|item| item.state.message().to_string())
+            .unwrap_or_else(|| "尚未检测网络状态".to_string()),
+        // 没检测过时按既有语义兜底：可用 / 非计量（绝不能因此阻止同步）。
+        available: snapshot.map(|item| item.available).unwrap_or(true),
+        metered: snapshot.map(|item| item.metered).unwrap_or(false),
+        detected: snapshot.is_some(),
+        failures: retry.failures,
+        next_retry_at: retry.next_retry_at,
+        next_retry_in_secs: retry.next_retry_at.map(|next| next.saturating_sub(now)),
+    })
+}
+
+/// 用户点「检测网络状态」时才调用：真正探一次，拿到全部结论。
+///
+/// 一次探测就够了（available / metered / state 都从同一份结果里取），
+/// 不像以前那样 state()、available()、is_metered() 各探一遍。
+#[tauri::command]
+fn cmd_probe_network_status(app: AppHandle) -> Result<NetworkStatus, String> {
+    let snapshot = NetworkPolicy::system().probe_once();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let retry = RetryState::load(&state_dir(&app)?.join("retry.json")).unwrap_or_default();
+    Ok(NetworkStatus {
+        state: snapshot.state.as_str().to_string(),
+        message: snapshot.state.message().to_string(),
+        available: snapshot.available,
+        metered: snapshot.metered,
+        detected: true,
         failures: retry.failures,
         next_retry_at: retry.next_retry_at,
         next_retry_in_secs: retry.next_retry_at.map(|next| next.saturating_sub(now)),
@@ -833,7 +991,13 @@ fn run_sync_inner(app: &AppHandle, inner: &Arc<Inner>, mode: SyncMode) -> Result
         SyncMode::Transport => engine.transport(),
         SyncMode::Apply => engine.apply(),
     };
-    let verdict = if report.ok { "成功" } else { "失败" };
+    // 上传冲突（远端词库已被别的设备改写）也算失败：
+    // 用户看到的必须是「没推上去」，不能是「成功」。
+    let verdict = if report.ok && !report.upload_conflict {
+        "成功"
+    } else {
+        "失败"
+    };
     push_log(
         inner,
         format!(
@@ -1307,11 +1471,38 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
+            // 旧目录 → 共享目录的一次性迁移（状态与备份，配置文件不动）。
+            //
+            // 为什么排在建日志**之前**：迁移会把旧日志与崩溃标记一起搬过去，
+            // 搬完再建日志，才能既保住上次的日志，又认得出「上次崩了」。
+            //
+            // 迁移失败只记日志、绝不中断启动：拿不到旧数据顶多是从零开始，
+            // 而起不来就是彻底用不了。
+            let migration = match (config_dir(&handle), state_dir(&handle)) {
+                (Ok(legacy), Ok(shared)) => Some(paths::migrate_legacy_state(&legacy, &shared)),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("[rime-sync] 状态目录迁移跳过：{error}");
+                    None
+                }
+            };
             // 落盘日志先建起来：后面的 push_log、core 的 tracing::、panic 钩子
             // 全都写进这同一个文件。
             match app_log::init(&handle) {
                 Ok(path) => push_log(&state.0, format!("日志文件：{}", path.display())),
                 Err(error) => push_log(&state.0, format!("日志文件不可用：{error}")),
+            }
+            // 迁移结果说清楚：搬了什么、跳过了什么、什么没搬成。
+            if let Some(report) = &migration {
+                if !report.is_noop() {
+                    push_log(&state.0, format!("状态目录迁移：{}", report.summary()));
+                    for line in report.failure_lines() {
+                        push_log(&state.0, format!("状态目录迁移失败：{line}"));
+                    }
+                }
+            }
+            // 状态目录（基线与备份都在这里）说给用户听，便于排查两端是否同一处。
+            if let Ok(dir) = state_dir(&handle) {
+                push_log(&state.0, format!("状态目录：{}", dir.display()));
             }
             // 上次启动崩过的话，弹一次提示（abort 会带走同进程的弹窗，
             // 跨进程的这次提示才是真正能被用户看到的）。
@@ -1396,6 +1587,7 @@ pub fn run() {
             cmd_detect_rime_dir,
             cmd_test_connection,
             cmd_network_status,
+            cmd_probe_network_status,
             cmd_list_remote,
             cmd_transport,
             cmd_apply,
@@ -1413,6 +1605,10 @@ pub fn run() {
             prebuilt_cmds::cmd_fix_ime,
             prebuilt_cmds::cmd_ime_status,
             prebuilt_cmds::cmd_restart_elevated,
+            // 方案裁剪：先预演（不动磁盘），用户确认后才真的删。
+            prune_cmds::cmd_prune_preview,
+            prune_cmds::cmd_prune_confirm,
+            prune_cmds::cmd_prune_cancel,
             conflict_cmds::cmd_list_conflicts,
             conflict_cmds::cmd_resolve_conflict,
             conflict_cmds::cmd_conflict_remote_sizes,

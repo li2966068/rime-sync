@@ -42,7 +42,12 @@ fn save(app: &AppHandle, prefs: &PlatformPrefs) -> Result<(), String> {
     let path = prefs_path(app)?;
     let text = serde_json::to_string_pretty(prefs)
         .map_err(|error| format!("序列化窗口偏好失败：{error}"))?;
-    std::fs::write(&path, text).map_err(|error| format!("写入 {} 失败：{error}", path.display()))
+    // 原子写：先写同目录临时文件再改名。
+    // 以前是直接 fs::write ⇒ 断电/进程被杀会留下**半个** JSON，
+    // 下次启动解析失败 ⇒ 用户在设置里选的「关闭窗口时退出」被静默变回「隐藏到托盘」，
+    // 而且界面上看不出任何异常。
+    rime_sync_core::atomic::write_atomic(&path, text.as_bytes())
+        .map_err(|error| format!("写入 {} 失败：{error:#}", path.display()))
 }
 
 /// 关窗是否隐藏。托盘没建起来时必须放行关闭：
@@ -54,11 +59,13 @@ pub(crate) fn should_hide_on_close(app: &AppHandle, inner: &Inner) -> bool {
     match load(app) {
         Ok(prefs) => prefs.close_to_tray,
         Err(error) => {
+            // 读不出来（文件坏了/没权限）时**放行关闭**：隐藏到托盘一旦托盘也没起来，
+            // 用户就既没窗口也没托盘，进程成了僵尸。宁可这次窗口直接关掉。
             push_log(
                 inner,
-                format!("读取窗口偏好失败（按默认隐藏处理）：{error}"),
+                format!("读取窗口偏好失败（按关闭窗口即退出处理）：{error}"),
             );
-            true
+            false
         }
     }
 }

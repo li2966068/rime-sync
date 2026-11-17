@@ -205,6 +205,11 @@ textarea { resize: vertical; min-height: 62px; font-family: var(--mono); font-si
 .hint { margin: 5px 0 0; font-size: 11px; color: var(--muted); }
 .hint code, .muted code { font-family: var(--mono); font-size: 11px; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; }
 
+/* 网络状态行：左边是状态文字，右边是「检测网络状态」按钮。 */
+.network-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.network-row .hint { flex: 1 1 auto; margin: 5px 0 0; min-width: 0; }
+.network-row button { flex: 0 0 auto; margin-top: 5px; }
+
 .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
 .actions.big { margin-top: 4px; }
 .actions.big button { padding: 10px 16px; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }

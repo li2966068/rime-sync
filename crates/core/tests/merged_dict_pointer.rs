@@ -580,3 +580,46 @@ fn pointer_write_is_atomic_and_keeps_a_copy_of_the_old_content() {
         "原子写不许留下临时文件：{leftovers:?}"
     );
 }
+
+/// 回归（2026-11-17 复核发现）：.rimesync-orig 必须**只建一次**。
+///
+/// data_patch.rs 与 managed_custom.rs 对同一个路径的规矩都是「只做一次」，
+/// recover_from_backup() 也靠它抢救被写坏的方案文件。
+/// 之前 merged_dict 改成「每次覆盖前都刷新」⇒ 第二次覆盖后，
+/// .rimesync-orig 里变成「已被 rime-sync 打过补丁的版本」，
+/// 用户**最初的原件**被永久顶掉，抢救也救不回原件。
+#[test]
+fn the_original_backup_is_never_overwritten_by_a_later_write() {
+    let (rime_dir, data_dir) = scene("orig-preserved");
+    let custom = rime_dir.join("luna_pinyin_simp.custom.yaml");
+    let original = custom_yaml_without_pointer();
+    write(&custom, &original);
+    let dirs = vec![data_dir];
+
+    // 第一次写：指针写进去，同时把「改动前的内容」留底。
+    let changes = ensure_pointers(&rime_dir, &dirs);
+    assert!(change_for(&changes, "luna_pinyin_simp")
+        .expect("change")
+        .wrote());
+    let orig = rime_sync_core::data_patch::backup_path(&custom);
+    assert!(orig.is_file(), "首次写必须留底：{}", orig.display());
+    assert_eq!(
+        fs::read_to_string(&orig).expect("read orig"),
+        original,
+        "留底的内容必须是改动前的那一份"
+    );
+
+    // 第二次写：文件内容被别的流程改写过（指针不在里面了），于是又要写一次。
+    // 这正是真实场景：同步把用户文件覆盖回来 ⇒ 指针丢了 ⇒ 再补一次。
+    write(&custom, &custom_yaml_without_pointer());
+    let changes = ensure_pointers(&rime_dir, &dirs);
+    assert!(change_for(&changes, "luna_pinyin_simp")
+        .expect("change")
+        .wrote());
+
+    assert_eq!(
+        fs::read_to_string(&orig).expect("read orig"),
+        original,
+        "第二次覆盖后，留底里必须仍是用户**最初**的那一份（不能被顶成打过补丁的版本）"
+    );
+}

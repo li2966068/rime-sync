@@ -8,6 +8,7 @@ import { busy, requireConfig } from "./state";
 import { refreshSecretStatus } from "./secret";
 import { renderConfig } from "./settings";
 import { proxyDraft, proxyValidationError } from "./proxy";
+import { passwordDraftValue } from "./password";
 
 // 连接页：WebDAV 连通性、写探测、远端列表与网络状态。
 
@@ -18,7 +19,8 @@ export function connectionDraft(): Config {
     webdav: {
       url: el.url.value.trim(),
       username: el.user.value,
-      password: el.pass.value,
+      // 掩码 ⇒ 空串：后端理解为「沿用已保存的密码」（只改地址不会把密码抹掉）。
+      password: passwordDraftValue(),
       // 留空 = 服务器根（SPEC-3 §A4）。
       remote_dir: el.dir.value.trim(),
     },
@@ -182,17 +184,42 @@ export function formatRetry(seconds: number): string {
 export async function refreshNetwork(): Promise<void> {
   try {
     const status: NetworkStatus = await api.networkStatus();
-    const lines = [t("network.label", { state: status.message })];
-    if (status.state === "metered") {
-      lines.push(t("network.meteredNote"));
-    }
-    if (typeof status.next_retry_in_secs === "number") {
-      lines.push(formatRetry(status.next_retry_in_secs));
-    }
-    el.networkStatus.textContent = lines.join(" · ");
-    el.networkStatus.className =
-      "hint network-" + status.state + (status.state === "online" ? "" : " warn");
+    renderNetworkStatus(status);
   } catch {
     el.networkStatus.textContent = "";
+  }
+}
+
+/** 把网络状态画到那一行文字上。 */
+function renderNetworkStatus(status: NetworkStatus): void {
+  const lines = [t("network.label", { state: status.message })];
+  if (status.state === "metered") {
+    lines.push(t("network.meteredNote"));
+  }
+  if (typeof status.next_retry_in_secs === "number") {
+    lines.push(formatRetry(status.next_retry_in_secs));
+  }
+  el.networkStatus.textContent = lines.join(" · ");
+  el.networkStatus.className =
+    "hint network-" + status.state + (status.state === "online" ? "" : " warn");
+}
+
+/**
+ * 用户点「检测网络状态」：真的探一次。
+ *
+ * 探测在 Windows 上会起一个 powershell.exe 查 WinRT（判断是否按流量计费），
+ * 所以平时**不自动探**——只有用户主动点才探，避免每 10 分钟白起两个进程。
+ */
+export async function probeNetworkStatus(): Promise<void> {
+  el.probeNetwork.disabled = true;
+  setStatus(el.connStatus, "idle", t("conn.probingNetwork"));
+  try {
+    const status: NetworkStatus = await api.probeNetworkStatus();
+    renderNetworkStatus(status);
+    setStatus(el.connStatus, "ok", t("conn.probeNetworkDone"));
+  } catch (error) {
+    setStatus(el.connStatus, "err", t("conn.probeNetworkFail", { error: errorText(error) }));
+  } finally {
+    el.probeNetwork.disabled = false;
   }
 }

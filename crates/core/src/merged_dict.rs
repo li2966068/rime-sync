@@ -612,13 +612,22 @@ fn write_pointer(
 
     // 备份两道闸：
     // ① 外部钩子（引擎的 BackupManager 会话）—— 用户能在 App 里看到并回滚；
-    // ② .rimesync-orig —— 引擎外的兜底，**每次覆盖前都刷新**（不再是只建一次），
-    //    否则第一次覆盖后的旧内容会被后续覆盖悄悄顶掉。
+    // ② .rimesync-orig —— 引擎外的兜底。
+    //
+    // ② **只建一次**（2026-11-17 复核修正）：data_patch.rs 与 managed_custom.rs
+    // 对同一个路径（<schema>.custom.yaml.rimesync-orig）的规矩都是「只做一次」，
+    // recover_from_backup() 也靠它抢救被写坏的方案文件。
+    // 之前这里改成「每次覆盖前都刷新」，于是第二次覆盖后 .rimesync-orig 里
+    // 变成「已被 rime-sync 打过补丁的版本」⇒ 用户**原始文件**被永久顶掉，
+    // 抢救也救不回原件。三处必须一致：只建一次。
     if make_backup {
         backup(path)?;
         let backup_file = crate::data_patch::backup_path(path);
-        crate::atomic::write_atomic(&backup_file, &bytes)
-            .with_context(|| format!("备份 {}", backup_file.display()))?;
+        // 已经存在就**不覆盖**：那里面存的是用户最初的原件。
+        if !backup_file.exists() {
+            crate::atomic::write_atomic(&backup_file, &bytes)
+                .with_context(|| format!("备份 {}", backup_file.display()))?;
+        }
     }
     let output = if has_bom {
         format!("\u{feff}{patched}")

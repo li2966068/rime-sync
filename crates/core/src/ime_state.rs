@@ -1174,8 +1174,18 @@ pub struct Options {
     pub data_resolver: Option<Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>>,
     /// 方案裁剪（prune）是否由 ensure 负责（A-5）。
     ///
-    /// Install/Fix 模式：true —— CLI 与 GUI 走同一条入口，结论一致。
-    /// Bootstrap：false —— 启动自举维持现状（自己在 bootstrap 里裁剪）。
+    /// **默认 false**：裁剪会真删用户的 `<id>.custom.yaml` 并重写 schema_list，
+    /// 属于「用户没确认过」的动作，不能作为任何入口的隐含默认。
+    ///
+    /// * 默认（`Options::new` / `install()` / `fix()` / `bootstrap()`）⇒ **不裁剪**。
+    ///   桌面版首启自举走的就是这条（见 `src-tauri/src/prebuilt_cmds.rs`）：
+    ///   只做预演、把清单交给用户在设置页确认，绝不静默删方案。
+    /// * CLI 的 `ensure-ime` 是用户**显式敲的命令**，那里显式 `.with_prune(true)`
+    ///   保留旧的裁剪语义。
+    ///
+    /// 想裁剪又有两种正规途径：
+    /// ① 桌面版设置页的「清理输入方案」卡片（先预演、后确认）；
+    /// ② CLI 的 `prune-schemas`（`--dry-run` 可先看清单）。
     pub prune: bool,
     /// build/ 已可用时是否仍然铺一次 payload config/（A-3）。
     ///
@@ -1250,8 +1260,9 @@ impl Options {
         Self {
             install_ime: true,
             seed_templates: true,
-            // A-5：裁剪纳入 ensure —— CLI 与 GUI 走同一条入口。
-            prune: true,
+            // A-5：裁剪**默认不做** —— 删方案必须用户确认过（桌面设置页预演+确认，
+            // 或 CLI prune-schemas）。要裁剪的入口自己显式 .with_prune(true)。
+            prune: false,
             // A-3：build 已可用时也铺一次 payload config（缺才写）。
             always_config: true,
             ..Self::new(Mode::Install)
@@ -1266,8 +1277,9 @@ impl Options {
         Self {
             install_ime: true,
             seed_templates: false,
-            // A-5：裁剪纳入 ensure —— CLI 与 GUI 走同一条入口。
-            prune: true,
+            // A-5：裁剪**默认不做** —— 删方案必须用户确认过（桌面设置页预演+确认，
+            // 或 CLI prune-schemas）。要裁剪的入口自己显式 .with_prune(true)。
+            prune: false,
             // A-3：build 已可用时也铺一次 payload config（缺才写）。
             always_config: true,
             ..Self::new(Mode::Fix)
@@ -1280,9 +1292,9 @@ impl Options {
         Self {
             install_ime: true,
             seed_templates: true,
-            // A-5：裁剪统一由 ensure 负责（Bootstrap 也走这一条）—— 单一入口，
-            // 裁剪结果随 Outcome 一起回来（changed 的计算也才准）。
-            prune: true,
+            // A-5：裁剪**默认不做**。启动自举绝不能静默删用户的方案：
+            // 桌面版只做预演、把清单交给用户在设置页确认（见 prune_cmds）。
+            prune: false,
             // A-3：Bootstrap 不做多余写入（config 交给 Install/Fix 路径）。
             always_config: false,
             ..Self::new(Mode::Bootstrap)
@@ -2833,8 +2845,36 @@ engine:
             opts.install_ime,
             "Fix 模式必须自己装输入法本体（否则 data 补丁打在不存在的目录上）"
         );
-        assert!(opts.prune, "A-5：裁剪纳入 ensure");
+        assert!(
+            !opts.prune,
+            "裁剪默认必须关着：删用户方案要用户确认过（桌面设置页预演+确认 / CLI prune-schemas）"
+        );
         assert!(opts.always_config, "A-3：build 已可用时也要铺 config");
+    }
+
+    /// 回归：裁剪**不能**是任何入口的隐含默认。
+    ///
+    /// 缺陷（改前）：`Options::install()/fix()/bootstrap()` 默认 `prune: true`，
+    /// 桌面版首启自举因此会静默删掉不在保留名单里的 `<id>.custom.yaml` 并重写
+    /// schema_list —— 用户既没确认过、也没法预演，「我正在用的方案凭空消失」。
+    ///
+    /// 现在：三个预设一律 `prune: false`。要裁剪的入口自己显式 `.with_prune(true)`
+    /// （CLI 的 ensure-ime），或走设置页的「预演 → 确认」。
+    #[test]
+    fn no_preset_enables_prune_implicitly() {
+        for (name, opts) in [
+            ("install", Options::install()),
+            ("fix", Options::fix()),
+            ("bootstrap", Options::bootstrap()),
+            ("new(Fix)", Options::new(Mode::Fix)),
+            ("new(Install)", Options::new(Mode::Install)),
+            ("new(Bootstrap)", Options::new(Mode::Bootstrap)),
+        ] {
+            assert!(
+                !opts.prune,
+                "{name} 预设不许隐含裁剪：删用户方案必须用户确认过"
+            );
+        }
     }
 
     /// A-6：M1 的「装完才出现 wubi86」分支可注入、可测。

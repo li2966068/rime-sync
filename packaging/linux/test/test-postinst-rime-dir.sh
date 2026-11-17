@@ -54,6 +54,9 @@ extract "$postinst" rime_user_dir_from_cli "$tmp/postinst_cli.sh"
 extract "$postinst" resolve_rime_user_dir "$tmp/postinst_resolve.sh"
 extract "$uninstaller" resolve_config_home "$tmp/uninst_config.sh"
 extract "$extra" resolve_config_home "$tmp/extra_config.sh"
+extract "$extra" parse_rime_user_data_dir "$tmp/extra_parse.sh"
+extract "$extra" rime_user_dir_from_cli "$tmp/extra_cli.sh"
+extract "$extra" resolve_rime_user_dir "$tmp/extra_resolve.sh"
 extract "$uninstaller" parse_rime_user_data_dir "$tmp/uninst_parse.sh"
 extract "$uninstaller" rime_user_dir_from_cli "$tmp/uninst_cli.sh"
 extract "$uninstaller" rime_user_dir "$tmp/uninst_resolve.sh"
@@ -107,6 +110,9 @@ cp "$tmp/postinst_cli.sh" "$tmp/p/cli.sh"
 cp "$tmp/postinst_resolve.sh" "$tmp/p/resolve.sh"
 cp "$tmp/uninst_config.sh" "$tmp/u/config.sh"
 cp "$tmp/extra_config.sh" "$tmp/e/config.sh"
+cp "$tmp/extra_parse.sh" "$tmp/e/parse.sh"
+cp "$tmp/extra_cli.sh" "$tmp/e/cli.sh"
+cp "$tmp/extra_resolve.sh" "$tmp/e/resolve.sh"
 cp "$tmp/uninst_parse.sh" "$tmp/u/parse.sh"
 cp "$tmp/uninst_cli.sh" "$tmp/u/cli.sh"
 cp "$tmp/uninst_resolve.sh" "$tmp/u/resolve.sh"
@@ -118,16 +124,18 @@ cp "$tmp/inst_resolve.sh" "$tmp/i/resolve.sh"
 # check <描述> <期望> <HOME>
 # 四个实现（postinst / uninstall.sh / install.sh）必须给出同一个目录。
 check() {
-    local desc=$1 expect=$2 chome=$3
+    local desc=$1 expect=$2 chome=$3 got_p got_u got_e got_i
     got_p=$(run_in "$tmp/p" resolve_rime_user_dir "$chome" | tr -d '\n')
     got_u=$(run_in "$tmp/u" rime_user_dir "$chome" | tr -d '\n')
+    got_e=$(run_in "$tmp/e" resolve_rime_user_dir "$chome" | tr -d '\n')
     got_i=$(run_in "$tmp/i" resolve_rime_user_dir "$chome" | tr -d '\n')
-    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ] && [ "$got_i" = "$expect" ]; then
+    if [ "$got_p" = "$expect" ] && [ "$got_u" = "$expect" ] \
+        && [ "$got_e" = "$expect" ] && [ "$got_i" = "$expect" ]; then
         printf '  OK   %s -> %s\n' "$desc" "$got_p"
         pass=$((pass + 1))
     else
-        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s] install=[%s]\n' \
-            "$desc" "$expect" "$got_p" "$got_u" "$got_i"
+        printf '  FAIL %s -> 期望 [%s] postinst=[%s] uninstall=[%s] extra-ime=[%s] install=[%s]\n' \
+            "$desc" "$expect" "$got_p" "$got_u" "$got_e" "$got_i"
         fail=$((fail + 1))
     fi
 }
@@ -256,6 +264,14 @@ cli_u=$(
     . "$tmp/u/resolve.sh"
     rime_user_dir "$home" | tr -d '\n'
 )
+cli_e=$(
+    PATH="$tmp/bin2:$PATH"
+    . "$tmp/e/config.sh"
+    . "$tmp/e/parse.sh"
+    . "$tmp/e/cli.sh"
+    . "$tmp/e/resolve.sh"
+    resolve_rime_user_dir "$home" | tr -d '\n'
+)
 cli_i=$(
     PATH="$tmp/bin2:$PATH"
     . "$tmp/i/config.sh"
@@ -265,12 +281,12 @@ cli_i=$(
     resolve_rime_user_dir "$home" | tr -d '\n'
 )
 if [ "$cli_p" = "/cli/authoritative" ] && [ "$cli_u" = "/cli/authoritative" ] \
-    && [ "$cli_i" = "/cli/authoritative" ]; then
+    && [ "$cli_e" = "/cli/authoritative" ] && [ "$cli_i" = "/cli/authoritative" ]; then
     printf '  OK   CLI 权威值优先 -> %s\n' "$cli_p"
     pass=$((pass + 1))
 else
-    printf '  FAIL CLI 权威值优先 -> postinst=[%s] uninstall=[%s] install=[%s]\n' \
-        "$cli_p" "$cli_u" "$cli_i"
+    printf '  FAIL CLI 权威值优先 -> postinst=[%s] uninstall=[%s] extra-ime=[%s] install=[%s]\n' \
+        "$cli_p" "$cli_u" "$cli_e" "$cli_i"
     fail=$((fail + 1))
 fi
 
@@ -319,6 +335,28 @@ sig_same "install.sh 与 postinst 的 rime_user_dir_from_cli" \
     "$tmp/postinst_cli.sh" "$tmp/inst_cli.sh"
 sig_same "install.sh 与 postinst 的 resolve_rime_user_dir" \
     "$tmp/postinst_resolve.sh" "$tmp/inst_resolve.sh"
+
+# install-extra-ime.sh（GUI 通过 pkexec 调的额外输入法安装器）同样必须与 postinst
+# 逐字一致：它以前直接取 CLI 的 detect --json 的 path 字段，没有「known: 修正」，
+# 于是 rime.conf 里的 UserDataDirPath 指向的目录还不存在时，本脚本与 postinst
+# 会算出**不同的** Rime 目录，受管 custom.yaml 与预编译产物被写进没人读的目录。
+sig_same "install-extra-ime.sh 与 postinst 的 resolve_config_home" \
+    "$tmp/postinst_config.sh" "$tmp/extra_config.sh"
+sig_same "install-extra-ime.sh 与 postinst 的 parse_rime_user_data_dir" \
+    "$tmp/postinst_parse.sh" "$tmp/extra_parse.sh"
+sig_same "install-extra-ime.sh 与 postinst 的 rime_user_dir_from_cli" \
+    "$tmp/postinst_cli.sh" "$tmp/extra_cli.sh"
+sig_same "install-extra-ime.sh 与 postinst 的 resolve_rime_user_dir" \
+    "$tmp/postinst_resolve.sh" "$tmp/extra_resolve.sh"
+
+# install-extra-ime.sh 必须真的走 resolve_rime_user_dir（而不是自己解析 CLI 的 path）。
+if grep -q 'resolve_rime_user_dir "\$TARGET_HOME"' "$extra"; then
+    printf '  OK   install-extra-ime.sh 使用 resolve_rime_user_dir 解析用户目录\n'
+    pass=$((pass + 1))
+else
+    printf '  FAIL install-extra-ime.sh 没有用 resolve_rime_user_dir\n'
+    fail=$((fail + 1))
+fi
 
 # install.sh 不得再硬编码默认 Rime 用户目录（缺陷回归护栏）：
 # 硬编码会把配置写进 fcitx5 根本不读的目录。

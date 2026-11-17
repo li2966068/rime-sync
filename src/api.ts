@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 export interface WebDavConfig {
   url: string;
   username: string;
-  password: string;
+  /** 后端不返回明文密码（留空 = 沿用已保存的密码）。 */
+  password?: string;
   remote_dir: string;
 }
 
@@ -144,10 +145,12 @@ export interface ProbeResult {
 }
 
 export interface NetworkStatus {
-  state: "online" | "metered" | "offline";
+  state: "online" | "metered" | "offline" | "unknown";
   message: string;
   available: boolean;
   metered: boolean;
+  /** 本次结果是不是真探测出来的；false = 还没探测过。 */
+  detected: boolean;
   failures: number;
   next_retry_at: number | null;
   next_retry_in_secs: number | null;
@@ -475,6 +478,59 @@ export interface SetSchemasResult {
   deploy_error: string | null;
 }
 
+/// 方案裁剪预演（cmd_prune_preview）：只读，一个字节都没动。
+export interface PrunePreview {
+  /** 确认执行时必须带回的令牌；内容变了令牌就变（旧令牌会被拒绝）。 */
+  token: string;
+  /** 会被删除的文件（绝对路径）。 */
+  files: string[];
+  /** 会被改写的 schema_list 文件。 */
+  schema_lists: PruneSchemaListPreview[];
+  /** 会因此在输入法里消失的方案 id。 */
+  affected_schemas: string[];
+  /** 保留集合（保留清单 + 追加白名单 + 依赖闭包）。 */
+  keep: string[];
+  /** 随包保留清单。 */
+  retained: string[];
+  /** 扫描过的 data 目录。 */
+  data_dirs: string[];
+  /** 扫描过的 Rime 用户目录（探测不到时为空串）。 */
+  user_dir: string;
+  /** 告警（用户目录探测失败等）。 */
+  warnings: string[];
+  /** 有没有东西会被删或被改。 */
+  has_changes: boolean;
+  /** 被 RIMESYNC_PRUNE_SCHEMAS=0 关闭。 */
+  disabled: boolean;
+}
+
+/** 一个 schema_list 文件的改动预览。 */
+export interface PruneSchemaListPreview {
+  path: string;
+  /** 改写后的完整内容。 */
+  after: string;
+  /** 被删掉的条目数。 */
+  dropped: number;
+  /** 被删掉的方案 id。 */
+  removed_schemas: string[];
+}
+
+/** 方案裁剪执行结果（cmd_prune_confirm）。 */
+export interface PruneConfirmReport {
+  disabled: boolean;
+  dry_run: boolean;
+  timestamp: string;
+  retained: string[];
+  kept_by_env: string[];
+  keep: string[];
+  warnings: string[];
+  data_dirs: string[];
+  user_dir: string;
+  removed: string[];
+  backups: string[];
+  failures: string[];
+}
+
 /// build/ 产物状态：none = 没有判据文件；deploy = 有文件但没插件标记（官方部署）；
 /// prebuilt = 含 rimesync_vnum / rimesync_punct，可用。
 export type BuildProbe = "none" | "deploy" | "prebuilt";
@@ -596,6 +652,8 @@ export const api = {
   detectRimeDir: () => invoke<Detection>("cmd_detect_rime_dir"),
   testConnection: () => invoke<ProbeResult>("cmd_test_connection"),
   networkStatus: () => invoke<NetworkStatus>("cmd_network_status"),
+  // 手动探测：只有用户点「检测网络状态」才调（会起一个 powershell.exe）。
+  probeNetworkStatus: () => invoke<NetworkStatus>("cmd_probe_network_status"),
   listRemote: () => invoke<RemoteList>("cmd_list_remote"),
   transport: () => invoke<Report>("cmd_transport"),
   planSync: () => invoke<PlanReport>("cmd_plan_sync"),
@@ -657,6 +715,12 @@ export const api = {
   // 把界面语言告诉后端：输入法失败对话框是原生窗口，用不到前端 i18n。
   setLocale: (locale: string) => invoke<void>("cmd_set_locale", { locale }),
   restartElevated: () => invoke<void>("cmd_restart_elevated"),
+
+  // 方案裁剪：先预演（只读，不动磁盘），用户确认后才凭令牌真的删。
+  prunePreview: () => invoke<PrunePreview>("cmd_prune_preview"),
+  pruneConfirm: (token: string) => invoke<PruneConfirmReport>("cmd_prune_confirm", { token }),
+  // 取消这次预演：作废令牌，不产生任何副作用。
+  pruneCancel: (token: string) => invoke<void>("cmd_prune_cancel", { token }),
 
   pickFolder: (title?: string) => invoke<string | null>("cmd_pick_folder", { title }),
 

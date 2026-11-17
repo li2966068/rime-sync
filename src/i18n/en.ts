@@ -85,6 +85,10 @@ export const en: Record<keyof Dict, string> = {
   "conn.test": "Test connection",
   "conn.probe": "Probe write access",
   "conn.remote": "Browse remote",
+  "conn.probeNetwork": "Check network status",
+  "conn.probingNetwork": "Checking network status…",
+  "conn.probeNetworkDone": "Network status checked",
+  "conn.probeNetworkFail": "Network check failed: {error}",
   "conn.saved": "Connection settings saved",
   "conn.saveFail": "Save failed: {error}",
   "conn.testing": "Testing connection…",
@@ -542,6 +546,28 @@ export const en: Record<keyof Dict, string> = {
   "fixIme.punctBad": "Direct punctuation output is not in effect: {list}",
   "fixIme.punctNext": "Click Repair input method once to add it; if the engine is reported unsupported, install rime-sync's own input method build",
   "fixIme.punctDetail": "Direct punctuation technical details: {text}",
+
+  // Schema cleanup (prune): preview first, delete only after confirmation.
+  // The app used to delete <id>.custom.yaml of non-retained schemas during
+  // bootstrap without asking; now it only reports what would change.
+  "prune.title": "Clean up input schemas",
+  "prune.desc": "Only three schemas ship with the package: Luna Pinyin (Simplified) / Wubi Pinyin / Wubi86. Cleanup deletes the other schemas' <id>.custom.yaml from the Rime user directory and removes them from schema_list — those schemas will disappear from the input method (deleted files are renamed as backups first, so they can be recovered). The app never decides for you: press “Preview” to see exactly what would be deleted, and only then confirm.",
+  "prune.preview": "Preview",
+  "prune.previewing": "Working out what would be deleted…",
+  "prune.previewFailed": "Preview failed: {error}",
+  "prune.summary": "Will delete {files} files; {schemas} schemas will disappear from the input method",
+  "prune.nothing": "There is nothing to clean up",
+  "prune.disabled": "Schema cleanup is disabled (RIMESYNC_PRUNE_SCHEMAS=0)",
+  "prune.filesTitle": "Files that will be deleted",
+  "prune.schemaListTitle": "schema_list after the cleanup",
+  "prune.affectedTitle": "Schemas that will disappear from the input method",
+  "prune.warningTitle": "Notes",
+  "prune.empty": "(none)",
+  "prune.confirm": "Delete",
+  "prune.cancel": "Cancel",
+  "prune.cancelled": "Cancelled — nothing was deleted",
+  "prune.done": "Cleaned up: {count} files deleted",
+  "prune.failed": "Cleanup failed: {error}",
 
   // Input method extras (numeric keypad / direct Chinese punctuation / v-to-number):
   // only the rime-sync build has them; a distro Rime does not.

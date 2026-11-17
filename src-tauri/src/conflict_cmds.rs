@@ -8,6 +8,10 @@
 //! - conflict：用冲突副本覆盖原版后删除副本（副本就是本地拷贝，内容等价于保留本地）
 //! - remote：从 WebDAV 取 shared/files/<rel> 覆盖本地，并把 index.json 的
 //!   基线更新为远端 meta；网络失败时不改动任何本地文件。
+//!
+//! 三种方式都走 `conflict_files::resolve_conflict_files`：覆盖用户文件之前先把
+//! 旧内容存进一轮备份会话，删冲突副本之前先把副本内容存进同一轮备份 ——
+//! 备份失败就不许覆盖，冲突副本也不会被无声地永久删除（可在备份页回滚找回）。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,7 +25,8 @@ use rime_sync_core::webdav::DavClient;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
-use crate::{dav_client, push_log, rime_dir_for, state_dir, AppState};
+use crate::conflict_files::{self, Resolution};
+use crate::{backup_manager, dav_client, push_log, rime_dir_for, state_dir, AppState};
 
 /// 超过该大小或不是 UTF-8 的文件不回传内容（前端显示“无法预览”）。
 const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
@@ -307,7 +312,10 @@ fn list_conflicts(app: &AppHandle, inner: &crate::Inner) -> Result<Vec<ConflictV
 }
 
 /// 把冲突副本路径拆成原版路径（两者都做路径校验）。
-fn split_paths(root: &Path, target_path: &str) -> Result<(PathBuf, String, PathBuf), String> {
+fn split_paths(
+    root: &Path,
+    target_path: &str,
+) -> Result<(PathBuf, String, PathBuf, String), String> {
     let rel = target_path.trim().replace('\\', "/");
     plan::validate_rel_path(&rel).map_err(|error| format!("冲突路径无效：{error:#}"))?;
     let Some(name) = rel.rsplit('/').next() else {
@@ -334,7 +342,7 @@ fn split_paths(root: &Path, target_path: &str) -> Result<(PathBuf, String, PathB
     if !conflict_canonical.starts_with(&root_canonical) {
         return Err("冲突副本不在 Rime 目录内，已拒绝处理".to_string());
     }
-    Ok((conflict_canonical, target_rel, target_abs))
+    Ok((conflict_canonical, target_rel, target_abs, rel))
 }
 
 #[tauri::command]
@@ -358,33 +366,50 @@ fn resolve(
     choice: &str,
 ) -> Result<ResolveView, String> {
     let root = rime_dir_for(app, inner)?;
-    let (conflict_abs, target_rel, target_abs) = split_paths(&root, target_path)?;
+    let (conflict_abs, target_rel, _target_abs, conflict_rel) = split_paths(&root, target_path)?;
+    let backup_root = backup_manager(app, inner)?.root().to_path_buf();
 
-    match choice.trim() {
-        "local" => {}
+    let (resolution, verb, bytes_len) = match choice.trim() {
+        "local" => (Resolution::KeepLocal, "保留本地版本", None),
         "conflict" => {
             let bytes =
                 fs::read(&conflict_abs).map_err(|error| format!("读取冲突副本失败：{error}"))?;
-            write_local(&target_abs, &bytes)?;
+            let len = bytes.len() as u64;
+            (Resolution::UseConflict(bytes), "采用冲突副本", Some(len))
         }
         "remote" => {
-            return resolve_with_remote(app, inner, &target_rel, &target_abs, &conflict_abs);
+            return resolve_with_remote(
+                app,
+                inner,
+                &root,
+                &backup_root,
+                &target_rel,
+                &conflict_rel,
+            );
         }
         other => return Err(format!("未知的处理方式：{other}")),
-    }
-
-    fs::remove_file(&conflict_abs).map_err(|error| format!("删除冲突副本失败：{error}"))?;
-    let verb = if choice.trim() == "conflict" {
-        "采用冲突副本"
-    } else {
-        "保留本地版本"
     };
-    push_log(inner, format!("{verb}：{target_rel}"));
+
+    // 覆盖前先备份、删副本前先把副本存进备份：备份失败就不许覆盖。
+    let outcome = conflict_files::resolve_conflict_files(
+        &root,
+        &backup_root,
+        &target_rel,
+        &conflict_rel,
+        &resolution,
+    )?;
+    push_log(
+        inner,
+        format!(
+            "{verb}：{target_rel}（备份 {}，含冲突副本内容）",
+            outcome.backup_id
+        ),
+    );
     Ok(ResolveView {
         target: target_rel,
         choice: choice.trim().to_string(),
         removed: true,
-        bytes: None,
+        bytes: bytes_len,
     })
 }
 
@@ -393,9 +418,10 @@ fn resolve(
 fn resolve_with_remote(
     app: &AppHandle,
     inner: &crate::Inner,
+    root: &Path,
+    backup_root: &Path,
     target_rel: &str,
-    target_abs: &Path,
-    conflict_abs: &Path,
+    conflict_rel: &str,
 ) -> Result<ResolveView, String> {
     let (_, client) = dav_client(app, inner)?;
     let remote_path = format!("shared/files/{target_rel}");
@@ -405,24 +431,32 @@ fn resolve_with_remote(
         .ok_or_else(|| format!("远端不存在 {remote_path}，无法用远端覆盖本地。本地文件未改动。"))?;
 
     let meta = remote_meta(&client, &remote_path, &bytes);
-    let previous = fs::read(target_abs).ok();
-    if let Err(error) = write_local(target_abs, &bytes) {
-        restore_local(target_abs, previous.as_deref());
-        return Err(format!("{error}。本地文件未改动。"));
-    }
+    let target_abs = root.join(target_rel);
+    let previous = fs::read(&target_abs).ok();
+    // 覆盖前先备份（旧内容 + 冲突副本都进这一轮备份），备份失败就不覆盖。
+    let outcome = conflict_files::resolve_conflict_files(
+        root,
+        backup_root,
+        target_rel,
+        conflict_rel,
+        &Resolution::UseRemote(bytes.clone()),
+    )?;
 
     let index_path = state_dir(app)?.join("index.json");
     if let Err(error) = update_baseline(&index_path, target_rel, &meta) {
-        restore_local(target_abs, previous.as_deref());
-        return Err(format!("{error}。已恢复本地文件，冲突副本保留，可重试。"));
+        restore_local(&target_abs, previous.as_deref());
+        return Err(format!(
+            "{error}。已恢复本地文件；冲突副本内容保存在备份 {} 里，可回滚找回。",
+            outcome.backup_id
+        ));
     }
     remember_base(app, &meta, &bytes);
-    fs::remove_file(conflict_abs).map_err(|error| format!("删除冲突副本失败：{error}"))?;
     push_log(
         inner,
         format!(
-            "用远端覆盖本地：{target_rel}（{} 字节，来自 {remote_path}）",
-            bytes.len()
+            "用远端覆盖本地：{target_rel}（{} 字节，来自 {remote_path}；备份 {}）",
+            bytes.len(),
+            outcome.backup_id
         ),
     );
     Ok(ResolveView {
@@ -475,28 +509,10 @@ fn remember_base(app: &AppHandle, meta: &FileMeta, bytes: &[u8]) {
     let _ = fs::write(path, bytes);
 }
 
-/// 先写同目录临时文件再 rename，避免写一半破坏原文件。
-fn write_local(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("创建目录 {} 失败：{error}", parent.display()))?;
-    }
-    let name = path
-        .file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| "conflict".to_string());
-    let tmp = path.with_file_name(format!(".{name}.rime-sync.tmp"));
-    fs::write(&tmp, bytes).map_err(|error| format!("写入 {} 失败：{error}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|error| {
-        let _ = fs::remove_file(&tmp);
-        format!("写入 {} 失败：{error}", path.display())
-    })
-}
-
 fn restore_local(path: &Path, previous: Option<&[u8]>) {
     match previous {
         Some(bytes) => {
-            let _ = write_local(path, bytes);
+            let _ = conflict_files::write_local(path, bytes);
         }
         None => {
             let _ = fs::remove_file(path);
@@ -607,7 +623,7 @@ mod tests {
     fn write_local_is_atomic_and_creates_parents() {
         let dir = std::env::temp_dir().join(format!("rime-sync-conflict-{}", std::process::id()));
         let path = dir.join("nested").join("a.yaml");
-        write_local(&path, b"remote").expect("write");
+        conflict_files::write_local(&path, b"remote").expect("write");
         assert_eq!(fs::read(&path).expect("read"), b"remote");
         restore_local(&path, Some(b"local"));
         assert_eq!(fs::read(&path).expect("read"), b"local");

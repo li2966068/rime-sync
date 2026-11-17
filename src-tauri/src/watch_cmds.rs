@@ -129,7 +129,10 @@ fn run_watched_transport(app: &AppHandle, inner: &Arc<Inner>) {
         return;
     }
     // SPEC-3 §B7：离线/计量网络下跳过自动搬运；手动同步不受影响。
-    if let Some(reason) = NetworkPolicy::system().scheduled_block_reason(false) {
+    //
+    // 用 cached 版：只看不探测。Windows 上探测一次要起一个 powershell.exe，
+    // 自动搬运不该偷偷起进程；没检测过时一律放行（绝不能因探测缺失阻止同步）。
+    if let Some(reason) = NetworkPolicy::system().scheduled_block_reason_cached(false) {
         push_log(inner, reason);
         return;
     }

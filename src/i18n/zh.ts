@@ -82,6 +82,10 @@ export const zh = {
   "conn.test": "测试连接",
   "conn.probe": "写权限探测",
   "conn.remote": "查看远端",
+  "conn.probeNetwork": "检测网络状态",
+  "conn.probingNetwork": "正在检测网络状态…",
+  "conn.probeNetworkDone": "网络状态已检测",
+  "conn.probeNetworkFail": "检测网络状态失败：{error}",
   "conn.saved": "连接配置已保存",
   "conn.saveFail": "保存失败：{error}",
   "conn.testing": "正在测试连接…",
@@ -539,6 +543,28 @@ export const zh = {
   "fixIme.punctBad": "标点直出未生效：{list}",
   "fixIme.punctNext": "点一次「修复输入法」补上；若提示引擎不支持，请换装 rime-sync 自建的输入法本体",
   "fixIme.punctDetail": "标点直出技术细节：{text}",
+
+  // 方案清理（prune）：先预演、后确认。
+  // 以前程序在首启自举时直接删掉不在保留名单里的 <id>.custom.yaml，
+  // 用户既没确认过、也没法预演；现在改成「先看清单，确认后才删」。
+  "prune.title": "清理输入方案",
+  "prune.desc": "随包只保留朙月拼音·简化字 / 五笔拼音 / 五笔86 三个方案。清理会删掉其余方案在 Rime 用户目录里的 <id>.custom.yaml，并从 schema_list 里去掉它们 —— 那些方案会因此从输入法里消失（删掉的文件会先改名备份，可以找回）。程序不会替你做决定：先点「预演」看清楚要删什么，确认后才真的删。",
+  "prune.preview": "预演",
+  "prune.previewing": "正在算要删什么…",
+  "prune.previewFailed": "预演失败：{error}",
+  "prune.summary": "将要删除 {files} 个文件，{schemas} 个方案会从输入法里消失",
+  "prune.nothing": "没有需要清理的东西",
+  "prune.disabled": "方案清理已被关闭（RIMESYNC_PRUNE_SCHEMAS=0）",
+  "prune.filesTitle": "会被删除的文件",
+  "prune.schemaListTitle": "删除后的 schema_list",
+  "prune.affectedTitle": "会从输入法里消失的方案",
+  "prune.warningTitle": "注意事项",
+  "prune.empty": "（无）",
+  "prune.confirm": "确认删除",
+  "prune.cancel": "取消",
+  "prune.cancelled": "已取消，什么都没有删",
+  "prune.done": "已清理：删除 {count} 个文件",
+  "prune.failed": "清理失败：{error}",
 
   // 输入法增强功能（数字小键盘 / 中文标点直出 / v 转数字）：
   // 只有 rime-sync 自建的输入法才有；装的是发行版 Rime 就没有。

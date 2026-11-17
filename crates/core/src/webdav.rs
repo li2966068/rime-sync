@@ -92,20 +92,50 @@ impl DavClient {
         remote_dir: &str,
         proxy: Option<&ProxyConfig>,
     ) -> Result<Self> {
-        let url = url.trim().trim_end_matches('/');
+        let raw = url.trim();
+        // 地址里带账号密码（https://user:pass@host/dav）时，**在这里拆开**：
+        // 凭据只进请求头（basic_auth），base/root 一律用剥干净的地址
+        // ⇒ 日志、错误信息、诊断包里都不会出现明文密码。
+        //
+        // 为什么以前是直接拒绝：那时的地址会原样进 base，于是密码跟着进日志。
+        // 现在改成「拆出来单独用」，凭据既能正常生效，又不会漏到别处。
+        let (url, url_creds) = match split_userinfo(raw) {
+            Some(creds) => (
+                creds.clean_url.trim().trim_end_matches('/').to_string(),
+                Some(creds),
+            ),
+            None => {
+                ensure!(
+                    !has_userinfo(raw),
+                    "WebDAV 地址里的账号密码解析不出来（{}）：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里",
+                    redact_userinfo(raw)
+                );
+                (raw.trim_end_matches('/').to_string(), None)
+            }
+        };
         ensure!(
             url.starts_with("http://") || url.starts_with("https://"),
             "webdav url must be http(s): {}",
-            redact_userinfo(url)
+            redact_userinfo(&url)
         );
-        // 明文账号密码（https://user:pass@host/dav）一律拒绝：
-        // 它会被原样写进 base，随后出现在错误信息、日志和诊断包里。
-        // 账号密码必须填在「用户名/密码」两个字段里。
-        ensure!(
-            !has_userinfo(url),
-            "WebDAV 地址里不能带账号密码（{}）：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里",
-            redact_userinfo(url)
-        );
+        // 「用户名/密码」字段优先；字段为空时才用地址里的。
+        let mut username = username.trim().to_string();
+        let mut password = password.to_string();
+        if let Some(creds) = url_creds.as_ref() {
+            // 两处账号不一样 ⇒ 说不清该用哪个 ⇒ 明确报错（绝不猜）。
+            // 报错里只出现脱敏后的地址（`***@host`），不出现账号与密码原文。
+            ensure!(
+                username.is_empty() || creds.username.is_empty() || username == creds.username,
+                "WebDAV 地址里的账号与「用户名」字段填的账号不一致（{}）：请把地址改成不含账号密码的形式，账号与密码分别填在「用户名」「密码」里",
+                redact_userinfo(raw)
+            );
+            if username.is_empty() {
+                username = creds.username.clone();
+            }
+            if password.is_empty() {
+                password = creds.password.clone().unwrap_or_default();
+            }
+        }
         let remote = remote_dir.trim().trim_matches('/');
         if !remote.is_empty() {
             plan::validate_rel_path(remote).context("invalid remote_dir")?;
@@ -334,7 +364,8 @@ impl DavClient {
         let mut last_error = String::new();
         for attempt in 0..=MAX_RETRIES {
             let mut request = self.http.request(method.clone(), url);
-            if !self.username.is_empty() {
+            // 有账号**或**有密码就要带认证头：有些服务器是「空用户名 + 密码」。
+            if !self.username.is_empty() || !self.password.is_empty() {
                 request = request.basic_auth(&self.username, Some(&self.password));
             }
             for (key, value) in headers {
@@ -488,8 +519,8 @@ impl DavClient {
     pub fn put(&self, rel: &str, bytes: &[u8], if_match: Option<&str>) -> Result<PutOutcome> {
         let url = self.url_for(rel)?;
         let mut headers = vec![("Content-Type", "application/octet-stream".to_string())];
-        if let Some(etag) = if_match {
-            headers.push(("If-Match", etag.to_string()));
+        if let Some(etag) = if_match.and_then(if_match_value) {
+            headers.push(("If-Match", etag));
         }
         let response = self.send(Method::PUT, &url, Some(bytes), &headers)?;
         match response.status().as_u16() {
@@ -611,11 +642,53 @@ fn entry_from_headers(response: &Response, rel: &str) -> RemoteEntry {
     }
 }
 
+/// ETag 归一化：比较用的实体标记。
+///
+/// 服务端的 ETag 有两种写法：强 `("abc")` 与弱 `W/("abc")`。
+/// 同一个文件在不同接口（HEAD 头 / PROPFIND `getetag`）拿到的形式可能不一样，
+/// 直接比字符串会把「其实没变」判成「变了」。这里统一剥掉弱标记与外层引号，
+/// 只留下可比较的部分。
+pub fn etag_token(raw: &str) -> String {
+    let mut value = raw.trim();
+    if let Some(rest) = value.strip_prefix("W/") {
+        value = rest.trim();
+    } else if let Some(rest) = value.strip_prefix("w/") {
+        value = rest.trim();
+    }
+    value.trim_matches('"').trim().to_string()
+}
+
+/// ETag 是否是弱验证器（`W/"..."`）。
+///
+/// RFC 7232：`If-Match` 用的是**强比较**，弱验证器永远不匹配 ——
+/// 把弱 ETag 原样发过去，服务端必定回 412，同步就永远推不上去。
+pub fn is_weak_etag(raw: &str) -> bool {
+    let value = raw.trim();
+    value.starts_with("W/") || value.starts_with("w/")
+}
+
+/// 能安全放进 `If-Match` 的 ETag 值。
+///
+/// * 强 ETag（`"abc"`）⇒ 原样使用；
+/// * 弱 ETag（`W/"abc"`）⇒ **不返回**。
+///
+/// 为什么弱的一律不发：只产出弱验证器的服务器，按 RFC 的强比较语义
+/// 永远匹配不上 ⇒ 每轮上传都被 412 拒掉，同步彻底卡死。
+/// 这种服务器上我们改用「上传前 HEAD 比对」来防覆盖，代价是少了
+/// HEAD→PUT 之间的那一瞬间窗口，但至少不会卡死。
+pub fn if_match_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || is_weak_etag(value) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// ETag 优先；缺失任一侧时退回 size + mtime。
 pub fn entry_unchanged(entry: &RemoteEntry, meta: &FileMeta) -> bool {
     if let (Some(remote), Some(known)) = (entry.etag.as_deref(), meta.etag.as_deref()) {
         if !remote.is_empty() && !known.is_empty() {
-            return remote == known;
+            return etag_token(remote) == etag_token(known);
         }
     }
     if entry.size != Some(meta.size) {
@@ -693,8 +766,12 @@ pub struct UrlCredentials {
 /// * 账号与密码用**第一个** `:` 分开 ⇒ 密码里可以含 `:`；
 /// * 百分号编码会被解开（`%40` → `@`）；不认识的 `%` 原样保留。
 ///
-/// 拆不出用户名（没有 `@`、用户名为空、主机为空）时返回 None —— 调用方按
-/// 「原样保留、不猜」处理。
+/// 拆不出可用的凭据（没有 `@`、主机为空、既没用户名也没密码）时返回 None ——
+/// 调用方按「原样保留、不猜」处理。
+///
+/// 用户名为空但**有密码**（`https://:pass@host/dav`）是允许的：
+/// 有些服务器就是空用户名 + 密码，这种地址以前会被整条判成「拆不出来」，
+/// 结果地址被原样留着，而客户端又拒绝任何带凭据的地址 ⇒ 同步直接不能用。
 pub fn split_userinfo(url: &str) -> Option<UrlCredentials> {
     let trimmed = url.trim();
     let (head, rest) = match trimmed.find("://") {
@@ -715,12 +792,15 @@ pub fn split_userinfo(url: &str) -> Option<UrlCredentials> {
         Some(pos) => (&userinfo[..pos], Some(&userinfo[pos + 1..])),
         None => (userinfo, None),
     };
-    if username.is_empty() {
+    let username = percent_decode(username);
+    let password = password.map(percent_decode);
+    // 既没有用户名也没有密码 ⇒ 这段 userinfo 没有信息量，当作没有凭据。
+    if username.is_empty() && password.as_deref().unwrap_or("").is_empty() {
         return None;
     }
     Some(UrlCredentials {
-        username: percent_decode(username),
-        password: password.map(percent_decode),
+        username,
+        password,
         clean_url: format!("{head}{host}{tail}"),
     })
 }
@@ -1342,16 +1422,36 @@ mod write_probe_tests {
 mod userinfo_tests {
     use super::*;
 
-    /// 带 userinfo 的地址必须被直接拒绝，并明确告诉用户账号密码该填在哪。
+    /// 地址里带账号密码时**不再直接拒绝**：客户端自己把它拆出来用
+    /// （凭据只进请求头，base/root 一律是剥干净的地址）。
+    ///
+    /// 但账号与「用户名」字段冲突时必须明确报错，且报错里不许出现明文密码。
     #[test]
-    fn urls_with_userinfo_are_rejected() {
+    fn urls_with_userinfo_are_split_instead_of_rejected() {
+        let client = DavClient::new(
+            "https://alice:s3cr3t@example.com/dav",
+            "alice",
+            "",
+            "rime-sync",
+        )
+        .expect("地址里的账号密码应该能拆出来用");
+        assert_eq!(client.base_url(), "https://example.com/dav/rime-sync");
+        assert_eq!(client.root_url(), "https://example.com/dav");
+        // 地址里的密码只用来做认证，不许出现在 base/root 里。
+        assert!(!client.base_url().contains("s3cr3t"));
+        assert!(!client.root_url().contains("s3cr3t"));
+    }
+
+    /// 账号与「用户名」字段不一致 ⇒ 说不清该用哪个 ⇒ 报错，且不泄露明文密码。
+    #[test]
+    fn a_conflicting_username_is_rejected_without_leaking_the_password() {
         let error = DavClient::new(
             "https://alice:s3cr3t@example.com/dav",
             "u",
             "p",
             "rime-sync",
         )
-        .expect_err("带账号密码的地址必须被拒绝");
+        .expect_err("账号冲突必须报错");
         let text = format!("{error:#}");
         assert!(
             !text.contains("s3cr3t"),
@@ -1398,12 +1498,20 @@ mod userinfo_tests {
         assert_eq!(creds.clean_url, "https://example.com:8443/dav/sub?x=1#frag");
     }
 
-    /// 拆不出用户名时返回 None（调用方按「原样保留、不猜」处理）。
+    /// 拆不出凭据时返回 None（调用方按「原样保留、不猜」处理）。
+    ///
+    /// 注意：`https://:pass@host/dav`（**用户名为空但有密码**）现在能拆出来 ——
+    /// 有些服务器就是空用户名 + 密码，以前这条地址整条被判死 ⇒ 同步直接不能用。
     #[test]
     fn unparsable_userinfo_yields_nothing() {
         assert!(split_userinfo("https://host/dav").is_none());
-        assert!(split_userinfo("https://:pass@host/dav").is_none());
         assert!(split_userinfo("https://user@/dav").is_none());
+        assert!(split_userinfo("https://@host/dav").is_none());
+
+        let creds = split_userinfo("https://:pass@host/dav").expect("空用户名 + 密码要能拆");
+        assert_eq!(creds.username, "");
+        assert_eq!(creds.password.as_deref(), Some("pass"));
+        assert_eq!(creds.clean_url, "https://host/dav");
     }
 
     /// 百分号编码会被解开；不合法的转义原样保留。

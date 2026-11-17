@@ -411,7 +411,9 @@ pub fn resolve_installer(exe_dir: Option<&Path>) -> Option<(PathBuf, String)> {
 
 /// 安装器命令行（参数固定，单测直接断言 get_args）。
 pub fn installer_command(installer: &Path) -> Command {
-    let mut command = Command::new(installer);
+    // 走统一入口：Windows 上多带一个 CREATE_NO_WINDOW，
+    // 万一随包安装器是控制台子系统程序，也不会给用户弹黑框。
+    let mut command = crate::process::command(installer);
     command.args(INSTALLER_ARGS);
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
@@ -426,7 +428,7 @@ fn run_installer(
     args: &[&str],
     timeout: Duration,
 ) -> Result<InstallExit, InstallError> {
-    let mut command = Command::new(installer);
+    let mut command = crate::process::command(installer);
     command
         .args(args)
         .stdin(Stdio::null())
