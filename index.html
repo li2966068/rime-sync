@@ -198,6 +198,31 @@
             </div>
           </div>
 
+          <div class="card" id="history-card">
+            <div class="card-head">
+              <h3 data-i18n="history.title">同步历史</h3>
+              <div class="card-actions">
+                <button class="ghost small" id="btn-history-refresh" type="button" data-i18n="common.refresh">刷新</button>
+              </div>
+            </div>
+            <p class="muted" data-i18n="history.desc"></p>
+            <table class="table" id="history-table">
+              <thead>
+                <tr>
+                  <th data-i18n="history.time">时间</th>
+                  <th data-i18n="history.mode">方式</th>
+                  <th data-i18n="history.result">结果</th>
+                  <th data-i18n="history.counts">拉取 / 推送 / 合并</th>
+                  <th data-i18n="history.conflicts">冲突</th>
+                  <th data-i18n="history.duration">耗时</th>
+                  <th data-i18n="history.detail">说明</th>
+                </tr>
+              </thead>
+              <tbody id="history-body"></tbody>
+            </table>
+            <p class="muted empty" id="history-empty" hidden></p>
+          </div>
+
           <div class="card log-card">
             <div class="log-head">
               <span data-i18n="sync.log">实时日志</span>

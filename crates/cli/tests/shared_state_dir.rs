@@ -44,6 +44,10 @@ fn run(home: &PathBuf, args: &[&str]) -> std::process::Output {
 }
 
 /// 默认配置下，CLI 的备份根必须落在共享状态目录里。
+///
+/// 验证手段：仍然存在的 `backup` 命令会在普通输出里打印
+/// `path=<备份根>/<id>`（`--json` 模式则是 JSON 的 `path` 字段），
+/// 从这条路径就能看出备份根落在哪儿。
 #[test]
 fn cli_backups_live_in_the_shared_state_dir() {
     let home = temp_dir("backups");
@@ -52,7 +56,7 @@ fn cli_backups_live_in_the_shared_state_dir() {
 
     let output = run(
         &home,
-        &["backups", "--rime-dir", rime.to_str().expect("路径")],
+        &["backup", "--rime-dir", rime.to_str().expect("路径")],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = home
@@ -83,7 +87,7 @@ fn explicit_config_keeps_its_own_state_dir() {
     let output = Command::new(env!("CARGO_BIN_EXE_rime-sync-cli"))
         .arg("--config")
         .arg(&config)
-        .args(["backups", "--rime-dir"])
+        .args(["backup", "--rime-dir"])
         .arg(&rime)
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")

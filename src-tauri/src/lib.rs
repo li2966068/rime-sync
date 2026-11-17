@@ -37,6 +37,8 @@ mod diagnostics;
 mod extra_ime;
 /// 交给前端的配置（地址去凭据、密码不外泄）：单独成模块便于集成测试。
 pub mod frontend_config;
+/// 同步历史（只读）：把 core 写下的 history.jsonl 读给前端看。
+pub mod history_cmds;
 mod ime_text;
 /// 共享状态目录的解析 + 旧目录的一次性迁移（单独成模块便于集成测试）。
 pub mod paths;
@@ -1626,6 +1628,8 @@ pub fn run() {
             backup_cmds::cmd_restore_backup,
             backup_cmds::cmd_delete_backup,
             backup_cmds::cmd_prune_backups,
+            // 同步历史（只读）：最近几次同步的记录。
+            history_cmds::cmd_list_history,
             preset_cmds::cmd_list_presets,
             preset_cmds::cmd_apply_preset,
             schema_cmds::cmd_list_schemas,

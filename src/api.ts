@@ -385,6 +385,22 @@ export interface CreatedBackup {
   id: string;
 }
 
+/** 同步历史里的一条记录（后端读的是 core 写的 history.jsonl，只读）。 */
+export interface HistoryEntry {
+  /** 同步发生的时间（Unix 秒）。 */
+  ts: number;
+  /** transport（只搬运）/ apply（合并生效）。 */
+  mode: string;
+  ok: boolean;
+  pulled: number;
+  pushed: number;
+  merged: number;
+  conflicts: number;
+  duration_ms: number;
+  backup_id: string | null;
+  error: string | null;
+}
+
 export interface RestoreResult {
   backup_id: string;
   pre_restore_id: string | null;
@@ -699,6 +715,9 @@ export const api = {
   restoreBackup: (id: string) => invoke<RestoreResult>("cmd_restore_backup", { id }),
   deleteBackup: (id: string) => invoke<void>("cmd_delete_backup", { id }),
   pruneBackups: () => invoke<PruneResult>("cmd_prune_backups"),
+
+  // 同步历史（只读）：最近几次同步的记录，缺省取最近 50 条。
+  listHistory: (limit = 50) => invoke<HistoryEntry[]>("cmd_list_history", { limit }),
 
   listPresets: () => invoke<PresetInfo[]>("cmd_list_presets"),
   applyPreset: (presetId: string, rawUrl: string) =>

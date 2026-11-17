@@ -88,18 +88,12 @@ enum Command {
         #[arg(long, default_value = "manual")]
         reason: String,
     },
-    /// 列出已有备份
-    Backups,
-    /// 回滚到指定备份（写回前自动建 pre-restore 备份）
-    Rollback { id: String },
     /// 前台监听 Rime 目录，变更后自动 transport
     Watch {
         /// 去抖秒数
         #[arg(long, default_value_t = 3)]
         debounce_secs: u64,
     },
-    /// 写权限探测（MKCOL → PUT → DELETE）
-    Probe,
     /// 查看同步历史（history.jsonl，最多 500 条）
     History {
         /// 只显示最近 N 条
@@ -211,7 +205,6 @@ impl Command {
                 | Command::Status
                 | Command::Transport
                 | Command::Apply
-                | Command::Probe
                 | Command::Watch { .. }
         )
     }
@@ -316,19 +309,6 @@ struct BackupReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     prune_error: Option<String>,
 }
-
-#[derive(Serialize)]
-struct RollbackReport {
-    ok: bool,
-    backup_id: String,
-    /// 还原点备份 id：必存在（留不下还原点时 rollback 直接失败）。
-    pre_restore_id: String,
-    restored: usize,
-}
-
-/// probe 失败时已经打印了结构化结果，main 不再重复输出一行错误。
-#[derive(Debug)]
-struct ProbeFailed;
 
 /// fix-ime 铺完仍不可用：报告已经打印过，main 只负责退出码。
 #[derive(Debug)]
@@ -538,14 +518,6 @@ impl std::fmt::Display for FixImeFailed {
 
 impl std::error::Error for FixImeFailed {}
 
-impl std::fmt::Display for ProbeFailed {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("write probe failed")
-    }
-}
-
-impl std::error::Error for ProbeFailed {}
-
 impl std::fmt::Display for SyncFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("sync failed")
@@ -574,8 +546,7 @@ fn main() {
     let cli = Cli::parse();
     let wants_json = cli.json;
     if let Err(error) = run(cli) {
-        if error.downcast_ref::<ProbeFailed>().is_some()
-            || error.downcast_ref::<FixImeFailed>().is_some()
+        if error.downcast_ref::<FixImeFailed>().is_some()
             || error.downcast_ref::<SyncFailed>().is_some()
             || error.downcast_ref::<CheckFailed>().is_some()
             || error.downcast_ref::<RepairFailed>().is_some()
@@ -915,73 +886,6 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("警告：清理旧备份失败（旧还原点还留在磁盘上）：{error}");
                 }
                 Ok(())
-            }
-        }
-        Command::Backups => {
-            let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
-            let manager = BackupManager::new(&detection, &app_data.join("backups"));
-            let infos = manager.list()?;
-            if cli.json {
-                print_json(&infos)
-            } else if infos.is_empty() {
-                println!("no backups in {}", manager.root().display());
-                Ok(())
-            } else {
-                for info in &infos {
-                    println!(
-                        "{}  files={} bytes={} reason={}",
-                        info.id, info.file_count, info.total_bytes, info.reason
-                    );
-                }
-                Ok(())
-            }
-        }
-        Command::Rollback { id } => {
-            let detection = resolve_rime_dir(cli.rime_dir.as_deref(), &config)?;
-            let manager = BackupManager::new(&detection, &app_data.join("backups"));
-            let restored = manager.restore(&id)?;
-            let report = RollbackReport {
-                ok: true,
-                backup_id: restored.backup_id,
-                pre_restore_id: restored.pre_restore_id,
-                restored: restored.restored,
-            };
-            if cli.json {
-                print_json(&report)
-            } else {
-                println!(
-                    "rollback={} restored={} pre_restore={}",
-                    report.backup_id, report.restored, report.pre_restore_id
-                );
-                Ok(())
-            }
-        }
-        Command::Probe => {
-            let dav = dav_client(&config)?;
-            let probe = dav.check_write()?;
-            if cli.json {
-                print_json(&probe)?;
-            } else {
-                println!(
-                    "ok={} preset={} server={}",
-                    probe.ok,
-                    probe.preset.as_deref().unwrap_or("-"),
-                    probe.server.as_deref().unwrap_or("-")
-                );
-                for step in &probe.steps {
-                    println!(
-                        "  {:<8} status={} ok={} {}",
-                        step.step, step.status, step.ok, step.detail
-                    );
-                }
-                if let Some(hint) = &probe.hint {
-                    println!("hint: {hint}");
-                }
-            }
-            if probe.ok {
-                Ok(())
-            } else {
-                Err(anyhow::Error::new(ProbeFailed))
             }
         }
         Command::FixIme {
@@ -1802,7 +1706,7 @@ fn run(cli: Cli) -> Result<()> {
                         .clone()
                         .unwrap_or_else(|| "同步失败".to_string());
                     report.error = Some(format!(
-                        "{detail}（还原点备份 {backup_id}，可用 rime-sync-cli rollback {backup_id} 回滚）"
+                        "{detail}（还原点备份 {backup_id}，可在桌面端「设置 → 备份区」还原）"
                     ));
                 }
             }
@@ -2328,16 +2232,13 @@ mod tests {
             Cli::try_parse_from(args).expect("解析命令行").command
         };
         assert!(!command(&["rime-sync-cli", "detect"]).needs_credentials());
-        assert!(!command(&["rime-sync-cli", "backups"]).needs_credentials());
         assert!(!command(&["rime-sync-cli", "history"]).needs_credentials());
         assert!(!command(&["rime-sync-cli", "backup"]).needs_credentials());
-        assert!(!command(&["rime-sync-cli", "rollback", "id"]).needs_credentials());
-        let needing: [&[&str]; 6] = [
+        let needing: [&[&str]; 5] = [
             &["rime-sync-cli", "test-conn"],
             &["rime-sync-cli", "status"],
             &["rime-sync-cli", "transport"],
             &["rime-sync-cli", "apply"],
-            &["rime-sync-cli", "probe"],
             &["rime-sync-cli", "watch"],
         ];
         for args in needing {

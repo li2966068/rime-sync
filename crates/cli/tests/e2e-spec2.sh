@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# SPEC-2 E2E：备份 / 回滚 / 残留锁回收 / watch 事件 / probe 只读失败 + 红线复验。
+# SPEC-2 E2E：备份 / 残留锁回收 / watch 事件 + 红线复验。
 # 依赖：rclone（本地 WebDAV）、timeout、curl、python3。
 # 默认用 RIME_SYNC_SECRET_BACKEND=file 模拟无 Secret Service 的 headless 环境；
 # 末尾会在不带该变量时再跑一次 status，报告本机真实探测到的后端。
+#
+# 注：列备份（backups）、回滚（rollback）、写权限探测（probe）这三个 CLI 子命令
+# 已删除（桌面端 GUI 里有等价入口：设置页备份区、连接页写权限探测）。
+# 备份「列出来」的事实改用文件系统核对（备份根下的目录），
+# restore 仍由 core 提供并由 crates/core/tests/transport_backup.rs 覆盖。
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -21,7 +26,6 @@ STATE="$WORK/state"
 DAV_DIR="$WORK/dav"
 DAV_RO="$WORK/dav-ro"
 CFG="$STATE/config.json"
-CFG_RO="$STATE/config-ro.json"
 PORT=${PORT:-18181}
 PORT_RO=${PORT_RO:-18182}
 SERVER_PID=""
@@ -95,11 +99,12 @@ if grep -q 'default.custom.yaml' "$STATE/backups/$BACKUP_ID/manifest.json" 2>/de
 else
   fail "备份 manifest 缺少 *.custom.yaml"
 fi
-"$BIN" --config "$CFG" --rime-dir "$RIME" backups --json >"$WORK/backups.json" 2>&1
-if grep -q "$BACKUP_ID" "$WORK/backups.json"; then
-  pass "backups 子命令列出备份 $BACKUP_ID"
+# 列备份：CLI 的 `backups` 子命令已删除，改用文件系统核对同一个事实
+# （备份确实落在备份根下、能被列出来）。
+if [ -d "$STATE/backups/$BACKUP_ID" ]; then
+  pass "备份 $BACKUP_ID 落在备份根下、可被列出"
 else
-  fail "backups 子命令没有列出备份"; head -10 "$WORK/backups.json"
+  fail "备份根下找不到 $BACKUP_ID"; ls -1 "$STATE/backups" 2>/dev/null | head -10
 fi
 
 echo "== 迁移：config.json 不再含明文 password（file 后端模拟 headless）=="
@@ -114,22 +119,47 @@ else
   fail "secrets.json 缺失或权限不是 0600"; ls -l "$STATE"
 fi
 
-echo "== b) rollback 还原被改动的 *.custom.yaml =="
+echo "== b) 还原点备份里留着改动前的 *.custom.yaml（供 GUI 还原） =="
+# CLI 的 `rollback` 子命令已删（桌面端设置页备份区有还原按钮），
+# 这里改成核对同一个事实：备份 manifest 里记下了改动前的原文件内容，
+# 还原所需的还原点确实在备份根下。
 printf 'patch:\n  a: 99\n  hacked: true\n' > "$RIME/default.custom.yaml"
-"$BIN" --config "$CFG" --rime-dir "$RIME" rollback "$BACKUP_ID" --json >"$WORK/rollback.json" 2>&1
-ROLLBACK_CODE=$?
-head -10 "$WORK/rollback.json"
 EXPECTED=$(printf 'patch:\n  a: 1')
-if [ "$ROLLBACK_CODE" -eq 0 ] && [ "$(cat "$RIME/default.custom.yaml")" = "$EXPECTED" ]; then
-  pass "rollback 还原 default.custom.yaml"
+if python3 - "$STATE/backups/$BACKUP_ID/manifest.json" "$RIME" <<'PY'
+import json,sys,hashlib,os
+manifest=json.load(open(sys.argv[1]))
+rime=sys.argv[2]
+old=None
+for entry in manifest.get("files",[]):
+    if entry.get("rel")=="default.custom.yaml":
+        old=entry
+        break
+assert old is not None, "manifest 里没有 default.custom.yaml"
+path=os.path.join(rime,"default.custom.yaml")
+print("manifest sha256:", old["sha256"])
+print("current  sha256:", hashlib.sha256(open(path,"rb").read()).hexdigest())
+PY
+then
+  pass "还原点备份 manifest 记下了改动前的 default.custom.yaml（GUI 可据此还原）"
 else
-  fail "rollback 未还原（exit=$ROLLBACK_CODE, content=$(head -2 "$RIME/default.custom.yaml" | tr '\n' '|'))"
+  fail "还原点备份 manifest 里查不到 default.custom.yaml"
 fi
-PRE_RESTORE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pre_restore_id") or "")' "$WORK/rollback.json" 2>/dev/null)
-if [ -n "$PRE_RESTORE" ] && [ -d "$STATE/backups/$PRE_RESTORE" ]; then
-  pass "rollback 前自动建了 pre-restore 备份 $PRE_RESTORE"
+if [ -d "$STATE/backups/$BACKUP_ID" ]; then
+  pass "还原点 $BACKUP_ID 落在备份根下（GUI 备份区可列出并还原）"
 else
-  fail "缺少 pre-restore 备份"
+  fail "备份根下找不到还原点 $BACKUP_ID"
+fi
+# 用备份里存的那份把文件放回去（core 的 restore 就是这么干的：
+# 校验 manifest 后把 files/ 下的内容写回），后续步骤的文件状态与原来一致。
+if [ -f "$STATE/backups/$BACKUP_ID/files/default.custom.yaml" ]; then
+  cp "$STATE/backups/$BACKUP_ID/files/default.custom.yaml" "$RIME/default.custom.yaml"
+  if [ "$(cat "$RIME/default.custom.yaml")" = "$EXPECTED" ]; then
+    pass "还原点里的 default.custom.yaml 内容与改动前一致（还原可行）"
+  else
+    fail "还原点里的内容与改动前不一致（content=$(head -2 "$RIME/default.custom.yaml" | tr '\n' '|'))"
+  fi
+else
+  fail "还原点里找不到 default.custom.yaml"
 fi
 
 echo "== c) 伪造 stale 锁（不存在的 pid）→ 第二次运行自动接管 =="
@@ -178,41 +208,17 @@ else
   fail "watch 触发的 transport 没有上传 words.txt"
 fi
 
-echo "== e) probe 对只读 WebDAV 返回带中文提示的失败 =="
-cat > "$CFG_RO" <<EOF
-{
-  "webdav": {
-    "url": "http://127.0.0.1:${PORT_RO}",
-    "username": "u",
-    "remote_dir": "rime-sync"
-  },
-  "device_id": "devA",
-  "rime_dir": "$RIME"
-}
-EOF
-"$BIN" --config "$CFG_RO" --dav-pass p --rime-dir "$RIME" probe --json >"$WORK/probe.json" 2>"$WORK/probe.err"
-PROBE_CODE=$?
-head -30 "$WORK/probe.json"
-if [ "$PROBE_CODE" -ne 0 ] && grep -q '"ok": false' "$WORK/probe.json"; then
-  pass "probe 判失败（exit=$PROBE_CODE）"
+echo "== e) 只读 WebDAV 拒绝写入（写权限探测的底层前提） =="
+# CLI 的 `probe` 子命令已删（桌面端连接页有「写权限探测」按钮），
+# core 的 DavClient::check_write 仍在，桌面端仍用它。
+# 「只读服务端确实拒绝写」这个前提，改用 curl 直接打只读服务端核对；
+# 探测结果本身（判失败 + 中文提示）由 crates/cli/tests/core_backup_probe_parity.rs 覆盖。
+RO_MKCOL=$(curl -s -o /dev/null -w '%{http_code}' -X MKCOL \
+  -u 'u:p' "http://127.0.0.1:${PORT_RO}/rime-sync/.rime-sync-probe-check" 2>/dev/null || true)
+if [ -n "$RO_MKCOL" ] && [ "$RO_MKCOL" -ge 400 ]; then
+  pass "只读 WebDAV 拒绝写入（MKCOL → $RO_MKCOL）"
 else
-  fail "probe 未按预期失败（exit=$PROBE_CODE）"; head -5 "$WORK/probe.err"
-fi
-if python3 - "$WORK/probe.json" <<'PY'
-import json,sys
-data=json.load(open(sys.argv[1]))
-hint=data.get("hint") or ""
-assert any("一" <= ch <= "鿿" for ch in hint), "hint has no chinese"
-failed=[s for s in data.get("steps",[]) if not s.get("ok")]
-assert failed, "no failed step"
-assert failed[0]["status"] >= 400, "no 4xx/5xx status"
-print("failed step:", failed[0]["step"], failed[0]["status"])
-print("hint:", hint)
-PY
-then
-  pass "probe 返回中文可执行提示（失败步骤已映射状态）"
-else
-  fail "probe 提示不是中文可执行建议"
+  fail "只读 WebDAV 竟允许写入（MKCOL → ${RO_MKCOL:-无响应}）"
 fi
 
 echo "== 红线复验：*.userdb/ 不上传 / 无明文密码 =="

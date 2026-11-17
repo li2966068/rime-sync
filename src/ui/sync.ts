@@ -4,6 +4,7 @@ import { el, setFooter, setStatus } from "./dom";
 import { errorText, timeStamp } from "./format";
 import { toast } from "./toast";
 import { appendLog, localLog } from "./logs";
+import { loadHistory } from "./history";
 import { confirmDialog } from "./modal";
 import { refreshNetwork } from "./connection";
 import { config, busy, plannedActions, setBusyFlag, touchLastRun } from "./state";
@@ -158,5 +159,9 @@ export async function run(mode: "transport" | "apply", automatic = false): Promi
     setBusy(false);
     el.progress.classList.remove("is-running");
     void refreshNetwork();
+    // 同步历史：这一轮刚写进 history.jsonl，重新读一次给用户看。
+    // 读不出来最多是卡片上显示一句失败提示（loadHistory 内部自己兜住），
+    // 绝不影响这次同步本身的结果。
+    void loadHistory();
   }
 }

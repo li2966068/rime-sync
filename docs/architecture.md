@@ -152,5 +152,5 @@ Manage 权限）。MKCOL 的 405 在 RFC 里既可能是"已存在"也可能是"
 ## CLI 命令
 
 `detect` / `test-conn` / `status`（含锁状态与后端）/ `transport` / `apply` /
-`backup [--reason]` / `backups` / `rollback <id>` / `watch [--debounce-secs]` /
-`probe`（写权限探测）。全部支持 `--json`；`--preset` 会在建连前归一化 `--dav-url`。
+`backup [--reason]` / `watch [--debounce-secs]`。
+全部支持 `--json`；`--preset` 会在建连前归一化 `--dav-url`。

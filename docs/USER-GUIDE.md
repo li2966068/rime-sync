@@ -152,7 +152,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X MKCOL \
   -u 'admin:密码' 'http://192.168.1.10:5244/dav/aliyun/rime-sync-probe'
 ```
 
-应用内也有写权限探测（CLI：`rime-sync-cli probe`），失败时会把状态码翻译成可执行建议。
+应用内也有写权限探测（连接页的「写权限探测」按钮），失败时会把状态码翻译成可执行建议。
 
 ---
 

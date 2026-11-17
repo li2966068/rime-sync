@@ -198,7 +198,7 @@ AList 的 WebDAV 地址是 `http://<主机>:5244/dav`，账号密码就是 AList
    | 离线下载 / 其他 | ❌ | 与本工具无关 |
 
 2. 「远端目录」要带**挂载路径前缀**，例如挂载点叫 `aliyun`，则填 `aliyun/rime-sync`。
-3. 保存后点「测试连接」；若失败，用写权限探测（v0.2.0 的 `rime-sync-cli probe`，或下面的 curl）看具体 HTTP 状态：
+3. 保存后点「测试连接」；若失败，用「写权限探测」按钮（或下面的 curl）看具体 HTTP 状态：
    - `403` + AList：几乎都是没勾 Webdav Read / Webdav Manage，或存储本身只读。
    - `404`：地址少了 `/dav`，或远端目录前缀写错。
 
@@ -220,9 +220,10 @@ rime-sync-cli apply
 | `status` | 配置、本地文件数、远端设备 |
 | `transport` | 只搬文件（pull → merge → push） |
 | `apply` | 合并 + 部署 + push |
-| `backup` / `backups` / `rollback <id>` | 手动备份、列备份、回滚（v0.2.0） |
+| `backup` | 手动生成一份备份（v0.2.0） |
 | `watch` | 前台监听本地变化并跑 transport（v0.2.0） |
-| `probe` | WebDAV 写权限探测（v0.2.0） |
+
+列备份、回滚、写权限探测这几项在桌面端图形界面里都有对应入口（设置页备份区、连接页写权限探测），命令行不再重复提供。
 
 全局参数：`--config <path>`、`--rime-dir <path>`、`--dav-url/--dav-user/--dav-pass`、`--json`。
 `--dav-pass` 只在内存中使用，不落盘。

@@ -3,6 +3,7 @@ import { config, busy, lastRun, touchLastRun, setLastReport } from "./ui/state";
 import { errorText } from "./ui/format";
 import { toast } from "./ui/toast";
 import { clearLog, localLog, loadLog } from "./ui/logs";
+import { loadHistory } from "./ui/history";
 import { settleModal } from "./ui/modal";
 import { refreshSecretStatus } from "./ui/secret";
 import { markPasswordEdited } from "./ui/password";
@@ -79,6 +80,10 @@ export function switchPanel(name: string): void {
     void ensureSchemasLoaded();
     // 自启条目可能被用户在系统里改动过，每次进设置页都重新读一次。
     void loadAutostart();
+  }
+  if (name === "sync") {
+    // 同步历史：进同步页就重读一次，免得看到的还是上一次的记录。
+    void loadHistory();
   }
 }
 
@@ -230,6 +235,10 @@ export function bindEvents(): void {
 
   el.refreshLog.addEventListener("click", () => {
     void loadLog();
+  });
+  // 同步历史卡片（静态骨架在 index.html 里，按钮单独取）。
+  document.getElementById("btn-history-refresh")?.addEventListener("click", () => {
+    void loadHistory();
   });
   el.clearLog.addEventListener("click", () => {
     clearLog();
@@ -620,6 +629,7 @@ export async function init(): Promise<void> {
     // 后端除了发事件还留了一份短命槽位（只在进程内活着），这里兜底取一次。
     const lateSetup = await api.takeSetupSlot();
     await loadLog();
+    await loadHistory();
     await refreshSecretStatus();
     await refreshNetwork();
     await loadWatchStatus();

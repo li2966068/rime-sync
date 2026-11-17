@@ -75,6 +75,11 @@
 `backup`、`backups`、`rollback <id>`、`watch`、`probe`（写权限探测）。
 全部支持 `--json`。
 
+> 注（2026-11-17，v0.7.0）：`backups`、`rollback <id>`、`probe` 三个 CLI 入口已移除
+> （桌面端图形界面有等价入口：设置页备份区、连接页写权限探测）。
+> 底层能力（`BackupManager::list`/`restore`、`DavClient::check_write`）未删除，
+> 桌面端仍在使用。`backup` 与 `watch` 保留。
+
 ## 3. S2 · 工程与发布需求
 
 ### 3.1 LICENSE

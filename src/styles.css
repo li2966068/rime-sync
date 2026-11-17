@@ -565,6 +565,13 @@ button.warn:hover:not(:disabled) { filter: brightness(0.98); }
 .warn-text { color: var(--warn); }
 .empty { padding: 10px 2px; }
 
+/* 同步历史卡片：结果列用颜色区分成败，失败原因允许换行。 */
+.history-ok { color: var(--ok); font-weight: 600; }
+.history-fail { color: var(--danger); font-weight: 600; }
+.history-error { color: var(--danger); font-size: 11px; word-break: break-all; }
+#history-table td { font-variant-numeric: tabular-nums; }
+#history-card .muted { margin: 0 0 8px; }
+
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 .card-head h3 { font-size: 14px; margin: 0; }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
