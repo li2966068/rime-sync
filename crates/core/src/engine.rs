@@ -84,6 +84,10 @@ pub struct Report {
     /// 写了就必须重新部署，否则 librime 不会重编译、指针不生效。
     #[serde(default)]
     pub merged_pointer_written: bool,
+    /// 本轮清洗了第三方词库里的碎音节词条（英文单词被逐字母拆开的那种）。
+    /// 改了词库文件就必须重新部署，否则 librime 不会重编译、首字母候选仍是坏的。
+    #[serde(default)]
+    pub dict_sanitized: bool,
     /// 本轮拉到新的/变化的 *.userdb.txt：transport 只搬文件，必须再跑 apply
     /// （rime_dict_manager --sync）才算真正合并进本地词库。
     #[serde(default)]
@@ -555,6 +559,53 @@ impl Engine {
         // Linux 靠安装器铺的 /usr/share/rime-sync/defaults/schemas。
         let template_dirs = crate::merged_dict::template_dirs(None);
         self.write_merged_dict_pointer_with(&data_dirs, &template_dirs, report);
+    }
+
+    /// 清洗合并词典导入的第三方词库（碎音节词条）。
+    ///
+    /// 返回值：是否找到了合并词典包装器（也就是「这轮有没有东西可洗」）。
+    ///
+    /// 单独成一个步骤而不是塞进指针写入：清洗要在**上传之前**做，
+    /// 这样本轮推给远端的就是干净版本（修复随同步传播到其它设备）。
+    fn sanitize_merged_dicts(&mut self, report: &mut Report) -> bool {
+        let mut data_dirs = crate::data_patch::data_dirs();
+        // 用户目录也要作为查表来源（自建词库只存在于用户目录）。
+        data_dirs.push(self.rime_dir.clone());
+        let rime_dir = self.rime_dir.clone();
+        let mut backup = |path: &Path| -> Result<()> {
+            let rel = path
+                .strip_prefix(&rime_dir)
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+                .map_err(|_| anyhow!("dict path outside rime dir: {}", path.display()))?;
+            self.backup_before_overwrite_with_reason(&rel, "dict-sanitize")
+        };
+        let outcomes =
+            match crate::dict_sanitize::sanitize_imported_dicts(&rime_dir, &data_dirs, &mut backup)
+            {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    // 清洗失败不是致命错误：词库还是坏的，但同步本身不该因此全废。
+                    // 如实记进报告，用户能看到「清洗失败」而不是「一切正常」。
+                    tracing::error!("sanitize merged dicts failed: {error:#}");
+                    report.skipped.push(format!("dict-sanitize: {error:#}"));
+                    return false;
+                }
+            };
+        for outcome in &outcomes {
+            if !outcome.changed {
+                continue;
+            }
+            report.dict_sanitized = true;
+            // 改了词库文件 ⇒ 必须重编译，否则 build/ 里还是旧的 .table.bin，
+            // 首字母候选依旧是坏的（这正是 227 上「重装后还是打不出渤海钻探」的原因）。
+            report.config_changed = true;
+            tracing::info!(
+                "sanitized dictionary {}: removed {} entries with broken syllables",
+                outcome.dict,
+                outcome.removed
+            );
+        }
+        !outcomes.is_empty()
     }
 
     /// 指针写入的可测版本：查表来源与模板目录由调用方给定。
@@ -1060,7 +1111,20 @@ impl Engine {
     /// backup_keep 清理旧备份 —— 备份不能无界堆积。
     fn do_transport(&mut self, report: &mut Report) -> Result<()> {
         self.backup_session = None;
+        // 传输**之后**清洗合并词典导入的第三方词库。
+        //
+        // 为什么放在传输之后而不是之前：
+        // 清洗会把本地词库改干净，若先清洗再传输，而远端那份还是脏的
+        // （且本机没有基线），三向合并会判成「双方都改过」⇒ 假冲突，
+        // 远端永远推不上去。先同步（建立基线）再清洗：
+        //   * 第 1 轮：本地变干净 ⇒ 用户立刻能用首字母（并触发重编译）；
+        //   * 第 2 轮：干净版本推给远端 ⇒ 修复随同步传播到其它设备。
+        //
+        // 预演（dry-run）一律不写盘 ⇒ 跳过清洗。
         let result = self.do_transport_round(report);
+        if !self.dry_run {
+            self.sanitize_merged_dicts(report);
+        }
         // 指针补写也在这轮备份会话里完成：它同样会覆盖用户目录里的
         // custom.yaml，必须能回滚（否则 App 备份列表里看不到这一份）。
         // 预演（dry-run）一律不写盘。
@@ -2849,6 +2913,7 @@ mod tests {
             pulled: 1,
             pushed: 2,
             merged: 3,
+            dict_sanitized: false,
             conflicts: vec!["a".into()],
             notes: vec!["default.custom.yaml: schema_list union".into()],
             skipped: vec![],

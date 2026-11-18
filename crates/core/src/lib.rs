@@ -11,6 +11,7 @@ pub mod config;
 pub mod data_patch;
 pub mod dedupe;
 pub mod deploy;
+pub mod dict_sanitize;
 pub mod engine;
 pub mod history;
 pub mod ime;

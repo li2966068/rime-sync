@@ -2062,6 +2062,40 @@ pub fn ensure(
         actions.push(Action::new("merged-pointer", true, detail));
     }
 
+    // ---- 合并词典里的第三方词库清洗（碎音节）------------------------------
+    //
+    // 搜狗一类的第三方词库混着英文词，code 被逐字母拆开（`web` → `w e b`）。
+    // 这些单音节会挤进 librime 的音节表，把 `speller/algebra` 的首字母缩写
+    // 索引顶掉：用户敲 `bhzt` 就查不出「渤海钻探」。
+    //
+    // 清洗 = 剔除 code 里含非法单音节的整条词条（白名单取官方词库的单音节，
+    // 所以 `pinyin_simp` 的 `m`/`n` 这类方言词不会被误删）。
+    //
+    // 清洗会改写用户目录里的 `*.dict.yaml` ⇒ 必须重编译，否则 build/ 里还是
+    // 旧的 .table.bin，首字母依旧是坏的。
+    let sanitize_outcomes =
+        crate::dict_sanitize::sanitize_imported_dicts(rime_dir, &pointer_data_dirs, &mut |_path| {
+            Ok(())
+        });
+    let dict_sanitized = match &sanitize_outcomes {
+        Ok(outcomes) => outcomes.iter().any(|outcome| outcome.changed),
+        Err(error) => {
+            tracing::error!("sanitize merged dicts failed: {error:#}");
+            false
+        }
+    };
+    if let Ok(outcomes) = &sanitize_outcomes {
+        let detail = outcomes
+            .iter()
+            .filter(|outcome| outcome.changed)
+            .map(|outcome| format!("{}=removed{}", outcome.dict, outcome.removed))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !detail.is_empty() {
+            actions.push(Action::new("dict-sanitize", true, detail));
+        }
+    }
+
     // ---- 配置变更后的重建（统一入口）--------------------------------------
     //
     // 自定义 custom.yaml 被修好（numpad 等增强组件补上）、或者合并词典指针写
@@ -2077,7 +2111,7 @@ pub fn ensure(
     //             DBus 的 ReloadConfig 都不会重编译，只有 rime_deployer --build 会。
     //
     // 一轮只重建一次：custom.yaml 修好了、指针也写了 ⇒ 仍然只重建一次。
-    let config_changed = custom_repair_changed || pointer_changed;
+    let config_changed = custom_repair_changed || pointer_changed || dict_sanitized;
     let need_rebuild = config_changed && opts.deploy && opts.mode != Mode::Bootstrap;
     // Windows 的部署闸门（下面的 prebuilt::finish_deploy）里那一次进程内 librime
     // 部署**就是**重建（当场重编译）⇒ 那里不再单独重建，否则一轮编译两次；
@@ -2126,7 +2160,9 @@ pub fn ensure(
         // 用户 custom.yaml 被修 = 真的要重编译（否则 deploy 分支会被 no-changes 跳过）。
         || custom_repair_changed
         // 合并词典指针写入 = 用户 custom.yaml 变了 = 也要重编译。
-        || pointer_changed;
+        || pointer_changed
+        // 第三方词库被清洗 = build/ 里的 .table.bin 是旧的 = 也要重编译。
+        || dict_sanitized;
     let mut deploy_detail = String::new();
     if !opts.deploy {
         actions.push(Action::new("deploy", false, "skipped reason=disabled"));
