@@ -371,3 +371,62 @@ fn no_merged_dict_nothing_happens() {
     assert!(text.contains("w e b"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// ensure（fix-ime / 首启自举）这条路径也要清洗 —— 它是 Windows 上
+/// 「重装后还是打不出首字母」的实际入口。
+#[test]
+fn ensure_path_cleans_third_party_dict() {
+    use rime_sync_core::ime_state::{self, Options};
+
+    let dir = temp_dir("ensure");
+    let rime_dir = dir.join("rime");
+    let data_dir = dir.join("data");
+    fs::create_dir_all(&rime_dir).expect("mkdir");
+    fs::create_dir_all(&data_dir).expect("mkdir");
+    // 官方 luna（基准词库，白名单来源）。
+    write(
+        &data_dir.join("luna_pinyin.dict.yaml"),
+        &official_luna_dict(),
+    );
+    // 合并词典 + 脏的第三方词库。
+    write(
+        &rime_dir.join("merged.dict.yaml"),
+        &merged_dict_yaml("merged", &["luna_pinyin", "extra_sogou"]),
+    );
+    write(&rime_dir.join("extra_sogou.dict.yaml"), &third_party_dict());
+
+    let mut opts = Options::fix();
+    opts.install_ime = false;
+    opts.seed_templates = false;
+    opts.patch_data = false;
+    opts.auto_data_patch = false;
+    opts.deploy = false;
+    let outcome = ime_state::ensure(&rime_dir, None, std::slice::from_ref(&data_dir), &opts);
+
+    // 词库被清洗了。
+    let extra = fs::read_to_string(rime_dir.join("extra_sogou.dict.yaml")).expect("read");
+    assert!(!extra.contains("w e b"), "broken entry must be gone");
+    assert!(extra.contains("渤海"), "valid entry must survive");
+    // 官方词库没动。
+    assert_eq!(
+        fs::read_to_string(data_dir.join("luna_pinyin.dict.yaml")).expect("read"),
+        official_luna_dict()
+    );
+    // 动作清单里要有这一条。
+    let sanitize = outcome
+        .actions
+        .iter()
+        .find(|action| action.kind == "dict-sanitize")
+        .expect("dict-sanitize action");
+    assert!(
+        sanitize.changed,
+        "the sanitize must be recorded as a change"
+    );
+    assert!(
+        sanitize.detail.contains("extra_sogou"),
+        "detail should name the dictionary, got {}",
+        sanitize.detail
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
